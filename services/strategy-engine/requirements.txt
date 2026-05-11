@@ -1,0 +1,10 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+redis[hiredis]==5.0.8
+numpy==1.26.4
+scipy==1.13.1
+scikit-learn==1.5.1
+giotto-tda==0.6.0
+cvxpy==1.5.3
+prometheus-client==0.20.0
+motor==3.5.1

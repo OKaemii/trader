@@ -1,0 +1,64 @@
+global:
+  namespace: trader
+  imageRegistry: ""
+  imagePullPolicy: IfNotPresent
+
+redis:
+  host: redis-master
+  port: 6379
+
+mongodb:
+  host: mongodb
+  port: 27017
+  database: trader
+
+ingress:
+  host: trader.local
+  className: nginx
+
+services:
+  apiGateway:
+    replicaCount: 1
+    image: trader/api-gateway:latest
+    port: 3000
+  authService:
+    replicaCount: 1
+    image: trader/auth-service:latest
+    port: 3001
+  marketDataService:
+    replicaCount: 1
+    image: trader/market-data-service:latest
+    port: 3002
+  strategyEngine:
+    replicaCount: 1
+    image: trader/strategy-engine:latest
+    port: 8000
+    activeStrategy: factor_rank_v1
+  signalService:
+    replicaCount: 1
+    image: trader/signal-service:latest
+    port: 3003
+  notificationService:
+    replicaCount: 1
+    image: trader/notification-service:latest
+    port: 3004
+  tradingService:
+    replicaCount: 1
+    image: trader/trading-service:latest
+    port: 3005
+    tradingMode: paper
+  portfolioService:
+    replicaCount: 1
+    image: trader/portfolio-service:latest
+    port: 3006
+  frontendWeb:
+    replicaCount: 1
+    image: trader/frontend-web:latest
+    port: 3007
+
+env:
+  tradingMode: paper        # paper | live
+  barFrequency: daily       # daily | intraday
+  activeStrategy: factor_rank_v1
+  volTarget: "0.10"
+  minActionableConfidence: "0.30"
