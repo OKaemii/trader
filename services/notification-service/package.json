@@ -1,0 +1,19 @@
+{
+  "name": "@trader/notification-service",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "dev": "bun run --watch src/index.ts",
+    "start": "bun run src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@trader/shared-auth": "workspace:*",
+    "@trader/shared-mongo": "workspace:*",
+    "@trader/shared-redis": "workspace:*",
+    "@trader/shared-types": "workspace:*",
+    "expo-server-sdk": "^3.10.0",
+    "hono": "^4.3.0",
+    "resend": "^3.2.0"
+  }
+}

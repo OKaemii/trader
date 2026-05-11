@@ -1,0 +1,73 @@
+export interface OHLCVBar {
+  ticker: string;
+  timestamp: number;   // Unix ms
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  adjustedClose?: number;
+  adjustmentFactor?: number;
+}
+
+// StrategyOutput is the inter-service contract between strategy-engine (Python) and signal-service (TS).
+// topology-specific fields are optional — only populated by TopologyStrategy.
+export interface StrategyOutput {
+  timestamp: number;
+  strategy_id: string;                                       // e.g. 'factor_rank_v1', 'topology_v1'
+  ticker_universe: string[];
+  composite_scores: Record<string, number>;                  // ticker → ranked score (higher = more bullish)
+  factor_attributions: Record<string, Record<string, number>>;  // ticker → {factor: contribution}
+  sectors: Record<string, string>;                           // ticker → GICS sector
+  covariance_matrix: number[][];                             // shrunk covariance (Ledoit-Wolf)
+  regime_confidence: number;                                 // [0,1] — stability of current regime
+  betti_curves?: { epsilon_range: number[]; beta0: number[]; beta1: number[] };
+  persistence_pairs?: Array<[number, number, number]>;
+  laplacian_residuals?: Record<string, number>;
+}
+
+// TopologyFeatures — retained for backward-compatible dashboard reads only.
+// Core pipeline uses StrategyOutput. Do not add new service dependencies on this type.
+export interface TopologyFeatures {
+  timestamp: number;
+  ticker_universe: string[];
+  laplacian_residuals: Record<string, number>;
+  betti_curves: { epsilon_range: number[]; beta0: number[]; beta1: number[] };
+  persistence_pairs: Array<[number, number, number]>;
+}
+
+// TradeSignalDTO — wire format for MongoDB storage and notifications.
+// Domain entity (TradeSignal class) has the same fields; this is the plain-object form.
+export interface TradeSignalDTO {
+  id: string;
+  timestamp: number;
+  ticker: string;
+  action: 'BUY' | 'SELL' | 'HOLD';  // SELL = reduce/exit long; never initiates a short (v1 long-only)
+  confidence: number;                  // 0-1
+  targetWeight: number;                // [0,1] portfolio weight; 0 = exit position
+  rationale: string;                   // JSON-serialised SignalRationale
+  features_snapshot?: StrategyOutput;
+  approved?: boolean;
+}
+
+export interface SignalRationale {
+  plain_english: string;              // one sentence a non-quant can act on
+  economic_mechanism: string;         // which known microstructure phenomenon drives this
+  factor_exposures: Record<string, number>;  // factor → attribution
+  residual_alpha: number;             // alpha after factor attribution (must be positive)
+  topology_contribution: string;      // what TDA features added over simpler factors
+  uncertainty: 'high' | 'medium' | 'low';
+}
+
+// Redis stream keys (use xAdd/xReadGroup — NOT publish/subscribe)
+export const REDIS_STREAMS = {
+  MARKET_RAW:       'market:raw',        // market-data-service → strategy-engine
+  STRATEGY_OUTPUT:  'signals:strategy',  // strategy-engine → signal-service
+  TRADE_SIGNALS:    'signals:trade',     // signal-service → notification-service
+} as const;
+
+// Redis pub/sub channels — ephemeral dashboard events only (not the trading pipeline)
+export const REDIS_PUBSUB = {
+  STRATEGY_DASHBOARD: 'strategy:dashboard',   // strategy-engine publishes after each cycle for WS feeds
+  NOTIFICATIONS:      'notifications:pending',
+} as const;

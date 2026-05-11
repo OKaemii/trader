@@ -1,0 +1,14 @@
+{
+  "name": "trader",
+  "private": true,
+  "workspaces": [
+    "services/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev":       "bun run --filter '*' dev",
+    "build":     "bun run --filter '*' build",
+    "typecheck": "bun run --filter '*' typecheck",
+    "test":      "bun run --filter '*' test"
+  }
+}
