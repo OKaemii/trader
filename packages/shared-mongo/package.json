@@ -1,0 +1,9 @@
+{
+  "name": "@trader/shared-mongo",
+  "version": "0.0.1",
+  "private": true,
+  "main": "./src/index.ts",
+  "dependencies": {
+    "mongodb": "^6.5.0"
+  }
+}

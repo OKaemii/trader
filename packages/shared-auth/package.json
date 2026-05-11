@@ -1,0 +1,17 @@
+{
+  "name": "@trader/shared-auth",
+  "version": "0.0.1",
+  "private": true,
+  "main": "./src/index.ts",
+  "dependencies": {
+    "jose": "^5.2.0",
+    "hono": "^4.3.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  }
+}

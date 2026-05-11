@@ -1,0 +1,10 @@
+{
+  "name": "@trader/shared-data",
+  "version": "0.0.1",
+  "private": true,
+  "main": "./src/index.ts",
+  "dependencies": {
+    "mongodb": "^6.5.0",
+    "redis": "^4.7.0"
+  }
+}

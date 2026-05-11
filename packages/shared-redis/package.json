@@ -1,0 +1,9 @@
+{
+  "name": "@trader/shared-redis",
+  "version": "0.0.1",
+  "private": true,
+  "main": "./src/index.ts",
+  "dependencies": {
+    "redis": "^4.7.0"
+  }
+}
