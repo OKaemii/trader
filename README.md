@@ -1,0 +1,2 @@
+# trader
+my personal trader
