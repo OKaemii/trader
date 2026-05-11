@@ -6,7 +6,7 @@ resource "helm_release" "redis" {
   name       = "redis"
   repository = "https://charts.bitnami.com/bitnami"
   chart      = "redis"
-  version    = "19.6.2"
+  version    = "25.5.2"
   namespace  = var.namespace
 
   set {
@@ -23,7 +23,7 @@ resource "helm_release" "mongodb" {
   name       = "mongodb"
   repository = "https://charts.bitnami.com/bitnami"
   chart      = "mongodb"
-  version    = "15.6.20"
+  version    = "18.7.1"
   namespace  = var.namespace
 
   set {
