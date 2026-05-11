@@ -12,6 +12,6 @@ resource "helm_release" "nginx_ingress" {
   }
   set {
     name  = "controller.service.nodePorts.http"
-    value = "80"
+    value = "30080"
   }
 }
