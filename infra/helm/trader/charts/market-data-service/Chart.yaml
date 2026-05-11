@@ -1,0 +1,5 @@
+apiVersion: v2
+name: market-data-service
+description: market-data-service microservice
+type: application
+version: 0.1.0

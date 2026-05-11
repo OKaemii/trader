@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: market-data-service
+  namespace: {{ .Release.Namespace }}
+spec:
+  replicas: {{ .Values.replicaCount | default 1 }}
+  selector:
+    matchLabels:
+      app: market-data-service
+  template:
+    metadata:
+      labels:
+        app: market-data-service
+    spec:
+      containers:
+        - name: market-data-service
+          image: {{ .Values.image | default "trader/market-data-service:latest" }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3002
+          envFrom:
+            - secretRef:
+                name: trader-secrets
+          env:
+            - name: REDIS_URL
+              value: "redis://:$(REDIS_PASSWORD)@redis-master:6379"
+            - name: MONGODB_URL
+              value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb:27017/trader"
+            - name: TRADING_MODE
+              value: paper
+            - name: ACTIVE_STRATEGY
+              value: factor_rank_v1
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3002
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3002
+            initialDelaySeconds: 10
+            periodSeconds: 10
