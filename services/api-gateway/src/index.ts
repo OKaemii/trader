@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { upgradeWebSocket } from 'hono/bun';
 import { getRedisClient, subscribe } from '@trader/shared-redis';
-import { requireAuth, requireRole, generateInternalToken } from '@trader/shared-auth';
+import { requireAuth, requireRole, generateInternalToken, verifyAccessToken } from '@trader/shared-auth';
 
 const app = new Hono();
 
@@ -38,13 +38,24 @@ app.get('/api/market/live',    (c) => proxy('http://market-data-service:3002', c
 const authed = new Hono();
 authed.use('*', requireAuth);
 
-authed.get('/api/signals',       (c) => proxy('http://signal-service:3003', c));
-authed.get('/api/signals/:id',   (c) => proxy('http://signal-service:3003', c));
+authed.get('/api/signals',          (c) => proxy('http://signal-service:3003', c));
+// Specific path must come before the :id catch-all so it isn't shadowed.
+authed.get('/api/signals/progress', (c) => proxy('http://signal-service:3003', c));
+authed.get('/api/signals/:id',      (c) => proxy('http://signal-service:3003', c));
 authed.get('/api/portfolio',     (c) => proxy('http://portfolio-service:3006', c));
 authed.get('/api/portfolio/pnl', (c) => proxy('http://portfolio-service:3006', c));
 
-// WebSocket: topology feature stream (auth via query param for WS handshake)
-authed.get('/ws/topology', upgradeWebSocket(async (_c) => {
+// WebSocket: topology feature stream — auth via ?token= query param (browsers can't set headers on WS)
+app.get('/ws/topology', upgradeWebSocket(async (c) => {
+  const token = c.req.query('token');
+  if (!token) {
+    return { onOpen(_, ws) { ws.close(1008, 'Unauthorized'); } };
+  }
+  try {
+    await verifyAccessToken(token);
+  } catch {
+    return { onOpen(_, ws) { ws.close(1008, 'Invalid token'); } };
+  }
   let cleanup: (() => void) | undefined;
   return {
     async onOpen(_, ws) {
@@ -74,6 +85,19 @@ admin.get('/api/admin/risk/status',                   (c) => proxy('http://signa
 admin.post('/api/admin/risk/circuit-breaker/reset',   (c) => proxy('http://signal-service:3003', c));
 admin.post('/api/admin/backtest/run',                 (c) => proxy('http://backtest-engine:8001', c));
 admin.get('/api/admin/backtest/results',              (c) => proxy('http://backtest-engine:8001', c));
+admin.get('/api/admin/system/status', async (c) => {
+  const token = generateInternalToken('api-gateway');
+  const headers = { 'X-Internal-Token': token };
+  const [marketRes, strategyRes] = await Promise.allSettled([
+    fetch('http://market-data-service:3002/health', { headers }).then(r => r.json()),
+    fetch('http://strategy-engine:8000/status',     { headers }).then(r => r.json()),
+  ]);
+  return c.json({
+    market_data: marketRes.status === 'fulfilled' ? marketRes.value : { error: 'unavailable' },
+    strategy:    strategyRes.status === 'fulfilled' ? strategyRes.value : { error: 'unavailable' },
+  });
+});
+
 admin.get('/api/admin/system/health', async (c) => {
   const services = [
     ['auth',          'http://auth-service:3001/health'],
