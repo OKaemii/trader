@@ -1,0 +1,8 @@
+{
+  "name": "@trader/infra-scripts",
+  "private": true,
+  "version": "0.0.1",
+  "dependencies": {
+    "mongodb": "^6.5.0"
+  }
+}
