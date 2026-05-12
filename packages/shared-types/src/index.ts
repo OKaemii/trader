@@ -44,6 +44,13 @@ export interface TopologyFeatures {
   persistence_pairs: Array<[number, number, number]>;
 }
 
+// Lifecycle states for a TradeSignal — see TradeSignal entity for transitions.
+//   pending  → just emitted, awaiting approval (paper mode default for SELL/BUY)
+//   approved → admin approved (or auto-approved in unrestricted mode)
+//   executed → order placed and filled by trading-service
+//   closed   → position exited (exitPrice + closedAt populated)
+export type SignalLifecycle = 'pending' | 'approved' | 'executed' | 'closed';
+
 // TradeSignalDTO — wire format for MongoDB storage and notifications.
 // Domain entity (TradeSignal class) has the same fields; this is the plain-object form.
 export interface TradeSignalDTO {
@@ -57,6 +64,24 @@ export interface TradeSignalDTO {
   rationale: string;                   // JSON-serialised SignalRationale
   features_snapshot?: StrategyOutput;
   approved?: boolean;
+  // Progress / lifecycle fields — populated as the signal flows through approve / execute / close.
+  // All optional for backwards compatibility with signals written before these fields existed.
+  entryPrice?: number;                 // close-of-bar price at emission, used for P&L
+  lifecycle?: SignalLifecycle;
+  approvedAt?: number;                 // unix ms
+  executedAt?: number;                 // unix ms — set by trading-service after fill
+  closedAt?: number;                   // unix ms — set when position is exited
+  exitPrice?: number;                  // price at close, paired with closedAt
+}
+
+// SignalProgressDTO — enriched view served by /api/signals/progress for the portal.
+// Built by joining a TradeSignalDTO with the latest market quote and current portfolio weight.
+export interface SignalProgressDTO extends TradeSignalDTO {
+  currentPrice: number | null;     // latest close from OHLCV bars; null if unavailable
+  currentWeight: number;           // ticker's weight in current portfolio (0 if not held)
+  pnlPct: number | null;           // direction-aware return since emission; null if no entryPrice
+  ageMs: number;                   // now - timestamp
+  lifecycleResolved: SignalLifecycle;  // lifecycle with reasonable defaults applied
 }
 
 export interface SignalRationale {
