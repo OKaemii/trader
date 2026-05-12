@@ -6,13 +6,34 @@ export function useTopologyStream() {
   const [features, setFeatures] = useState<StrategyOutput | null>(null);
 
   useEffect(() => {
-    const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${protocol}://${window.location.host}/ws/topology`);
-    ws.onmessage = (evt) => {
-      try { setFeatures(JSON.parse(evt.data)); } catch {}
+    let ws: WebSocket | null = null;
+    let cancelled = false;
+
+    async function connect() {
+      let token: string;
+      try {
+        const res = await fetch('/api/auth/ws-token');
+        if (!res.ok) return;
+        ({ token } = await res.json());
+      } catch {
+        return;
+      }
+
+      if (cancelled) return;
+
+      const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+      ws = new WebSocket(`${protocol}://${window.location.host}/ws/topology?token=${encodeURIComponent(token)}`);
+      ws.onmessage = (evt) => {
+        try { setFeatures(JSON.parse(evt.data)); } catch {}
+      };
+      ws.onerror = console.error;
+    }
+
+    connect();
+    return () => {
+      cancelled = true;
+      ws?.close();
     };
-    ws.onerror = console.error;
-    return () => ws.close();
   }, []);
 
   return { features };

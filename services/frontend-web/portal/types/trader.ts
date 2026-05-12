@@ -15,6 +15,8 @@ export interface StrategyOutput {
   laplacian_residuals?: Record<string, number>;
 }
 
+export type SignalLifecycle = 'pending' | 'approved' | 'executed' | 'closed';
+
 export interface TradeSignalDTO {
   id: string;
   timestamp: number;
@@ -25,6 +27,20 @@ export interface TradeSignalDTO {
   targetWeight: number;
   rationale: string;
   approved?: boolean;
+  entryPrice?: number;
+  lifecycle?: SignalLifecycle;
+  approvedAt?: number;
+  executedAt?: number;
+  closedAt?: number;
+  exitPrice?: number;
+}
+
+export interface SignalProgressDTO extends TradeSignalDTO {
+  currentPrice: number | null;
+  currentWeight: number;
+  pnlPct: number | null;
+  ageMs: number;
+  lifecycleResolved: SignalLifecycle;
 }
 
 export interface SignalRationale {
