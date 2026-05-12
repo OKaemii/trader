@@ -54,6 +54,19 @@ _bars_processed = Counter(
 CONSUMER_GROUP = "strategy-engine"
 CONSUMER_NAME  = f"strategy-engine-{os.getenv('POD_NAME', 'local')}"
 
+# Shared state exposed by /status — written by process_loop, read by HTTP handlers.
+_engine_state: dict = {
+    "strategy":        ACTIVE_STRATEGY,
+    "rolling_window":  ROLLING_WINDOW_BARS,
+    "bars_needed":     ROLLING_WINDOW_BARS,
+    "cycles":          0,
+    "signals_emitted": 0,
+    "last_cycle_ts":   None,
+    "ticker_bars":     {},   # ticker -> bar count accumulated
+    "ready_tickers":   [],   # tickers with >= ROLLING_WINDOW_BARS bars
+    "last_signal":     None,
+}
+
 
 @app.get("/health")
 def health():
@@ -68,6 +81,26 @@ def healthz():
 @app.get("/strategies")
 def list_strategies():
     return {"available": list(STRATEGY_REGISTRY.keys()), "active": ACTIVE_STRATEGY}
+
+
+@app.get("/status")
+def status():
+    s = _engine_state
+    ready   = len(s["ready_tickers"])
+    total   = len(s["ticker_bars"])
+    warming = {t: {"have": n, "need": s["bars_needed"]} for t, n in s["ticker_bars"].items() if n < s["bars_needed"]}
+    return {
+        "strategy":        s["strategy"],
+        "rolling_window":  s["rolling_window"],
+        "cycles_received": s["cycles"],
+        "signals_emitted": s["signals_emitted"],
+        "last_cycle_ts":   s["last_cycle_ts"],
+        "last_signal":     s["last_signal"],
+        "universe_size":   total,
+        "ready_tickers":   ready,
+        "warming_up":      len(warming),
+        "warming_detail":  warming,
+    }
 
 
 @app.get("/metrics", response_class=PlainTextResponse)
@@ -121,18 +154,38 @@ async def process_loop() -> None:
                 try:
                     bars = bars_from_json(json.loads(fields[b"data"]))
                     _bars_processed.labels(strategy_id=ACTIVE_STRATEGY).inc(len(bars))
+
+                    # Update shared state for /status
+                    import time as _time
+                    _engine_state["cycles"] += 1
+                    _engine_state["last_cycle_ts"] = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
+                    for bar in bars:
+                        _engine_state["ticker_bars"][bar.ticker] = _engine_state["ticker_bars"].get(bar.ticker, 0) + 1
+                    _engine_state["ready_tickers"] = [
+                        t for t, n in _engine_state["ticker_bars"].items() if n >= ROLLING_WINDOW_BARS
+                    ]
+
                     output = strategy.update(bars)
-                    if output is not None:
+
+                    # Log warmup progress every cycle until ready, then only on signals
+                    ready  = len(_engine_state["ready_tickers"])
+                    total  = len(_engine_state["ticker_bars"])
+                    if output is None:
+                        print(f"[strategy-engine] warming up — cycle {_engine_state['cycles']}: "
+                              f"{ready}/{total} tickers ready ({ROLLING_WINDOW_BARS} bars needed)")
+                    else:
                         payload = json.dumps(dataclasses.asdict(output))
-                        # Durable delivery to signal-service via Redis Streams
                         await r.xadd("signals:strategy", {"data": payload})
-                        # Ephemeral latest-value keys (dashboard reads, not trading pipeline)
                         await r.set("strategy:latest_output", payload)
                         await r.set("regime:confidence", str(output.regime_confidence))
-                        # Pub/sub for WebSocket dashboard feeds (missed updates are OK for UI)
                         await r.publish("strategy:dashboard", payload)
                         _signals_published.labels(strategy_id=ACTIVE_STRATEGY).inc()
                         _regime_confidence.labels(strategy_id=ACTIVE_STRATEGY).set(output.regime_confidence)
+                        _engine_state["signals_emitted"] += 1
+                        _engine_state["last_signal"] = _engine_state["last_cycle_ts"]
+                        print(f"[strategy-engine] signal emitted — {ready} tickers, "
+                              f"regime_confidence={output.regime_confidence:.3f}")
+
                     await r.xack("market:raw", CONSUMER_GROUP, entry_id)
                 except Exception as exc:
                     # Log but do not ACK — message stays in PEL for retry/inspection
