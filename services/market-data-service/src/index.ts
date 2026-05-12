@@ -10,12 +10,17 @@ import { UniverseManager } from './universe-manager.ts';
 import { REDIS_STREAMS, type OHLCVBar } from '@trader/shared-types';
 
 const app = new Hono();
-// BAR_FREQUENCY=daily   → poll once per day at market close (60-min retry until bars arrive)
-// BAR_FREQUENCY=intraday → poll at POLL_INTERVAL_MS (default 60s)
-const BAR_FREQUENCY    = process.env.BAR_FREQUENCY ?? 'daily';
-const POLL_INTERVAL_MS = BAR_FREQUENCY === 'daily'
-  ? 60 * 60 * 1000
-  : parseInt(process.env.POLL_INTERVAL_MS ?? '60000');
+// BAR_FREQUENCY=daily   → re-poll Yahoo every POLL_INTERVAL_MS (default 20m) until the
+//                        EOD adjusted bar arrives; the cycle then idles until next close.
+// BAR_FREQUENCY=intraday → poll at POLL_INTERVAL_MS (default 60s).
+//
+// The original 60m default was conservative — chosen when EOD bar latency wasn't well
+// understood and the priority was avoiding hammering Yahoo. In practice the post-close
+// bar lands within minutes, so 60m made signal generation lag a full cycle on bad days.
+// 20m matches our observed publishing latency while staying well under any rate limit.
+const BAR_FREQUENCY     = process.env.BAR_FREQUENCY ?? 'daily';
+const DEFAULT_POLL_MS   = BAR_FREQUENCY === 'daily' ? 20 * 60 * 1000 : 60 * 1000;
+const POLL_INTERVAL_MS  = parseInt(process.env.POLL_INTERVAL_MS ?? String(DEFAULT_POLL_MS));
 
 // Universe refresh cadence: monthly in production; override via env for testing
 const UNIVERSE_REFRESH_MS = parseInt(process.env.UNIVERSE_REFRESH_MS ?? String(30 * 24 * 60 * 60 * 1000));
@@ -109,7 +114,10 @@ async function pollLoop(): Promise<void> {
           await redis.setEx(`market:latest:${bar.ticker}`, 120, JSON.stringify(bar));
         }
 
-        console.log(`[market-data] published ${valid.length} bars`);
+        pollStats.lastPollTs   = Date.now();
+        pollStats.lastBarCount = valid.length;
+        pollStats.totalCycles++;
+        console.log(`[market-data] published ${valid.length} bars (cycle ${pollStats.totalCycles})`);
       }
     } catch (e) {
       console.error('[market-data] poll error:', e);
@@ -119,7 +127,17 @@ async function pollLoop(): Promise<void> {
   }
 }
 
-app.get('/health', (c) => c.json({ status: 'ok', bar_frequency: BAR_FREQUENCY, universe_size: universeManager.activeTickers.length }));
+// Poll stats updated each cycle for /health visibility
+const pollStats = { lastPollTs: null as number | null, lastBarCount: 0, totalCycles: 0 };
+
+app.get('/health', (c) => c.json({
+  status:       'ok',
+  bar_frequency: BAR_FREQUENCY,
+  universe_size: universeManager.activeTickers.length,
+  last_poll_ts:  pollStats.lastPollTs,
+  last_bar_count: pollStats.lastBarCount,
+  total_cycles:  pollStats.totalCycles,
+}));
 
 app.get('/latest/:ticker', async (c) => {
   const redis = await getRedisClient();
