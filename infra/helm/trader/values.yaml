@@ -51,6 +51,10 @@ services:
     replicaCount: 1
     image: trader/portfolio-service:latest
     port: 3006
+  backtestEngine:
+    replicaCount: 1
+    image: trader/backtest-engine:latest
+    port: 8001
   frontendWeb:
     replicaCount: 1
     image: trader/frontend-web:latest
@@ -58,7 +62,15 @@ services:
 
 env:
   tradingMode: paper        # paper | live
+  executionMode: t212       # t212 | unrestricted
   barFrequency: daily       # daily | intraday
   activeStrategy: factor_rank_v1
   volTarget: "0.10"
   minActionableConfidence: "0.30"
+  # Raised from 0.20: demo T212 universe contains ETPs/small-caps with no Yahoo Finance equivalent.
+  # Lower back to 0.20 once a real-data universe (standard tickers only) is in use.
+  gapThreshold: "0.60"
+  # Fallback universe used when T212 instruments API is unavailable (rate-limited, auth failure, etc.).
+  # Also the seed on a fresh deployment before the monthly T212 refresh succeeds.
+  # All tickers here are major-cap stocks available on both T212 and Yahoo Finance.
+  tickerUniverse: "AAPL,MSFT,GOOGL,AMZN,NVDA,META,TSLA,JPM,JNJ,UNH,V,PG,MA,HD,CVX,MRK,ABBV,PEP,KO,AVGO,LLY,COST,MCD,BAC,TMO,ABT,WMT,CSCO,XOM,CRM,ACN,DHR,NEE,INTC,NFLX,AMD,QCOM,TXN,INTU,CAT,HON,AMGN,SBUX,IBM,GILD,AXP,GS,MS,BLK,SPGI"

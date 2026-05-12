@@ -92,6 +92,36 @@ async function main() {
   );
   console.log(`TTL index on ${COLLECTIONS.BAD_TICKS}.timestamp (7 days)`);
 
+  // risk_rejections — 90-day TTL audit log; indexed by timestamp for today-count queries
+  if (!existingCollections.has(COLLECTIONS.RISK_REJECTIONS)) {
+    await db.createCollection(COLLECTIONS.RISK_REJECTIONS);
+  }
+  await db.collection(COLLECTIONS.RISK_REJECTIONS).createIndex(
+    { timestamp: 1 },
+    { expireAfterSeconds: 90 * 24 * 60 * 60, name: 'ttl_90d' }
+  );
+  console.log(`TTL index on ${COLLECTIONS.RISK_REJECTIONS}.timestamp (90 days)`);
+
+  // risk_state — singleton document; no special indexes needed
+  if (!existingCollections.has(COLLECTIONS.RISK_STATE)) {
+    await db.createCollection(COLLECTIONS.RISK_STATE);
+  }
+  console.log(`Created collection: ${COLLECTIONS.RISK_STATE}`);
+
+  // model_versions — 90-day retrain cadence; indexed by strategy + promoted_at for shadow-test queries
+  if (!existingCollections.has(COLLECTIONS.MODEL_VERSIONS)) {
+    await db.createCollection(COLLECTIONS.MODEL_VERSIONS);
+  }
+  await db.collection(COLLECTIONS.MODEL_VERSIONS).createIndex(
+    { strategy: 1, promoted_at: -1 },
+    { name: 'strategy_promoted' }
+  );
+  await db.collection(COLLECTIONS.MODEL_VERSIONS).createIndex(
+    { status: 1, strategy: 1 },
+    { name: 'status_strategy' }
+  );
+  console.log(`Indexes on ${COLLECTIONS.MODEL_VERSIONS}`);
+
   await client.close();
   console.log('MongoDB setup complete.');
 }

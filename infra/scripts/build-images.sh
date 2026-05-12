@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# Build all service Docker images and load them into the homeserver's k3s containerd.
+#
+# Usage:
+#   ./infra/scripts/build-images.sh              # build + load all images
+#   ./infra/scripts/build-images.sh api-gateway  # build + load one service only
+#
+# Requirements: docker, ssh, scp — SSH key recommended (avoids repeated password prompts).
+#
+# Run from the repo root.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+HOMESERVER_USER="okamii"
+HOMESERVER_HOST="192.168.50.2"
+HOMESERVER_PORT="1984"
+HOMESERVER="${HOMESERVER_USER}@${HOMESERVER_HOST}"
+
+BUN_SERVICES=(
+  api-gateway
+  auth-service
+  market-data-service
+  signal-service
+  notification-service
+  trading-service
+  portfolio-service
+)
+
+build_and_load() {
+  local service="$1"
+  local tag="trader/${service}:latest"
+  local tmpfile="/tmp/trader-${service}.tar"
+
+  echo ""
+  echo "══════════════════════════════════════════"
+  echo "  Building: ${tag}"
+  echo "══════════════════════════════════════════"
+
+  case "${service}" in
+    strategy-engine)
+      docker build \
+        -f infra/docker/strategy-engine.Dockerfile \
+        -t "${tag}" \
+        "${REPO_ROOT}"
+      ;;
+    backtest-engine)
+      docker build \
+        -f infra/docker/backtest-engine.Dockerfile \
+        -t "${tag}" \
+        "${REPO_ROOT}"
+      ;;
+    frontend-web)
+      docker build \
+        -f infra/docker/frontend-web.Dockerfile \
+        -t "${tag}" \
+        "${REPO_ROOT}"
+      ;;
+    *)
+      docker build \
+        -f infra/docker/bun-service.Dockerfile \
+        --build-arg SERVICE="${service}" \
+        -t "${tag}" \
+        "${REPO_ROOT}"
+      ;;
+  esac
+
+  echo "--> Saving ${tag} to ${tmpfile} ..."
+  docker save "${tag}" -o "${tmpfile}"
+
+  echo "--> Uploading to homeserver ..."
+  scp -P "${HOMESERVER_PORT}" "${tmpfile}" "${HOMESERVER}:/tmp/"
+
+  echo "--> Importing into k3s containerd ..."
+  # -t allocates a pseudo-terminal so sudo can prompt for a password interactively
+  # shellcheck disable=SC2029
+  ssh -t -p "${HOMESERVER_PORT}" "${HOMESERVER}" \
+    "sudo k3s ctr images import /tmp/trader-${service}.tar && rm /tmp/trader-${service}.tar"
+
+  rm -f "${tmpfile}"
+  echo "--> Done: ${tag}"
+}
+
+verify_images() {
+  echo ""
+  echo "Verifying imported images on homeserver ..."
+  # shellcheck disable=SC2029
+  ssh -t -p "${HOMESERVER_PORT}" "${HOMESERVER}" \
+    "sudo k3s ctr images list | grep 'trader/'"
+}
+
+cd "${REPO_ROOT}"
+
+TARGET="${1:-all}"
+
+if [[ "${TARGET}" == "all" ]]; then
+  for svc in "${BUN_SERVICES[@]}"; do
+    build_and_load "${svc}"
+  done
+  build_and_load "strategy-engine"
+  build_and_load "backtest-engine"
+  build_and_load "frontend-web"
+  verify_images
+else
+  build_and_load "${TARGET}"
+fi
+
+echo ""
+echo "All images loaded. Next: cd infra/terraform && terraform apply -var-file=terraform.tfvars"

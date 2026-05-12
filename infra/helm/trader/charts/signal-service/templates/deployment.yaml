@@ -16,19 +16,33 @@ spec:
       containers:
         - name: signal-service
           image: {{ .Values.image | default "trader/signal-service:latest" }}
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Never
           ports:
             - containerPort: 3003
           envFrom:
             - secretRef:
                 name: trader-secrets
           env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: REDIS_PASSWORD
+            - name: MONGODB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: MONGODB_PASSWORD
             - name: REDIS_URL
               value: "redis://:$(REDIS_PASSWORD)@redis-master:6379"
             - name: MONGODB_URL
               value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb:27017/trader"
             - name: TRADING_MODE
               value: paper
+            - name: BAR_FREQUENCY
+              value: daily
+            - name: EXECUTION_MODE
+              value: t212
             - name: ACTIVE_STRATEGY
               value: factor_rank_v1
           livenessProbe:

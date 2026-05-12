@@ -16,22 +16,26 @@ spec:
       containers:
         - name: strategy-engine
           image: {{ .Values.image | default "trader/strategy-engine:latest" }}
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Never
           ports:
             - containerPort: 8000
           env:
-            - name: REDIS_URL
-              value: "redis://:$(REDIS_PASSWORD)@redis-master:6379"
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: trader-secrets
                   key: REDIS_PASSWORD
+            - name: REDIS_URL
+              value: "redis://:$(REDIS_PASSWORD)@redis-master:6379"
             - name: INTERNAL_SECRET
               valueFrom:
                 secretKeyRef:
                   name: trader-secrets
                   key: INTERNAL_SECRET
+            - name: BAR_FREQUENCY
+              value: daily
+            - name: EXECUTION_MODE
+              value: t212
             - name: ACTIVE_STRATEGY
               value: {{ .Values.activeStrategy | default "factor_rank_v1" | quote }}
           livenessProbe:

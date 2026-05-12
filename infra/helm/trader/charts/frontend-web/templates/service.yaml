@@ -1,13 +1,13 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: api-gateway
+  name: frontend-web
   namespace: {{ .Release.Namespace }}
 spec:
   type: ClusterIP
   selector:
-    app: api-gateway
+    app: frontend-web
   ports:
-    - port: 80
+    - port: 3000
       targetPort: 3000
       protocol: TCP

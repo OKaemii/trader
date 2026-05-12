@@ -16,13 +16,23 @@ spec:
       containers:
         - name: portfolio-service
           image: {{ .Values.image | default "trader/portfolio-service:latest" }}
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Never
           ports:
             - containerPort: 3006
           envFrom:
             - secretRef:
                 name: trader-secrets
           env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: REDIS_PASSWORD
+            - name: MONGODB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: MONGODB_PASSWORD
             - name: REDIS_URL
               value: "redis://:$(REDIS_PASSWORD)@redis-master:6379"
             - name: MONGODB_URL
@@ -32,14 +42,12 @@ spec:
             - name: ACTIVE_STRATEGY
               value: factor_rank_v1
           livenessProbe:
-            httpGet:
-              path: /health
+            tcpSocket:
               port: 3006
             initialDelaySeconds: 15
             periodSeconds: 30
           readinessProbe:
-            httpGet:
-              path: /health
+            tcpSocket:
               port: 3006
             initialDelaySeconds: 10
             periodSeconds: 10
