@@ -11,6 +11,7 @@ class OHLCVBar:
     low: float
     close: float
     volume: float
+    raw_close: Optional[float] = None         # unadjusted price; set when adjustment_factor != 1
     adjusted_close: Optional[float] = None
     adjustment_factor: Optional[float] = None
 
@@ -25,6 +26,9 @@ class StrategyOutput:
     sectors: dict[str, str]                           # ticker → GICS sector
     covariance_matrix: list[list[float]]              # shrunk covariance (Ledoit-Wolf)
     regime_confidence: float                          # [0,1] stability of current regime
+    position_size_multiplier: float = 1.0             # from RegimeState; applied in signal-service
+    signal_weights: Optional[dict] = None             # from RegimeState; factor → weight
+    feature_stability: Optional[dict] = None          # FeatureStabilityReport as dict
     # Optional topology extras — only present when strategy_id starts with 'topology_'
     betti_curves: Optional[dict] = None
     persistence_pairs: Optional[list] = None

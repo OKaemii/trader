@@ -1,10 +1,12 @@
 import { Hono } from 'hono';
 import { requireInternalToken } from '@trader/shared-auth/middleware';
 import type { ApproveSignalUseCase } from '../../application/use-cases/ApproveSignal.ts';
+import type { RiskEngine } from '../../application/services/RiskEngine.ts';
 
 interface Deps {
   findRecent: { execute: (limit: number) => Promise<unknown[]> };
   approveSignal: ApproveSignalUseCase;
+  riskEngine: RiskEngine;
 }
 
 export function createInternalRouter(deps: Deps): Hono {
@@ -21,6 +23,16 @@ export function createInternalRouter(deps: Deps): Hono {
     const id = c.req.param('id');
     await deps.approveSignal.execute(id);
     return c.json({ approved: id });
+  });
+
+  router.get('/internal/risk/status', async (c) => {
+    const status = await deps.riskEngine.status();
+    return c.json(status);
+  });
+
+  router.post('/internal/risk/circuit-breaker/reset', async (c) => {
+    await deps.riskEngine.resetCircuitBreaker();
+    return c.json({ reset: true, ts: Date.now() });
   });
 
   return router;

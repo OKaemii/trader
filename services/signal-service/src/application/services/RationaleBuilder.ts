@@ -3,6 +3,7 @@ import type { StrategyOutput, SignalRationale } from '@trader/shared-types';
 export function buildStructuredRationale(
   ticker: string,
   features: StrategyOutput,
+  uncertaintyOverride?: 'low' | 'medium' | 'high',
 ): SignalRationale | null {
   const attribution = features.factor_attributions[ticker];
   if (!attribution) return null;
@@ -31,6 +32,6 @@ export function buildStructuredRationale(
     topology_contribution: Math.abs(topoContrib) > 0.01
       ? `TDA added ${(topoContrib * 100).toFixed(1)}% to the composite score (β₁ cluster tension)`
       : 'TDA contribution below threshold — signal dominated by simpler factors',
-    uncertainty: (features.regime_confidence ?? 1) < 0.5 ? 'high' : 'medium',
+    uncertainty: uncertaintyOverride ?? ((features.regime_confidence ?? 1) < 0.5 ? 'high' : 'medium'),
   };
 }

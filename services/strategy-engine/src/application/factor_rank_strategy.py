@@ -1,12 +1,17 @@
+import os
 import time
+import dataclasses
 import numpy as np
 from typing import Optional
 from .base_strategy import BaseStrategy
 from .covariance import shrunk_covariance
 from .regime_engine import RegimeEngine
+from .feature_stability import FeatureStabilityAnalyser
 from ..domain.dataclasses import OHLCVBar, StrategyOutput
 
-ROLLING_WINDOW = 20   # days for momentum, reversal, volatility factors
+# BAR_FREQUENCY=daily → 20 bars = 20 trading days; BAR_FREQUENCY=intraday → 60 bars (shorter horizon)
+ROLLING_WINDOW = int(os.getenv("ROLLING_WINDOW_BARS", "20" if os.getenv("BAR_FREQUENCY", "daily") == "daily" else "60"))
+STABILITY_WINDOW = 30  # cycles to accumulate before running stability analysis
 
 
 class FactorRankStrategy(BaseStrategy):
@@ -31,6 +36,11 @@ class FactorRankStrategy(BaseStrategy):
         self._price_history: dict[str, list[float]] = {}
         self._sectors: dict[str, str] = {}
         self._regime_engine = RegimeEngine()
+        self._stability_analyser = FeatureStabilityAnalyser()
+        # Rolling history for stability analysis: feature_name → list of cross-sectional mean values
+        self._feature_history: dict[str, list[float]] = {
+            'momentum': [], 'reversal': [], 'low_vol': [],
+        }
 
     @property
     def strategy_id(self) -> str:
@@ -83,9 +93,22 @@ class FactorRankStrategy(BaseStrategy):
                 'residual_alpha': float(composite[i]),
             }
 
-        # Regime confidence
+        # Regime confidence + soft multipliers
         cross_sectional_returns = returns[:, -1]
         regime = self._regime_engine.update(cross_sectional_returns)
+
+        # Feature stability — accumulate cross-sectional means, analyse after warm-up
+        self._feature_history['momentum'].append(float(momentum.mean()))
+        self._feature_history['reversal'].append(float(reversal.mean()))
+        self._feature_history['low_vol'].append(float(low_vol.mean()))
+        for k in self._feature_history:
+            if len(self._feature_history[k]) > STABILITY_WINDOW * 2:
+                self._feature_history[k].pop(0)
+
+        stability_report = None
+        if len(self._feature_history['momentum']) >= STABILITY_WINDOW:
+            report = self._stability_analyser.analyse(self._feature_history)
+            stability_report = dataclasses.asdict(report)
 
         # Ledoit-Wolf covariance
         cov = shrunk_covariance(returns)
@@ -99,4 +122,7 @@ class FactorRankStrategy(BaseStrategy):
             sectors=self._sectors,
             covariance_matrix=cov.tolist(),
             regime_confidence=regime.confidence,
+            position_size_multiplier=regime.position_size_multiplier,
+            signal_weights=regime.signal_weights,
+            feature_stability=stability_report,
         )
