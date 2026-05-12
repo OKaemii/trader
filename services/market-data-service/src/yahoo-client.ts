@@ -1,19 +1,5 @@
 import type { OHLCVBar } from '@trader/shared-types';
 
-/**
- * Trading212 ticker examples:
- *
- * AAPL_US_EQ
- * SHEL_UK_EQ
- * ZGYd_EQ
- * V6Cd1_EQ
- *
- * Notes:
- * - trailing "d" = fractional share variant
- * - trailing "l" = CFD variant
- * - many symbols require Yahoo exchange suffixes
- */
-
 interface YahooQuote {
   open: (number | null)[];
   high: (number | null)[];
@@ -38,13 +24,7 @@ const BATCH_SIZE = 20;
 const BATCH_DELAY_MS = 500;
 
 /**
- * Persistent symbol cache
- * Helps avoid repeated normalization work
- */
-const yahooSymbolCache = new Map<string, string>();
-
-/**
- * Yahoo Finance exchange suffix mapping
+ * Exchange suffix mapping
  */
 const EXCHANGE_SUFFIX: Record<string, string> = {
   UK: '.L',
@@ -70,53 +50,89 @@ const EXCHANGE_SUFFIX: Record<string, string> = {
 };
 
 /**
+ * Heuristic exchange mappings for symbols
+ * that arrive without exchange metadata.
+ */
+const HEURISTIC_SUFFIXES: Record<string, string> = {
+  SGLN: '.L',
+  VFEM: '.L',
+  IUKD: '.L',
+  XUSE: '.L',
+  SRSA: '.L',
+  SSLN: '.L',
+  SUPR: '.L',
+  GLINT: '.L',
+
+  SXR1: '.DE',
+  XDN0: '.DE',
+  DBXH: '.DE',
+};
+
+/**
+ * Symbols known to be unsupported by Yahoo.
+ * Prevents repeated wasted requests.
+ */
+const UNSUPPORTED_SYMBOLS = new Set<string>();
+
+/**
+ * Persistent ticker cache
+ */
+const yahooSymbolCache = new Map<string, string>();
+
+/**
+ * Retry suffixes for unresolved European ETFs
+ */
+const FALLBACK_SUFFIXES = [
+  '.L',
+  '.DE',
+  '.PA',
+  '.AS',
+  '.MI',
+];
+
+/**
  * Remove ONLY Trading212 synthetic suffixes:
- * - d = fractional
- * - l = CFD
- *
- * Examples:
- * ZGYd  -> ZGY
- * SHELl -> SHEL
- *
- * Does NOT corrupt:
- * V6Cd1
- * WCCPl
- * etc.
+ * d = fractional
+ * l = CFD
  */
 function normalizeBaseSymbol(raw: string): string {
   return raw.replace(/[dl]$/, '');
 }
 
-/**
- * Convert Trading212 ticker -> Yahoo ticker
- */
-function toYahooSymbol(t212Ticker: string): string {
-  const cached = yahooSymbolCache.get(t212Ticker);
-  if (cached) return cached;
-
+function parseT212Ticker(t212Ticker: string): {
+  rawSymbol: string;
+  symbol: string;
+  exchange: string | null;
+} {
   const parts = t212Ticker.split('_');
 
-  /**
-   * Examples:
-   *
-   * AAPL_US_EQ
-   * SGLN_UK_EQ
-   * ZGYd_EQ
-   * V6Cd1_EQ
-   */
-
   const rawSymbol = parts[0];
+  const symbol = normalizeBaseSymbol(rawSymbol);
+
   const exchange =
     parts.length >= 3
       ? parts[1]
       : null;
 
-  const symbol = normalizeBaseSymbol(rawSymbol);
+  return {
+    rawSymbol,
+    symbol,
+    exchange,
+  };
+}
+
+function toYahooSymbol(t212Ticker: string): string {
+  const cached = yahooSymbolCache.get(t212Ticker);
+
+  if (cached) return cached;
+
+  const { symbol, exchange } =
+    parseT212Ticker(t212Ticker);
 
   const suffix =
     exchange && EXCHANGE_SUFFIX[exchange]
       ? EXCHANGE_SUFFIX[exchange]
-      : '';
+      : HEURISTIC_SUFFIXES[symbol] ?? '';
 
   const yahooSymbol = `${symbol}${suffix}`;
 
@@ -125,12 +141,9 @@ function toYahooSymbol(t212Ticker: string): string {
   return yahooSymbol;
 }
 
-async function fetchOne(
-  t212Ticker: string,
-  fetchTime: number
-): Promise<OHLCVBar> {
-  const yahooSymbol = toYahooSymbol(t212Ticker);
-
+async function fetchYahooChart(
+  yahooSymbol: string
+): Promise<YahooResponse> {
   const url =
     `https://query1.finance.yahoo.com/v8/finance/chart/` +
     `${encodeURIComponent(yahooSymbol)}` +
@@ -149,13 +162,19 @@ async function fetchOne(
     );
   }
 
-  const data = (await res.json()) as YahooResponse;
+  return (await res.json()) as YahooResponse;
+}
 
+function extractOHLCV(
+  ticker: string,
+  fetchTime: number,
+  data: YahooResponse
+): OHLCVBar {
   const result = data.chart?.result?.[0];
 
   if (!result?.timestamp?.length) {
     throw new Error(
-      `Yahoo ${yahooSymbol}: no chart result`
+      `Yahoo ${ticker}: no chart result`
     );
   }
 
@@ -163,13 +182,10 @@ async function fetchOne(
 
   if (!quote) {
     throw new Error(
-      `Yahoo ${yahooSymbol}: missing quote data`
+      `Yahoo ${ticker}: missing quote data`
     );
   }
 
-  /**
-   * Walk backwards to find latest valid candle
-   */
   let i = result.timestamp.length - 1;
 
   while (
@@ -184,7 +200,7 @@ async function fetchOne(
 
   if (i < 0) {
     throw new Error(
-      `Yahoo ${yahooSymbol}: no valid close`
+      `Yahoo ${ticker}: no valid close`
     );
   }
 
@@ -195,7 +211,7 @@ async function fetchOne(
   const volume = quote.volume[i] ?? 0;
 
   return {
-    ticker: t212Ticker,
+    ticker,
     timestamp: fetchTime,
     open,
     high,
@@ -205,12 +221,106 @@ async function fetchOne(
   };
 }
 
+async function fetchWithFallbacks(
+  t212Ticker: string,
+  fetchTime: number
+): Promise<OHLCVBar> {
+  const primaryYahooSymbol =
+    toYahooSymbol(t212Ticker);
+
+  if (
+    UNSUPPORTED_SYMBOLS.has(
+      primaryYahooSymbol
+    )
+  ) {
+    throw new Error(
+      `Yahoo ${primaryYahooSymbol}: blacklisted`
+    );
+  }
+
+  const attempted = new Set<string>();
+
+  const candidates: string[] = [];
+
+  candidates.push(primaryYahooSymbol);
+
+  const { symbol, exchange } =
+    parseT212Ticker(t212Ticker);
+
+  /**
+   * If no explicit exchange,
+   * try fallback European exchanges.
+   */
+  if (!exchange) {
+    for (const suffix of FALLBACK_SUFFIXES) {
+      candidates.push(`${symbol}${suffix}`);
+    }
+  }
+
+  for (const yahooSymbol of candidates) {
+    if (attempted.has(yahooSymbol)) {
+      continue;
+    }
+
+    attempted.add(yahooSymbol);
+
+    try {
+      const data =
+        await fetchYahooChart(yahooSymbol);
+
+      /**
+       * Cache successful resolution
+       */
+      yahooSymbolCache.set(
+        t212Ticker,
+        yahooSymbol
+      );
+
+      return extractOHLCV(
+        t212Ticker,
+        fetchTime,
+        data
+      );
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : String(err);
+
+      /**
+       * Continue trying fallbacks
+       */
+      if (
+        message.includes('404') ||
+        message.includes('no chart result')
+      ) {
+        continue;
+      }
+
+      throw err;
+    }
+  }
+
+  /**
+   * Blacklist permanently unsupported symbols
+   */
+  UNSUPPORTED_SYMBOLS.add(
+    primaryYahooSymbol
+  );
+
+  throw new Error(
+    `Yahoo ${primaryYahooSymbol}: unresolved`
+  );
+}
+
 export async function fetchYahooPrices(
   t212Tickers: string[]
 ): Promise<OHLCVBar[]> {
   const fetchTime = Date.now();
 
   const bars: OHLCVBar[] = [];
+
+  let failures = 0;
 
   for (
     let i = 0;
@@ -224,32 +334,60 @@ export async function fetchYahooPrices(
 
     const results = await Promise.allSettled(
       batch.map((ticker) =>
-        fetchOne(ticker, fetchTime)
+        fetchWithFallbacks(
+          ticker,
+          fetchTime
+        )
       )
     );
 
     for (let j = 0; j < results.length; j++) {
       const result = results[j];
       const t212Ticker = batch[j];
-      const yahooSymbol = toYahooSymbol(t212Ticker);
 
       if (result.status === 'fulfilled') {
         bars.push(result.value);
       } else {
-        console.warn('[yahoo] price fetch failed', {
-          t212Ticker,
-          yahooSymbol,
-          error:
-            result.reason instanceof Error
-              ? result.reason.message
-              : String(result.reason),
-        });
+        failures++;
+
+        console.warn(
+          '[yahoo] price fetch failed',
+          {
+            t212Ticker,
+            yahooSymbol:
+              toYahooSymbol(t212Ticker),
+            error:
+              result.reason instanceof Error
+                ? result.reason.message
+                : String(result.reason),
+          }
+        );
       }
     }
 
     if (i + BATCH_SIZE < t212Tickers.length) {
       await Bun.sleep(BATCH_DELAY_MS);
     }
+  }
+
+  const coverage =
+    bars.length / t212Tickers.length;
+
+  /**
+   * Only fail hard if core coverage collapses.
+   */
+  if (coverage < 0.35) {
+    console.error(
+      `[market-data] critical coverage failure (${Math.round(
+        coverage * 100
+      )}%)`
+    );
+  } else {
+    console.info(
+      `[market-data] coverage ${Math.round(
+        coverage * 100
+      )}% (${bars.length}/${t212Tickers.length})`
+    );
   }
 
   return bars;
