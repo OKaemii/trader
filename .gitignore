@@ -9,6 +9,9 @@ legacy/target/
 # MSVC debug info
 *.pdb
 
+# Sensitive
+terraform.tfvars
+
 # cargo-mutants
 **/mutants.out*/
 
@@ -28,7 +31,12 @@ CLAUDE.md
 CLAUDE.md.bak
 *.prompt
 *.llm
+PROGRESS.md
 
 # Misc
 *.orig
 *.bk
+**/node_modules/
+kubectl
+checklist.md
+
