@@ -14,6 +14,8 @@ export const COLLECTIONS = {
   PUSH_TOKENS:           'push_tokens',
   RISK_REJECTIONS:       'risk_rejections',
   RISK_STATE:            'risk_state',
+  PORTAL_UNIVERSE_OVERRIDES: 'portal_universe_overrides',
+  PORTAL_MARKET_CONFIG:      'portal_market_config',
 } as const;
 
 export type CollectionName = typeof COLLECTIONS[keyof typeof COLLECTIONS];
