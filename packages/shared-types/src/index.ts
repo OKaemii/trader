@@ -1,11 +1,12 @@
 export interface OHLCVBar {
   ticker: string;
-  timestamp: number;   // Unix ms
+  timestamp: number;    // Unix ms
   open: number;
   high: number;
   low: number;
-  close: number;
+  close: number;        // primary price — adjusted if adjustmentFactor is set, otherwise raw
   volume: number;
+  rawClose?: number;    // unadjusted closing price (stored when a corporate-action adjustment is applied)
   adjustedClose?: number;
   adjustmentFactor?: number;
 }
@@ -21,6 +22,13 @@ export interface StrategyOutput {
   sectors: Record<string, string>;                           // ticker → GICS sector
   covariance_matrix: number[][];                             // shrunk covariance (Ledoit-Wolf)
   regime_confidence: number;                                 // [0,1] — stability of current regime
+  position_size_multiplier?: number;                         // [0.25, 1.0] — from RegimeState
+  signal_weights?: Record<string, number>;                   // factor → weight (topology fades in crisis)
+  feature_stability?: {                                      // FeatureStabilityReport summary
+    stability_score: number;
+    n_unstable: number;
+    features: Array<{ name: string; cv: number; is_stationary: boolean }>;
+  };
   betti_curves?: { epsilon_range: number[]; beta0: number[]; beta1: number[] };
   persistence_pairs?: Array<[number, number, number]>;
   laplacian_residuals?: Record<string, number>;
@@ -42,6 +50,7 @@ export interface TradeSignalDTO {
   id: string;
   timestamp: number;
   ticker: string;
+  strategy_id: string;                 // e.g. 'factor_rank_v1', 'topology_v1'
   action: 'BUY' | 'SELL' | 'HOLD';  // SELL = reduce/exit long; never initiates a short (v1 long-only)
   confidence: number;                  // 0-1
   targetWeight: number;                // [0,1] portfolio weight; 0 = exit position

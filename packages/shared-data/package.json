@@ -3,6 +3,15 @@
   "version": "0.0.1",
   "private": true,
   "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./adapters/MongoDataAdapter": "./src/adapters/MongoDataAdapter.ts",
+    "./adapters/RedisCacheAdapter": "./src/adapters/RedisCacheAdapter.ts",
+    "./adapters/RedisCacheInvalidationBus": "./src/adapters/RedisCacheInvalidationBus.ts",
+    "./interfaces/IDataManager": "./src/interfaces/IDataManager.ts",
+    "./interfaces/ICache": "./src/interfaces/ICache.ts",
+    "./interfaces/ICacheInvalidationBus": "./src/interfaces/ICacheInvalidationBus.ts"
+  },
   "dependencies": {
     "mongodb": "^6.5.0",
     "redis": "^4.7.0"
