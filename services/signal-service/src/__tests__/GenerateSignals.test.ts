@@ -4,6 +4,7 @@ import { TradeSignal } from '../domain/entities/TradeSignal.ts';
 import type { ISignalRepository } from '../domain/interfaces/ISignalRepository.ts';
 import type { ISignalPublisher } from '../domain/interfaces/ISignalPublisher.ts';
 import type { IPortfolioState } from '../domain/interfaces/IPortfolioState.ts';
+import type { IPriceLookup } from '../domain/interfaces/IPriceLookup.ts';
 import type { RiskEngine } from '../application/services/RiskEngine.ts';
 import type { StrategyOutput } from '@trader/shared-types';
 
@@ -14,7 +15,9 @@ class MockSignalRepository implements ISignalRepository {
   async save(s: TradeSignal) { this.saved.push(s); }
   async findById(_id: string) { return null; }
   async findRecent(_limit: number) { return []; }
-  async update(_s: TradeSignal) {}
+  async approve(_id: string) {}
+  async markExecuted(_id: string, _at: number) {}
+  async markClosed(_id: string, _at: number, _exitPrice: number) {}
 }
 
 class MockPublisher implements ISignalPublisher {
@@ -26,6 +29,16 @@ class MockPortfolioState implements IPortfolioState {
   constructor(private weights: Record<string, number> = {}, private drawdown = 0) {}
   async currentWeights() { return this.weights; }
   async currentDrawdown() { return this.drawdown; }
+}
+
+class MockPriceLookup implements IPriceLookup {
+  constructor(private prices: Record<string, number | null> = {}) {}
+  async lastClose(t: string) { return this.prices[t] ?? null; }
+  async lastCloseMany(tickers: string[]) {
+    const out: Record<string, number | null> = {};
+    for (const t of tickers) out[t] = this.prices[t] ?? null;
+    return out;
+  }
 }
 
 function makeMockRiskEngine(allowed = true): RiskEngine {
@@ -133,5 +146,67 @@ describe('GenerateSignalsUseCase', () => {
       expect(s.confidence).toBeGreaterThanOrEqual(0);
       expect(s.confidence).toBeLessThanOrEqual(1);
     }
+  });
+
+  it('stamps entryPrice from the price lookup when available', async () => {
+    const prices = new MockPriceLookup({ AAPL: 200, MSFT: 400, GOOG: 150 });
+    const withPrices = new GenerateSignalsUseCase(
+      repo, publisher, portfolioState, makeMockRiskEngine(),
+      undefined, undefined, prices,
+    );
+    const signals = await withPrices.execute(baseFeatures());
+    expect(signals.length).toBeGreaterThan(0);
+    for (const s of signals) {
+      // Either the ticker had a price (entryPrice set) or it didn't (undefined).
+      // Never zero, never NaN.
+      if (s.entryPrice !== undefined) {
+        expect(s.entryPrice).toBeGreaterThan(0);
+      }
+    }
+    // At least one signal in the emitted set should have been stamped.
+    expect(signals.some((s) => s.entryPrice !== undefined)).toBe(true);
+  });
+
+  it('leaves entryPrice undefined when no price is available', async () => {
+    const prices = new MockPriceLookup({}); // empty
+    const noPrices = new GenerateSignalsUseCase(
+      repo, publisher, portfolioState, makeMockRiskEngine(),
+      undefined, undefined, prices,
+    );
+    const signals = await noPrices.execute(baseFeatures());
+    for (const s of signals) expect(s.entryPrice).toBeUndefined();
+  });
+
+  it('emitted signals start with lifecycle="pending"', async () => {
+    const signals = await useCase.execute(baseFeatures());
+    for (const s of signals) expect(s.lifecycle).toBe('pending');
+  });
+});
+
+describe('TradeSignal.pnlPct', () => {
+  const make = (action: 'BUY' | 'SELL', entry?: number) =>
+    new TradeSignal({
+      id: 'x', timestamp: 0, ticker: 'AAPL', strategy_id: 's',
+      action, confidence: 0.5, targetWeight: 0.1, rationale: '{}',
+      entryPrice: entry,
+    });
+
+  it('BUY: positive return when price rises', () => {
+    expect(make('BUY', 100).pnlPct(110)).toBeCloseTo(0.1);
+  });
+  it('BUY: negative return when price falls', () => {
+    expect(make('BUY', 100).pnlPct(90)).toBeCloseTo(-0.1);
+  });
+  it('SELL: inverts sign — profit when price falls', () => {
+    expect(make('SELL', 100).pnlPct(90)).toBeCloseTo(0.1);
+  });
+  it('null entryPrice → null pnl', () => {
+    expect(make('BUY').pnlPct(110)).toBeNull();
+  });
+  it('null currentPrice → null pnl', () => {
+    expect(make('BUY', 100).pnlPct(null)).toBeNull();
+  });
+  it('non-positive currentPrice → null pnl', () => {
+    expect(make('BUY', 100).pnlPct(0)).toBeNull();
   });
 });

@@ -26,7 +26,32 @@ export class MongoSignalRepository implements ISignalRepository {
   }
 
   async approve(id: string): Promise<void> {
-    await this.manager.update(id, { approved: true, approvedAt: new Date() });
+    await this.manager.update(id, {
+      approved: true,
+      approvedAt: new Date(),
+      lifecycle: 'approved',
+    });
+    await this.invalidate(id);
+  }
+
+  async markExecuted(id: string, at: number): Promise<void> {
+    await this.manager.update(id, {
+      executedAt: new Date(at),
+      lifecycle: 'executed',
+    });
+    await this.invalidate(id);
+  }
+
+  async markClosed(id: string, at: number, exitPrice: number): Promise<void> {
+    await this.manager.update(id, {
+      closedAt: new Date(at),
+      exitPrice,
+      lifecycle: 'closed',
+    });
+    await this.invalidate(id);
+  }
+
+  private async invalidate(id: string): Promise<void> {
     await this.cache.invalidate(id);
     await this.bus.publish('signals', id);
   }
