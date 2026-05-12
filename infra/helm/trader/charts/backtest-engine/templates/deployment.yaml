@@ -32,6 +32,11 @@ spec:
               value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb:27017/trader"
             - name: MONGODB_DB
               value: trader
+          resources:
+            requests:
+              ephemeral-storage: "256Mi"
+            limits:
+              ephemeral-storage: "512Mi"
           livenessProbe:
             httpGet:
               path: /health
