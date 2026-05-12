@@ -1,0 +1,12 @@
+node_modules/
+**/node_modules/
+.git/
+.claude/
+agent-docs/
+*.tar
+*.tar.gz
+kubectl
+infra/terraform/.terraform/
+infra/terraform/terraform.tfstate
+infra/terraform/terraform.tfstate.backup
+infra/terraform/.terraform.lock.hcl
