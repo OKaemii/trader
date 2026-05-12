@@ -17,6 +17,15 @@ HOMESERVER_HOST="192.168.50.2"
 HOMESERVER_PORT="1984"
 HOMESERVER="${HOMESERVER_USER}@${HOMESERVER_HOST}"
 
+if [[ -z "${HOMESERVER_SSH_KEY:-}" ]]; then
+  echo "Error: HOMESERVER_SSH_KEY env var is not set. Run infra/scripts/setup-agent-ssh.sh first." >&2
+  exit 1
+fi
+TMPKEY="$(mktemp)"
+printf '%b' "${HOMESERVER_SSH_KEY}" > "${TMPKEY}"
+chmod 600 "${TMPKEY}"
+trap 'rm -f "${TMPKEY}"' EXIT
+
 BUN_SERVICES=(
   api-gateway
   auth-service
@@ -69,12 +78,10 @@ build_and_load() {
   docker save "${tag}" -o "${tmpfile}"
 
   echo "--> Uploading to homeserver ..."
-  scp -P "${HOMESERVER_PORT}" "${tmpfile}" "${HOMESERVER}:/tmp/"
+  scp -i "${TMPKEY}" -P "${HOMESERVER_PORT}" "${tmpfile}" "${HOMESERVER}:/tmp/"
 
   echo "--> Importing into k3s containerd ..."
-  # -t allocates a pseudo-terminal so sudo can prompt for a password interactively
-  # shellcheck disable=SC2029
-  ssh -t -p "${HOMESERVER_PORT}" "${HOMESERVER}" \
+  ssh -i "${TMPKEY}" -p "${HOMESERVER_PORT}" "${HOMESERVER}" \
     "sudo k3s ctr images import /tmp/trader-${service}.tar && rm /tmp/trader-${service}.tar"
 
   rm -f "${tmpfile}"
@@ -84,8 +91,7 @@ build_and_load() {
 verify_images() {
   echo ""
   echo "Verifying imported images on homeserver ..."
-  # shellcheck disable=SC2029
-  ssh -t -p "${HOMESERVER_PORT}" "${HOMESERVER}" \
+  ssh -i "${TMPKEY}" -p "${HOMESERVER_PORT}" "${HOMESERVER}" \
     "sudo k3s ctr images list | grep 'trader/'"
 }
 
