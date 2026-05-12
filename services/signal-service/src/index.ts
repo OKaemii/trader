@@ -8,6 +8,8 @@ import { RedisStrategySubscriber } from './infrastructure/messaging/RedisStrateg
 import { MongoPortfolioState } from './infrastructure/MongoPortfolioState.ts';
 import { GenerateSignalsUseCase } from './application/use-cases/GenerateSignals.ts';
 import { ApproveSignalUseCase } from './application/use-cases/ApproveSignal.ts';
+import { RiskEngine } from './application/services/RiskEngine.ts';
+import { StrategyDecayMonitor } from './application/services/StrategyDecayMonitor.ts';
 import { createRouter } from './infrastructure/http/router.ts';
 import { createInternalRouter } from './infrastructure/http/internal-router.ts';
 
@@ -25,9 +27,16 @@ async function main() {
   // Repository receives only interfaces — adapter choice is invisible to it
   const signalRepo = new MongoSignalRepository(manager, cache, bus);
 
+  // Risk engine: circuit breaker + audit log
+  const riskEngine = new RiskEngine(db, redis);
+  await riskEngine.init();
+
+  // Strategy decay monitor: runs after every rebalance, writes to strategy:health + strategy_health_log
+  const decayMonitor = new StrategyDecayMonitor(db, redis);
+
   // Use cases receive only domain ports
   const portfolioState  = new MongoPortfolioState(db.collection('positions'));
-  const generateSignals = new GenerateSignalsUseCase(signalRepo, new RedisSignalPublisher(redis), portfolioState);
+  const generateSignals = new GenerateSignalsUseCase(signalRepo, new RedisSignalPublisher(redis), portfolioState, riskEngine, undefined, decayMonitor);
   const approveSignal   = new ApproveSignalUseCase(signalRepo);
   const findRecent      = { execute: (limit: number) => signalRepo.findRecent(limit) };
 
@@ -41,7 +50,41 @@ async function main() {
   });
 
   app.route('/', createRouter({ findRecent, approveSignal }));
-  app.route('/', createInternalRouter({ findRecent, approveSignal }));
+  app.route('/', createInternalRouter({ findRecent, approveSignal, riskEngine }));
+
+  // Prometheus metrics endpoint — scraped by kube-prometheus-stack for Grafana Strategy Health panel
+  app.get('/metrics', async (c) => {
+    try {
+      const health = (await redis.get('strategy:health')) ?? 'unknown';
+      const score  = ({ healthy: 1, warning: 0.75, degraded: 0.25, suspended: 0 } as Record<string, number>)[health] ?? -1;
+      const m = await decayMonitor.getLastMetrics();
+      const lines = [
+        '# HELP strategy_health_score Health state (1=healthy 0.75=warning 0.25=degraded 0=suspended)',
+        '# TYPE strategy_health_score gauge',
+        `strategy_health_score ${score}`,
+        '# HELP strategy_rolling_sharpe_30d Rolling 30-day Sharpe ratio',
+        '# TYPE strategy_rolling_sharpe_30d gauge',
+        `strategy_rolling_sharpe_30d ${m?.rollingSharpe30d ?? 0}`,
+        '# HELP strategy_hit_rate_30d 30-day signal hit rate',
+        '# TYPE strategy_hit_rate_30d gauge',
+        `strategy_hit_rate_30d ${m?.hitRate30d ?? 0}`,
+        '# HELP strategy_turnover_ratio Turnover ratio vs weekly budget',
+        '# TYPE strategy_turnover_ratio gauge',
+        `strategy_turnover_ratio ${m?.turnoverRatio ?? 0}`,
+        '# HELP strategy_ic_tstat IC t-statistic',
+        '# TYPE strategy_ic_tstat gauge',
+        `strategy_ic_tstat ${m?.icTStat ?? 0}`,
+        '# HELP strategy_feature_drift_kl Feature KL divergence from training baseline',
+        '# TYPE strategy_feature_drift_kl gauge',
+        `strategy_feature_drift_kl ${m?.featureDriftKL ?? 0}`,
+      ];
+      return new Response(lines.join('\n') + '\n', {
+        headers: { 'Content-Type': 'text/plain; version=0.0.4' },
+      });
+    } catch {
+      return new Response('# metrics unavailable\n', { headers: { 'Content-Type': 'text/plain' } });
+    }
+  });
 }
 
 main().catch((err) => {

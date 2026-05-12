@@ -3,12 +3,12 @@ import type { ISignalRepository } from '../../domain/interfaces/ISignalRepositor
 import type { ISignalPublisher } from '../../domain/interfaces/ISignalPublisher.ts';
 import type { IPortfolioState } from '../../domain/interfaces/IPortfolioState.ts';
 import type { StrategyOutput } from '@trader/shared-types';
-import { solveLongOnly } from '../services/LongOnlyOptimiser.ts';
 import { buildStructuredRationale } from '../services/RationaleBuilder.ts';
+import { PortfolioConstructor } from '../services/PortfolioConstructor.ts';
+import type { RiskEngine } from '../services/RiskEngine.ts';
+import type { StrategyDecayMonitor } from '../services/StrategyDecayMonitor.ts';
 import { randomUUID } from 'node:crypto';
 
-// Strategy policy — source from env/config in the composition root.
-// Not a domain constant: it will vary by regime, strategy, and retraining cycle.
 const MIN_ACTIONABLE_CONFIDENCE = parseFloat(process.env.MIN_ACTIONABLE_CONFIDENCE ?? '0.3');
 
 export class GenerateSignalsUseCase {
@@ -16,19 +16,57 @@ export class GenerateSignalsUseCase {
     private readonly signalRepo: ISignalRepository,
     private readonly publisher: ISignalPublisher,
     private readonly portfolioState: IPortfolioState,
+    private readonly riskEngine: RiskEngine,
+    private readonly portfolioConstructor: PortfolioConstructor = new PortfolioConstructor(),
+    private readonly decayMonitor?: StrategyDecayMonitor,
   ) {}
 
   async execute(features: StrategyOutput): Promise<TradeSignal[]> {
+    const { allowed, reason } = await this.riskEngine.canTrade();
+    if (!allowed) {
+      console.warn(`[GenerateSignals] circuit open — ${reason}`);
+      return [];
+    }
+
+    // Strategy decay check: runs after every rebalance cycle (Section 28)
+    let decayMultiplier = 1.0;
+    if (this.decayMonitor) {
+      const health = await this.decayMonitor.run();
+      if (health === 'suspended') {
+        console.warn('[GenerateSignals] strategy suspended by decay monitor — no new signals');
+        return [];
+      }
+      if (health === 'degraded') {
+        decayMultiplier = 0.25;
+        console.warn('[GenerateSignals] strategy degraded — reducing position size to 25%');
+      }
+    }
+
     const currentWeights = await this.portfolioState.currentWeights();
 
-    const weights = solveLongOnly({
-      scores: features.ticker_universe.map((t) => features.composite_scores[t] ?? 0),
-      tickers: features.ticker_universe,
-      sectors: features.ticker_universe.map((t) => features.sectors[t] ?? 'Unknown'),
-      currentWeights: features.ticker_universe.map((t) => currentWeights[t] ?? 0),
-      targetVol: parseFloat(process.env.VOL_TARGET ?? '0.10'),
-      covariance: features.covariance_matrix,
-    });
+    const { weights: rawWeights, stabilityWarnings, uncertainty } =
+      this.portfolioConstructor.construct(
+        {
+          scores: features.ticker_universe.map((t) => features.composite_scores[t] ?? 0),
+          tickers: features.ticker_universe,
+          sectors: features.ticker_universe.map((t) => features.sectors[t] ?? 'Unknown'),
+          currentWeights: features.ticker_universe.map((t) => currentWeights[t] ?? 0),
+          targetVol: parseFloat(process.env.VOL_TARGET ?? '0.10'),
+          covariance: features.covariance_matrix,
+        },
+        features.factor_attributions ?? {},
+      );
+
+    if (stabilityWarnings.length > 0) {
+      for (const w of stabilityWarnings) console.warn(`[PortfolioConstructor] ${w}`);
+    }
+
+    const weights = this.riskEngine.applyRegimeScaling(
+      rawWeights,
+      (features.position_size_multiplier ?? 1.0) * decayMultiplier,
+    );
+
+    const decayFactor = this.riskEngine.confidenceDecayFactor();
 
     const signals = features.ticker_universe
       .map((ticker, i): TradeSignal | null => {
@@ -43,7 +81,7 @@ export class GenerateSignalsUseCase {
 
         if (action === 'HOLD') return null;
 
-        const rationale = buildStructuredRationale(ticker, features);
+        const rationale = buildStructuredRationale(ticker, features, uncertainty);
         if (!rationale) return null;
 
         try {
@@ -51,8 +89,9 @@ export class GenerateSignalsUseCase {
             id: randomUUID(),
             timestamp: features.timestamp,
             ticker,
+            strategy_id: features.strategy_id,
             action,
-            confidence: Math.min(Math.abs(features.composite_scores[ticker] ?? 0) / 0.05, 1),
+            confidence: Math.min(Math.abs(features.composite_scores[ticker] ?? 0) / 0.05, 1) * decayFactor,
             targetWeight: w,
             rationale: JSON.stringify(rationale),
           });

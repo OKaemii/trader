@@ -14,4 +14,12 @@ export class MongoPortfolioState implements IPortfolioState {
     }
     return weights;
   }
+
+  async currentDrawdown(): Promise<number> {
+    const positions = await this.collection.find({}).toArray();
+    const nav    = positions.reduce((s: number, p: any) => s + (p.currentValue ?? 0), 0);
+    const hwm    = positions.reduce((s: number, p: any) => s + (p.hwmValue ?? p.currentValue ?? 0), 0);
+    if (hwm <= 0) return 0;
+    return Math.max(0, (hwm - nav) / hwm);
+  }
 }

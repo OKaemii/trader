@@ -15,6 +15,7 @@ export const RISK_LIMITS = {
   maxSingleName:          0.15,   // 15% max per name
   maxSectorConcentration: 0.30,   // 30% in any single GICS sector
   volatilityTarget:       0.10,   // 10% annualised portfolio σ
+  maxDailyLoss:           0.03,   // halt if NAV falls 3% intraday
   maxDrawdownHalt:        0.10,   // halt at 10% drawdown from HWM
   maxWeeklyTurnover:      0.20,   // 20% of portfolio per week
   minConfidence:          0.30,   // discard signals below this threshold

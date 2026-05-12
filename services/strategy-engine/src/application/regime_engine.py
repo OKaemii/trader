@@ -4,11 +4,26 @@ from dataclasses import dataclass
 
 @dataclass
 class RegimeState:
-    confidence: float           # [0,1] — 1 = stable market, 0 = crisis/unstable
+    confidence: float           # [0,1] — 1 = stable, 0 = crisis; drives position_size_multiplier
     trend_score: float          # rolling 63-day index return (positive = uptrend)
     volatility_z: float         # realised vol relative to historical average
     dispersion: float           # cross-sectional return dispersion
     correlation_stability: float  # Frobenius distance of corr matrix from previous period
+    # Derived soft multipliers (continuous, no binary enable/disable)
+    position_size_multiplier: float = 1.0   # in [0.25, 1.0]; scales all position sizes
+    signal_weights: dict = None             # factor → weight; topology weight → 0 in crisis
+
+    def __post_init__(self) -> None:
+        # position_size_multiplier: minimum 25% in crisis, full in stable regime
+        self.position_size_multiplier = 0.25 + 0.75 * self.confidence
+        # Signal weights: topology contribution fades below confidence 0.6
+        topo_w  = max(0.0, (self.confidence - 0.6) / 0.4)
+        base_w  = 1.0 - topo_w * 0.2          # momentum/reversal take the remaining share
+        self.signal_weights = {
+            'momentum': round(base_w * 0.55, 4),
+            'reversal':  round(base_w * 0.45, 4),
+            'topology':  round(topo_w * 0.20, 4),
+        }
 
 
 class RegimeEngine:
