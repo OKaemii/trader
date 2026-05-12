@@ -103,6 +103,8 @@ agent-docs/
 CLAUDE.md
 CLAUDE.md.bak
 
+AGENTS.md
+
 *.prompt
 *.llm
 
