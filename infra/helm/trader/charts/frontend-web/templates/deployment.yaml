@@ -22,6 +22,8 @@ spec:
           env:
             - name: NEXT_PUBLIC_API_URL
               value: "http://trader.local"
+            - name: GATEWAY_URL
+              value: "http://api-gateway"
           livenessProbe:
             httpGet:
               path: /

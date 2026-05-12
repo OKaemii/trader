@@ -36,6 +36,17 @@ variable "notify_email" {
   default = "panxiaqi@gmail.com"
 }
 
+variable "seed_admin_email" {
+  description = "Email of the admin account seeded on first auth-service startup. Leave empty to skip seeding."
+  default     = ""
+}
+
+variable "seed_admin_password" {
+  description = "Password for the seeded admin. Required if seed_admin_email is set."
+  sensitive   = true
+  default     = ""
+}
+
 variable "homeserver_ip" {
   default = "192.168.50.2"
 }
