@@ -3,7 +3,8 @@
   "private": true,
   "workspaces": [
     "services/*",
-    "packages/*"
+    "packages/*",
+    "infra/scripts"
   ],
   "scripts": {
     "dev":       "bun run --filter '*' dev",
