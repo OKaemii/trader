@@ -63,8 +63,17 @@ admin.use('*', requireAuth, requireRole('admin'));
 
 admin.get('/api/admin/signals/history',       (c) => proxy('http://signal-service:3003', c));
 admin.post('/api/admin/signals/approve/:id',  (c) => proxy('http://signal-service:3003', c));
-admin.post('/api/admin/trading/toggle',       (c) => proxy('http://trading-service:3005', c));
+admin.post('/api/admin/trading/toggle',             (c) => proxy('http://trading-service:3005', c));
+admin.post('/api/admin/trading/approve-live',       (c) => proxy('http://trading-service:3005', c));
+admin.post('/api/admin/trading/revoke-live',        (c) => proxy('http://trading-service:3005', c));
+admin.get('/api/admin/trading/status',              (c) => proxy('http://trading-service:3005', c));
+admin.post('/api/admin/trading/execute',            (c) => proxy('http://trading-service:3005', c));
+admin.get('/api/admin/trading/orders',              (c) => proxy('http://trading-service:3005', c));
 admin.get('/api/admin/users',                 (c) => proxy('http://auth-service:3001', c));
+admin.get('/api/admin/risk/status',                   (c) => proxy('http://signal-service:3003', c));
+admin.post('/api/admin/risk/circuit-breaker/reset',   (c) => proxy('http://signal-service:3003', c));
+admin.post('/api/admin/backtest/run',                 (c) => proxy('http://backtest-engine:8001', c));
+admin.get('/api/admin/backtest/results',              (c) => proxy('http://backtest-engine:8001', c));
 admin.get('/api/admin/system/health', async (c) => {
   const services = [
     ['auth',          'http://auth-service:3001/health'],
@@ -74,6 +83,7 @@ admin.get('/api/admin/system/health', async (c) => {
     ['notifications', 'http://notification-service:3004/health'],
     ['trading',       'http://trading-service:3005/health'],
     ['portfolio',     'http://portfolio-service:3006/health'],
+    ['backtest',      'http://backtest-engine:8001/health'],
   ] as const;
   const token = generateInternalToken('api-gateway');
   const results = await Promise.allSettled(
