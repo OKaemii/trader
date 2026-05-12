@@ -6,12 +6,10 @@ resource "helm_release" "nginx_ingress" {
   namespace        = "ingress-nginx"
   create_namespace = true
 
-  set {
-    name  = "controller.service.type"
-    value = "NodePort"
-  }
-  set {
-    name  = "controller.service.nodePorts.http"
-    value = "30080"
-  }
+  set = [
+    {
+      name  = "controller.service.type"
+      value = "LoadBalancer"
+    },
+  ]
 }

@@ -1,55 +1,46 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: notification-service
+  name: backtest-engine
   namespace: {{ .Release.Namespace }}
 spec:
-  replicas: {{ .Values.replicaCount | default 1 }}
+  replicas: 1
   selector:
     matchLabels:
-      app: notification-service
+      app: backtest-engine
   template:
     metadata:
       labels:
-        app: notification-service
+        app: backtest-engine
     spec:
       containers:
-        - name: notification-service
-          image: {{ .Values.image | default "trader/notification-service:latest" }}
+        - name: backtest-engine
+          image: {{ .Values.image | default "trader/backtest-engine:latest" }}
           imagePullPolicy: Never
           ports:
-            - containerPort: 3004
+            - containerPort: 8001
           envFrom:
             - secretRef:
                 name: trader-secrets
           env:
-            - name: REDIS_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: trader-secrets
-                  key: REDIS_PASSWORD
             - name: MONGODB_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: trader-secrets
                   key: MONGODB_PASSWORD
-            - name: REDIS_URL
-              value: "redis://:$(REDIS_PASSWORD)@redis-master:6379"
             - name: MONGODB_URL
               value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb:27017/trader"
-            - name: TRADING_MODE
-              value: paper
-            - name: ACTIVE_STRATEGY
-              value: factor_rank_v1
+            - name: MONGODB_DB
+              value: trader
           livenessProbe:
             httpGet:
               path: /health
-              port: 3004
+              port: 8001
             initialDelaySeconds: 15
             periodSeconds: 30
           readinessProbe:
             httpGet:
               path: /health
-              port: 3004
+              port: 8001
             initialDelaySeconds: 10
             periodSeconds: 10

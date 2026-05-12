@@ -16,21 +16,39 @@ spec:
       containers:
         - name: market-data-service
           image: {{ .Values.image | default "trader/market-data-service:latest" }}
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Never
           ports:
             - containerPort: 3002
           envFrom:
             - secretRef:
                 name: trader-secrets
           env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: REDIS_PASSWORD
+            - name: MONGODB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: MONGODB_PASSWORD
             - name: REDIS_URL
               value: "redis://:$(REDIS_PASSWORD)@redis-master:6379"
             - name: MONGODB_URL
               value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb:27017/trader"
             - name: TRADING_MODE
               value: paper
+            - name: BAR_FREQUENCY
+              value: daily
+            - name: EXECUTION_MODE
+              value: t212
             - name: ACTIVE_STRATEGY
               value: factor_rank_v1
+            - name: GAP_THRESHOLD
+              value: "0.60"
+            - name: TICKER_UNIVERSE
+              value: "AAPL,MSFT,GOOGL,AMZN,NVDA,META,AVGO,AMD,NFLX,CRM,INTU,QCOM,TXN,JPM,V,MA,BLK,SPGI,JNJ,LLY,ABBV,TMO,ABT,UNH,COST,WMT,PG,KO,HD,MCD,XOM,CVX,NEE,CAT,HON,VFEM,IUKD,SGLN,XUSE,SRSA"
           livenessProbe:
             httpGet:
               path: /health

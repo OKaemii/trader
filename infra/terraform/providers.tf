@@ -15,13 +15,13 @@ terraform {
 }
 
 provider "kubernetes" {
-  config_path    = pathexpand("~/.kube/trader-config")
+  config_path    = pathexpand("~/.kube/config")
   config_context = "default"
 }
 
 provider "helm" {
-  kubernetes {
-    config_path    = pathexpand("~/.kube/trader-config")
+  kubernetes = {
+    config_path    = pathexpand("~/.kube/config")
     config_context = "default"
   }
 }
