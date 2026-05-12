@@ -12,6 +12,8 @@ export const COLLECTIONS = {
   ORDERS:                'orders',
   BAD_TICKS:             'bad_ticks',
   PUSH_TOKENS:           'push_tokens',
+  RISK_REJECTIONS:       'risk_rejections',
+  RISK_STATE:            'risk_state',
 } as const;
 
 export type CollectionName = typeof COLLECTIONS[keyof typeof COLLECTIONS];

@@ -1,6 +1,5 @@
 import { Hono } from 'hono';
-import { requireAuth } from '@trader/shared-auth/middleware';
-import { requireInternalToken } from '@trader/shared-auth/middleware';
+import { requireAuth, generateInternalToken } from '@trader/shared-auth';
 import { getMongoDb } from '@trader/shared-mongo';
 import { COLLECTIONS } from '@trader/shared-mongo';
 
@@ -10,7 +9,7 @@ const app = new Hono();
 async function syncPositions(): Promise<void> {
   try {
     const res = await fetch('http://trading-service:3005/internal/trading/positions', {
-      headers: { 'X-Internal-Token': process.env.INTERNAL_TOKEN_BOOTSTRAP ?? 'dev' },
+      headers: { 'X-Internal-Token': generateInternalToken('portfolio-service') },
     });
     if (!res.ok) return;
     const { positions } = await res.json() as { positions: Array<Record<string, unknown>> };
@@ -50,8 +49,8 @@ authed.get('/api/portfolio/pnl', async (c) => {
   });
 });
 
-app.route('/', authed);
 app.get('/health', (c) => c.json({ status: 'ok' }));
+app.route('/', authed);
 
 // Sync positions every 5 minutes
 setInterval(syncPositions, 5 * 60 * 1000);
