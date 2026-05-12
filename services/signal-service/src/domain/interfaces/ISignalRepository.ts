@@ -5,4 +5,6 @@ export interface ISignalRepository {
   findById(id: string): Promise<TradeSignal | null>;
   findRecent(limit: number): Promise<TradeSignal[]>;
   approve(id: string): Promise<void>;
+  markExecuted(id: string, at: number): Promise<void>;
+  markClosed(id: string, at: number, exitPrice: number): Promise<void>;
 }

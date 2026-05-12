@@ -1,4 +1,7 @@
+import type { SignalLifecycle } from '@trader/shared-types';
+
 export type Action = 'BUY' | 'SELL' | 'HOLD';
+export type { SignalLifecycle };
 
 export class TradeSignal {
   public readonly id: string;
@@ -11,6 +14,14 @@ export class TradeSignal {
   public readonly rationale: string;
   public readonly approved: boolean;
 
+  // Progress / lifecycle — optional, populated as the signal flows through the system.
+  public readonly entryPrice?: number;
+  public readonly lifecycle: SignalLifecycle;
+  public readonly approvedAt?: number;
+  public readonly executedAt?: number;
+  public readonly closedAt?: number;
+  public readonly exitPrice?: number;
+
   constructor(params: {
     id: string;
     timestamp: number;
@@ -21,11 +32,19 @@ export class TradeSignal {
     targetWeight: number;
     rationale: string;
     approved?: boolean;
+    entryPrice?: number;
+    lifecycle?: SignalLifecycle;
+    approvedAt?: number;
+    executedAt?: number;
+    closedAt?: number;
+    exitPrice?: number;
   }) {
     if (params.confidence < 0 || params.confidence > 1)
       throw new Error('confidence must be in [0, 1]');
     if (params.targetWeight < 0 || params.targetWeight > 1)
       throw new Error('targetWeight must be in [0, 1] (long-only)');
+    if (params.entryPrice !== undefined && params.entryPrice <= 0)
+      throw new Error('entryPrice must be positive when provided');
 
     this.id = params.id;
     this.timestamp = params.timestamp;
@@ -36,11 +55,30 @@ export class TradeSignal {
     this.targetWeight = params.targetWeight;
     this.rationale = params.rationale;
     this.approved = params.approved ?? false;
+    this.entryPrice = params.entryPrice;
+    // Derive default lifecycle from existing fields so old persisted docs still resolve sensibly.
+    this.lifecycle = params.lifecycle
+      ?? (params.closedAt ? 'closed'
+        : params.executedAt ? 'executed'
+        : (params.approved ?? false) ? 'approved'
+        : 'pending');
+    this.approvedAt = params.approvedAt;
+    this.executedAt = params.executedAt;
+    this.closedAt = params.closedAt;
+    this.exitPrice = params.exitPrice;
   }
 
   // minConfidence is strategy policy — not a domain invariant.
   // Source from env/config; it will vary by regime, strategy, and retraining cycle.
   isActionable(minConfidence: number): boolean {
     return this.action !== 'HOLD' && this.confidence >= minConfidence;
+  }
+
+  // Direction-aware P&L vs. entry. SELL signals profit when price falls below entry.
+  // Returns null if entryPrice is missing or currentPrice is non-positive.
+  pnlPct(currentPrice: number | null | undefined): number | null {
+    if (!this.entryPrice || !currentPrice || currentPrice <= 0) return null;
+    const ret = (currentPrice - this.entryPrice) / this.entryPrice;
+    return this.action === 'SELL' ? -ret : ret;
   }
 }

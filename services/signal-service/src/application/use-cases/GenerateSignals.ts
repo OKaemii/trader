@@ -2,6 +2,7 @@ import { TradeSignal, type Action } from '../../domain/entities/TradeSignal.ts';
 import type { ISignalRepository } from '../../domain/interfaces/ISignalRepository.ts';
 import type { ISignalPublisher } from '../../domain/interfaces/ISignalPublisher.ts';
 import type { IPortfolioState } from '../../domain/interfaces/IPortfolioState.ts';
+import type { IPriceLookup } from '../../domain/interfaces/IPriceLookup.ts';
 import type { StrategyOutput } from '@trader/shared-types';
 import { buildStructuredRationale } from '../services/RationaleBuilder.ts';
 import { PortfolioConstructor } from '../services/PortfolioConstructor.ts';
@@ -19,6 +20,7 @@ export class GenerateSignalsUseCase {
     private readonly riskEngine: RiskEngine,
     private readonly portfolioConstructor: PortfolioConstructor = new PortfolioConstructor(),
     private readonly decayMonitor?: StrategyDecayMonitor,
+    private readonly priceLookup?: IPriceLookup,
   ) {}
 
   async execute(features: StrategyOutput): Promise<TradeSignal[]> {
@@ -68,6 +70,12 @@ export class GenerateSignalsUseCase {
 
     const decayFactor = this.riskEngine.confidenceDecayFactor();
 
+    // Look up last close for every universe ticker in one round-trip — used as entryPrice
+    // when emitting BUY/SELL signals. Optional dependency: tests can omit priceLookup.
+    const lastCloses = this.priceLookup
+      ? await this.priceLookup.lastCloseMany(features.ticker_universe)
+      : {};
+
     const signals = features.ticker_universe
       .map((ticker, i): TradeSignal | null => {
         const w = weights[i];
@@ -85,6 +93,7 @@ export class GenerateSignalsUseCase {
         if (!rationale) return null;
 
         try {
+          const entry = lastCloses[ticker];
           return new TradeSignal({
             id: randomUUID(),
             timestamp: features.timestamp,
@@ -94,6 +103,8 @@ export class GenerateSignalsUseCase {
             confidence: Math.min(Math.abs(features.composite_scores[ticker] ?? 0) / 0.05, 1) * decayFactor,
             targetWeight: w,
             rationale: JSON.stringify(rationale),
+            entryPrice: entry && entry > 0 ? entry : undefined,
+            lifecycle: 'pending',
           });
         } catch { return null; }
       })

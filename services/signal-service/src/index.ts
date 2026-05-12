@@ -6,8 +6,10 @@ import { MongoSignalRepository } from './infrastructure/repositories/MongoSignal
 import { RedisSignalPublisher } from './infrastructure/messaging/RedisSignalPublisher.ts';
 import { RedisStrategySubscriber } from './infrastructure/messaging/RedisStrategySubscriber.ts';
 import { MongoPortfolioState } from './infrastructure/MongoPortfolioState.ts';
+import { MongoPriceLookup } from './infrastructure/MongoPriceLookup.ts';
 import { GenerateSignalsUseCase } from './application/use-cases/GenerateSignals.ts';
 import { ApproveSignalUseCase } from './application/use-cases/ApproveSignal.ts';
+import { GetSignalProgressUseCase } from './application/use-cases/GetSignalProgress.ts';
 import { RiskEngine } from './application/services/RiskEngine.ts';
 import { StrategyDecayMonitor } from './application/services/StrategyDecayMonitor.ts';
 import { createRouter } from './infrastructure/http/router.ts';
@@ -36,9 +38,11 @@ async function main() {
 
   // Use cases receive only domain ports
   const portfolioState  = new MongoPortfolioState(db.collection('positions'));
-  const generateSignals = new GenerateSignalsUseCase(signalRepo, new RedisSignalPublisher(redis), portfolioState, riskEngine, undefined, decayMonitor);
+  const priceLookup     = new MongoPriceLookup(db);
+  const generateSignals = new GenerateSignalsUseCase(signalRepo, new RedisSignalPublisher(redis), portfolioState, riskEngine, undefined, decayMonitor, priceLookup);
   const approveSignal   = new ApproveSignalUseCase(signalRepo);
   const findRecent      = { execute: (limit: number) => signalRepo.findRecent(limit) };
+  const getProgress     = new GetSignalProgressUseCase(signalRepo, portfolioState, priceLookup);
 
   await new RedisStrategySubscriber(redis).subscribe(
     (features) => generateSignals.execute(features),
@@ -49,7 +53,7 @@ async function main() {
     await cache.invalidatePattern('*');
   });
 
-  app.route('/', createRouter({ findRecent, approveSignal }));
+  app.route('/', createRouter({ findRecent, approveSignal, getProgress }));
   app.route('/', createInternalRouter({ findRecent, approveSignal, riskEngine }));
 
   // Prometheus metrics endpoint — scraped by kube-prometheus-stack for Grafana Strategy Health panel
