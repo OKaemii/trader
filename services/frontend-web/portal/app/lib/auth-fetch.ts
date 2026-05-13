@@ -15,7 +15,7 @@ async function refreshAccessToken(refreshToken: string): Promise<string | null> 
 }
 
 export async function authedFetch(path: string, init?: RequestInit): Promise<Response> {
-  let at = await getAccessToken()
+  const at = await getAccessToken()
   const rt = await getRefreshToken()
 
   if (!at && !rt) {
@@ -45,14 +45,23 @@ export async function authedFetch(path: string, init?: RequestInit): Promise<Res
 
   const newAt = await refreshAccessToken(rt)
   if (!newAt) {
-    await deleteSession()
+    // Cannot await deleteSession() from a Server Component context — Next.js forbids
+    // cookie mutations outside Server Actions / Route Handlers. The cookie will simply
+    // expire on its own; the next request will re-prompt login.
     return new Response(JSON.stringify({ error: 'Session expired' }), {
       status: 401,
       headers: { 'Content-Type': 'application/json' },
     })
   }
 
-  await rotateAccessToken(newAt)
+  // rotateAccessToken would persist the refreshed token, but cookie mutations are only
+  // legal in Server Actions / Route Handlers. Swallow the error so callers from RSCs
+  // still get a valid response — the next call will just refresh again.
+  try {
+    await rotateAccessToken(newAt)
+  } catch {
+    // intentionally ignored — see comment above
+  }
   return tryFetch(newAt)
 }
 
