@@ -7,6 +7,8 @@ import { BarValidator } from './bar-validator.ts';
 import { GapDetector } from './gap-detector.ts';
 import { StaleDetector } from './stale-detector.ts';
 import { UniverseManager } from './universe-manager.ts';
+import { getLiveConfig } from './live-config.ts';
+import { createAdminRouter } from './admin-routes.ts';
 import { REDIS_STREAMS, type OHLCVBar } from '@trader/shared-types';
 
 const app = new Hono();
@@ -14,13 +16,9 @@ const app = new Hono();
 //                        EOD adjusted bar arrives; the cycle then idles until next close.
 // BAR_FREQUENCY=intraday → poll at POLL_INTERVAL_MS (default 60s).
 //
-// The original 60m default was conservative — chosen when EOD bar latency wasn't well
-// understood and the priority was avoiding hammering Yahoo. In practice the post-close
-// bar lands within minutes, so 60m made signal generation lag a full cycle on bad days.
-// 20m matches our observed publishing latency while staying well under any rate limit.
-const BAR_FREQUENCY     = process.env.BAR_FREQUENCY ?? 'daily';
-const DEFAULT_POLL_MS   = BAR_FREQUENCY === 'daily' ? 20 * 60 * 1000 : 60 * 1000;
-const POLL_INTERVAL_MS  = parseInt(process.env.POLL_INTERVAL_MS ?? String(DEFAULT_POLL_MS));
+// Effective values are resolved per poll-iteration via getLiveConfig() so portal
+// overrides (portal_market_config) take effect without a service restart.
+// Env values are used as the fallback when no override is set.
 
 // Universe refresh cadence: monthly in production; override via env for testing
 const UNIVERSE_REFRESH_MS = parseInt(process.env.UNIVERSE_REFRESH_MS ?? String(30 * 24 * 60 * 60 * 1000));
@@ -29,8 +27,13 @@ const UNIVERSE_REFRESH_MS = parseInt(process.env.UNIVERSE_REFRESH_MS ?? String(3
 const GAP_THRESHOLD = parseFloat(process.env.GAP_THRESHOLD ?? '0.20');
 
 const validator  = new BarValidator();
-const gapDetector = new GapDetector(POLL_INTERVAL_MS);
-const staleDetector = new StaleDetector(POLL_INTERVAL_MS * 3);
+// Gap/stale detectors are initialized with the env-default poll interval; their
+// thresholds aren't latency-critical so live-config changes don't need to rewire them.
+const INITIAL_POLL_MS = parseInt(process.env.POLL_INTERVAL_MS ?? String(
+  (process.env.BAR_FREQUENCY ?? 'daily') === 'daily' ? 20 * 60 * 1000 : 60 * 1000,
+));
+const gapDetector = new GapDetector(INITIAL_POLL_MS);
+const staleDetector = new StaleDetector(INITIAL_POLL_MS * 3);
 const universeManager = new UniverseManager();
 
 async function persistBars(bars: OHLCVBar[]): Promise<void> {
@@ -65,6 +68,9 @@ async function pollLoop(): Promise<void> {
   let lastUniverseRefresh = Date.now();
 
   while (true) {
+    const cfg = await getLiveConfig();
+    const pollIntervalMs = cfg.pollIntervalMs;
+
     // Monthly universe refresh
     if (Date.now() - lastUniverseRefresh > UNIVERSE_REFRESH_MS) {
       activeTickers = await universeManager.refresh();
@@ -102,7 +108,7 @@ async function pollLoop(): Promise<void> {
           loggedAt: new Date(),
         });
         console.warn(`[market-data] ${(gapReport.gapFraction * 100).toFixed(0)}% of universe missing — skipping strategy cycle`);
-        await Bun.sleep(POLL_INTERVAL_MS);
+        await Bun.sleep(pollIntervalMs);
         continue;
       }
 
@@ -123,21 +129,27 @@ async function pollLoop(): Promise<void> {
       console.error('[market-data] poll error:', e);
     }
 
-    await Bun.sleep(POLL_INTERVAL_MS);
+    await Bun.sleep(pollIntervalMs);
   }
 }
 
 // Poll stats updated each cycle for /health visibility
 const pollStats = { lastPollTs: null as number | null, lastBarCount: 0, totalCycles: 0 };
 
-app.get('/health', (c) => c.json({
-  status:       'ok',
-  bar_frequency: BAR_FREQUENCY,
-  universe_size: universeManager.activeTickers.length,
-  last_poll_ts:  pollStats.lastPollTs,
-  last_bar_count: pollStats.lastBarCount,
-  total_cycles:  pollStats.totalCycles,
-}));
+app.get('/health', async (c) => {
+  const cfg = await getLiveConfig().catch(() => ({ barFrequency: 'daily', pollIntervalMs: INITIAL_POLL_MS }));
+  return c.json({
+    status:         'ok',
+    bar_frequency:  cfg.barFrequency,
+    poll_interval_ms: cfg.pollIntervalMs,
+    universe_size:  universeManager.activeTickers.length,
+    last_poll_ts:   pollStats.lastPollTs,
+    last_bar_count: pollStats.lastBarCount,
+    total_cycles:   pollStats.totalCycles,
+  });
+});
+
+app.route('/', createAdminRouter(universeManager));
 
 app.get('/latest/:ticker', async (c) => {
   const redis = await getRedisClient();
