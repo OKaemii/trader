@@ -2,11 +2,27 @@ import type { Context, Next } from 'hono';
 import { verifyAccessToken, type UserRole } from './jwt.ts';
 import { validateInternalToken } from './internal-token.ts';
 
-export async function requireAuth(c: Context, next: Next): Promise<Response | void> {
+// Extract the bearer token from either `Authorization: Bearer …` (server-to-server,
+// portal authedFetch) or the `at` cookie (browser XHR from client components).
+// The cookie path lets client-rendered components hit /api/* through the ingress
+// without the portal having to proxy every endpoint as a Next route handler.
+function extractBearer(c: Context): string | null {
   const header = c.req.header('Authorization');
-  if (!header?.startsWith('Bearer ')) return c.json({ error: 'Unauthorized' }, 401);
+  if (header?.startsWith('Bearer ')) return header.slice(7);
+  const cookieHeader = c.req.header('Cookie');
+  if (!cookieHeader) return null;
+  for (const part of cookieHeader.split(';')) {
+    const [rawName, ...rest] = part.trim().split('=');
+    if (rawName === 'at') return decodeURIComponent(rest.join('='));
+  }
+  return null;
+}
+
+export async function requireAuth(c: Context, next: Next): Promise<Response | void> {
+  const token = extractBearer(c);
+  if (!token) return c.json({ error: 'Unauthorized' }, 401);
   try {
-    const payload = await verifyAccessToken(header.slice(7));
+    const payload = await verifyAccessToken(token);
     c.set('user', payload);
     return next();
   } catch {
