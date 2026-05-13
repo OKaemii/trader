@@ -24,6 +24,10 @@ spec:
               value: "http://trader.local"
             - name: GATEWAY_URL
               value: "http://api-gateway"
+            # Set to "true" only when the portal is fronted by HTTPS — browsers reject
+            # Secure cookies over plain HTTP, which breaks the login flow.
+            - name: COOKIE_SECURE
+              value: {{ .Values.cookieSecure | default "false" | quote }}
           livenessProbe:
             httpGet:
               path: /

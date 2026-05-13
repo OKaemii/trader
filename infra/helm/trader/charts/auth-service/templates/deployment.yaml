@@ -42,12 +42,14 @@ spec:
             - name: ACTIVE_STRATEGY
               value: factor_rank_v1
           livenessProbe:
-            tcpSocket:
+            httpGet:
+              path: /health
               port: 3001
             initialDelaySeconds: 15
             periodSeconds: 30
           readinessProbe:
-            tcpSocket:
+            httpGet:
+              path: /health
               port: 3001
             initialDelaySeconds: 10
             periodSeconds: 10
