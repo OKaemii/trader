@@ -22,7 +22,14 @@ export function createPublicRouter(login: LoginUseCase, register: RegisterUseCas
   });
 
   app.post('/api/auth/login', async (c) => {
-    const { email, password } = await c.req.json<{ email: string; password: string }>();
+    let body: { email?: string; password?: string };
+    try {
+      body = await c.req.json<{ email?: string; password?: string }>();
+    } catch {
+      return c.json({ error: 'email and password required' }, 400);
+    }
+    const { email, password } = body;
+    if (!email || !password) return c.json({ error: 'email and password required' }, 400);
     try {
       const tokens = await login.execute(email, password);
       return c.json(tokens);
