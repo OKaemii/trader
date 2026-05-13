@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 
-const protectedRoutes = ['/signals']
+const protectedRoutes = ['/dashboard', '/signals', '/universe', '/market-data']
 const publicRoutes = ['/login']
 
 export function proxy(req: NextRequest) {
@@ -17,7 +17,7 @@ export function proxy(req: NextRequest) {
   }
 
   if (isPublic && hasSession) {
-    return NextResponse.redirect(new URL('/signals', req.nextUrl))
+    return NextResponse.redirect(new URL('/dashboard', req.nextUrl))
   }
 
   return NextResponse.next()

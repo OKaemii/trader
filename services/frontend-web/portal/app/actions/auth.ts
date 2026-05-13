@@ -31,7 +31,7 @@ export async function login(
 
   const { accessToken, refreshToken } = await res.json()
   await createSession(accessToken, refreshToken)
-  redirect('/signals')
+  redirect('/dashboard')
 }
 
 export async function logout() {
