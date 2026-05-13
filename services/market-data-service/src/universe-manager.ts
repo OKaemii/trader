@@ -22,6 +22,35 @@ export interface InstrumentMeta {
   t212Tradable: boolean;
 }
 
+/**
+ * Apply portal-driven adds/removes on top of the eligibility-filtered selection.
+ * Removes win over T212 inclusion; adds bypass the sector cap and are marked
+ * t212Tradable=false so downstream code can detect operator-forced entries.
+ * Exported for unit testing.
+ */
+export function applyUniverseOverrides(
+  selected: InstrumentMeta[],
+  overrides: { adds?: string[]; removes?: string[] } | null,
+): { result: InstrumentMeta[]; added: number; removed: number } {
+  if (!overrides) return { result: selected, added: 0, removed: 0 };
+
+  const removeSet = new Set((overrides.removes ?? []).map((t) => t.toUpperCase().trim()).filter(Boolean));
+  const before = selected.length;
+  let result = selected.filter((i) => !removeSet.has(i.ticker.toUpperCase()));
+  const removed = before - result.length;
+
+  const presentTickers = new Set(result.map((i) => i.ticker.toUpperCase()));
+  let added = 0;
+  for (const rawTicker of overrides.adds ?? []) {
+    const ticker = rawTicker.toUpperCase().trim();
+    if (!ticker || presentTickers.has(ticker)) continue;
+    result.push({ ticker, name: ticker, sector: 'Unknown', t212Tradable: false });
+    presentTickers.add(ticker);
+    added++;
+  }
+  return { result, added, removed };
+}
+
 export class UniverseManager {
   private _activeUniverse: string[] = [];
   private _sectorMap: Record<string, string> = {};
@@ -99,7 +128,7 @@ export class UniverseManager {
     // fall into 'Unknown' until enriched. Capping Unknown would silently truncate the universe.
     const sectorCap = Math.floor(MAX_UNIVERSE_SIZE * MAX_SECTOR_FRACTION);
     const sectorCount: Record<string, number> = {};
-    const selected: InstrumentMeta[] = [];
+    let selected: InstrumentMeta[] = [];
 
     for (const inst of eligible) {
       if (selected.length >= MAX_UNIVERSE_SIZE) break;
@@ -107,6 +136,21 @@ export class UniverseManager {
       if (sector !== 'Unknown' && (sectorCount[sector] ?? 0) >= sectorCap) continue;
       selected.push(inst);
       sectorCount[sector] = (sectorCount[sector] ?? 0) + 1;
+    }
+
+    // ── 4b. Portal overrides — applied AFTER eligibility/sector filtering ─────
+    // Reason: forced adds/removes are an operator decision and must take precedence over
+    // the criteria-driven selection. Removes win over T212 inclusion; adds bypass sector cap.
+    const overridesDoc = await db.collection<{
+      _id: 'singleton';
+      adds: string[];
+      removes: string[];
+    }>(COLLECTIONS.PORTAL_UNIVERSE_OVERRIDES).findOne({ _id: 'singleton' });
+
+    const overrideResult = applyUniverseOverrides(selected, overridesDoc);
+    selected = overrideResult.result;
+    if (overrideResult.added || overrideResult.removed) {
+      console.log(`[universe] overrides applied: +${overrideResult.added} -${overrideResult.removed}`);
     }
 
     const newTickers = new Set(selected.map((i) => i.ticker));
@@ -131,6 +175,9 @@ export class UniverseManager {
       const toReactivate = added.filter((i) =>  existingSet.has(i.ticker));
 
       if (toInsert.length > 0) {
+        const overrideAdds = new Set(
+          (overridesDoc?.adds ?? []).map((t) => t.toUpperCase().trim()),
+        );
         await db.collection(COLLECTIONS.INSTRUMENT_REGISTRY).insertMany(
           toInsert.map((i) => ({
             ticker:      i.ticker,
@@ -138,7 +185,7 @@ export class UniverseManager {
             sector:      i.sector,
             activeFrom:  now,
             activeTo:    null,
-            addedReason: 'universe_refresh',
+            addedReason: overrideAdds.has(i.ticker.toUpperCase()) ? 'override_add' : 'universe_refresh',
             updatedAt:   now,
           })),
         );
