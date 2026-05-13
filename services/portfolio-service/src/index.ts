@@ -6,12 +6,14 @@ import { COLLECTIONS } from '@trader/shared-mongo';
 const app = new Hono();
 
 // Sync positions from trading-service on schedule
+let tradingServiceUnreachableLogged = false;
 async function syncPositions(): Promise<void> {
   try {
     const res = await fetch('http://trading-service:3005/internal/trading/positions', {
       headers: { 'X-Internal-Token': generateInternalToken('portfolio-service') },
     });
     if (!res.ok) return;
+    tradingServiceUnreachableLogged = false;
     const { positions } = await res.json() as { positions: Array<Record<string, unknown>> };
     const db = await getMongoDb();
     for (const pos of positions) {
@@ -22,6 +24,15 @@ async function syncPositions(): Promise<void> {
       );
     }
   } catch (e) {
+    const cause = (e as { cause?: { code?: string } })?.cause;
+    const code = cause?.code ?? (e as { code?: string })?.code;
+    if (code === 'ECONNREFUSED' || code === 'ENOTFOUND' || code === 'EAI_AGAIN') {
+      if (!tradingServiceUnreachableLogged) {
+        console.warn('[portfolio] trading-service unreachable, skipping position sync');
+        tradingServiceUnreachableLogged = true;
+      }
+      return;
+    }
     console.error('[portfolio] sync error:', e);
   }
 }
