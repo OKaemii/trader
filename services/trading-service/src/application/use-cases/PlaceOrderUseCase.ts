@@ -1,11 +1,33 @@
 import { randomUUID } from 'node:crypto';
+import { generateInternalToken } from '@trader/shared-auth';
 import type { Order } from '../../domain/entities/Order.ts';
 import type { IOrderRepository } from '../../domain/interfaces/IOrderRepository.ts';
 import type { IOrderExecutor } from '../../domain/interfaces/IOrderExecutor.ts';
 import { OrderRouter } from '../services/OrderRouter.ts';
 
-const TRADING_MODE    = process.env.TRADING_MODE    ?? 'paper';
-const EXECUTION_MODE  = (process.env.EXECUTION_MODE ?? 't212') as 't212' | 'unrestricted';
+type TradingMode = 'paper' | 'demo' | 'live';
+const TRADING_MODE     = (process.env.TRADING_MODE ?? 'paper') as TradingMode;
+const EXECUTION_MODE   = (process.env.EXECUTION_MODE ?? 't212') as 't212' | 'unrestricted';
+const SIGNAL_SERVICE   = process.env.SIGNAL_SERVICE_URL ?? 'http://signal-service:3003';
+
+async function notifySignalExecuted(signalId: string, at: number): Promise<void> {
+  try {
+    const res = await fetch(`${SIGNAL_SERVICE}/internal/trading/signals/${signalId}/executed`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Internal-Token': generateInternalToken('trading-service'),
+      },
+      body: JSON.stringify({ at }),
+    });
+    if (!res.ok) {
+      console.warn(`[PlaceOrder] signal lifecycle update failed for ${signalId}: ${res.status}`);
+    }
+  } catch (err) {
+    // Lifecycle update is best-effort — order state in trading-service is authoritative.
+    console.warn(`[PlaceOrder] signal lifecycle update error for ${signalId}:`, err);
+  }
+}
 
 export interface PlaceOrderInput {
   signalId:     string;
@@ -28,15 +50,21 @@ export class PlaceOrderUseCase {
   ) {}
 
   async execute(input: PlaceOrderInput): Promise<Order | null> {
-    if (TRADING_MODE !== 'live') {
-      console.log(`[PlaceOrder] TRADING_MODE=${TRADING_MODE} — skipping order for ${input.ticker}`);
+    // Mode semantics:
+    //   paper → no broker call; notifications only.
+    //   demo  → real orders to demo.trading212 with demo API keys; no live-gate required.
+    //   live  → real orders to trading212 with live API keys; live-gate must be approved.
+    if (TRADING_MODE === 'paper') {
+      console.log(`[PlaceOrder] TRADING_MODE=paper — skipping order for ${input.ticker}`);
       return null;
     }
 
-    const approved = await this.liveApproved();
-    if (!approved) {
-      console.warn(`[PlaceOrder] live trading gate not approved — rejecting order for ${input.ticker}. Call POST /api/admin/trading/approve-live first.`);
-      return null;
+    if (TRADING_MODE === 'live') {
+      const approved = await this.liveApproved();
+      if (!approved) {
+        console.warn(`[PlaceOrder] live trading gate not approved — rejecting order for ${input.ticker}. Call POST /api/admin/trading/approve-live first.`);
+        return null;
+      }
     }
 
     // Long-only enforcement: targetWeight must be [0,1]; no short positions
@@ -92,6 +120,13 @@ export class PlaceOrderUseCase {
     }
 
     await this.orderRepo.save(order);
+
+    // T212 returns 'submitted' on placement; fills are async and not yet polled, so we
+    // mark the signal as executed at submit time. Re-evaluate once a fills poller exists.
+    if ((order.status === 'submitted' || order.status === 'filled') && order.executedAt) {
+      await notifySignalExecuted(order.signalId, order.executedAt);
+    }
+
     return order;
   }
 

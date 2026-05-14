@@ -15,5 +15,8 @@ export interface Order {
   targetWeight:  number;    // [0,1] — from TradeSignal; always >= 0 (long-only)
   timestamp:     number;    // Unix ms
   executedAt?:   number;
+  filledAt?:        number;  // Set by the fills poller when T212 confirms the fill.
+  fillPrice?:       number;  // Average fill price in the instrument currency, as reported by T212.
+  filledQuantity?:  number;  // T212 reports this in the history payload; useful for partial fills.
   errorMessage?: string;
 }

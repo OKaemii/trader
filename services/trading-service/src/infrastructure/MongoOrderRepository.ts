@@ -29,6 +29,14 @@ export class MongoOrderRepository implements IOrderRepository {
     return docs.map((d) => this._fromDoc(d));
   }
 
+  async findOpen(): Promise<Order[]> {
+    const docs = await this.col.find({
+      status: 'submitted',
+      t212OrderId: { $exists: true, $ne: '' },
+    }).toArray();
+    return docs.map((d) => this._fromDoc(d));
+  }
+
   private _fromDoc(doc: any): Order {
     const { _id, ...rest } = doc;
     return { id: _id, ...rest } as Order;
