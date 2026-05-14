@@ -62,7 +62,7 @@ async function pollLoop(): Promise<void> {
   let activeTickers = await universeManager.refresh();
   if (activeTickers.length === 0) {
     // Fallback to env var seed list if registry is empty
-    activeTickers = (process.env.TICKER_UNIVERSE ?? 'AAPL,MSFT,GOOGL,AMZN,NVDA,TSLA,META,NFLX,AMD,INTC').split(',');
+    activeTickers = (process.env.TICKER_UNIVERSE ?? 'AAPL_US_EQ,MSFT_US_EQ,GOOGL_US_EQ,AMZN_US_EQ,NVDA_US_EQ,TSLA_US_EQ,FB_US_EQ,NFLX_US_EQ,AMD_US_EQ,INTC_US_EQ').split(',');
     console.warn(`[market-data] universe empty — using TICKER_UNIVERSE env: ${activeTickers.join(',')}`);
   }
   let lastUniverseRefresh = Date.now();
