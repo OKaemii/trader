@@ -45,11 +45,36 @@ export interface TopologyFeatures {
 }
 
 // Lifecycle states for a TradeSignal — see TradeSignal entity for transitions.
-//   pending  → just emitted, awaiting approval (paper mode default for SELL/BUY)
-//   approved → admin approved (or auto-approved in unrestricted mode)
-//   executed → order placed and filled by trading-service
-//   closed   → position exited (exitPrice + closedAt populated)
-export type SignalLifecycle = 'pending' | 'approved' | 'executed' | 'closed';
+//   pending   → just emitted, awaiting approval (paper mode default for SELL/BUY)
+//   approved  → admin approved (or auto-approved in unrestricted mode)
+//   queued    → handed to trading-service dispatcher; awaiting send to T212. Retries
+//               also live in this state — `attempts > 0` indicates a retry-in-progress.
+//   executing → claimed by the dispatcher, in-flight to T212 (short-lived; reverted to
+//               `queued` by the boot sweep if a pod crashes mid-call).
+//   executed  → T212 accepted the order (submit/fill confirmed by FillsPoller).
+//   closed    → round-trip closed (exitPrice + closedAt populated).
+//   failed    → terminal: conditions changed (drift, cash, expiry), broker rejected, or
+//               attempts cap reached. Excluded from strategy/portfolio accounting — the
+//               order is treated as if it never happened.
+//   cancelled → terminal: explicit cancel from broker history (T212 CANCELLED/REJECTED/EXPIRED).
+export type SignalLifecycle =
+  | 'pending'
+  | 'approved'
+  | 'queued'
+  | 'executing'
+  | 'executed'
+  | 'closed'
+  | 'failed'
+  | 'cancelled';
+
+// Why a signal landed in `failed`. Surfaced in the portal next to the row.
+export type SignalFailureReason =
+  | 'cash_insufficient'      // computed quantity rounded to zero against current cash
+  | 'market_drift'           // mid-price moved past PRICE_DRIFT_TOLERANCE since emission
+  | 'queue_expired'          // aged past QUEUE_TTL_MS before successful send
+  | 'broker_rejected'        // T212 returned a non-retryable 4xx
+  | 'retries_exhausted'      // hit ORDER_MAX_ATTEMPTS on transient errors (429 / network)
+  | 'manual_cancel';         // admin clicked Cancel in the portal
 
 // TradeSignalDTO — wire format for MongoDB storage and notifications.
 // Domain entity (TradeSignal class) has the same fields; this is the plain-object form.
@@ -72,6 +97,13 @@ export interface TradeSignalDTO {
   executedAt?: number;                 // unix ms — set by trading-service after fill
   closedAt?: number;                   // unix ms — set when position is exited
   exitPrice?: number;                  // price at close, paired with closedAt
+  executedQuantity?: number;           // shares actually filled (for FIFO round-trip)
+  // Queue / failure bookkeeping. `attempts` increments on every dispatcher claim; if it
+  // reaches ORDER_MAX_ATTEMPTS the signal is moved to `failed` with reason `retries_exhausted`.
+  attempts?: number;
+  lastAttemptAt?: number;              // unix ms — set whenever the dispatcher claims the row
+  failureReason?: SignalFailureReason;
+  failureDetail?: string;              // free-text from the underlying error / context
 }
 
 // SignalProgressDTO — enriched view served by /api/signals/progress for the portal.
