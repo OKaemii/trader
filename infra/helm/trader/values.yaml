@@ -17,6 +17,14 @@ global:
     # 30s strikes a balance between freshness for the portal Order/Signal lifecycle view and
     # T212 rate limits; tighten only if you find yourself watching fills in real time.
     fillPollIntervalMs: "30000"
+    # ---- Order-dispatcher (trading-service) knobs ----
+    # The dispatcher drains the signal queue (lifecycle='queued') one row at a time, throttling
+    # T212 calls to avoid 429s. See CLAUDE.md "Order dispatcher" for the full state machine.
+    orderMinIntervalMs:   "1100"          # min ms between T212 placeOrder calls
+    accountCacheTtlMs:    "30000"         # cash/positions snapshot TTL (in-process)
+    orderMaxAttempts:     "5"             # attempts cap → lifecycle=failed/retries_exhausted
+    queueTtlMs:           "3600000"       # signal age cap (1h daily); past this → queue_expired
+    priceDriftTolerance:  "0.01"          # 1% absolute price drift → market_drift (terminal)
     activeStrategy: factor_rank_v1      # factor_rank_v1 | sector_momentum_v1 | topology_v1
     volTarget: "0.10"                   # portfolio vol target (signal-service)
     minActionableConfidence: "0.30"     # min confidence to emit a TradeSignal (signal-service)
