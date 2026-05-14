@@ -27,6 +27,9 @@ global:
     # Also the seed on a fresh deployment before the monthly T212 refresh succeeds.
     # All tickers here are major-cap stocks available on both T212 and Yahoo Finance.
     tickerUniverse: "AAPL,MSFT,GOOGL,AMZN,NVDA,META,TSLA,JPM,JNJ,UNH,V,PG,MA,HD,CVX,MRK,ABBV,PEP,KO,AVGO,LLY,COST,MCD,BAC,TMO,ABT,WMT,CSCO,XOM,CRM,ACN,DHR,NEE,INTC,NFLX,AMD,QCOM,TXN,INTU,CAT,HON,AMGN,SBUX,IBM,GILD,AXP,GS,MS,BLK,SPGI,SGLN,IUKD,SUPR,SRSA,VFEM,XUSE,SSLN"
+    # Max active universe size. Bumping invalidates prior backtest_results — re-run validation
+    # before re-enabling topology_v1 or any go-live gate (see CLAUDE.md / Research page).
+    universeMaxSize: "200"
 
 redis:
   host: redis-master
