@@ -33,11 +33,11 @@ spec:
                   name: trader-secrets
                   key: INTERNAL_SECRET
             - name: BAR_FREQUENCY
-              value: daily
+              value: {{ .Values.global.env.barFrequency | default "daily" | quote }}
             - name: EXECUTION_MODE
-              value: t212
+              value: {{ .Values.global.env.executionMode | default "t212" | quote }}
             - name: ACTIVE_STRATEGY
-              value: {{ .Values.activeStrategy | default "factor_rank_v1" | quote }}
+              value: {{ .Values.global.env.activeStrategy | default "factor_rank_v1" | quote }}
           livenessProbe:
             httpGet:
               path: /healthz

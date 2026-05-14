@@ -10,6 +10,13 @@ spec:
     - host: trader.local
       http:
         paths:
+          - path: /portal-api
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend-web
+                port:
+                  number: 3000
           - path: /
             pathType: Prefix
             backend:

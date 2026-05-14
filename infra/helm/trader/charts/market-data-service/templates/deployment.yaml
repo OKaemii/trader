@@ -38,17 +38,21 @@ spec:
             - name: MONGODB_URL
               value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb:27017/trader"
             - name: TRADING_MODE
-              value: paper
+              value: {{ .Values.global.env.tradingMode | default "paper" | quote }}
             - name: BAR_FREQUENCY
-              value: daily
+              value: {{ .Values.global.env.barFrequency | default "daily" | quote }}
+            {{- with .Values.global.env.pollIntervalMs }}
+            - name: POLL_INTERVAL_MS
+              value: {{ . | quote }}
+            {{- end }}
             - name: EXECUTION_MODE
-              value: t212
+              value: {{ .Values.global.env.executionMode | default "t212" | quote }}
             - name: ACTIVE_STRATEGY
-              value: factor_rank_v1
+              value: {{ .Values.global.env.activeStrategy | default "factor_rank_v1" | quote }}
             - name: GAP_THRESHOLD
-              value: "0.60"
+              value: {{ .Values.global.env.gapThreshold | default "0.60" | quote }}
             - name: TICKER_UNIVERSE
-              value: "AAPL,MSFT,GOOGL,AMZN,NVDA,META,AVGO,AMD,NFLX,CRM,INTU,QCOM,TXN,JPM,V,MA,BLK,SPGI,JNJ,LLY,ABBV,TMO,ABT,UNH,COST,WMT,PG,KO,HD,MCD,XOM,CVX,NEE,CAT,HON,VFEM,IUKD,SGLN,XUSE,SRSA"
+              value: {{ .Values.global.env.tickerUniverse | quote }}
           livenessProbe:
             httpGet:
               path: /health

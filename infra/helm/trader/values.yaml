@@ -2,6 +2,31 @@ global:
   namespace: trader
   imageRegistry: ""
   imagePullPolicy: IfNotPresent
+  env:
+    # Single source of truth for all service-tunable env vars. Lives under `global` so subchart
+    # deployment templates can read `.Values.global.env.*` directly. Bump these and redeploy —
+    # no code change required for any of the toggles documented in CLAUDE.md.
+    tradingMode: demo                   # paper (notify only) | demo (demo.trading212) | live (trading212; admin gate required)
+    executionMode: t212                 # t212 (limit, weekly) | unrestricted (market, daily)
+    barFrequency: daily                 # daily | intraday
+    # Optional override for market-data-service polling cadence. Empty = per-frequency built-in
+    # default (daily: 20m EOD retry; intraday: bar-interval). Portal runtime override
+    # (MongoDB portal_market_config) takes precedence over this.
+    pollIntervalMs: ""
+    # Fills poller cadence in trading-service (only active when tradingMode != paper).
+    # 30s strikes a balance between freshness for the portal Order/Signal lifecycle view and
+    # T212 rate limits; tighten only if you find yourself watching fills in real time.
+    fillPollIntervalMs: "30000"
+    activeStrategy: factor_rank_v1      # factor_rank_v1 | sector_momentum_v1 | topology_v1
+    volTarget: "0.10"                   # portfolio vol target (signal-service)
+    minActionableConfidence: "0.30"     # min confidence to emit a TradeSignal (signal-service)
+    # Raised from 0.20: demo T212 universe contains ETPs/small-caps with no Yahoo Finance equivalent.
+    # Lower back to 0.20 once a real-data universe (standard tickers only) is in use.
+    gapThreshold: "0.60"
+    # Fallback universe used when T212 instruments API is unavailable (rate-limited, auth failure, etc.).
+    # Also the seed on a fresh deployment before the monthly T212 refresh succeeds.
+    # All tickers here are major-cap stocks available on both T212 and Yahoo Finance.
+    tickerUniverse: "AAPL,MSFT,GOOGL,AMZN,NVDA,META,TSLA,JPM,JNJ,UNH,V,PG,MA,HD,CVX,MRK,ABBV,PEP,KO,AVGO,LLY,COST,MCD,BAC,TMO,ABT,WMT,CSCO,XOM,CRM,ACN,DHR,NEE,INTC,NFLX,AMD,QCOM,TXN,INTU,CAT,HON,AMGN,SBUX,IBM,GILD,AXP,GS,MS,BLK,SPGI,SGLN,IUKD,SUPR,SRSA,VFEM,XUSE,SSLN"
 
 redis:
   host: redis-master
@@ -33,7 +58,6 @@ services:
     replicaCount: 1
     image: trader/strategy-engine:latest
     port: 8000
-    activeStrategy: factor_rank_v1
   signalService:
     replicaCount: 1
     image: trader/signal-service:latest
@@ -46,7 +70,6 @@ services:
     replicaCount: 1
     image: trader/trading-service:latest
     port: 3005
-    tradingMode: paper
   portfolioService:
     replicaCount: 1
     image: trader/portfolio-service:latest
@@ -60,17 +83,3 @@ services:
     image: trader/frontend-web:latest
     port: 3007
 
-env:
-  tradingMode: paper        # paper | live
-  executionMode: t212       # t212 | unrestricted
-  barFrequency: daily       # daily | intraday
-  activeStrategy: factor_rank_v1
-  volTarget: "0.10"
-  minActionableConfidence: "0.30"
-  # Raised from 0.20: demo T212 universe contains ETPs/small-caps with no Yahoo Finance equivalent.
-  # Lower back to 0.20 once a real-data universe (standard tickers only) is in use.
-  gapThreshold: "0.60"
-  # Fallback universe used when T212 instruments API is unavailable (rate-limited, auth failure, etc.).
-  # Also the seed on a fresh deployment before the monthly T212 refresh succeeds.
-  # All tickers here are major-cap stocks available on both T212 and Yahoo Finance.
-  tickerUniverse: "AAPL,MSFT,GOOGL,AMZN,NVDA,META,TSLA,JPM,JNJ,UNH,V,PG,MA,HD,CVX,MRK,ABBV,PEP,KO,AVGO,LLY,COST,MCD,BAC,TMO,ABT,WMT,CSCO,XOM,CRM,ACN,DHR,NEE,INTC,NFLX,AMD,QCOM,TXN,INTU,CAT,HON,AMGN,SBUX,IBM,GILD,AXP,GS,MS,BLK,SPGI"
