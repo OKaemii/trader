@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { upgradeWebSocket, websocket } from 'hono/bun';
 import { getRedisClient, subscribe } from '@trader/shared-redis';
+import { getMongoDb } from '@trader/shared-mongo';
 import { requireAuth, requireRole, generateInternalToken, verifyAccessToken } from '@trader/shared-auth';
 
 const app = new Hono();
@@ -77,6 +78,8 @@ admin.use('*', requireAuth, requireRole('admin'));
 
 admin.get('/api/admin/signals/history',       (c) => proxy('http://signal-service:3003', c));
 admin.post('/api/admin/signals/approve/:id',  (c) => proxy('http://signal-service:3003', c));
+admin.get('/api/admin/signals/auto-approve',  (c) => proxy('http://signal-service:3003', c));
+admin.post('/api/admin/signals/auto-approve', (c) => proxy('http://signal-service:3003', c));
 admin.post('/api/admin/trading/toggle',             (c) => proxy('http://trading-service:3005', c));
 admin.post('/api/admin/trading/approve-live',       (c) => proxy('http://trading-service:3005', c));
 admin.post('/api/admin/trading/revoke-live',        (c) => proxy('http://trading-service:3005', c));
@@ -106,6 +109,66 @@ admin.get('/api/admin/system/status', async (c) => {
     market_data: marketRes.status === 'fulfilled' ? marketRes.value : { error: 'unavailable' },
     strategy:    strategyRes.status === 'fulfilled' ? strategyRes.value : { error: 'unavailable' },
   });
+});
+
+// System reset — wipes trading history + strategy state to start fresh from today.
+// Drops: signals, ohlcv_bars, orders, positions, backtest_results, instrument_registry,
+//        topology_snapshots, strategy_health_log, model_versions, feature_importance_log,
+//        risk_state, risk_rejections, bad_ticks.
+// Preserves: users, portal_universe_overrides, portal_market_config.
+// Clears Redis: market:raw + signals:strategy streams; strategy:* / trading:live_approved
+// / signal:auto_approve / regime warm-up keys. Requires a typed confirmation phrase to
+// guard against accidental clicks. Real T212 broker state is NOT touched (external).
+admin.post('/api/admin/system/reset', async (c) => {
+  const body = await c.req.json<{ confirm?: string }>().catch(() => ({}));
+  if (body.confirm !== 'RESET') {
+    return c.json({ error: 'confirmation phrase mismatch (expected "RESET")' }, 400);
+  }
+
+  const result: Record<string, number | string> = {};
+  try {
+    const db = await getMongoDb();
+    const wipe = [
+      'signals', 'ohlcv_bars', 'orders', 'positions', 'backtest_results',
+      'instrument_registry', 'topology_snapshots', 'strategy_health_log',
+      'model_versions', 'feature_importance_log', 'risk_state', 'risk_rejections',
+      'bad_ticks',
+    ];
+    for (const name of wipe) {
+      const r = await db.collection(name).deleteMany({});
+      result[`mongo.${name}`] = r.deletedCount ?? 0;
+    }
+
+    const redis = await getRedisClient();
+    // Streams: hard-trim to length 0. Consumer-group offsets are preserved (xtrim doesn't
+    // touch them); next consumer read just finds an empty stream.
+    try { await redis.sendCommand(['XTRIM', 'market:raw',       'MAXLEN', '0']); result['redis.stream.market:raw'] = 'trimmed'; }
+    catch (e) { result['redis.stream.market:raw'] = `error: ${(e as Error).message}`; }
+    try { await redis.sendCommand(['XTRIM', 'signals:strategy', 'MAXLEN', '0']); result['redis.stream.signals:strategy'] = 'trimmed'; }
+    catch (e) { result['redis.stream.signals:strategy'] = `error: ${(e as Error).message}`; }
+
+    // State keys: scan + delete by prefix. Falls back gracefully if any prefix doesn't exist.
+    const prefixes = ['strategy:', 'regime:', 'trading:', 'signal:auto_approve'];
+    for (const p of prefixes) {
+      const pattern = p.endsWith(':') ? `${p}*` : p;
+      try {
+        const keys: string[] = [];
+        for await (const k of redis.scanIterator({ MATCH: pattern, COUNT: 200 })) {
+          if (Array.isArray(k)) keys.push(...k);
+          else keys.push(k);
+        }
+        if (keys.length > 0) await redis.del(keys);
+        result[`redis.keys.${p}`] = keys.length;
+      } catch (e) {
+        result[`redis.keys.${p}`] = `error: ${(e as Error).message}`;
+      }
+    }
+
+    console.warn('[system/reset] state wiped:', result);
+    return c.json({ ok: true, result, note: 'T212 broker holdings are external and unchanged. Restart pods to clear in-memory caches.' });
+  } catch (e) {
+    return c.json({ error: e instanceof Error ? e.message : 'reset failed', partial: result }, 500);
+  }
 });
 
 admin.get('/api/admin/system/health', async (c) => {
