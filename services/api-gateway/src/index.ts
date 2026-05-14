@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { upgradeWebSocket } from 'hono/bun';
+import { upgradeWebSocket, websocket } from 'hono/bun';
 import { getRedisClient, subscribe } from '@trader/shared-redis';
 import { requireAuth, requireRole, generateInternalToken, verifyAccessToken } from '@trader/shared-auth';
 
@@ -9,10 +9,13 @@ const app = new Hono();
 app.use('*', cors({ origin: ['http://trader.local', 'http://localhost:3007'] }));
 
 // ── Internal token helper ────────────────────────────────────────────────────
+// Keep the user's Authorization header intact when forwarding — downstream services use
+// `requireAuth` on user-facing routes and validate the same JWT. Cookies are forwarded too
+// (the same JWT can also arrive as the `at` cookie). The X-Internal-Token attests that the
+// request came through the gateway and unlocks `requireInternalToken('api-gateway')` routes.
 function withInternalHeaders(headers: Headers): Headers {
   const out = new Headers(headers);
   out.set('X-Internal-Token', generateInternalToken('api-gateway'));
-  out.delete('Authorization'); // don't forward user tokens downstream
   return out;
 }
 
@@ -126,4 +129,6 @@ admin.get('/api/admin/system/health', async (c) => {
 
 app.route('/', admin);
 
-export default { port: 3000, fetch: app.fetch };
+// idleTimeout raised from Bun's 10s default so the gateway's proxy of slow downstream
+// admin endpoints (e.g. approve → trading-service → T212) doesn't hit a premature reset.
+export default { port: 3000, idleTimeout: 60, fetch: app.fetch, websocket };
