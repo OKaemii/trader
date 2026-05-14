@@ -15,7 +15,23 @@ export interface StrategyOutput {
   laplacian_residuals?: Record<string, number>;
 }
 
-export type SignalLifecycle = 'pending' | 'approved' | 'executed' | 'closed';
+export type SignalLifecycle =
+  | 'pending'
+  | 'approved'
+  | 'queued'
+  | 'executing'
+  | 'executed'
+  | 'closed'
+  | 'failed'
+  | 'cancelled';
+
+export type SignalFailureReason =
+  | 'cash_insufficient'
+  | 'market_drift'
+  | 'queue_expired'
+  | 'broker_rejected'
+  | 'retries_exhausted'
+  | 'manual_cancel';
 
 export interface TradeSignalDTO {
   id: string;
@@ -33,6 +49,11 @@ export interface TradeSignalDTO {
   executedAt?: number;
   closedAt?: number;
   exitPrice?: number;
+  executedQuantity?: number;
+  attempts?: number;
+  lastAttemptAt?: number;
+  failureReason?: SignalFailureReason;
+  failureDetail?: string;
 }
 
 export interface SignalProgressDTO extends TradeSignalDTO {
