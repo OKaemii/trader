@@ -28,24 +28,34 @@ async function notificationLoop(): Promise<void> {
     for (const { id, data } of entries) {
       const signal = data as TradeSignalDTO;
       try {
-        // Deduplication: skip if already delivered within 4 hours
-        const dedupKey = `notif:dedup:${signal.ticker}:${signal.action}`;
+        // Per-signal-id dedup. The earlier (ticker, action, 4h) window swallowed every
+        // recurring AAPL BUY emission; per-id means each unique signal gets exactly one
+        // email even if the consumer retries (e.g. crash before ACK). New emission =
+        // new id = new email.
+        const dedupKey = `notif:delivered:${signal.id}`;
         const alreadySent = await redis.get(dedupKey);
         if (alreadySent) {
-          console.log(`[notification] dedup skip ${signal.ticker} ${signal.action}`);
+          console.log(`[notification] dedup skip — signal ${signal.id} already delivered`);
           await xAck(redis, REDIS_STREAMS.TRADE_SIGNALS, CONSUMER_GROUP, id);
           continue;
         }
 
+        // Per-channel try/catch so a Resend failure is logged AND doesn't block push,
+        // and vice versa. Errors surface as warnings (allSettled previously swallowed them).
+        const tag = `${signal.action} ${signal.ticker} (${signal.id.slice(0, 8)})`;
         await Promise.allSettled([
-          sendEmail(signal),
-          sendPush(signal),
+          (async () => {
+            try { await sendEmail(signal); console.log(`[notification] email sent — ${tag}`); }
+            catch (e) { console.warn(`[notification] email FAILED — ${tag}:`, e instanceof Error ? e.message : e); }
+          })(),
+          (async () => {
+            try { await sendPush(signal); }
+            catch (e) { console.warn(`[notification] push FAILED — ${tag}:`, e instanceof Error ? e.message : e); }
+          })(),
         ]);
 
-        // Mark as delivered in MongoDB + set dedup key (4-hour window)
-        await redis.setEx(dedupKey, 4 * 3600, '1');
-        await redis.setEx(`notif:delivered:${signal.id}`, 86400, '1');
-
+        // 24-hour TTL: covers consumer-retry safety without permanently pinning ids.
+        await redis.setEx(dedupKey, 86400, '1');
         await xAck(redis, REDIS_STREAMS.TRADE_SIGNALS, CONSUMER_GROUP, id);
       } catch (e) {
         console.error('[notification] processing error on', id, e);
