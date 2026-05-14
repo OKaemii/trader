@@ -41,7 +41,16 @@ function mapT212ToBar(ticker: string, data: unknown, ts: number): OHLCVBar {
   return { ticker, timestamp: ts, open: price, high: price, low: price, close: price, volume: 0 };
 }
 
-export async function fetchT212Instruments(): Promise<Array<{ ticker: string; name: string; sector?: string }>> {
+export interface T212Instrument {
+  ticker: string;
+  name: string;
+  shortName?: string;
+  currencyCode?: string;
+  type?: string;
+  sector?: string;
+}
+
+export async function fetchT212Instruments(): Promise<T212Instrument[]> {
   const headers = { Authorization: t212Auth() };
   // Retry with exponential backoff — 429s accumulate when pods restart frequently during debugging.
   for (let attempt = 0; attempt < 3; attempt++) {

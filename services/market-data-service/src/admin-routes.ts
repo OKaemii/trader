@@ -35,10 +35,37 @@ export function createAdminRouter(universeManager: UniverseManager): Hono {
     const db = await getMongoDb();
     const doc = await db.collection<UniverseOverridesDoc>(COLLECTIONS.PORTAL_UNIVERSE_OVERRIDES)
       .findOne({ _id: 'singleton' });
+
+    // Enrich the active universe from instrument_registry so the portal can render
+    // market + ADV per ticker. Fall back to bare tickers if the registry is empty
+    // (cold start before first refresh). The activeUniverse string array is kept for
+    // backwards-compat with anything that still treats it as `string[]`.
+    type RegistryDoc = { ticker: string; name?: string; sector?: string; market?: string; adv?: number };
+    const activeTickers = universeManager.activeTickers;
+    const registry = await db.collection<RegistryDoc>(COLLECTIONS.INSTRUMENT_REGISTRY)
+      .find({ ticker: { $in: activeTickers }, activeTo: null })
+      .project({ _id: 0, ticker: 1, name: 1, sector: 1, market: 1, adv: 1 })
+      .toArray();
+    const byTicker = new Map<string, RegistryDoc>(registry.map((r) => [r.ticker, r]));
+    const activeUniverseDetailed = activeTickers.map((t) => {
+      const reg = byTicker.get(t);
+      const inferredMarket: 'US' | 'LSE' | 'OTHER' =
+        reg?.market as 'US' | 'LSE' | 'OTHER' | undefined
+        ?? (/_US_EQ$/.test(t) ? 'US' : /l_EQ$/.test(t) ? 'LSE' : 'OTHER');
+      return {
+        ticker: t,
+        name:   reg?.name ?? t,
+        sector: reg?.sector ?? 'Unknown',
+        market: inferredMarket,
+        adv:    reg?.adv ?? 0,
+      };
+    });
+
     return c.json({
       adds: doc?.adds ?? [],
       removes: doc?.removes ?? [],
-      activeUniverse: universeManager.activeTickers,
+      activeUniverse: activeTickers,
+      activeUniverseDetailed,
       sectorMap: universeManager.sectorMap,
       updatedBy: doc?.updatedBy ?? null,
       updatedAt: doc?.updatedAt ?? null,
