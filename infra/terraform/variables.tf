@@ -27,6 +27,21 @@ variable "t212_api_key" {
   default   = ""
 }
 
+variable "t212_api_key_id" {
+  sensitive = true
+  default   = ""
+}
+
+variable "t212_api_key_demo" {
+  sensitive = true
+  default   = ""
+}
+
+variable "t212_api_key_id_demo" {
+  sensitive = true
+  default   = ""
+}
+
 variable "resend_api_key" {
   sensitive = true
   default   = ""
