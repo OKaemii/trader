@@ -53,6 +53,10 @@ spec:
               value: {{ .Values.global.env.gapThreshold | default "0.60" | quote }}
             - name: TICKER_UNIVERSE
               value: {{ .Values.global.env.tickerUniverse | quote }}
+            {{- with .Values.global.env.universeMaxSize }}
+            - name: UNIVERSE_MAX_SIZE
+              value: {{ . | quote }}
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /health
