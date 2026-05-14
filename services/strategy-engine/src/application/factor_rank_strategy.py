@@ -42,6 +42,10 @@ class FactorRankStrategy(BaseStrategy):
             'momentum': [], 'reversal': [], 'low_vol': [],
         }
 
+    def regime_engine_for_persistence(self) -> RegimeEngine:
+        """Hook for main.py to attach Redis state persistence to this strategy's regime engine."""
+        return self._regime_engine
+
     @property
     def strategy_id(self) -> str:
         return 'factor_rank_v1'

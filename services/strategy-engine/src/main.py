@@ -140,6 +140,14 @@ async def process_loop() -> None:
         raise RuntimeError(f"Unknown strategy: {ACTIVE_STRATEGY}")
     strategy = strategy_cls()
 
+    # Persist regime state across pod restarts so the engine doesn't spend ~21 cycles
+    # in the warm-up sentinel after every redeploy. Only strategies that expose their
+    # regime engine via `regime_engine_for_persistence` participate.
+    if hasattr(strategy, "regime_engine_for_persistence"):
+        re = strategy.regime_engine_for_persistence()
+        re.attach_store(r)
+        await re.load_from_store()
+
     while True:
         # Block up to 5 seconds for new messages; recover from PEL on restart
         messages = await r.xreadgroup(
@@ -166,6 +174,11 @@ async def process_loop() -> None:
                     ]
 
                     output = strategy.update(bars)
+
+                    # Persist regime state out-of-band so warm-up survives restarts. The
+                    # strategy.update() path is synchronous; this hook fires after each cycle.
+                    if hasattr(strategy, "regime_engine_for_persistence"):
+                        await strategy.regime_engine_for_persistence()._persist()
 
                     # Log warmup progress every cycle until ready, then only on signals
                     ready  = len(_engine_state["ready_tickers"])

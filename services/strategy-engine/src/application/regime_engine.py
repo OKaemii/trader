@@ -1,5 +1,7 @@
+import json
 import numpy as np
 from dataclasses import dataclass
+from typing import Optional, Protocol
 
 
 @dataclass
@@ -36,15 +38,63 @@ class RegimeEngine:
     Low confidence (≈ 0) = unstable/crisis (reduced position sizing).
 
     Position sizing in the signal service scales by: regime_confidence.
+
+    State (returns history + previous correlation matrix) can be persisted to a Redis-like
+    store via `attach_store()` so warm-up survives pod restarts. Without a store, the engine
+    spends ~21 daily cycles (or ~21 intraday bars) in the warm-up sentinel after every boot.
     """
 
     WINDOW_TREND = 63   # trading days for trend estimation
     WINDOW_VOL   = 21   # trading days for realised vol
     HISTORY_MIN  = 63   # minimum history required
+    STATE_KEY    = "regime:state"
 
     def __init__(self) -> None:
         self._returns_history: list[np.ndarray] = []  # list of cross-sectional return vectors
         self._prev_corr: np.ndarray | None = None
+        self._store: Optional["AsyncStore"] = None
+
+    def attach_store(self, store: "AsyncStore") -> None:
+        """Attach an async key-value store (typically a redis client) for state persistence."""
+        self._store = store
+
+    async def load_from_store(self) -> None:
+        """Best-effort restore from the attached store. Safe to call before any update()."""
+        if self._store is None:
+            return
+        raw = await self._store.get(self.STATE_KEY)
+        if not raw:
+            return
+        try:
+            blob = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+            self._returns_history = [np.asarray(row, dtype=float) for row in blob.get("returns_history", [])]
+            prev = blob.get("prev_corr")
+            self._prev_corr = np.asarray(prev, dtype=float) if prev is not None else None
+            print(f"[RegimeEngine] restored {len(self._returns_history)} cycles of warm-up state")
+        except (ValueError, KeyError, TypeError) as exc:
+            print(f"[RegimeEngine] state restore failed (ignoring): {exc}")
+
+    async def _persist(self) -> None:
+        if self._store is None:
+            return
+        # Only persist after warm-up to keep the payload bounded; pre-warmup state would be
+        # rebuilt in 21 cycles either way.
+        if len(self._returns_history) < self.WINDOW_VOL:
+            return
+        try:
+            blob = {
+                "returns_history": [r.tolist() for r in self._returns_history],
+                "prev_corr": self._prev_corr.tolist() if self._prev_corr is not None else None,
+            }
+            await self._store.set(self.STATE_KEY, json.dumps(blob))
+        except Exception as exc:  # noqa: BLE001 — logging only; persistence is best-effort
+            print(f"[RegimeEngine] state persist failed (ignoring): {exc}")
+
+    async def update_async(self, cross_sectional_returns: np.ndarray) -> RegimeState:
+        """Async variant of update() that also persists state to the attached store."""
+        state = self.update(cross_sectional_returns)
+        await self._persist()
+        return state
 
     def update(self, cross_sectional_returns: np.ndarray) -> RegimeState:
         """
@@ -82,9 +132,13 @@ class RegimeEngine:
             stability = float(np.linalg.norm(corr - self._prev_corr, 'fro'))
         self._prev_corr = corr.copy()
 
-        # Soft confidence: logistic function of volatility excess and correlation instability
+        # Soft confidence: logistic centred on (vol_z=0, stability=0) → 1.0 in calm markets,
+        # decaying toward 0 as vol excess and correlation instability grow. Previous formula
+        # `raw = -(k_v * max(vol_z, 0) + k_s * stability)` capped at 0.5 because raw was
+        # always ≤ 0; that contradicted the docstring (1 = stable). Anchor offset 4.0 puts
+        # the calm-market sigmoid output near 0.98.
         k_v, k_s = 2.0, 1.5
-        raw = -(k_v * max(vol_z, 0) + k_s * stability)
+        raw = 4.0 - (k_v * max(vol_z, 0) + k_s * stability)
         confidence = float(1.0 / (1.0 + np.exp(-raw)))
 
         return RegimeState(
@@ -94,3 +148,9 @@ class RegimeEngine:
             dispersion=dispersion,
             correlation_stability=stability,
         )
+
+
+class AsyncStore(Protocol):
+    """Minimal interface for the optional persistence store (matches redis.asyncio)."""
+    async def get(self, key: str) -> object: ...
+    async def set(self, key: str, value: str) -> object: ...
