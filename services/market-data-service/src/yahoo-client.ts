@@ -69,6 +69,16 @@ const HEURISTIC_SUFFIXES: Record<string, string> = {
 };
 
 /**
+ * Legacy-rename overrides. T212's catalog keeps the pre-rebrand symbol; Yahoo only
+ * recognises the post-rebrand one. Keyed by the normalised symbol after
+ * `normalizeBaseSymbol` strips T212 synthetic suffixes — so `FB_US_EQ` and the bare
+ * `FB` both resolve to `META` on Yahoo.
+ */
+const SYMBOL_RENAMES: Record<string, string> = {
+  FB: 'META',
+}
+
+/**
  * Symbols known to be unsupported by Yahoo.
  * Prevents repeated wasted requests.
  */
@@ -126,8 +136,12 @@ function toYahooSymbol(t212Ticker: string): string {
 
   if (cached) return cached;
 
-  const { symbol, exchange } =
+  const { symbol: rawSymbol, exchange } =
     parseT212Ticker(t212Ticker);
+
+  // Apply legacy renames before suffix selection so e.g. Meta still gets the .L
+  // heuristic correctly if it were ever cross-listed under a renamed base.
+  const symbol = SYMBOL_RENAMES[rawSymbol] ?? rawSymbol;
 
   const suffix =
     exchange && EXCHANGE_SUFFIX[exchange]
