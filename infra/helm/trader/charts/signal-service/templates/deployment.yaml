@@ -38,13 +38,17 @@ spec:
             - name: MONGODB_URL
               value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb:27017/trader"
             - name: TRADING_MODE
-              value: paper
+              value: {{ .Values.global.env.tradingMode | default "paper" | quote }}
             - name: BAR_FREQUENCY
-              value: daily
+              value: {{ .Values.global.env.barFrequency | default "daily" | quote }}
             - name: EXECUTION_MODE
-              value: t212
+              value: {{ .Values.global.env.executionMode | default "t212" | quote }}
             - name: ACTIVE_STRATEGY
-              value: factor_rank_v1
+              value: {{ .Values.global.env.activeStrategy | default "factor_rank_v1" | quote }}
+            - name: VOL_TARGET
+              value: {{ .Values.global.env.volTarget | default "0.10" | quote }}
+            - name: MIN_ACTIONABLE_CONFIDENCE
+              value: {{ .Values.global.env.minActionableConfidence | default "0.30" | quote }}
           livenessProbe:
             httpGet:
               path: /health
