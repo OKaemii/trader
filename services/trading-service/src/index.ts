@@ -176,6 +176,33 @@ export function buildApp(deps: AppDeps): Hono {
     return c.json({ orders });
   });
 
+  // Admin-facing reads of T212 state. Used by the portal dashboard. In paper mode the
+  // T212 client isn't authenticated, so we return an empty payload instead of erroring —
+  // the portal renders "no broker connection" rather than 500.
+  admin.get('/api/admin/trading/cash', async (c) => {
+    if (tradingMode === 'paper') {
+      return c.json({ free: 0, total: 0, mode: tradingMode });
+    }
+    try {
+      const cash = await deps.client().getCash();
+      return c.json({ ...cash, mode: tradingMode });
+    } catch (e) {
+      return c.json({ error: e instanceof Error ? e.message : 'cash fetch failed', mode: tradingMode }, 502);
+    }
+  });
+
+  admin.get('/api/admin/trading/positions', async (c) => {
+    if (tradingMode === 'paper') {
+      return c.json({ positions: [], mode: tradingMode });
+    }
+    try {
+      const positions = await deps.client().getPositions();
+      return c.json({ positions, mode: tradingMode });
+    } catch (e) {
+      return c.json({ error: e instanceof Error ? e.message : 'positions fetch failed', mode: tradingMode }, 502);
+    }
+  });
+
   return app;
 }
 
