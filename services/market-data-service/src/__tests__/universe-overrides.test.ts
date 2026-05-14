@@ -15,10 +15,17 @@ describe('applyUniverseOverrides', () => {
     expect(removed).toBe(0);
   });
 
-  it('removes tickers listed in removes (case-insensitive)', () => {
-    const { result, removed } = applyUniverseOverrides(base, { removes: ['aapl'] });
+  it('removes tickers listed in removes (case-sensitive)', () => {
+    const { result, removed } = applyUniverseOverrides(base, { removes: ['AAPL'] });
     expect(result.map((i) => i.ticker)).toEqual(['MSFT', 'GOOGL']);
     expect(removed).toBe(1);
+  });
+
+  it('does NOT match removes with wrong case (T212 suffix l/d/L/D are distinct)', () => {
+    const lseBase = [inst('SGLNl_EQ'), inst('IUKDl_EQ')];
+    const { result, removed } = applyUniverseOverrides(lseBase, { removes: ['SGLNL_EQ'] });
+    expect(result.map((i) => i.ticker)).toEqual(['SGLNl_EQ', 'IUKDl_EQ']);
+    expect(removed).toBe(0);
   });
 
   it('appends adds not already present, marked t212Tradable=false', () => {
