@@ -148,6 +148,43 @@ describe('GenerateSignalsUseCase', () => {
     }
   });
 
+  // Regression: previously the confidence formula used a hardcoded 0.05 saturation point,
+  // which clamped to 1.0 for every realistic composite score (live scores were ~[-4, 4]).
+  // The fix normalises by the cross-sectional p95 of |score|, so confidence spreads across
+  // [0, 1] instead of being uniformly 1.0.
+  it('confidence spreads across [0, 1] under realistic score magnitudes', async () => {
+    const features = baseFeatures();
+    // Three tickers with distinctly different conviction. The top score should saturate
+    // (it equals p95 in this 3-element distribution); the bottom should be well under 1.0.
+    // Pick magnitudes such that after p95 normalisation, ratios land above the
+    // MIN_ACTIONABLE_CONFIDENCE threshold (default 0.3) so multiple signals survive.
+    features.composite_scores = { AAPL: 4.0, MSFT: 3.0, GOOG: 1.5 };
+    // Ensure all three tickers produce a signal regardless of weight thresholds by giving
+    // them disjoint weight targets via the score sign + magnitude.
+    const signals = await useCase.execute(features);
+
+    // The set of confidences should NOT all be 1.0 — at least one should be < 1.
+    const confidences = signals.map((s) => s.confidence);
+    expect(confidences.length).toBeGreaterThan(0);
+    expect(Math.min(...confidences)).toBeLessThan(1);
+
+    // The signal for the highest-conviction ticker (AAPL: 4.0) should be at or near the cap,
+    // while the lowest (GOOG: 0.1) should be well below.
+    const byTicker = Object.fromEntries(signals.map((s) => [s.ticker, s.confidence]));
+    if (byTicker.AAPL !== undefined && byTicker.GOOG !== undefined) {
+      expect(byTicker.AAPL).toBeGreaterThan(byTicker.GOOG);
+    }
+  });
+
+  it('confidence is well-defined when all composite scores are zero', async () => {
+    const features = baseFeatures();
+    features.composite_scores = { AAPL: 0, MSFT: 0, GOOG: 0 };
+    // Empty p95 path → divisor falls back to 1.0; |score|=0 → confidence = 0. No signals
+    // make it past MIN_ACTIONABLE_CONFIDENCE, but the call must not throw.
+    const signals = await useCase.execute(features);
+    expect(signals).toHaveLength(0);
+  });
+
   it('stamps entryPrice from the price lookup when available', async () => {
     const prices = new MockPriceLookup({ AAPL: 200, MSFT: 400, GOOG: 150 });
     const withPrices = new GenerateSignalsUseCase(
