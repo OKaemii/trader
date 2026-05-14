@@ -3,12 +3,14 @@ import { requireAuth, requireRole } from '@trader/shared-auth/middleware';
 import type { ApproveSignalUseCase } from '../../application/use-cases/ApproveSignal.ts';
 import type { GetSignalProgressUseCase } from '../../application/use-cases/GetSignalProgress.ts';
 import type { AutoApprovalGate } from '../../application/services/AutoApprovalGate.ts';
+import type { ISignalRepository } from '../../domain/interfaces/ISignalRepository.ts';
 
 interface Deps {
   findRecent: { execute: (limit: number) => Promise<unknown[]> };
   approveSignal: ApproveSignalUseCase;
   getProgress: GetSignalProgressUseCase;
   autoApprovalGate: AutoApprovalGate;
+  signalRepo: ISignalRepository;
 }
 
 export function createRouter(deps: Deps): Hono {
@@ -53,6 +55,33 @@ export function createRouter(deps: Deps): Hono {
     if (typeof body.enabled !== 'boolean') return c.json({ error: 'enabled (boolean) required' }, 400);
     await deps.autoApprovalGate.setEnabled(body.enabled);
     return c.json({ enabled: body.enabled });
+  });
+
+  // Retry a failed signal: failed → queued, attempts reset. The dispatcher picks it up on
+  // its next claim. Conditions (drift, cash, TTL) are re-evaluated then — a retry doesn't
+  // guarantee execution, only another attempt.
+  router.post('/api/admin/signals/retry/:id', requireRole('admin'), async (c) => {
+    const id = c.req.param('id');
+    const signal = await deps.signalRepo.findById(id);
+    if (!signal) return c.json({ error: 'not found' }, 404);
+    if (signal.lifecycle !== 'failed') {
+      return c.json({ error: `cannot retry signal in lifecycle=${signal.lifecycle}` }, 400);
+    }
+    await deps.signalRepo.retry(id);
+    return c.json({ id, lifecycle: 'queued', attempts: 0 });
+  });
+
+  // Cancel a queued / executing signal: transitions to failed/manual_cancel. The strategy
+  // treats it as if it never happened (no entry in the FIFO BUY ledger).
+  router.post('/api/admin/signals/cancel/:id', requireRole('admin'), async (c) => {
+    const id = c.req.param('id');
+    const signal = await deps.signalRepo.findById(id);
+    if (!signal) return c.json({ error: 'not found' }, 404);
+    if (signal.lifecycle !== 'queued' && signal.lifecycle !== 'executing' && signal.lifecycle !== 'approved') {
+      return c.json({ error: `cannot cancel signal in lifecycle=${signal.lifecycle}` }, 400);
+    }
+    await deps.signalRepo.markFailed(id, 'manual_cancel', 'cancelled by admin from portal');
+    return c.json({ id, lifecycle: 'failed', reason: 'manual_cancel' });
   });
 
   return router;

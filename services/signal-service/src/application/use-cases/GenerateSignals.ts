@@ -127,7 +127,9 @@ export class GenerateSignalsUseCase {
       .filter((s): s is TradeSignal => s !== null && s.isActionable(MIN_ACTIONABLE_CONFIDENCE));
 
     await Promise.all(signals.map((s) => this.signalRepo.save(s)));
-    await Promise.all(signals.map((s) => this.publisher.publish(s)));
+    // Notification policy (b): emails fire only on lifecycle='executed', not on emission.
+    // The publish-to-TRADE_SIGNALS hop happens in the internal-router /executed callback so
+    // notification-service sees a signal exactly once, after T212 confirms placement.
 
     // Auto-approve gate: when the operator flips the Redis flag, every freshly emitted
     // signal is approved here without waiting for manual click. Fire-and-forget — the

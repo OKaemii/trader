@@ -29,6 +29,10 @@ const toSignalDoc = (s: TradeSignal) => ({
   closedAt:   s.closedAt   ? new Date(s.closedAt)   : undefined,
   exitPrice:  s.exitPrice,
   executedQuantity: s.executedQuantity,
+  attempts: s.attempts,
+  lastAttemptAt: s.lastAttemptAt ? new Date(s.lastAttemptAt) : undefined,
+  failureReason: s.failureReason,
+  failureDetail: s.failureDetail,
 });
 
 const fromSignalDoc = (doc: any): TradeSignal =>
@@ -49,7 +53,13 @@ const fromSignalDoc = (doc: any): TradeSignal =>
     closedAt:   toMs(doc.closedAt),
     exitPrice: typeof doc.exitPrice === 'number' ? doc.exitPrice : undefined,
     executedQuantity: typeof doc.executedQuantity === 'number' ? doc.executedQuantity : undefined,
+    attempts: typeof doc.attempts === 'number' ? doc.attempts : 0,
+    lastAttemptAt: toMs(doc.lastAttemptAt),
+    failureReason: doc.failureReason,
+    failureDetail: typeof doc.failureDetail === 'string' ? doc.failureDetail : undefined,
   });
+
+export { toSignalDoc, fromSignalDoc };
 
 export const createSignalDataLayer = (
   db: Db,
@@ -58,8 +68,13 @@ export const createSignalDataLayer = (
   manager: IDataManager<TradeSignal>;
   cache: ICache<TradeSignal>;
   bus: ICacheInvalidationBus;
+  // Raw collection handle for atomic operations the IDataManager interface doesn't expose
+  // (findOneAndUpdate, $inc with $set in one round trip). Used by MongoSignalRepository for
+  // claimNextQueued — concurrency-safe across multiple dispatcher pods.
+  collection: ReturnType<Db['collection']>;
 } => ({
   manager: new MongoDataAdapter(db.collection(COLLECTIONS.SIGNALS), toSignalDoc, fromSignalDoc),
   cache:   new RedisCacheAdapter<TradeSignal>(redis, 'signals', 3600),
   bus:     new RedisCacheInvalidationBus(redis),
+  collection: db.collection(COLLECTIONS.SIGNALS),
 });

@@ -18,6 +18,16 @@ class MockSignalRepository implements ISignalRepository {
   async approve(_id: string) {}
   async markExecuted(_id: string, _at: number) {}
   async markClosed(_id: string, _at: number, _exitPrice: number) {}
+  async findOpenBuysByTicker(_ticker: string) { return []; }
+  async decrementExecutedQuantity(_id: string, _by: number) {}
+  async setTargetWeight(_id: string, _w: number) {}
+  async markQueued(_id: string) {}
+  async claimNextQueued() { return null; }
+  async requeue(_id: string) {}
+  async markFailed() {}
+  async retry(_id: string) {}
+  async sweepStaleExecuting(_ms: number) { return 0; }
+  async findByLifecycle() { return []; }
 }
 
 class MockPublisher implements ISignalPublisher {

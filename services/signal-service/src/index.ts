@@ -24,11 +24,12 @@ async function main() {
   const db    = await getMongoDb();
 
   // Data layer: configure adapters, subscribe to invalidations
-  const { manager, cache, bus } = createSignalDataLayer(db, redis);
+  const { manager, cache, bus, collection } = createSignalDataLayer(db, redis);
   await bus.subscribe('signals', (key) => cache.invalidate(key));
 
-  // Repository receives only interfaces — adapter choice is invisible to it
-  const signalRepo = new MongoSignalRepository(manager, cache, bus);
+  // Repository receives only interfaces — adapter choice is invisible to it. The raw
+  // collection handle is required for queue methods (atomic findOneAndUpdate claim).
+  const signalRepo = new MongoSignalRepository(manager, cache, bus, collection);
 
   // Risk engine: circuit breaker + audit log
   const riskEngine = new RiskEngine(db, redis);
@@ -55,8 +56,10 @@ async function main() {
     await cache.invalidatePattern('*');
   });
 
-  app.route('/', createRouter({ findRecent, approveSignal, getProgress, autoApprovalGate }));
-  app.route('/', createInternalRouter({ findRecent, approveSignal, riskEngine, signalRepo }));
+  const publisher = new RedisSignalPublisher(redis);
+
+  app.route('/', createRouter({ findRecent, approveSignal, getProgress, autoApprovalGate, signalRepo }));
+  app.route('/', createInternalRouter({ findRecent, approveSignal, riskEngine, signalRepo, publisher }));
 
   // Prometheus metrics endpoint — scraped by kube-prometheus-stack for Grafana Strategy Health panel
   app.get('/metrics', async (c) => {
