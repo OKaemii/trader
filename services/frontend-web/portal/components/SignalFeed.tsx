@@ -18,18 +18,57 @@ function formatAge(ms: number): string {
 }
 
 const lifecycleStyles: Record<SignalLifecycle, string> = {
-  pending:  'bg-gray-700 text-gray-200',
-  approved: 'bg-blue-600 text-white',
-  executed: 'bg-amber-600 text-white',
-  closed:   'bg-slate-600 text-gray-200',
+  pending:   'bg-gray-700 text-gray-200',
+  approved:  'bg-blue-600 text-white',
+  queued:    'bg-indigo-700 text-white',
+  executing: 'bg-purple-600 text-white animate-pulse',
+  executed:  'bg-amber-600 text-white',
+  closed:    'bg-slate-600 text-gray-200',
+  failed:    'bg-red-700 text-white',
+  cancelled: 'bg-stone-600 text-gray-200',
 };
 
-function LifecycleBadge({ state }: { state: SignalLifecycle }) {
+// Display label for the chip. queued+attempts>0 reads as "Retrying (n/5)" so the user
+// can see at a glance that the dispatcher is actively retrying vs sitting idle. executing
+// shows "Sending to broker" because that's a more meaningful phrase than the state name.
+function lifecycleLabel(state: SignalLifecycle, attempts: number, maxAttempts: number): string {
+  if (state === 'queued' && attempts > 0)   return `Retrying (${attempts}/${maxAttempts})`;
+  if (state === 'queued')                    return 'Queued';
+  if (state === 'executing')                 return 'Sending to broker';
+  if (state === 'executed')                  return 'Submitted';
+  if (state === 'failed')                    return 'Failed';
+  if (state === 'cancelled')                 return 'Cancelled';
+  if (state === 'approved')                  return 'Approved';
+  if (state === 'closed')                    return 'Closed';
+  return 'Awaiting approval';
+}
+
+function LifecycleBadge({
+  state, attempts, maxAttempts, failureReason,
+}: {
+  state: SignalLifecycle; attempts: number; maxAttempts: number; failureReason?: string;
+}) {
+  const label = lifecycleLabel(state, attempts, maxAttempts);
+  const title = state === 'failed' && failureReason ? `Failed: ${failureReason}` : undefined;
   return (
-    <span className={`px-2 py-0.5 rounded text-[10px] uppercase tracking-wide font-semibold ${lifecycleStyles[state]}`}>
-      {state}
+    <span
+      title={title}
+      className={`px-2 py-0.5 rounded text-[10px] uppercase tracking-wide font-semibold ${lifecycleStyles[state]}`}
+    >
+      {label}
     </span>
   );
+}
+
+const MAX_ATTEMPTS_DISPLAY = 5;
+type LifecycleFilter = 'all' | 'in-transit' | 'failed' | 'closed';
+
+function matchesFilter(state: SignalLifecycle, filter: LifecycleFilter): boolean {
+  if (filter === 'all')         return true;
+  if (filter === 'in-transit')  return state === 'queued' || state === 'executing';
+  if (filter === 'failed')      return state === 'failed';
+  if (filter === 'closed')      return state === 'closed';
+  return true;
 }
 
 function PnLPill({ pnlPct }: { pnlPct: number | null }) {
@@ -66,7 +105,9 @@ export function SignalFeed() {
   const [signals, setSignals] = useState<SignalProgressDTO[]>([]);
   const [loading, setLoading] = useState(true);
   const [approvingId, setApprovingId] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [filter, setFilter] = useState<LifecycleFilter>('all');
 
   useEffect(() => {
     let cancelled = false;
@@ -84,6 +125,39 @@ export function SignalFeed() {
     const id = setInterval(load, REFRESH_MS);
     return () => { cancelled = true; clearInterval(id); };
   }, []);
+
+  async function retry(signal: SignalProgressDTO) {
+    setErrorMsg(null);
+    setBusyId(signal.id);
+    try {
+      const res = await fetch(`/portal-api/admin/signals/retry/${encodeURIComponent(signal.id)}`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        setErrorMsg(`Retry failed (${res.status}): ${body.error ?? 'unknown'}`);
+      }
+    } catch (e) {
+      setErrorMsg(`Retry error: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function cancel(signal: SignalProgressDTO) {
+    if (!window.confirm(`Cancel ${signal.action} ${signal.ticker}? The signal will be marked failed and the strategy will treat it as if it never happened.`)) return;
+    setErrorMsg(null);
+    setBusyId(signal.id);
+    try {
+      const res = await fetch(`/portal-api/admin/signals/cancel/${encodeURIComponent(signal.id)}`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        setErrorMsg(`Cancel failed (${res.status}): ${body.error ?? 'unknown'}`);
+      }
+    } catch (e) {
+      setErrorMsg(`Cancel error: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setBusyId(null);
+    }
+  }
 
   async function approve(signal: SignalProgressDTO) {
     // Confirm explicitly because in demo/live mode this places a real broker order.
@@ -113,15 +187,41 @@ export function SignalFeed() {
 
   if (loading) return <div className="animate-pulse bg-gray-800 rounded-lg h-64" />;
 
+  const filtered = signals.filter((s) => {
+    const lc = (s.lifecycleResolved ?? s.lifecycle ?? (s.approved ? 'approved' : 'pending')) as SignalLifecycle;
+    return matchesFilter(lc, filter);
+  });
+
+  const filters: Array<{ key: LifecycleFilter; label: string }> = [
+    { key: 'all',         label: 'All' },
+    { key: 'in-transit',  label: 'In transit' },
+    { key: 'failed',      label: 'Failed' },
+    { key: 'closed',      label: 'Closed' },
+  ];
+
   return (
     <div className="bg-gray-900 rounded-lg p-4">
       <div className="flex items-center justify-between mb-4">
         <h2 className="text-lg font-semibold text-white">Signal Feed</h2>
         <span className="text-[10px] text-gray-500">refreshes every {REFRESH_MS / 1000}s</span>
       </div>
+      <div className="flex gap-2 mb-3">
+        {filters.map((f) => (
+          <button
+            key={f.key}
+            type="button"
+            onClick={() => setFilter(f.key)}
+            className={`px-2 py-0.5 rounded text-[10px] uppercase tracking-wide font-semibold ${
+              filter === f.key ? 'bg-indigo-600 text-white' : 'bg-gray-800 text-gray-300 hover:bg-gray-700'
+            }`}
+          >
+            {f.label}
+          </button>
+        ))}
+      </div>
       {errorMsg && <p className="text-red-400 text-xs mb-3">{errorMsg}</p>}
-      {signals.length === 0 && <p className="text-gray-400">No signals yet.</p>}
-      {signals.map((s) => {
+      {filtered.length === 0 && <p className="text-gray-400">No signals match this filter.</p>}
+      {filtered.map((s) => {
         const rationale: SignalRationale | null = (() => {
           try { return JSON.parse(s.rationale); } catch { return null; }
         })();
@@ -137,7 +237,12 @@ export function SignalFeed() {
                 <span className={`px-2 py-0.5 rounded text-xs font-semibold ${
                   s.action === 'BUY' ? 'bg-green-600' : 'bg-red-600'
                 } text-white`}>{s.action}</span>
-                <LifecycleBadge state={lifecycle} />
+                <LifecycleBadge
+                  state={lifecycle}
+                  attempts={s.attempts ?? 0}
+                  maxAttempts={MAX_ATTEMPTS_DISPLAY}
+                  failureReason={s.failureReason}
+                />
               </div>
               <div className="flex items-center gap-3">
                 {lifecycle === 'pending' && (
@@ -150,12 +255,40 @@ export function SignalFeed() {
                     {approvingId === s.id ? '…' : 'Approve'}
                   </button>
                 )}
+                {lifecycle === 'failed' && (
+                  <button
+                    type="button"
+                    onClick={() => retry(s)}
+                    disabled={busyId === s.id}
+                    className="px-2 py-0.5 rounded text-[10px] uppercase tracking-wide font-semibold bg-sky-600 hover:bg-sky-500 disabled:opacity-50 text-white"
+                  >
+                    {busyId === s.id ? '…' : 'Retry'}
+                  </button>
+                )}
+                {(lifecycle === 'queued' || lifecycle === 'executing') && (
+                  <button
+                    type="button"
+                    onClick={() => cancel(s)}
+                    disabled={busyId === s.id}
+                    className="px-2 py-0.5 rounded text-[10px] uppercase tracking-wide font-semibold bg-stone-700 hover:bg-stone-600 disabled:opacity-50 text-white"
+                  >
+                    {busyId === s.id ? '…' : 'Cancel'}
+                  </button>
+                )}
                 <PnLPill pnlPct={s.pnlPct} />
                 <span className="text-[10px] text-gray-500" title={new Date(s.timestamp).toISOString()}>
                   {formatAge(s.ageMs)}
                 </span>
               </div>
             </div>
+            {lifecycle === 'failed' && s.failureReason && (
+              <p className="text-red-400 text-xs mt-2">
+                {s.failureReason.replace(/_/g, ' ')}{s.failureDetail ? ` — ${s.failureDetail}` : ''}
+              </p>
+            )}
+            {(s.attempts ?? 0) > 0 && lifecycle !== 'failed' && lifecycle !== 'executed' && lifecycle !== 'closed' && (
+              <p className="text-amber-400 text-[10px] mt-1">attempt {s.attempts}/{MAX_ATTEMPTS_DISPLAY}</p>
+            )}
             <p className="text-gray-300 text-sm mt-2">
               {rationale?.plain_english ?? s.rationale}
             </p>

@@ -18,7 +18,9 @@ export function UniverseEditor({ initial }: { initial: UniverseOverrides }) {
   const [pending, startTransition] = useTransition()
 
   function pushUnique(list: string[], raw: string): string[] {
-    const v = raw.toUpperCase().trim()
+    // Preserve case: T212 tickers like SGLNl_EQ encode exchange in the lowercase suffix
+    // letter (`l` = London). Upper-casing the whole ticker corrupts it. Whitespace trimmed.
+    const v = raw.trim()
     if (!v || list.includes(v)) return list
     return [...list, v]
   }
@@ -90,7 +92,7 @@ export function UniverseEditor({ initial }: { initial: UniverseOverrides }) {
             <input
               value={addInput}
               onChange={(e) => setAddInput(e.target.value)}
-              placeholder="Ticker (e.g. AAPL)"
+              placeholder="T212 ticker (e.g. AAPL_US_EQ or SGLNl_EQ — case matters)"
               className="flex-1 rounded border border-gray-700 bg-gray-950 px-2 py-1 text-sm text-gray-100 placeholder:text-gray-600"
             />
             <button
@@ -133,7 +135,7 @@ export function UniverseEditor({ initial }: { initial: UniverseOverrides }) {
             <input
               value={removeInput}
               onChange={(e) => setRemoveInput(e.target.value)}
-              placeholder="Ticker to exclude"
+              placeholder="T212 ticker to exclude (case-sensitive)"
               className="flex-1 rounded border border-gray-700 bg-gray-950 px-2 py-1 text-sm text-gray-100 placeholder:text-gray-600"
             />
             <button
