@@ -13,4 +13,9 @@ export interface ISignalRepository {
   // Decrements an open BUY signal's executedQuantity (used when a SELL only partially
   // consumes the next BUY in FIFO order). Caller is responsible for not driving below zero.
   decrementExecutedQuantity(id: string, by: number): Promise<void>;
+  // Used by the auto-approve cash pro-rate path. When free cash < total BUY notional, the
+  // gate scales every BUY's targetWeight by the same factor before approving so the
+  // optimiser's ratios and sector cap survive. The recorded targetWeight reflects what
+  // trading-service will size the order against.
+  setTargetWeight(id: string, targetWeight: number): Promise<void>;
 }
