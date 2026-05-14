@@ -1,14 +1,20 @@
+import type { Collection } from 'mongodb';
 import type { ISignalRepository } from '../../domain/interfaces/ISignalRepository.ts';
-import type { TradeSignal } from '../../domain/entities/TradeSignal.ts';
+import { TradeSignal, type SignalFailureReason, type SignalLifecycle } from '../../domain/entities/TradeSignal.ts';
 import type { IDataManager } from '@trader/shared-data/interfaces/IDataManager';
 import type { ICache } from '@trader/shared-data/interfaces/ICache';
 import type { ICacheInvalidationBus } from '@trader/shared-data/interfaces/ICacheInvalidationBus';
+import { fromSignalDoc } from '../data.ts';
 
 export class MongoSignalRepository implements ISignalRepository {
   constructor(
     private readonly manager: IDataManager<TradeSignal>,
     private readonly cache: ICache<TradeSignal>,
     private readonly bus: ICacheInvalidationBus,
+    // Optional raw-collection handle. Required for queue methods (claimNextQueued,
+    // sweepStaleExecuting) which use atomic findOneAndUpdate that IDataManager doesn't
+    // expose. Older call sites that only use save/find/markExecuted can omit it.
+    private readonly collection?: Collection,
   ) {}
 
   async save(signal: TradeSignal): Promise<void> {
@@ -75,6 +81,80 @@ export class MongoSignalRepository implements ISignalRepository {
     if (targetWeight < 0) return;
     await this.manager.update(id, { targetWeight });
     await this.invalidate(id);
+  }
+
+  async markQueued(id: string): Promise<void> {
+    await this.manager.update(id, { lifecycle: 'queued' });
+    await this.invalidate(id);
+  }
+
+  async claimNextQueued(): Promise<TradeSignal | null> {
+    if (!this.collection) throw new Error('claimNextQueued requires raw collection handle');
+    // Atomic FIFO claim. findOneAndUpdate with sort makes this safe under multi-pod
+    // dispatcher (only one pod wins the row). attempts increments here, not on requeue,
+    // so retry exhaustion is counted correctly even if a worker dies mid-call.
+    const now = new Date();
+    const res = await this.collection.findOneAndUpdate(
+      { lifecycle: 'queued' },
+      {
+        $set: { lifecycle: 'executing', lastAttemptAt: now },
+        $inc: { attempts: 1 },
+      },
+      { sort: { timestamp: 1 }, returnDocument: 'after' },
+    );
+    const doc = (res as any)?.value ?? res;
+    if (!doc) return null;
+    const signal = fromSignalDoc(doc);
+    await this.invalidate(signal.id);
+    return signal;
+  }
+
+  async requeue(id: string): Promise<void> {
+    await this.manager.update(id, { lifecycle: 'queued' });
+    await this.invalidate(id);
+  }
+
+  async markFailed(id: string, reason: SignalFailureReason, detail?: string): Promise<void> {
+    const changes: Record<string, unknown> = {
+      lifecycle: 'failed',
+      failureReason: reason,
+    };
+    if (detail) changes.failureDetail = detail;
+    await this.manager.update(id, changes);
+    await this.invalidate(id);
+  }
+
+  async retry(id: string): Promise<void> {
+    await this.manager.update(id, {
+      lifecycle: 'queued',
+      attempts: 0,
+      failureReason: null,
+      failureDetail: null,
+    });
+    await this.invalidate(id);
+  }
+
+  async sweepStaleExecuting(thresholdMs: number): Promise<number> {
+    if (!this.collection) throw new Error('sweepStaleExecuting requires raw collection handle');
+    const cutoff = new Date(Date.now() - thresholdMs);
+    const res = await this.collection.updateMany(
+      { lifecycle: 'executing', lastAttemptAt: { $lt: cutoff } },
+      { $set: { lifecycle: 'queued' } },
+    );
+    // Cache invalidation is best-effort: a wildcard publish notifies subscribers to drop
+    // their per-id entries. The dispatcher reads via claimNextQueued which goes direct to
+    // Mongo, so a momentary stale cache cannot cause double-execution.
+    await this.bus.publish('signals', '*');
+    return res.modifiedCount ?? 0;
+  }
+
+  async findByLifecycle(states: SignalLifecycle[], limit: number): Promise<TradeSignal[]> {
+    return this.manager.findMany({
+      filter: { lifecycle: { $in: states } } as any,
+      sortBy: 'timestamp',
+      sortDir: 'desc',
+      limit,
+    });
   }
 
   private async invalidate(id: string): Promise<void> {

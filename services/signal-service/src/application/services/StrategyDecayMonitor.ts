@@ -61,8 +61,14 @@ export class StrategyDecayMonitor {
 
   private async _computeMetrics(): Promise<LiveStrategyMetrics> {
     const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    // Health metrics must reflect what actually traded, not noise/queued/failed. Filtering
+    // to lifecycle ∈ {executed, closed} ensures the turnover ratio (and any future metric
+    // computed from this query) treats failed signals as if they never happened.
     const recentSignals = await this.signals
-      .find({ timestamp: { $gte: new Date(thirtyDaysAgo) } })
+      .find({
+        timestamp: { $gte: new Date(thirtyDaysAgo) },
+        lifecycle: { $in: ['executed', 'closed'] },
+      })
       .sort({ timestamp: -1 })
       .limit(500)
       .toArray();

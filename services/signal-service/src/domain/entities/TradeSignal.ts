@@ -1,7 +1,7 @@
-import type { SignalLifecycle } from '@trader/shared-types';
+import type { SignalLifecycle, SignalFailureReason } from '@trader/shared-types';
 
 export type Action = 'BUY' | 'SELL' | 'HOLD';
-export type { SignalLifecycle };
+export type { SignalLifecycle, SignalFailureReason };
 
 export class TradeSignal {
   public readonly id: string;
@@ -27,6 +27,15 @@ export class TradeSignal {
   // until executedQuantity is fully consumed.
   public readonly executedQuantity?: number;
 
+  // Dispatcher bookkeeping. attempts increments on every claim by order-dispatcher;
+  // reaching ORDER_MAX_ATTEMPTS transitions the signal to lifecycle='failed' with
+  // reason='retries_exhausted'. failureReason/failureDetail are populated on any
+  // failed transition so the portal can display why the order didn't go through.
+  public readonly attempts: number;
+  public readonly lastAttemptAt?: number;
+  public readonly failureReason?: SignalFailureReason;
+  public readonly failureDetail?: string;
+
   constructor(params: {
     id: string;
     timestamp: number;
@@ -44,6 +53,10 @@ export class TradeSignal {
     closedAt?: number;
     exitPrice?: number;
     executedQuantity?: number;
+    attempts?: number;
+    lastAttemptAt?: number;
+    failureReason?: SignalFailureReason;
+    failureDetail?: string;
   }) {
     if (params.confidence < 0 || params.confidence > 1)
       throw new Error('confidence must be in [0, 1]');
@@ -73,6 +86,10 @@ export class TradeSignal {
     this.closedAt = params.closedAt;
     this.exitPrice = params.exitPrice;
     this.executedQuantity = params.executedQuantity;
+    this.attempts = params.attempts ?? 0;
+    this.lastAttemptAt = params.lastAttemptAt;
+    this.failureReason = params.failureReason;
+    this.failureDetail = params.failureDetail;
   }
 
   // minConfidence is strategy policy — not a domain invariant.

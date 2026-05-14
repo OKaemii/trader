@@ -13,6 +13,16 @@ class StubRepo implements ISignalRepository {
   async approve() {}
   async markExecuted() {}
   async markClosed() {}
+  async findOpenBuysByTicker() { return []; }
+  async decrementExecutedQuantity() {}
+  async setTargetWeight() {}
+  async markQueued() {}
+  async claimNextQueued() { return null; }
+  async requeue() {}
+  async markFailed() {}
+  async retry() {}
+  async sweepStaleExecuting() { return 0; }
+  async findByLifecycle() { return []; }
 }
 
 class StubPortfolio implements IPortfolioState {

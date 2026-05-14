@@ -3,12 +3,16 @@ import { requireInternalToken } from '@trader/shared-auth/middleware';
 import type { ApproveSignalUseCase } from '../../application/use-cases/ApproveSignal.ts';
 import type { RiskEngine } from '../../application/services/RiskEngine.ts';
 import type { ISignalRepository } from '../../domain/interfaces/ISignalRepository.ts';
+import type { ISignalPublisher } from '../../domain/interfaces/ISignalPublisher.ts';
 
 interface Deps {
   findRecent: { execute: (limit: number) => Promise<unknown[]> };
   approveSignal: ApproveSignalUseCase;
   riskEngine: RiskEngine;
   signalRepo: ISignalRepository;
+  // Publisher gated on the executed transition so notification-service only emails
+  // signals that actually went through to T212 (policy b — see CLAUDE.md).
+  publisher: ISignalPublisher;
 }
 
 export function createInternalRouter(deps: Deps): Hono {
@@ -28,6 +32,14 @@ export function createInternalRouter(deps: Deps): Hono {
       // older callers (PlaceOrderUseCase notify-on-submit) keep working — they don't know
       // the fill quantity yet and pass undefined.
       await deps.signalRepo.markExecuted(id, at, body.quantity);
+      // Publish to TRADE_SIGNALS only on executed — this is the email trigger. The signal
+      // is reloaded so the published payload reflects the post-update state (lifecycle,
+      // executedAt, etc) rather than the wire-input.
+      const signal = await deps.signalRepo.findById(id);
+      if (signal) {
+        try { await deps.publisher.publish(signal); }
+        catch (e) { console.warn(`[internal] publish on executed failed for ${id}:`, e); }
+      }
       return c.json({ id, executedAt: at, executedQuantity: body.quantity });
     },
   );
@@ -66,6 +78,67 @@ export function createInternalRouter(deps: Deps): Hono {
       const body = await c.req.json<{ by: number }>();
       await deps.signalRepo.decrementExecutedQuantity(id, body.by);
       return c.json({ id, decrementedBy: body.by });
+    },
+  );
+
+  // ---------- Order-dispatcher queue endpoints (called by trading-service) ----------
+  //
+  // The signal collection IS the durable queue. claim returns the next queued signal
+  // atomically (no double-execution under multi-pod dispatcher). requeue/failed close
+  // the loop after the dispatcher tries to place the order.
+
+  router.post(
+    '/internal/queue/claim',
+    requireInternalToken('trading-service'),
+    async (c) => {
+      const signal = await deps.signalRepo.claimNextQueued();
+      if (!signal) return c.json({ signal: null }, 200);
+      return c.json({
+        signal: {
+          id:           signal.id,
+          ticker:       signal.ticker,
+          action:       signal.action,
+          targetWeight: signal.targetWeight,
+          confidence:   signal.confidence,
+          entryPrice:   signal.entryPrice,
+          timestamp:    signal.timestamp,
+          attempts:     signal.attempts,
+        },
+      });
+    },
+  );
+
+  router.post(
+    '/internal/queue/:id/requeue',
+    requireInternalToken('trading-service'),
+    async (c) => {
+      const id = c.req.param('id');
+      await deps.signalRepo.requeue(id);
+      return c.json({ id, lifecycle: 'queued' });
+    },
+  );
+
+  router.post(
+    '/internal/queue/:id/failed',
+    requireInternalToken('trading-service'),
+    async (c) => {
+      const id = c.req.param('id');
+      const body = await c.req.json<{ reason: string; detail?: string }>();
+      // Cast — the type narrowing happens at the repository level since the union is
+      // defined in shared-types and the body is unvalidated wire data.
+      await deps.signalRepo.markFailed(id, body.reason as any, body.detail);
+      return c.json({ id, lifecycle: 'failed', reason: body.reason });
+    },
+  );
+
+  router.post(
+    '/internal/queue/sweep',
+    requireInternalToken('trading-service'),
+    async (c) => {
+      const body = await c.req.json<{ thresholdMs?: number }>().catch(() => ({}));
+      const ms   = typeof body.thresholdMs === 'number' ? body.thresholdMs : 60_000;
+      const reverted = await deps.signalRepo.sweepStaleExecuting(ms);
+      return c.json({ reverted });
     },
   );
 
