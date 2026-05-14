@@ -21,6 +21,11 @@ export class TradeSignal {
   public readonly executedAt?: number;
   public readonly closedAt?: number;
   public readonly exitPrice?: number;
+  // Real share count attributed to this signal at fill time (BUYs only). Set by FillsPoller
+  // when a BUY order fills, then decremented as later SELLs FIFO-consume the position.
+  // Used for round-trip closure: a SELL fill walks open BUYs oldest-first and closes them
+  // until executedQuantity is fully consumed.
+  public readonly executedQuantity?: number;
 
   constructor(params: {
     id: string;
@@ -38,6 +43,7 @@ export class TradeSignal {
     executedAt?: number;
     closedAt?: number;
     exitPrice?: number;
+    executedQuantity?: number;
   }) {
     if (params.confidence < 0 || params.confidence > 1)
       throw new Error('confidence must be in [0, 1]');
@@ -66,6 +72,7 @@ export class TradeSignal {
     this.executedAt = params.executedAt;
     this.closedAt = params.closedAt;
     this.exitPrice = params.exitPrice;
+    this.executedQuantity = params.executedQuantity;
   }
 
   // minConfidence is strategy policy — not a domain invariant.

@@ -34,11 +34,13 @@ export class MongoSignalRepository implements ISignalRepository {
     await this.invalidate(id);
   }
 
-  async markExecuted(id: string, at: number): Promise<void> {
-    await this.manager.update(id, {
+  async markExecuted(id: string, at: number, executedQuantity?: number): Promise<void> {
+    const changes: Record<string, unknown> = {
       executedAt: new Date(at),
       lifecycle: 'executed',
-    });
+    };
+    if (typeof executedQuantity === 'number') changes.executedQuantity = executedQuantity;
+    await this.manager.update(id, changes);
     await this.invalidate(id);
   }
 
@@ -48,6 +50,24 @@ export class MongoSignalRepository implements ISignalRepository {
       exitPrice,
       lifecycle: 'closed',
     });
+    await this.invalidate(id);
+  }
+
+  async findOpenBuysByTicker(ticker: string): Promise<TradeSignal[]> {
+    return this.manager.findMany({
+      filter: { ticker, action: 'BUY', lifecycle: 'executed' },
+      sortBy: 'executedAt',
+      sortDir: 'asc',
+      limit: 200,
+    });
+  }
+
+  async decrementExecutedQuantity(id: string, by: number): Promise<void> {
+    if (by <= 0) return;
+    const sig = await this.manager.findById(id);
+    if (!sig) return;
+    const next = Math.max(0, (sig.executedQuantity ?? 0) - by);
+    await this.manager.update(id, { executedQuantity: next });
     await this.invalidate(id);
   }
 
