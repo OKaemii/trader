@@ -1,12 +1,8 @@
 import type { IOrderExecutor, OrderExecutionResult } from '../domain/interfaces/IOrderExecutor.ts';
-import { Trading212Client } from './t212.ts';
+import type { Trading212Client } from './t212.ts';
 
 export class T212OrderExecutor implements IOrderExecutor {
-  private client: Trading212Client;
-
-  constructor() {
-    this.client = new Trading212Client(process.env.T212_API_KEY ?? '');
-  }
+  constructor(private readonly client: Trading212Client) {}
 
   async execute(params: {
     ticker:      string;

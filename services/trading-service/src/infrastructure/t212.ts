@@ -31,7 +31,8 @@ export class Trading212Client {
   }
 
   async placeMarketOrder(ticker: string, quantity: number): Promise<{ orderId: string }> {
-    const body = JSON.stringify({ ticker, quantity, timeValidity: 'DAY' });
+    // T212 rejects market orders with `timeValidity` set ("Invalid payload"); only limit orders carry it.
+    const body = JSON.stringify({ ticker, quantity });
     const res  = await fetch(`${t212Base()}/equity/orders/market`, {
       method: 'POST', headers: this.headers, body,
     });
@@ -49,4 +50,51 @@ export class Trading212Client {
     const data = await res.json() as any;
     return { orderId: String(data.id ?? data.orderId ?? 'unknown') };
   }
+
+  // Active orders — anything still working. A submitted order that drops off this list has
+  // either filled or terminated. Returns raw objects; callers extract just the orderId.
+  async listActiveOrders(): Promise<Array<{ id: string }>> {
+    const res = await fetch(`${t212Base()}/equity/orders`, { headers: this.headers });
+    if (!res.ok) throw new Error(`T212 list orders: ${res.status}`);
+    const data = await res.json() as Array<any>;
+    return (data ?? []).map((o) => ({ id: String(o.id ?? o.orderId ?? '') }));
+  }
+
+  // History of orders that have reached a terminal state (FILLED / CANCELLED / REJECTED /
+  // EXPIRED). T212 paginates with `nextPagePath`, a path to follow until null. Caller drives
+  // the loop. Shape confirmed via demo probe — see PROGRESS.md.
+  async getHistoricalOrders(opts?: { cursor?: string; limit?: number }): Promise<{
+    items:        T212HistoryItem[];
+    nextPagePath: string | null;
+  }> {
+    const path = opts?.cursor ?? `/api/v0/equity/history/orders?limit=${opts?.limit ?? 50}`;
+    const base = t212Base().replace('/api/v0', '');
+    const res  = await fetch(`${base}${path}`, { headers: this.headers });
+    if (!res.ok) throw new Error(`T212 history orders: ${res.status}`);
+    const data = await res.json() as { items?: T212HistoryItem[]; nextPagePath?: string | null };
+    return { items: data.items ?? [], nextPagePath: data.nextPagePath ?? null };
+  }
+}
+
+// Subset of fields we actually use. T212 returns more (currency, walletImpact, taxes, etc.)
+// that we intentionally drop here so the structural type stays small and the tests are easy.
+export interface T212HistoryItem {
+  order: {
+    id:             number;
+    status:         string;   // 'FILLED' | 'CANCELLED' | 'REJECTED' | 'EXPIRED' | 'NEW' | ...
+    side:           'BUY' | 'SELL';
+    ticker:         string;
+    quantity:       number;
+    filledQuantity: number;
+    type:           string;   // 'MARKET' | 'LIMIT' | ...
+    limitPrice?:    number;
+    createdAt:      string;
+  };
+  fill?: {
+    id:            number;
+    quantity:      number;
+    price:         number;     // fill price in the instrument currency
+    filledAt:      string;     // ISO timestamp
+    tradingMethod?: string;
+  };
 }
