@@ -39,6 +39,7 @@ export function createAdminRouter(universeManager: UniverseManager): Hono {
       adds: doc?.adds ?? [],
       removes: doc?.removes ?? [],
       activeUniverse: universeManager.activeTickers,
+      sectorMap: universeManager.sectorMap,
       updatedBy: doc?.updatedBy ?? null,
       updatedAt: doc?.updatedAt ?? null,
     });
