@@ -6,10 +6,11 @@ import { getMongoDb } from '@trader/shared-mongo';
 import { getRedisClient } from '@trader/shared-redis';
 import { Trading212Client } from './infrastructure/t212.ts';
 import { MongoOrderRepository } from './infrastructure/MongoOrderRepository.ts';
-import { MongoPriceLookup } from './infrastructure/MongoPriceLookup.ts';
 import { T212OrderExecutor } from './infrastructure/T212OrderExecutor.ts';
 import { PlaceOrderUseCase } from './application/use-cases/PlaceOrderUseCase.ts';
 import { FillsPoller } from './application/services/FillsPoller.ts';
+import { AccountCache } from './infrastructure/account-cache.ts';
+import { OrderDispatcher } from './infrastructure/order-dispatcher.ts';
 
 export type TradingMode = 'paper' | 'demo' | 'live';
 
@@ -50,62 +51,15 @@ export function buildApp(deps: AppDeps): Hono {
     return c.json(cash);
   });
 
-  // Internal execute route (called by signal-service on approve). Trading-service self-resolves
-  // NAV / currentPrice / currentQuantity here so signal-service only hands over the signal identity.
+  // Legacy synchronous execute path. The order-dispatcher loop now owns signal → T212
+  // routing via the durable queue; this endpoint exists only for backwards compatibility
+  // with any caller still posting here. New callers should put signals on the queue
+  // (signal-service ApproveSignal flips lifecycle to 'queued') instead.
   app.post('/internal/signals/trading/execute', requireSignal, async (c) => {
-    if (tradingMode === 'paper') {
-      return c.json({ skipped: true, reason: 'TRADING_MODE=paper' }, 200);
-    }
-
-    const body = await c.req.json<{
-      signalId: string;
-      ticker: string;
-      action: 'BUY' | 'SELL';
-      targetWeight: number;
-      confidence: number;
-    }>();
-
-    const db    = await deps.getDb();
-    const redis = await deps.getRedis();
-    const client = deps.client();
-
-    const orderRepo = new MongoOrderRepository(db);
-    const existing  = await orderRepo.findBySignalId(body.signalId);
-    if (existing) {
-      return c.json({ skipped: true, reason: 'order already exists for signal', orderId: existing.id }, 200);
-    }
-
-    let totalNAV: number | undefined;
-    let currentQuantity = 0;
-    try {
-      const cash = await client.getCash();
-      totalNAV   = cash.total ?? cash.free;
-      const positions = await client.getPositions() as Array<{ ticker?: string; quantity?: number }>;
-      currentQuantity = positions.find(p => p.ticker === body.ticker)?.quantity ?? 0;
-    } catch (e) {
-      console.warn(`[execute] T212 cash/positions fetch failed for ${body.ticker}:`, e);
-    }
-    const currentPrice = (await new MongoPriceLookup(db).lastClose(body.ticker)) ?? undefined;
-
-    const executor     = new T212OrderExecutor(client);
-    const liveApproved = async () => !!(await redis.get(LIVE_GATE_KEY));
-    const useCase      = new PlaceOrderUseCase(orderRepo, executor, liveApproved);
-
-    const order = await useCase.execute({
-      signalId:        body.signalId,
-      ticker:          body.ticker,
-      action:          body.action,
-      targetWeight:    body.targetWeight,
-      confidence:      body.confidence,
-      totalNAV,
-      currentPrice,
-      currentQuantity,
-    });
-
-    if (!order) {
-      return c.json({ skipped: true, reason: 'live gate closed or zero quantity' }, 200);
-    }
-    return c.json({ order });
+    return c.json({
+      skipped: true,
+      reason:  'deprecated — signals are now routed through the order-dispatcher queue. Approve via signal-service to enqueue.',
+    }, 200);
   });
 
   // Admin routes. Middleware is mounted on a path prefix on the main app (not via a
@@ -227,13 +181,54 @@ const productionDeps: AppDeps = {
 const app = buildApp(productionDeps);
 
 const FILL_POLL_INTERVAL_MS = parseInt(process.env.FILL_POLL_INTERVAL_MS ?? '30000', 10);
-if (import.meta.main && tradingMode !== 'paper') {
+
+// Dispatcher knobs — defaults are conservative for `daily` mode. See CLAUDE.md.
+const ORDER_MIN_INTERVAL_MS   = parseInt(process.env.ORDER_MIN_INTERVAL_MS   ?? '1100',     10);
+const ORDER_MAX_ATTEMPTS      = parseInt(process.env.ORDER_MAX_ATTEMPTS      ?? '5',        10);
+const QUEUE_TTL_MS            = parseInt(process.env.QUEUE_TTL_MS            ?? '3600000',  10); // 1h
+const ACCOUNT_CACHE_TTL_MS    = parseInt(process.env.ACCOUNT_CACHE_TTL_MS    ?? '30000',    10);
+const PRICE_DRIFT_TOLERANCE   = parseFloat(process.env.PRICE_DRIFT_TOLERANCE ?? '0.01');         // 1%
+const SIGNAL_SERVICE_URL      = process.env.SIGNAL_SERVICE_URL ?? 'http://signal-service:3003';
+
+if (import.meta.main) {
   (async () => {
-    const db = await getMongoDb();
-    const orderRepo = new MongoOrderRepository(db);
-    new FillsPoller(orderRepo, productionClient(), FILL_POLL_INTERVAL_MS).start();
-    console.log(`[trading-service] fills poller started (${FILL_POLL_INTERVAL_MS}ms, mode=${tradingMode})`);
-  })().catch((e) => console.error('[trading-service] fills poller bootstrap failed:', e));
+    if (tradingMode !== 'paper') {
+      const db = await getMongoDb();
+      const orderRepo = new MongoOrderRepository(db);
+      new FillsPoller(orderRepo, productionClient(), FILL_POLL_INTERVAL_MS).start();
+      console.log(`[trading-service] fills poller started (${FILL_POLL_INTERVAL_MS}ms, mode=${tradingMode})`);
+    }
+
+    // Order-dispatcher loop runs in ALL modes including paper — in paper it drains the
+    // queue by marking signals as executed without calling T212 (see dispatcher code).
+    const client       = productionClient();
+    const accountCache = new AccountCache(client, { ttlMs: ACCOUNT_CACHE_TTL_MS });
+    const dispatcher = new OrderDispatcher({
+      signalServiceUrl:    SIGNAL_SERVICE_URL,
+      tradingMode,
+      client,
+      accountCache,
+      getDb:               () => getMongoDb(),
+      getRedis:            () => getRedisClient() as unknown as Promise<Pick<RedisClientType, 'get'>>,
+      minIntervalMs:       ORDER_MIN_INTERVAL_MS,
+      maxAttempts:         ORDER_MAX_ATTEMPTS,
+      queueTtlMs:          QUEUE_TTL_MS,
+      priceDriftTolerance: PRICE_DRIFT_TOLERANCE,
+    });
+
+    // Boot sweep: any signals stuck at lifecycle='executing' from a prior pod that
+    // crashed mid-flight get reverted to 'queued' so the new dispatcher picks them up.
+    // FillsPoller is the source of truth for whether the order actually reached T212;
+    // PlaceOrderUseCase's findBySignalId guard prevents duplicate placement.
+    try {
+      const reverted = await dispatcher.sweepStaleExecuting(60_000);
+      if (reverted > 0) console.warn(`[trading-service] boot sweep reverted ${reverted} stale executing signal(s)`);
+    } catch (e) {
+      console.warn('[trading-service] boot sweep failed (signal-service likely not up yet):', e);
+    }
+
+    dispatcher.start().catch((e) => console.error('[trading-service] dispatcher crashed:', e));
+  })().catch((e) => console.error('[trading-service] bootstrap failed:', e));
 }
 
 // idleTimeout raised from the Bun default (10s) so synchronous order-placement chains
