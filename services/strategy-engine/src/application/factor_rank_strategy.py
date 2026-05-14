@@ -64,7 +64,9 @@ class FactorRankStrategy(BaseStrategy):
         if len(tickers) < self.min_universe_size:
             return None
 
-        prices = np.array([self._price_history[t] for t in tickers])
+        # Histories can drift to LOOKBACK..LOOKBACK+2 entries (see cap above), so slice
+        # to a uniform tail before stacking — np.array on ragged lists raises.
+        prices = np.array([self._price_history[t][-self.LOOKBACK:] for t in tickers])
         returns = np.diff(np.log(prices), axis=1)   # (n_assets, n_periods - 1)
 
         if returns.shape[1] < 2:
