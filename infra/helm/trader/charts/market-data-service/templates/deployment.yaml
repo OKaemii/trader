@@ -57,6 +57,14 @@ spec:
             - name: UNIVERSE_MAX_SIZE
               value: {{ . | quote }}
             {{- end }}
+            {{- with .Values.global.env.universeIncludeUS }}
+            - name: UNIVERSE_INCLUDE_US
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.global.env.universeIncludeLSE }}
+            - name: UNIVERSE_INCLUDE_LSE
+              value: {{ . | quote }}
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /health
