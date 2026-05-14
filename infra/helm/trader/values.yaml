@@ -34,6 +34,13 @@ global:
     # Max active universe size. Bumping invalidates prior backtest_results — re-run validation
     # before re-enabling topology_v1 or any go-live gate (see CLAUDE.md / Research page).
     universeMaxSize: "200"
+    # Curated candidate pool — bare symbols, resolved against T212 instruments at refresh time.
+    # US list expected to use `_US_EQ` form in T212; LSE list uses primary listing `l_EQ` GBP/GBX.
+    # Symbols T212 doesn't carry are silently skipped (logged on refresh). Verify against current
+    # index constituents quarterly — these snapshots drift. Set both empty to disable curated mode
+    # and fall back to the legacy "first N from T212" selection.
+    universeIncludeUS: "AAPL,ABBV,ABT,ACN,ADBE,AIG,AMD,AMGN,AMT,AMZN,AVGO,AXP,BA,BAC,BK,BKNG,BLK,BMY,BRKB,C,CAT,CHTR,CL,CMCSA,COF,COP,COST,CRM,CSCO,CVS,CVX,DE,DHR,DIS,DOW,DUK,EMR,F,FDX,GD,GE,GILD,GM,GOOG,GOOGL,GS,HD,HON,IBM,INTC,INTU,ISRG,JNJ,JPM,KHC,KMI,KO,LIN,LLY,LMT,LOW,MA,MCD,MDLZ,MDT,META,MMM,MO,MRK,MS,MSFT,NEE,NFLX,NKE,NVDA,ORCL,PEP,PFE,PG,PM,PYPL,QCOM,RTX,SBUX,SCHW,SO,SPG,T,TGT,TMO,TMUS,TSLA,TXN,UNH,UNP,UPS,USB,V,VZ,WBA,WFC,WMT,XOM"
+    universeIncludeLSE: "AAL,ABF,ADM,AHT,ANTO,AUTO,AV,AZN,BARC,BATS,BDEV,BEZ,BKG,BME,BNZL,BP,BRBY,CCH,CNA,CRDA,CRH,CTEC,DGE,DPLM,DSV,EDV,ENT,EXPN,EZJ,FCIT,FRAS,FRES,GLEN,GSK,HIK,HL,HLN,HSBA,HWDN,IAG,IHG,III,IMB,IMI,INF,ITRK,JD,KGF,LAND,LGEN,LLOY,LMP,LSEG,MNDI,MNG,MRO,NG,NWG,NXT,PHNX,PRU,PSH,PSN,PSON,RIO,RKT,RMV,RR,RTO,SBRY,SDR,SGE,SGRO,SHEL,SMDS,SMIN,SMT,SN,SPX,SSE,STAN,STJ,SVT,TSCO,TW,ULVR,UTG,UU,VOD,WEIR,WPP,WTB"
 
 redis:
   host: redis-master

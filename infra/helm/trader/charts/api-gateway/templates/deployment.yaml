@@ -27,6 +27,13 @@ spec:
                   key: REDIS_PASSWORD
             - name: REDIS_URL
               value: "redis://:$(REDIS_PASSWORD)@redis-master:6379"
+            - name: MONGODB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: MONGODB_PASSWORD
+            - name: MONGODB_URL
+              value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb:27017/trader"
             - name: JWT_SECRET
               valueFrom:
                 secretKeyRef:
