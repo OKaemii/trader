@@ -70,6 +70,20 @@ export class GenerateSignalsUseCase {
 
     const decayFactor = this.riskEngine.confidenceDecayFactor();
 
+    // Confidence normalisation: cross-sectional, scale-free. Previously divided |score| by
+    // a hardcoded 0.05 which saturated to 1.0 for every ticker because composite scores
+    // routinely range over [-4, 4]. Now we divide by the 95th percentile of |score| in
+    // this batch, so the top ~5% of conviction signals saturate at 1.0 and the rest spread
+    // over [0, 1]. Falls back to 1.0 when the batch is empty or scores are all zero.
+    const absScores = features.ticker_universe
+      .map((t) => Math.abs(features.composite_scores[t] ?? 0))
+      .filter((v) => v > 0)
+      .sort((a, b) => a - b);
+    const p95 = absScores.length > 0
+      ? absScores[Math.min(absScores.length - 1, Math.floor(absScores.length * 0.95))]
+      : 1.0;
+    const scaleDivisor = p95 > 0 ? p95 : 1.0;
+
     // Look up last close for every universe ticker in one round-trip — used as entryPrice
     // when emitting BUY/SELL signals. Optional dependency: tests can omit priceLookup.
     const lastCloses = this.priceLookup
@@ -100,7 +114,7 @@ export class GenerateSignalsUseCase {
             ticker,
             strategy_id: features.strategy_id,
             action,
-            confidence: Math.min(Math.abs(features.composite_scores[ticker] ?? 0) / 0.05, 1) * decayFactor,
+            confidence: Math.min(Math.abs(features.composite_scores[ticker] ?? 0) / scaleDivisor, 1) * decayFactor,
             targetWeight: w,
             rationale: JSON.stringify(rationale),
             entryPrice: entry && entry > 0 ? entry : undefined,
