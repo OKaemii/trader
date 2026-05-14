@@ -193,6 +193,22 @@ async def process_loop() -> None:
                     print(f"[strategy-engine] processing error on {entry_id}: {exc}")
 
 
+def _on_loop_done(task: asyncio.Task) -> None:
+    # Surface silent crashes — without this, an exception in process_loop dies inside
+    # the asyncio task and the pod keeps serving /health 200s while consuming nothing.
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:
+        print(f"[strategy-engine] FATAL: process_loop crashed: {exc!r}", flush=True)
+
+
 @app.on_event("startup")
 async def startup() -> None:
-    asyncio.create_task(process_loop())
+    # Retain a reference on app.state so the task isn't GC'd. Previously this was a
+    # bare create_task() with no reference held, which Python is free to collect —
+    # observed in prod as "Task was destroyed but it is pending!" at startup.
+    task = asyncio.create_task(process_loop(), name="process_loop")
+    task.add_done_callback(_on_loop_done)
+    app.state.process_loop_task = task
