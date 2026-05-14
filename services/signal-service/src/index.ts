@@ -54,7 +54,7 @@ async function main() {
   });
 
   app.route('/', createRouter({ findRecent, approveSignal, getProgress }));
-  app.route('/', createInternalRouter({ findRecent, approveSignal, riskEngine }));
+  app.route('/', createInternalRouter({ findRecent, approveSignal, riskEngine, signalRepo }));
 
   // Prometheus metrics endpoint — scraped by kube-prometheus-stack for Grafana Strategy Health panel
   app.get('/metrics', async (c) => {
@@ -96,4 +96,7 @@ main().catch((err) => {
   process.exit(1);
 });
 
-export default { port: 3003, fetch: app.fetch };
+// idleTimeout raised from Bun's 10s default. Even though ApproveSignal is now fire-and-forget,
+// other handlers (notably the trading-service callback chain) can stall on slow downstream
+// systems; a higher ceiling avoids spurious 502s under rate-limit-induced lag.
+export default { port: 3003, idleTimeout: 60, fetch: app.fetch };

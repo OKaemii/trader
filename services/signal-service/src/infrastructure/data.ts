@@ -28,6 +28,7 @@ const toSignalDoc = (s: TradeSignal) => ({
   executedAt: s.executedAt ? new Date(s.executedAt) : undefined,
   closedAt:   s.closedAt   ? new Date(s.closedAt)   : undefined,
   exitPrice:  s.exitPrice,
+  executedQuantity: s.executedQuantity,
 });
 
 const fromSignalDoc = (doc: any): TradeSignal =>
@@ -47,6 +48,7 @@ const fromSignalDoc = (doc: any): TradeSignal =>
     executedAt: toMs(doc.executedAt),
     closedAt:   toMs(doc.closedAt),
     exitPrice: typeof doc.exitPrice === 'number' ? doc.exitPrice : undefined,
+    executedQuantity: typeof doc.executedQuantity === 'number' ? doc.executedQuantity : undefined,
   });
 
 export const createSignalDataLayer = (
