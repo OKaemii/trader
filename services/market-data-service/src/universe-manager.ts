@@ -39,17 +39,27 @@ export function applyUniverseOverrides(
 ): { result: InstrumentMeta[]; added: number; removed: number } {
   if (!overrides) return { result: selected, added: 0, removed: 0 };
 
-  const removeSet = new Set((overrides.removes ?? []).map((t) => t.toUpperCase().trim()).filter(Boolean));
+  // Case-sensitive matching. T212 tickers carry meaningful case in the exchange suffix
+  // (`SGLNl_EQ` is a London listing; `SGLNL_EQ` would be wrong). Earlier code upper-cased
+  // both sides, which silently mangled overrides like `SGLNl_EQ` into `SGLNL_EQ` and then
+  // failed to match against the T212 catalog.
+  const removeSet = new Set((overrides.removes ?? []).map((t) => t.trim()).filter(Boolean));
   const before = selected.length;
-  let result = selected.filter((i) => !removeSet.has(i.ticker.toUpperCase()));
+  let result = selected.filter((i) => !removeSet.has(i.ticker));
   const removed = before - result.length;
 
-  const presentTickers = new Set(result.map((i) => i.ticker.toUpperCase()));
+  const presentTickers = new Set(result.map((i) => i.ticker));
   let added = 0;
   for (const rawTicker of overrides.adds ?? []) {
-    const ticker = rawTicker.toUpperCase().trim();
+    const ticker = rawTicker.trim();
     if (!ticker || presentTickers.has(ticker)) continue;
-    result.push({ ticker, name: ticker, sector: 'Unknown', t212Tradable: false });
+    // Infer market from T212 suffix so the portal renders the right badge and so the
+    // value persists onto instrument_registry. Without this, override-added entries fall
+    // through to 'OTHER' in the upsert and the universe overview shows "—" for the region.
+    const market: 'US' | 'LSE' | 'OTHER' =
+      /_US_EQ$/.test(ticker) ? 'US' :
+      /l_EQ$/.test(ticker)   ? 'LSE' : 'OTHER';
+    result.push({ ticker, name: ticker, sector: 'Unknown', t212Tradable: false, market });
     presentTickers.add(ticker);
     added++;
   }

@@ -74,8 +74,10 @@ export function createAdminRouter(universeManager: UniverseManager): Hono {
 
   r.put('/api/admin/universe/overrides', async (c) => {
     const body = await c.req.json<{ adds?: string[]; removes?: string[]; userId?: string }>();
+    // Preserve case so T212 suffixes (e.g. `l_EQ` for London) survive. Earlier code upper-cased
+    // every entry, which silently broke any non-_US_EQ ticker passing through portal overrides.
     const norm = (arr: string[] | undefined) =>
-      (arr ?? []).map((t) => t.toUpperCase().trim()).filter(Boolean);
+      (arr ?? []).map((t) => t.trim()).filter(Boolean);
     const adds = norm(body.adds);
     const removes = norm(body.removes);
     const db = await getMongoDb();
