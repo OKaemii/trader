@@ -2,6 +2,8 @@ import Link from 'next/link'
 import { authedFetch } from '@/app/lib/auth-fetch'
 import { CashCard } from '@/components/CashCard'
 import { HoldingsPanel } from '@/components/HoldingsPanel'
+import { AutoApproveToggle } from '@/components/AutoApproveToggle'
+import { DangerZone } from '@/components/DangerZone'
 
 interface HealthRow {
   name: string
@@ -37,7 +39,8 @@ export default async function DashboardPage() {
 
       <section className="grid grid-cols-1 gap-4 lg:grid-cols-4">
         <CashCard />
-        <div className="rounded border border-gray-800 bg-gray-900 p-4 lg:col-span-3">
+        <AutoApproveToggle />
+        <div className="rounded border border-gray-800 bg-gray-900 p-4 lg:col-span-2">
           <h2 className="mb-2 text-sm font-medium text-gray-300">System health</h2>
           {health === null ? (
             <div className="text-sm text-gray-500">Health endpoint unavailable (admin role required).</div>
@@ -62,6 +65,8 @@ export default async function DashboardPage() {
       <section>
         <HoldingsPanel />
       </section>
+
+      <DangerZone />
 
       <section>
         <h2 className="mb-2 text-sm font-medium text-gray-300">Shortcuts</h2>

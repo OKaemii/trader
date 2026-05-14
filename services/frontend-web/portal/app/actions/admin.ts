@@ -3,10 +3,19 @@
 import { revalidatePath } from 'next/cache'
 import { authedFetch } from '@/app/lib/auth-fetch'
 
+export interface ActiveInstrument {
+  ticker: string
+  name: string
+  sector: string
+  market: 'US' | 'LSE' | 'OTHER'
+  adv: number
+}
+
 export interface UniverseOverrides {
   adds: string[]
   removes: string[]
   activeUniverse: string[]
+  activeUniverseDetailed?: ActiveInstrument[]
   updatedBy: string | null
   updatedAt: string | null
 }
