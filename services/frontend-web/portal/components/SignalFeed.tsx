@@ -1,6 +1,8 @@
 'use client';
 import { useEffect, useState } from 'react';
 import type { SignalProgressDTO, SignalRationale, SignalLifecycle } from '@/types/trader';
+import { MARKET_STYLES, marketOf } from './market';
+import { MarketBadge } from './MarketBadge';
 
 const REFRESH_MS = 30_000;
 
@@ -124,10 +126,13 @@ export function SignalFeed() {
           try { return JSON.parse(s.rationale); } catch { return null; }
         })();
         const lifecycle = s.lifecycleResolved ?? s.lifecycle ?? (s.approved ? 'approved' : 'pending');
+        const market = marketOf(s.ticker);
+        const accent = MARKET_STYLES[market].border;
         return (
-          <div key={s.id} className="border border-gray-700 rounded p-3 mb-3">
+          <div key={s.id} className={`border border-gray-700 border-l-2 ${accent} rounded p-3 mb-3`}>
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-2">
+                <MarketBadge market={market} />
                 <span className="font-bold text-white">{s.ticker}</span>
                 <span className={`px-2 py-0.5 rounded text-xs font-semibold ${
                   s.action === 'BUY' ? 'bg-green-600' : 'bg-red-600'

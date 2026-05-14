@@ -3,6 +3,7 @@
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { logout } from '@/app/actions/auth'
+import { WorldClock } from './WorldClock'
 
 const links = [
   { href: '/dashboard', label: 'Dashboard' },
@@ -37,14 +38,17 @@ export function AppNav() {
             )
           })}
         </div>
-        <form action={logout}>
-          <button
-            type="submit"
-            className="text-xs text-gray-500 transition-colors hover:text-gray-300"
-          >
-            Sign out
-          </button>
-        </form>
+        <div className="flex items-center gap-4">
+          <WorldClock />
+          <form action={logout}>
+            <button
+              type="submit"
+              className="text-xs text-gray-500 transition-colors hover:text-gray-300"
+            >
+              Sign out
+            </button>
+          </form>
+        </div>
       </div>
     </nav>
   )

@@ -3,6 +3,8 @@ import { useEffect, useMemo, useState } from 'react'
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip, Legend } from 'recharts'
 import type { SignalProgressDTO } from '@/types/trader'
 import { resolveSector } from './sectorLookup'
+import { MARKET_STYLES, marketOf } from './market'
+import { MarketBadge } from './MarketBadge'
 
 interface Position {
   ticker?: string
@@ -114,9 +116,16 @@ export function HoldingsPanel() {
               {positions.map((p, i) => {
                 const sector = resolveSector(p.ticker, sectorMap)
                 const pnl = p.ppl
+                const market = marketOf(p.ticker)
+                const accent = MARKET_STYLES[market].border
                 return (
-                  <tr key={i} className="border-b border-gray-800/50">
-                    <td className="py-1.5 font-mono text-gray-200">{p.ticker ?? '—'}</td>
+                  <tr key={i} className={`border-b border-gray-800/50 border-l-2 ${accent}`}>
+                    <td className="py-1.5 pl-2 font-mono text-gray-200">
+                      <span className="inline-flex items-center gap-1.5">
+                        <MarketBadge market={market} />
+                        {p.ticker ?? '—'}
+                      </span>
+                    </td>
                     <td className="py-1.5 text-gray-400">{sector}</td>
                     <td className="py-1.5 text-right font-mono text-gray-300">{p.quantity?.toFixed(2) ?? '—'}</td>
                     <td className="py-1.5 text-right font-mono text-gray-300">{p.averagePrice?.toFixed(2) ?? '—'}</td>
@@ -172,9 +181,13 @@ export function HoldingsPanel() {
           <p className="text-xs text-gray-500">No active signals on positions you hold.</p>
         ) : (
           <ul className="space-y-1.5">
-            {heldSignals.map((s) => (
-              <li key={s.id} className="flex items-center justify-between rounded bg-gray-950 px-3 py-2 text-xs">
+            {heldSignals.map((s) => {
+              const market = marketOf(s.ticker)
+              const accent = MARKET_STYLES[market].border
+              return (
+              <li key={s.id} className={`flex items-center justify-between rounded border-l-2 ${accent} bg-gray-950 px-3 py-2 text-xs`}>
                 <div className="flex items-center gap-2">
+                  <MarketBadge market={market} />
                   <span className="font-mono font-semibold text-white">{s.ticker}</span>
                   <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${
                     s.action === 'BUY' ? 'bg-emerald-700 text-white' :
@@ -195,7 +208,8 @@ export function HoldingsPanel() {
                   )}
                 </div>
               </li>
-            ))}
+              )
+            })}
           </ul>
         )}
       </div>
