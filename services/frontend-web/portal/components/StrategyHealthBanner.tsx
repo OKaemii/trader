@@ -13,7 +13,7 @@ export function StrategyHealthBanner() {
 
   useEffect(() => {
     const poll = () => {
-      fetch('/api/admin/system/health')
+      fetch('/portal-api/admin/system/health')
         .then((r) => (r.ok ? r.json() : Promise.reject()))
         .then((data: ServiceHealth[]) => { setServices(data); setLoading(false); })
         .catch(() => setLoading(false));
