@@ -327,6 +327,54 @@ async function fetchWithFallbacks(
   );
 }
 
+/**
+ * Compute the 5-day average dollar volume per T212 ticker. Used by UniverseManager to
+ * rank curated candidate pools (S&P 100 + FTSE 100) by liquidity before applying the
+ * top-N cap. Re-uses fetchWithFallbacks so suffix resolution is identical to price polling.
+ * Returns 0 for any ticker Yahoo can't resolve — caller treats 0 as "skip".
+ *
+ * Reuses the same /chart endpoint and 5d range fetchYahooChart already requests; we just
+ * average over the returned series instead of taking the last valid bar.
+ */
+export async function fetchYahooLiquidity(
+  t212Tickers: string[],
+): Promise<Record<string, number>> {
+  const out: Record<string, number> = {};
+  for (let i = 0; i < t212Tickers.length; i += BATCH_SIZE) {
+    const batch = t212Tickers.slice(i, i + BATCH_SIZE);
+    const results = await Promise.allSettled(
+      batch.map(async (ticker) => {
+        const yahooSymbol = toYahooSymbol(ticker);
+        if (UNSUPPORTED_SYMBOLS.has(yahooSymbol)) {
+          return { ticker, adv: 0 };
+        }
+        const chart = await fetchYahooChart(yahooSymbol);
+        const result = chart.chart?.result?.[0];
+        const quote = result?.indicators?.quote?.[0];
+        if (!result || !quote) return { ticker, adv: 0 };
+        let sum = 0;
+        let count = 0;
+        for (let k = 0; k < result.timestamp.length; k++) {
+          const c = quote.close[k];
+          const v = quote.volume[k];
+          if (c != null && c > 0 && v != null && v > 0) {
+            sum += c * v;
+            count++;
+          }
+        }
+        return { ticker, adv: count > 0 ? sum / count : 0 };
+      }),
+    );
+    for (const r of results) {
+      if (r.status === 'fulfilled') out[r.value.ticker] = r.value.adv;
+    }
+    if (i + BATCH_SIZE < t212Tickers.length) {
+      await new Promise((res) => setTimeout(res, BATCH_DELAY_MS));
+    }
+  }
+  return out;
+}
+
 export async function fetchYahooPrices(
   t212Tickers: string[]
 ): Promise<OHLCVBar[]> {
