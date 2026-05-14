@@ -1,5 +1,7 @@
 import Link from 'next/link'
 import { authedFetch } from '@/app/lib/auth-fetch'
+import { CashCard } from '@/components/CashCard'
+import { HoldingsPanel } from '@/components/HoldingsPanel'
 
 interface HealthRow {
   name: string
@@ -19,6 +21,7 @@ async function fetchHealth(): Promise<HealthRow[] | null> {
 
 const cards = [
   { href: '/signals', title: 'Signals', desc: 'Latest strategy signals, regime, factor exposure.' },
+  { href: '/research', title: 'Research', desc: 'Run backtests, view validation reports, factor decomposition.' },
   { href: '/universe', title: 'Universe', desc: 'Inspect the active universe and add or exclude tickers.' },
   { href: '/market-data', title: 'Market Data', desc: 'Override bar frequency and polling interval.' },
 ]
@@ -26,38 +29,43 @@ const cards = [
 export default async function DashboardPage() {
   const health = await fetchHealth()
   return (
-    <div className="p-6 space-y-6">
+    <div className="space-y-6 p-6">
       <div>
         <h1 className="text-2xl font-bold text-white">Dashboard</h1>
-        <p className="mt-1 text-sm text-gray-400">System overview and quick navigation.</p>
+        <p className="mt-1 text-sm text-gray-400">Account state, holdings, and system overview.</p>
       </div>
 
+      <section className="grid grid-cols-1 gap-4 lg:grid-cols-4">
+        <CashCard />
+        <div className="rounded border border-gray-800 bg-gray-900 p-4 lg:col-span-3">
+          <h2 className="mb-2 text-sm font-medium text-gray-300">System health</h2>
+          {health === null ? (
+            <div className="text-sm text-gray-500">Health endpoint unavailable (admin role required).</div>
+          ) : (
+            <ul className="grid grid-cols-2 gap-2 md:grid-cols-4">
+              {health.map((s) => (
+                <li
+                  key={s.name}
+                  className="flex items-center justify-between rounded bg-gray-950 px-3 py-2 text-sm"
+                >
+                  <span className="text-gray-300">{s.name}</span>
+                  <span className={s.ok ? 'text-emerald-400' : 'text-red-400'}>
+                    {s.ok ? 'ok' : `down${s.status ? ` (${s.status})` : ''}`}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </section>
+
       <section>
-        <h2 className="mb-2 text-sm font-medium text-gray-300">System health</h2>
-        {health === null ? (
-          <div className="rounded border border-gray-800 bg-gray-900 px-4 py-3 text-sm text-gray-500">
-            Health endpoint unavailable (admin role required).
-          </div>
-        ) : (
-          <ul className="grid grid-cols-2 gap-2 md:grid-cols-4">
-            {health.map((s) => (
-              <li
-                key={s.name}
-                className="flex items-center justify-between rounded border border-gray-800 bg-gray-900 px-3 py-2 text-sm"
-              >
-                <span className="text-gray-300">{s.name}</span>
-                <span className={s.ok ? 'text-emerald-400' : 'text-red-400'}>
-                  {s.ok ? 'ok' : `down${s.status ? ` (${s.status})` : ''}`}
-                </span>
-              </li>
-            ))}
-          </ul>
-        )}
+        <HoldingsPanel />
       </section>
 
       <section>
         <h2 className="mb-2 text-sm font-medium text-gray-300">Shortcuts</h2>
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-4">
           {cards.map((c) => (
             <Link
               key={c.href}
