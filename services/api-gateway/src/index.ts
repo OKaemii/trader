@@ -78,6 +78,8 @@ admin.use('*', requireAuth, requireRole('admin'));
 
 admin.get('/api/admin/signals/history',       (c) => proxy('http://signal-service:3003', c));
 admin.post('/api/admin/signals/approve/:id',  (c) => proxy('http://signal-service:3003', c));
+admin.post('/api/admin/signals/retry/:id',    (c) => proxy('http://signal-service:3003', c));
+admin.post('/api/admin/signals/cancel/:id',   (c) => proxy('http://signal-service:3003', c));
 admin.get('/api/admin/signals/auto-approve',  (c) => proxy('http://signal-service:3003', c));
 admin.post('/api/admin/signals/auto-approve', (c) => proxy('http://signal-service:3003', c));
 admin.post('/api/admin/trading/toggle',             (c) => proxy('http://trading-service:3005', c));
