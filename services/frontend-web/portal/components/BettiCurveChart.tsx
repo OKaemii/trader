@@ -5,14 +5,32 @@ import { LineChart, Line, XAxis, YAxis, Tooltip, Legend, ResponsiveContainer } f
 export function BettiCurveChart() {
   const { features } = useTopologyStream();
 
-  if (!features?.betti_curves) {
+  // Strategy state messaging:
+  //   - no features yet           → still connecting to the websocket; show skeleton
+  //   - features but no betti     → active strategy doesn't compute TDA; say so explicitly
+  //   - features with betti       → render the chart
+  if (!features) {
+    return (
+      <div className="bg-gray-900 rounded-lg p-4">
+        <h2 className="text-lg font-semibold text-white mb-2">Topology Shape</h2>
+        <p className="text-xs text-gray-400">Connecting to feature stream…</p>
+        <div className="animate-pulse bg-gray-800 rounded h-48 mt-4" />
+      </div>
+    );
+  }
+
+  if (!features.betti_curves) {
     return (
       <div className="bg-gray-900 rounded-lg p-4">
         <h2 className="text-lg font-semibold text-white mb-2">Topology Shape</h2>
         <p className="text-xs text-gray-400">
-          Last rebalance topology snapshot — updates weekly
+          Topology features inactive — active strategy is{' '}
+          <code className="text-amber-400">{features.strategy_id ?? 'unknown'}</code>.
+          Switch <code>ACTIVE_STRATEGY</code> to <code>topology_v1</code> to populate this chart.
         </p>
-        <div className="animate-pulse bg-gray-800 rounded h-48 mt-4" />
+        <div className="bg-gray-800 rounded h-48 mt-4 flex items-center justify-center text-gray-500 text-xs">
+          no Betti curves
+        </div>
       </div>
     );
   }
