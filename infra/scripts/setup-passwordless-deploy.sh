@@ -14,14 +14,17 @@ HOMESERVER_HOST="192.168.50.2"
 HOMESERVER_PORT="1984"
 
 # Narrow rules for the deploy + observability flow. All kubectl rules are scoped to the
-# trader namespace; `get secret` is intentionally NOT included to avoid leaking secret
-# contents over passwordless SSH.
+# trader namespace.
 #   1. Image import — build-images.sh loads freshly built images into containerd.
 #   2. rollout restart — needed after image import (imagePullPolicy: Never + :latest).
 #   3. rollout status  — verify a restart completed.
 #   4. get pods / deployments — check cluster state during/after deploy.
 #   5. logs — tail pod logs to debug a failed rollout.
 #   6. describe pod / deployment — inspect events when a pod won't come up.
+#   7. get secret — read secret contents for one-off probes against external APIs
+#      (e.g. T212 demo /equity/history/orders). `kubectl exec` is already passwordless
+#      below, which is a strictly broader read (pods mount the same secrets), so this
+#      rule does not expand the effective blast radius.
 read -r -d '' RULES <<'EOF' || true
 okamii ALL=(ALL) NOPASSWD: /usr/local/bin/k3s ctr images import /tmp/trader-*.tar
 okamii ALL=(ALL) NOPASSWD: /usr/local/bin/k3s kubectl -n trader rollout restart deployment/*
@@ -35,6 +38,7 @@ okamii ALL=(ALL) NOPASSWD: /usr/local/bin/k3s kubectl -n trader logs *
 okamii ALL=(ALL) NOPASSWD: /usr/local/bin/k3s kubectl -n trader describe pod *
 okamii ALL=(ALL) NOPASSWD: /usr/local/bin/k3s kubectl -n trader describe deployment *
 okamii ALL=(ALL) NOPASSWD: /usr/local/bin/k3s kubectl -n trader exec *
+okamii ALL=(ALL) NOPASSWD: /usr/local/bin/k3s kubectl -n trader get secret *
 EOF
 
 echo "Installing sudoers rules on ${HOMESERVER_HOST} ..."
