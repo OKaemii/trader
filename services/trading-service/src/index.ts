@@ -36,13 +36,16 @@ export function buildApp(deps: AppDeps): Hono {
   // turned every non-/health request into a 403.
   const requirePortfolio = requireInternalToken('portfolio-service');
   const requireSignal    = requireInternalToken('signal-service');
+  // /internal/trading/cash is also called by signal-service for the auto-approve cash
+  // pro-rate pass (compute scale = freeCash / totalBuyNotional before approving signals).
+  const requirePortfolioOrSignal = requireInternalToken('portfolio-service', 'signal-service');
 
   app.get('/internal/trading/positions', requirePortfolio, async (c) => {
     const positions = await deps.client().getPositions();
     return c.json({ positions });
   });
 
-  app.get('/internal/trading/cash', requirePortfolio, async (c) => {
+  app.get('/internal/trading/cash', requirePortfolioOrSignal, async (c) => {
     const cash = await deps.client().getCash();
     return c.json(cash);
   });
