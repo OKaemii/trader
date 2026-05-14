@@ -62,9 +62,13 @@ async def run_backtest(req: BacktestRequest):
     # Generate synthetic validation data from MongoDB signals collection
     # In production: replay historical bars through strategy for each ablation variant
     signals_col = _db['signals']
+    # Filter to lifecycle ∈ {executed, closed} so the validation report reflects what
+    # actually traded. Failed/queued/pending signals are excluded — they did not result
+    # in real broker activity and would otherwise inflate the validation sample size.
     recent = await signals_col.find(
         {'timestamp': {'$gte': datetime.utcfromtimestamp(req.data_start_ms / 1000),
-                       '$lt':  datetime.utcfromtimestamp(req.data_end_ms   / 1000)}}
+                       '$lt':  datetime.utcfromtimestamp(req.data_end_ms   / 1000)},
+         'lifecycle': {'$in': ['executed', 'closed']}}
     ).sort('timestamp', 1).to_list(length=10_000)
 
     if len(recent) < 20:
