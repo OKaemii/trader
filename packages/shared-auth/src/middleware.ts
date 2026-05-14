@@ -41,15 +41,18 @@ export function requireRole(role: UserRole) {
   };
 }
 
-export function requireInternalToken(callerService: string) {
+export function requireInternalToken(...callerServices: string[]) {
   return async (c: Context, next: Next): Promise<Response | void> => {
     const token = c.req.header('X-Internal-Token');
     if (!token) return c.json({ error: 'Forbidden' }, 403);
-    try {
-      validateInternalToken(token, callerService);
-      return next();
-    } catch {
-      return c.json({ error: 'Forbidden' }, 403);
+    for (const caller of callerServices) {
+      try {
+        validateInternalToken(token, caller);
+        return next();
+      } catch {
+        // try next allowed caller
+      }
     }
+    return c.json({ error: 'Forbidden' }, 403);
   };
 }
