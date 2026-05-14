@@ -71,6 +71,12 @@ export class MongoSignalRepository implements ISignalRepository {
     await this.invalidate(id);
   }
 
+  async setTargetWeight(id: string, targetWeight: number): Promise<void> {
+    if (targetWeight < 0) return;
+    await this.manager.update(id, { targetWeight });
+    await this.invalidate(id);
+  }
+
   private async invalidate(id: string): Promise<void> {
     await this.cache.invalidate(id);
     await this.bus.publish('signals', id);

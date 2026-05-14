@@ -8,6 +8,7 @@ import { buildStructuredRationale } from '../services/RationaleBuilder.ts';
 import { PortfolioConstructor } from '../services/PortfolioConstructor.ts';
 import type { RiskEngine } from '../services/RiskEngine.ts';
 import type { StrategyDecayMonitor } from '../services/StrategyDecayMonitor.ts';
+import type { AutoApprovalGate } from '../services/AutoApprovalGate.ts';
 import { randomUUID } from 'node:crypto';
 
 const MIN_ACTIONABLE_CONFIDENCE = parseFloat(process.env.MIN_ACTIONABLE_CONFIDENCE ?? '0.3');
@@ -21,6 +22,7 @@ export class GenerateSignalsUseCase {
     private readonly portfolioConstructor: PortfolioConstructor = new PortfolioConstructor(),
     private readonly decayMonitor?: StrategyDecayMonitor,
     private readonly priceLookup?: IPriceLookup,
+    private readonly autoApprovalGate?: AutoApprovalGate,
   ) {}
 
   async execute(features: StrategyOutput): Promise<TradeSignal[]> {
@@ -126,6 +128,16 @@ export class GenerateSignalsUseCase {
 
     await Promise.all(signals.map((s) => this.signalRepo.save(s)));
     await Promise.all(signals.map((s) => this.publisher.publish(s)));
+
+    // Auto-approve gate: when the operator flips the Redis flag, every freshly emitted
+    // signal is approved here without waiting for manual click. Fire-and-forget — the
+    // gate logs its own outcome and a slow trading-service round-trip shouldn't block
+    // the next strategy cycle. See AutoApprovalGate for the cash pro-rate logic.
+    if (this.autoApprovalGate) {
+      this.autoApprovalGate.process(signals).catch((e) => {
+        console.warn('[GenerateSignals] auto-approval gate failed:', e);
+      });
+    }
     return signals;
   }
 }

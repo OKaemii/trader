@@ -12,6 +12,7 @@ import { ApproveSignalUseCase } from './application/use-cases/ApproveSignal.ts';
 import { GetSignalProgressUseCase } from './application/use-cases/GetSignalProgress.ts';
 import { RiskEngine } from './application/services/RiskEngine.ts';
 import { StrategyDecayMonitor } from './application/services/StrategyDecayMonitor.ts';
+import { AutoApprovalGate } from './application/services/AutoApprovalGate.ts';
 import { createRouter } from './infrastructure/http/router.ts';
 import { createInternalRouter } from './infrastructure/http/internal-router.ts';
 
@@ -39,8 +40,9 @@ async function main() {
   // Use cases receive only domain ports
   const portfolioState  = new MongoPortfolioState(db.collection('positions'));
   const priceLookup     = new MongoPriceLookup(db);
-  const generateSignals = new GenerateSignalsUseCase(signalRepo, new RedisSignalPublisher(redis), portfolioState, riskEngine, undefined, decayMonitor, priceLookup);
   const approveSignal   = new ApproveSignalUseCase(signalRepo);
+  const autoApprovalGate = new AutoApprovalGate(redis, signalRepo, approveSignal);
+  const generateSignals = new GenerateSignalsUseCase(signalRepo, new RedisSignalPublisher(redis), portfolioState, riskEngine, undefined, decayMonitor, priceLookup, autoApprovalGate);
   const findRecent      = { execute: (limit: number) => signalRepo.findRecent(limit) };
   const getProgress     = new GetSignalProgressUseCase(signalRepo, portfolioState, priceLookup);
 
@@ -53,7 +55,7 @@ async function main() {
     await cache.invalidatePattern('*');
   });
 
-  app.route('/', createRouter({ findRecent, approveSignal, getProgress }));
+  app.route('/', createRouter({ findRecent, approveSignal, getProgress, autoApprovalGate }));
   app.route('/', createInternalRouter({ findRecent, approveSignal, riskEngine, signalRepo }));
 
   // Prometheus metrics endpoint — scraped by kube-prometheus-stack for Grafana Strategy Health panel
