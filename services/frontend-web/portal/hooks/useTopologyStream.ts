@@ -12,7 +12,7 @@ export function useTopologyStream() {
     async function connect() {
       let token: string;
       try {
-        const res = await fetch('/api/auth/ws-token');
+        const res = await fetch('/portal-api/auth/ws-token');
         if (!res.ok) return;
         ({ token } = await res.json());
       } catch {

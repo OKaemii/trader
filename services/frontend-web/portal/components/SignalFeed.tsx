@@ -63,11 +63,13 @@ function WeightProgress({ current, target }: { current: number; target: number }
 export function SignalFeed() {
   const [signals, setSignals] = useState<SignalProgressDTO[]>([]);
   const [loading, setLoading] = useState(true);
+  const [approvingId, setApprovingId] = useState<string | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     const load = () => {
-      fetch('/api/signals/progress')
+      fetch('/portal-api/signals/progress')
         .then((r) => r.json())
         .then(({ signals }) => {
           if (cancelled) return;
@@ -81,6 +83,32 @@ export function SignalFeed() {
     return () => { cancelled = true; clearInterval(id); };
   }, []);
 
+  async function approve(signal: SignalProgressDTO) {
+    // Confirm explicitly because in demo/live mode this places a real broker order.
+    const msg = `Approve ${signal.action} ${signal.ticker} (target ${(signal.targetWeight * 100).toFixed(1)}%)?\n\nThis triggers a real order on the active TRADING_MODE.`;
+    if (!window.confirm(msg)) return;
+
+    setErrorMsg(null);
+    setApprovingId(signal.id);
+    // Optimistic local update so the lifecycle badge flips immediately; the next refresh
+    // will reconcile to whatever the backend actually persisted.
+    setSignals((prev) => prev.map((s) => s.id === signal.id ? { ...s, lifecycleResolved: 'approved', approved: true } : s));
+    try {
+      const res = await fetch(`/portal-api/admin/signals/approve/${encodeURIComponent(signal.id)}`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        setErrorMsg(`Approve failed (${res.status}): ${body.error ?? 'unknown'}`);
+        // Roll back the optimistic update on failure.
+        setSignals((prev) => prev.map((s) => s.id === signal.id ? { ...s, lifecycleResolved: signal.lifecycleResolved, approved: signal.approved } : s));
+      }
+    } catch (e) {
+      setErrorMsg(`Approve error: ${e instanceof Error ? e.message : String(e)}`);
+      setSignals((prev) => prev.map((s) => s.id === signal.id ? { ...s, lifecycleResolved: signal.lifecycleResolved, approved: signal.approved } : s));
+    } finally {
+      setApprovingId(null);
+    }
+  }
+
   if (loading) return <div className="animate-pulse bg-gray-800 rounded-lg h-64" />;
 
   return (
@@ -89,6 +117,7 @@ export function SignalFeed() {
         <h2 className="text-lg font-semibold text-white">Signal Feed</h2>
         <span className="text-[10px] text-gray-500">refreshes every {REFRESH_MS / 1000}s</span>
       </div>
+      {errorMsg && <p className="text-red-400 text-xs mb-3">{errorMsg}</p>}
       {signals.length === 0 && <p className="text-gray-400">No signals yet.</p>}
       {signals.map((s) => {
         const rationale: SignalRationale | null = (() => {
@@ -106,6 +135,16 @@ export function SignalFeed() {
                 <LifecycleBadge state={lifecycle} />
               </div>
               <div className="flex items-center gap-3">
+                {lifecycle === 'pending' && (
+                  <button
+                    type="button"
+                    onClick={() => approve(s)}
+                    disabled={approvingId === s.id}
+                    className="px-2 py-0.5 rounded text-[10px] uppercase tracking-wide font-semibold bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white"
+                  >
+                    {approvingId === s.id ? '…' : 'Approve'}
+                  </button>
+                )}
                 <PnLPill pnlPct={s.pnlPct} />
                 <span className="text-[10px] text-gray-500" title={new Date(s.timestamp).toISOString()}>
                   {formatAge(s.ageMs)}
