@@ -91,19 +91,28 @@ async def run_backtest(req: BacktestRequest):
         regime_series=regime_labels,
     )
 
+    # Stamp the active universe size on the result so post-bump runs can be filtered out
+    # of historical comparisons. instrument_registry holds active members (activeTo=None);
+    # if the registry is empty (fresh deploy, T212 unreachable on first refresh) we fall
+    # back to the distinct ticker count in the signals window so the field is never null.
+    universe_size = await _db['instrument_registry'].count_documents({'activeTo': None})
+    if universe_size == 0:
+        universe_size = len({s.get('ticker') for s in recent if s.get('ticker')})
+
     # Persist result to MongoDB
     await _db['backtest_results'].insert_one({
-        'strategy_id': req.strategy_id,
-        'passed':      report.passed,
-        'failures':    report.failures,
-        'oos_sharpe':  report.oos_sharpe,
-        'mean_ic':     report.mean_ic,
-        'dsr':         report.deflated_sharpe,
-        'pbo':         report.pbo,
-        'fdr_p':       report.fdr_corrected_pvalue,
+        'strategy_id':   req.strategy_id,
+        'passed':        report.passed,
+        'failures':      report.failures,
+        'oos_sharpe':    report.oos_sharpe,
+        'mean_ic':       report.mean_ic,
+        'dsr':           report.deflated_sharpe,
+        'pbo':           report.pbo,
+        'fdr_p':         report.fdr_corrected_pvalue,
         'regime_breakdown': report.regime_breakdown,
-        'n_trials':    req.n_trials,
-        'run_at':      datetime.now(timezone.utc),
+        'n_trials':      req.n_trials,
+        'universe_size': universe_size,
+        'run_at':        datetime.now(timezone.utc),
     })
 
     return BacktestResult(
