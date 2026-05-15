@@ -1,7 +1,10 @@
 import type { Collection, Db } from 'mongodb';
 import type { RedisClientType } from 'redis';
+import { generateInternalToken } from '@trader/shared-auth';
 import { CircuitBreakerRedis } from '../../infrastructure/CircuitBreakerRedis.ts';
 import { RISK_LIMITS } from './LongOnlyOptimiser.ts';
+
+const TRADING_SERVICE_URL = process.env.TRADING_SERVICE_URL ?? 'http://trading-service:3005';
 
 export interface RiskStatus {
   circuit_open: boolean;
@@ -196,9 +199,54 @@ export class RiskEngine {
 
   // ── Private ──────────────────────────────────────────────────────────────────
 
+  // NAV in BASE_CURRENCY (GBP). Includes BOTH cash and positions:
+  //   - positions: portfolio-service writes `currentValueGBP` (FX-converted at sync time)
+  //   - cash: HTTP-fetched from trading-service /internal/trading/cash; T212 reports GBP
+  //
+  // Pre-FX-fix (2026-05-15) this summed `currentValue` across positions in MIXED currencies
+  // and ignored cash entirely — caused phantom 42% drawdowns when cash dominated NAV (e.g.
+  // after a deploy with no positions yet) and silent 100x errors on LSE pence quotes that
+  // weren't normalised. The drawdown breaker tripped on bad numbers, not bad performance.
+  //
+  // If cash fetch fails we degrade to positions-only with a warning. Better than blocking
+  // every signal during a transient trading-service outage; a rate-limited cash drift is
+  // bounded by the dispatcher's own retry semantics.
   private async _computeNav(): Promise<number> {
     const positions = await this.positions.find({}).toArray();
-    return positions.reduce((sum: number, p: any) => sum + (p.currentValue ?? 0), 0);
+    // Prefer the explicit currentValueGBP field. Fall back to currentValue for legacy
+    // rows pre-dating the FX work — the pre-FX value was scalar, in instrument currency,
+    // which mis-counts but matches what the engine would have computed before. Fresh
+    // syncs overwrite within a few minutes.
+    const positionsGBP = positions.reduce((sum: number, p: any) => {
+      const v = typeof p.currentValueGBP === 'number'
+        ? p.currentValueGBP
+        : typeof p.currentValue === 'number' ? p.currentValue : 0;
+      return sum + v;
+    }, 0);
+
+    let cashGBP = 0;
+    try {
+      const res = await fetch(`${TRADING_SERVICE_URL}/internal/trading/cash`, {
+        headers: { 'X-Internal-Token': generateInternalToken('signal-service') },
+      });
+      if (res.ok) {
+        // Wire format post-FX-fix: { free: { amount, currency }, total: { amount, currency } }.
+        // total includes invested capital + free cash; we want free + positions to avoid
+        // double-counting (positions are already in positionsGBP).
+        const body = await res.json() as { free?: { amount?: number; currency?: string } };
+        if (body.free && typeof body.free.amount === 'number' && body.free.currency === 'GBP') {
+          cashGBP = body.free.amount;
+        } else {
+          console.warn('[RiskEngine] cash response missing GBP free amount, using 0:', body);
+        }
+      } else {
+        console.warn(`[RiskEngine] cash HTTP ${res.status}, NAV degrades to positions-only`);
+      }
+    } catch (err) {
+      console.warn('[RiskEngine] cash fetch failed, NAV degrades to positions-only:', err);
+    }
+
+    return positionsGBP + cashGBP;
   }
 
   private async _logRejection(reason: string, detail: Record<string, unknown>): Promise<void> {

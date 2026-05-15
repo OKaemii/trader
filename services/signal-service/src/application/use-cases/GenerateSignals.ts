@@ -72,19 +72,29 @@ export class GenerateSignalsUseCase {
 
     const decayFactor = this.riskEngine.confidenceDecayFactor();
 
-    // Confidence normalisation: cross-sectional, scale-free. Previously divided |score| by
-    // a hardcoded 0.05 which saturated to 1.0 for every ticker because composite scores
-    // routinely range over [-4, 4]. Now we divide by the 95th percentile of |score| in
-    // this batch, so the top ~5% of conviction signals saturate at 1.0 and the rest spread
-    // over [0, 1]. Falls back to 1.0 when the batch is empty or scores are all zero.
-    const absScores = features.ticker_universe
-      .map((t) => Math.abs(features.composite_scores[t] ?? 0))
-      .filter((v) => v > 0)
-      .sort((a, b) => a - b);
-    const p95 = absScores.length > 0
-      ? absScores[Math.min(absScores.length - 1, Math.floor(absScores.length * 0.95))]
-      : 1.0;
-    const scaleDivisor = p95 > 0 ? p95 : 1.0;
+    // Confidence normalisation: sign-aware, cross-sectional, scale-free. We compute p95
+    // separately over positive and negative composite scores and pick the divisor matching
+    // the score's sign. Rationale: long-side conviction should be measured against the
+    // dispersion of *other long candidates*, not against an asymmetric bearish tail. A
+    // single divisor pooled over |score| lets a heavy short-side tail (e.g. distressed
+    // tickers in the universe) inflate the divisor and push every BUY confidence below
+    // MIN_ACTIONABLE_CONFIDENCE, silently dropping the entire long book. Falls back to 1.0
+    // when a side is empty or its p95 is zero.
+    const p95 = (xs: number[]): number => {
+      if (xs.length === 0) return 1.0;
+      const sorted = xs.slice().sort((a, b) => a - b);
+      const v = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))];
+      return v > 0 ? v : 1.0;
+    };
+    const posScores = features.ticker_universe
+      .map((t) => features.composite_scores[t] ?? 0)
+      .filter((v) => v > 0);
+    const negScores = features.ticker_universe
+      .map((t) => features.composite_scores[t] ?? 0)
+      .filter((v) => v < 0)
+      .map((v) => -v);
+    const divisorPos = p95(posScores);
+    const divisorNeg = p95(negScores);
 
     // Look up last close for every universe ticker in one round-trip — used as entryPrice
     // when emitting BUY/SELL signals. Optional dependency: tests can omit priceLookup.
@@ -110,13 +120,15 @@ export class GenerateSignalsUseCase {
 
         try {
           const entry = lastCloses[ticker];
+          const score = features.composite_scores[ticker] ?? 0;
+          const divisor = score >= 0 ? divisorPos : divisorNeg;
           return new TradeSignal({
             id: randomUUID(),
             timestamp: features.timestamp,
             ticker,
             strategy_id: features.strategy_id,
             action,
-            confidence: Math.min(Math.abs(features.composite_scores[ticker] ?? 0) / scaleDivisor, 1) * decayFactor,
+            confidence: Math.min(Math.abs(score) / divisor, 1) * decayFactor,
             targetWeight: w,
             rationale: JSON.stringify(rationale),
             entryPrice: entry && entry > 0 ? entry : undefined,
