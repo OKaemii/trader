@@ -61,7 +61,15 @@ async function syncPositions(): Promise<void> {
   } catch (e) {
     const cause = (e as { cause?: { code?: string } })?.cause;
     const code = cause?.code ?? (e as { code?: string })?.code;
-    if (code === 'ECONNREFUSED' || code === 'ENOTFOUND' || code === 'EAI_AGAIN') {
+    // Node libuv-style codes (`ECONNREFUSED`, `ENOTFOUND`, `EAI_AGAIN`) AND Bun's
+    // fetch error strings (`ConnectionRefused`, `UnknownHostname`, `ConnectionTimeout`).
+    // Without the Bun variants every boot race where trading-service comes up after
+    // portfolio-service emits a noisy stack trace instead of the suppressed warning.
+    const unreachableCodes = new Set([
+      'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN',
+      'ConnectionRefused', 'UnknownHostname', 'ConnectionTimeout', 'Timeout',
+    ]);
+    if (code && unreachableCodes.has(code)) {
       if (!tradingServiceUnreachableLogged) {
         console.warn('[portfolio] trading-service unreachable, skipping position sync');
         tradingServiceUnreachableLogged = true;
