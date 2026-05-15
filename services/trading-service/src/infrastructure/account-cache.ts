@@ -1,4 +1,5 @@
-import type { Trading212Client } from './t212.ts';
+import type { Money } from '@trader/shared-types';
+import type { Trading212Client, T212Position } from './t212.ts';
 
 // AccountCache — coalesces and caches T212 cash + positions reads so the dispatcher
 // doesn't hammer the broker once per signal.
@@ -16,9 +17,12 @@ import type { Trading212Client } from './t212.ts';
 // cache is just a request-rate dampener.
 
 export interface AccountSnapshot {
-  free: number;
-  total: number;
-  positions: Array<{ ticker: string; quantity: number; averagePrice?: number; currentPrice?: number }>;
+  // Cash: always GBP on a UK T212 account. The Money carrier is explicit so consumers
+  // (RiskEngine, AutoApprovalGate) can't accidentally add it to instrument-currency
+  // position values without going through FxClient.
+  free: Money;
+  total: Money;
+  positions: T212Position[];
   fetchedAt: number;
 }
 
@@ -78,19 +82,13 @@ export class AccountCache {
   }
 
   private async _fetch(): Promise<AccountSnapshot> {
-    const [cash, rawPositions] = await Promise.all([
+    const [cash, positions] = await Promise.all([
       this.client.getCash(),
-      this.client.getPositions() as Promise<Array<Record<string, unknown>>>,
+      this.client.getPositions(),
     ]);
-    const positions = (rawPositions ?? []).map((p) => ({
-      ticker:        String(p.ticker ?? ''),
-      quantity:      Number(p.quantity ?? 0),
-      averagePrice:  typeof p.averagePrice === 'number' ? p.averagePrice : undefined,
-      currentPrice:  typeof p.currentPrice === 'number' ? p.currentPrice : undefined,
-    }));
     return {
-      free:      Number(cash.free ?? 0),
-      total:     Number(cash.total ?? cash.free ?? 0),
+      free:      cash.free,
+      total:     cash.total,
       positions,
       fetchedAt: this.now(),
     };

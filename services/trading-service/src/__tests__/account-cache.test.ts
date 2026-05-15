@@ -12,16 +12,33 @@ class FakeClient {
   posCalls  = 0;
   free  = 1000;
   total = 2000;
-  positions: Array<{ ticker: string; quantity: number }> = [{ ticker: 'AAPL_US_EQ', quantity: 5 }];
+  positions: Array<{
+    ticker: string;
+    quantity: number;
+    averagePrice: { amount: number; currency: 'GBP' };
+    currentPrice: { amount: number; currency: 'GBP' };
+    currentValue: { amount: number; currency: 'GBP' };
+  }> = [{
+    ticker: 'AAPL_US_EQ',
+    quantity: 5,
+    averagePrice: { amount: 100, currency: 'GBP' },
+    currentPrice: { amount: 110, currency: 'GBP' },
+    currentValue: { amount: 550, currency: 'GBP' },
+  }];
   failNext = 0;          // throw on the next N getCash calls
   delayMs  = 0;
-  async getCash(): Promise<{ free: number; total: number }> {
+  // T212 UK accounts return cash in GBP. We carry the currency tag explicitly here so
+  // AccountCache stores it on the snapshot for downstream consumers.
+  async getCash() {
     this.cashCalls++;
     if (this.failNext > 0) { this.failNext--; throw new Error('T212 cash: 429'); }
     if (this.delayMs) await new Promise((r) => setTimeout(r, this.delayMs));
-    return { free: this.free, total: this.total };
+    return {
+      free:  { amount: this.free,  currency: 'GBP' as const },
+      total: { amount: this.total, currency: 'GBP' as const },
+    };
   }
-  async getPositions(): Promise<unknown[]> {
+  async getPositions() {
     this.posCalls++;
     return this.positions;
   }
@@ -33,8 +50,8 @@ describe('AccountCache', () => {
     const cache  = new AccountCache(client, { ttlMs: 1000 });
     const a = await cache.get();
     const b = await cache.get();
-    expect(a.free).toBe(1000);
-    expect(b.free).toBe(1000);
+    expect(a.free.amount).toBe(1000);
+    expect(b.free.amount).toBe(1000);
     expect(client.cashCalls).toBe(1);
     expect(client.posCalls).toBe(1);
   });
@@ -47,7 +64,7 @@ describe('AccountCache', () => {
     t += 200;
     client.free = 1500;
     const b = await cache.get();
-    expect(b.free).toBe(1500);
+    expect(b.free.amount).toBe(1500);
     expect(client.cashCalls).toBe(2);
   });
 
@@ -56,9 +73,9 @@ describe('AccountCache', () => {
     client.delayMs = 30;
     const cache  = new AccountCache(client, { ttlMs: 1000 });
     const [a, b, c] = await Promise.all([cache.get(), cache.get(), cache.get()]);
-    expect(a.free).toBe(1000);
-    expect(b.free).toBe(1000);
-    expect(c.free).toBe(1000);
+    expect(a.free.amount).toBe(1000);
+    expect(b.free.amount).toBe(1000);
+    expect(c.free.amount).toBe(1000);
     // Coalesced: only one underlying T212 fetch despite three concurrent callers
     expect(client.cashCalls).toBe(1);
   });
@@ -71,7 +88,7 @@ describe('AccountCache', () => {
     t += 200;                           // TTL expires
     client.failNext = 1;                // next fetch throws 429
     const b = await cache.get();        // should serve the stale snapshot, not throw
-    expect(b.free).toBe(1000);
+    expect(b.free.amount).toBe(1000);
   });
 
   it('propagates error when no stale fallback available', async () => {

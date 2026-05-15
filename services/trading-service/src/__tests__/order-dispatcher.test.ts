@@ -42,7 +42,15 @@ function installFetch(): { calls: FetchCall[]; restore: () => void } {
 
 function makeDeps(overrides: Partial<OrderDispatcherDeps> = {}): OrderDispatcherDeps {
   const cache = new AccountCache(
-    { getCash: async () => ({ free: 1_000_000, total: 2_000_000 }), getPositions: async () => [] },
+    {
+      // T212 UK accounts return cash in GBP. Money-tagged so AccountSnapshot.total/free
+      // match the production shape; PlaceOrderUseCase access patterns stay valid.
+      getCash:      async () => ({
+        free:  { amount: 1_000_000, currency: 'GBP' as const },
+        total: { amount: 2_000_000, currency: 'GBP' as const },
+      }),
+      getPositions: async () => [],
+    },
   );
   return {
     signalServiceUrl:    'http://signal-service:3003',
