@@ -140,15 +140,11 @@ export function WorldClock() {
           <div key={s.label} className="flex items-center gap-1.5">
             <span className="text-gray-500">{s.label}</span>
             <span className="text-gray-200">{t.display}</span>
-            {/* group wrapper enables the rich CSS-only tooltip on hover. We keep the
-                native title attribute as an accessibility fallback so keyboard / screen-
-                reader users still see the countdown. */}
             <span className="group relative inline-block">
               <span
                 className={`cursor-help rounded px-1 py-0.5 text-[9px] font-semibold uppercase ${
                   status.open ? 'bg-emerald-900/60 text-emerald-300' : 'bg-gray-800 text-gray-500'
                 }`}
-                title={`${status.nextLabel} in ${fmtCountdown(status.nextMs)}`}
               >
                 {status.open ? 'open' : 'closed'}
               </span>
@@ -180,7 +176,7 @@ export function WorldClock() {
                   <div className="mt-1 border-t border-gray-800 pt-1">
                     <div className="flex justify-between">
                       <span className="text-gray-500">
-                        {status.open ? 'Closes' : `Next ${status.nextLabel}`}
+                        {status.open ? 'Closes in' : 'Opens in'}
                       </span>
                       <span className="font-mono text-gray-100">{fmtCountdown(status.nextMs)}</span>
                     </div>
