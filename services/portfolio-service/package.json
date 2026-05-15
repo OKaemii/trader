@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@trader/shared-auth": "workspace:*",
+    "@trader/shared-fx": "workspace:*",
     "@trader/shared-mongo": "workspace:*",
     "@trader/shared-redis": "workspace:*",
     "@trader/shared-types": "workspace:*",
