@@ -15,6 +15,23 @@ export interface StrategyOutput {
   laplacian_residuals?: Record<string, number>;
 }
 
+// Mirror of @trader/shared-types PollIntervalOption. Kept on the FE so the portal
+// stays single-package-deep on its types/trader.ts copy.
+export type PollIntervalTier = 'intraday' | 'hourly' | 'daily'
+
+export interface PollIntervalOption {
+  key:   string
+  ms:    number
+  label: string
+  tier:  PollIntervalTier
+}
+
+export interface ProviderInfo {
+  name:                 string
+  maxLookbackMs:        number
+  allowedPollIntervals: PollIntervalOption[]
+}
+
 export type SignalLifecycle =
   | 'pending'
   | 'approved'

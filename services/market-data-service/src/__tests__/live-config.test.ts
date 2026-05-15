@@ -27,7 +27,7 @@ describe('live-config', () => {
     process.env.BAR_FREQUENCY = 'daily';
     const cfg = await liveConfig.getLiveConfig();
     expect(cfg.barFrequency).toBe('daily');
-    expect(cfg.pollIntervalMs).toBe(20 * 60_000);
+    expect(cfg.pollIntervalMs).toBe(24 * 60 * 60_000);
   });
 
   it('uses intraday env default when set', async () => {
@@ -36,7 +36,7 @@ describe('live-config', () => {
     liveConfig.invalidateLiveConfig();
     const cfg = await liveConfig.getLiveConfig();
     expect(cfg.barFrequency).toBe('intraday');
-    expect(cfg.pollIntervalMs).toBe(60_000);
+    expect(cfg.pollIntervalMs).toBe(15 * 60_000);
   });
 
   it('applies override doc fields and falls back per-field', async () => {
@@ -51,7 +51,7 @@ describe('live-config', () => {
     liveConfig.invalidateLiveConfig();
     const cfg = await liveConfig.getLiveConfig();
     expect(cfg.barFrequency).toBe('intraday');     // from override
-    expect(cfg.pollIntervalMs).toBe(20 * 60_000);  // from env default (override null)
+    expect(cfg.pollIntervalMs).toBe(24 * 60 * 60_000);  // from env default (override null)
   });
 
   it('caches reads for 15 s', async () => {
@@ -80,6 +80,6 @@ describe('live-config', () => {
     liveConfig.invalidateLiveConfig();
     const cfg = await liveConfig.getLiveConfig();
     expect(cfg.barFrequency).toBe('daily');
-    expect(cfg.pollIntervalMs).toBe(20 * 60_000);
+    expect(cfg.pollIntervalMs).toBe(24 * 60 * 60_000);
   });
 });

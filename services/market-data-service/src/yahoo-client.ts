@@ -1,4 +1,4 @@
-import type { OHLCVBar } from '@trader/shared-types';
+import type { OHLCVBar, BarInterval } from '@trader/shared-types';
 
 interface YahooQuote {
   open: (number | null)[];
@@ -131,7 +131,11 @@ function parseT212Ticker(t212Ticker: string): {
   };
 }
 
-function toYahooSymbol(t212Ticker: string): string {
+export function isBlacklisted(yahooSymbol: string): boolean {
+  return UNSUPPORTED_SYMBOLS.has(yahooSymbol);
+}
+
+export function toYahooSymbol(t212Ticker: string): string {
   const cached = yahooSymbolCache.get(t212Ticker);
 
   if (cached) return cached;

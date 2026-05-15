@@ -9,10 +9,14 @@ global:
     tradingMode: demo                   # paper (notify only) | demo (demo.trading212) | live (trading212; admin gate required)
     executionMode: t212                 # t212 (limit, weekly) | unrestricted (market, daily)
     barFrequency: daily                 # daily | intraday
-    # Optional override for market-data-service polling cadence. Empty = per-frequency built-in
-    # default (daily: 20m EOD retry; intraday: bar-interval). Portal runtime override
-    # (MongoDB portal_market_config) takes precedence over this.
-    pollIntervalMs: ""
+    # Default polling cadence for market-data-service live polling. Must be one of the
+    # active provider's allowedPollIntervals (Yahoo: 15m / 1h / 24h). The portal renders
+    # the dropdown from those values; this default is what new deploys land on before
+    # any operator override.
+    # 86_400_000 = 24h. fetchRecent pulls a 24h window per call so this gives one poll
+    # per day with full coverage — appropriate for a daily strategy. Portal override
+    # (portal_market_config in Mongo) takes precedence at runtime.
+    pollIntervalMs: "86400000"
     # Fills poller cadence in trading-service (only active when tradingMode != paper).
     # 30s strikes a balance between freshness for the portal Order/Signal lifecycle view and
     # T212 rate limits; tighten only if you find yourself watching fills in real time.
