@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import asyncio
 import dataclasses
@@ -11,6 +12,7 @@ from .application.sector_momentum_strategy import SectorMomentumStrategy
 from .application.factor_rank_strategy import FactorRankStrategy
 from .domain.dataclasses import OHLCVBar
 from .infrastructure.market_data_client import MarketDataClient
+from .infrastructure.live_config import get_live_config, invalidate as invalidate_live_config
 
 STRATEGY_REGISTRY = {
     'topology_v1':        TopologyStrategy,
@@ -256,6 +258,54 @@ def _on_loop_done(task: asyncio.Task) -> None:
         print(f"[strategy-engine] FATAL: process_loop crashed: {exc!r}", flush=True)
 
 
+async def watch_config_invalidations() -> None:
+    """Subscribe to the portal's `config:invalidated` pubsub and self-restart when
+    bar_frequency changes from the boot-time value.
+
+    Strategy classes capture ROLLING_WINDOW (20 daily / 60 intraday) at module
+    import time, and the running strategy instance owns regime / lookback state we
+    don't want to corrupt with a mid-flight swap. Exiting cleanly here lets k8s
+    restart the pod with the new env, which takes ~10s end-to-end — fast enough
+    that the operator perceives "Save in portal → engine picks up new mode" as a
+    single action without manual `kubectl rollout restart`.
+
+    Failure to subscribe (e.g. Redis briefly unavailable at boot) is logged but
+    non-fatal: the 15s TTL still propagates changes, just slower.
+    """
+    redis_url = os.getenv("REDIS_URL", "redis://redis:6379")
+    boot_bar_frequency = BAR_FREQUENCY
+    try:
+        r = await aioredis.from_url(redis_url)
+        pubsub = r.pubsub()
+        await pubsub.subscribe("config:invalidated")
+        print(f"[strategy-engine] subscribed to config:invalidated (boot bar_frequency={boot_bar_frequency})", flush=True)
+        async for msg in pubsub.listen():
+            if msg is None or msg.get("type") != "message":
+                continue
+            invalidate_live_config()
+            try:
+                cfg = await get_live_config()
+            except Exception as exc:
+                print(f"[strategy-engine] post-invalidation live-config read failed: {exc!r}", flush=True)
+                continue
+            if cfg.bar_frequency != boot_bar_frequency:
+                print(
+                    f"[strategy-engine] bar_frequency flipped {boot_bar_frequency} → {cfg.bar_frequency} via portal; "
+                    f"exiting cleanly so k8s restarts the pod with the new ROLLING_WINDOW.",
+                    flush=True,
+                )
+                # os._exit bypasses asyncio shutdown — that's deliberate: we want a hard,
+                # immediate exit so kubelet restarts us. A graceful shutdown would let
+                # the in-flight cycle finish on the OLD config, which is exactly what
+                # we're trying to avoid.
+                sys.stdout.flush()
+                os._exit(0)
+            else:
+                print(f"[strategy-engine] config invalidation: bar_frequency unchanged ({cfg.bar_frequency})", flush=True)
+    except Exception as exc:
+        print(f"[strategy-engine] config-invalidated watcher crashed: {exc!r} — TTL fallback still active", flush=True)
+
+
 @app.on_event("startup")
 async def startup() -> None:
     # Retain a reference on app.state so the task isn't GC'd. Previously this was a
@@ -264,3 +314,8 @@ async def startup() -> None:
     task = asyncio.create_task(process_loop(), name="process_loop")
     task.add_done_callback(_on_loop_done)
     app.state.process_loop_task = task
+
+    # Separate task so a pubsub stall (e.g. Redis hiccup) can't deadlock the strategy
+    # loop. Watcher does its own try/except; failure logs and is non-fatal.
+    watcher = asyncio.create_task(watch_config_invalidations(), name="config_watcher")
+    app.state.config_watcher_task = watcher
