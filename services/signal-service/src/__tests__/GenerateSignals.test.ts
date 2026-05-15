@@ -190,6 +190,25 @@ describe('GenerateSignalsUseCase', () => {
     }
   });
 
+  // Regression: production incident 2026-05-15. factor_rank_v1 emitted realistic scores
+  // with a small positive long-side tail (top ~+0.2) and a large negative short-side tail
+  // (bottom ~−1.75). The pooled-|score| p95 was driven by the bearish tail, so every BUY
+  // confidence landed below MIN_ACTIONABLE_CONFIDENCE=0.30 and the entire long book was
+  // silently filtered — `db.signals.count() == 0`. Sign-aware normalisation measures each
+  // side's conviction against its own dispersion, so a long-side ticker at the +p95 of the
+  // positive cohort saturates at 1.0 regardless of how heavy the short tail is.
+  it('long-side confidence is not crushed by an asymmetric bearish tail', async () => {
+    const features = baseFeatures();
+    features.composite_scores = { AAPL: 0.5, MSFT: 0.3, GOOG: -2.0 };
+    const signals = await useCase.execute(features);
+    const buys = signals.filter((s) => s.action === 'BUY');
+    expect(buys.length).toBeGreaterThan(0);
+    // Top long-side conviction (AAPL at the positive p95) should saturate at 1.0,
+    // independent of the −2.0 short-side outlier.
+    const aapl = signals.find((s) => s.ticker === 'AAPL');
+    expect(aapl?.confidence).toBeCloseTo(1.0, 5);
+  });
+
   it('confidence is well-defined when all composite scores are zero', async () => {
     const features = baseFeatures();
     features.composite_scores = { AAPL: 0, MSFT: 0, GOOG: 0 };

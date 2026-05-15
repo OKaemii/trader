@@ -68,28 +68,42 @@ export class AutoApprovalGate {
 
     if (buys.length === 0) return { approved, scaled, skipped };
 
-    // 2. Fetch cash for the pro-rate
-    let cash: { free: number; total: number } | null = null;
+    // 2. Fetch cash for the pro-rate. Wire format post-FX-fix is Money-shaped:
+    //    { free: { amount, currency }, total: { amount, currency } } in GBP.
+    let cash: { freeGBP: number; totalGBP: number } | null = null;
     try {
       const res = await fetch(`${TRADING_SERVICE}/internal/trading/cash`, {
         headers: { 'X-Internal-Token': generateInternalToken('signal-service') },
       });
-      if (res.ok) cash = await res.json() as { free: number; total: number };
+      if (res.ok) {
+        const raw = await res.json() as {
+          free?:  { amount?: number; currency?: string };
+          total?: { amount?: number; currency?: string };
+        };
+        const freeAmt  = raw.free?.amount;
+        const totalAmt = raw.total?.amount;
+        if (typeof freeAmt === 'number' && typeof totalAmt === 'number'
+            && raw.free?.currency === 'GBP' && raw.total?.currency === 'GBP') {
+          cash = { freeGBP: freeAmt, totalGBP: totalAmt };
+        } else {
+          console.warn('[AutoApprovalGate] cash response not GBP Money-shaped, skipping BUYs:', raw);
+        }
+      }
     } catch (e) {
       console.warn('[AutoApprovalGate] cash fetch failed, skipping BUY auto-approve:', e);
     }
-    if (!cash || cash.free <= 0 || cash.total <= 0) {
-      console.warn(`[AutoApprovalGate] no free cash (free=${cash?.free} total=${cash?.total}) — skipping ${buys.length} BUY(s)`);
+    if (!cash || cash.freeGBP <= 0 || cash.totalGBP <= 0) {
+      console.warn(`[AutoApprovalGate] no free cash (free=${cash?.freeGBP} total=${cash?.totalGBP}) — skipping ${buys.length} BUY(s)`);
       return { approved, scaled, skipped: skipped + buys.length };
     }
 
-    // 3. Total BUY notional and scale
+    // 3. Total BUY notional and scale (all in GBP — targetWeight is dimensionless).
     const totalBuyWeight    = buys.reduce((acc, s) => acc + s.targetWeight, 0);
-    const totalBuyNotional  = totalBuyWeight * cash.total;
-    const scale = totalBuyNotional > cash.free ? cash.free / totalBuyNotional : 1.0;
+    const totalBuyNotional  = totalBuyWeight * cash.totalGBP;
+    const scale = totalBuyNotional > cash.freeGBP ? cash.freeGBP / totalBuyNotional : 1.0;
 
     if (scale < 1.0) {
-      console.log(`[AutoApprovalGate] pro-rating ${buys.length} BUYs: notional=${totalBuyNotional.toFixed(2)} > free=${cash.free.toFixed(2)} → scale=${scale.toFixed(3)}`);
+      console.log(`[AutoApprovalGate] pro-rating ${buys.length} BUYs: notional=${totalBuyNotional.toFixed(2)} > free=${cash.freeGBP.toFixed(2)} → scale=${scale.toFixed(3)}`);
     }
 
     // 4. Persist scaled weight + approve
