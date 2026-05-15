@@ -1,6 +1,17 @@
 // Local copy of @trader/shared-types for the standalone Next.js portal.
 // Keep in sync with packages/shared-types/src/index.ts.
 
+// Money + Currency mirror. The portal receives `{amount, currency}` JSON from
+// /portal-api/admin/trading/cash and /api/portfolio. Format helpers below render
+// per-currency without hardcoding GBP.
+export type Currency = 'GBP' | 'USD'
+export interface Money { readonly amount: number; readonly currency: Currency }
+
+export function formatMoney(m: Money | undefined | null): string {
+  if (!m || typeof m.amount !== 'number') return '—'
+  return m.amount.toLocaleString(undefined, { style: 'currency', currency: m.currency })
+}
+
 export interface StrategyOutput {
   timestamp: number;
   strategy_id: string;

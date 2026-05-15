@@ -1,21 +1,31 @@
 'use client'
 import { useEffect, useMemo, useState } from 'react'
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip, Legend } from 'recharts'
-import type { SignalProgressDTO } from '@/types/trader'
+import { type SignalProgressDTO, type Money, SignalLifecycle } from '@/types/trader'
 import { resolveSector } from './sectorLookup'
 import { MARKET_STYLES, marketOf } from './market'
 import { MarketBadge } from './MarketBadge'
 
+// Wire shape from /portal-api/admin/trading/positions (post-FX-fix). averagePrice /
+// currentPrice / currentValue are Money-tagged so a USD-listed position shows USD prices.
+// We deliberately do NOT FX-convert in the UI: each row displays in its own currency,
+// labelled by a market badge. Sector exposure aggregates `currentValue.amount` directly
+// because — short of doing FX in the browser — the cleanest "sector breakdown" is one
+// per-currency. With most accounts holding either US or UK but not both heavily, the
+// chart reads sensibly. A future enhancement could render a GBP-converted overlay.
 interface Position {
   ticker?: string
   quantity?: number
-  averagePrice?: number
-  currentPrice?: number
-  ppl?: number  // T212 unrealised P&L
+  averagePrice?: Money
+  currentPrice?: Money
+  currentValue?: Money
+  ppl?: number  // T212 unrealised P&L (instrument currency)
 }
 
 interface PositionsResp { positions?: Position[]; mode?: string; error?: string }
 interface UniverseResp { sectorMap?: Record<string, string>; activeUniverse?: string[] }
+
+const fmtPrice = (m?: Money) => m && typeof m.amount === 'number' ? m.amount.toFixed(2) : '—'
 
 const SECTOR_COLOURS = [
   '#6366f1', '#10b981', '#f59e0b', '#ef4444', '#3b82f6',
@@ -58,8 +68,13 @@ export function HoldingsPanel() {
   const sectorBreakdown = useMemo(() => {
     const totals: Record<string, number> = {}
     for (const p of positions) {
-      if (!p.ticker || !p.quantity || !p.currentPrice) continue
-      const value = p.quantity * p.currentPrice
+      if (!p.ticker || !p.quantity) continue
+      // Prefer the explicit currentValue (Money) the backend computed; fall back to
+      // qty × currentPrice for any oddly-shaped row. Both are in instrument currency —
+      // see top-of-file note on why we don't FX-convert in the UI.
+      const value = p.currentValue?.amount
+        ?? (p.currentPrice?.amount ? p.quantity * p.currentPrice.amount : 0)
+      if (value <= 0) continue
       const sector = resolveSector(p.ticker, sectorMap)
       totals[sector] = (totals[sector] ?? 0) + value
     }
@@ -75,11 +90,11 @@ export function HoldingsPanel() {
     return <div className="h-64 animate-pulse rounded bg-gray-800" />
   }
 
-  if (pos?.mode === 'paper') {
+  if (pos?.mode === 'Paper') {
     return (
       <div className="rounded border border-gray-800 bg-gray-900 p-4 text-sm text-gray-400">
         Holdings unavailable in paper mode — set <code className="text-gray-300">TRADING_MODE</code> to{' '}
-        <code className="text-gray-300">demo</code> or <code className="text-gray-300">live</code> to surface broker positions.
+        <code className="text-gray-300">Demo</code> or <code className="text-gray-300">Live</code> to surface broker positions.
       </div>
     )
   }
@@ -128,8 +143,8 @@ export function HoldingsPanel() {
                     </td>
                     <td className="py-1.5 text-gray-400">{sector}</td>
                     <td className="py-1.5 text-right font-mono text-gray-300">{p.quantity?.toFixed(2) ?? '—'}</td>
-                    <td className="py-1.5 text-right font-mono text-gray-300">{p.averagePrice?.toFixed(2) ?? '—'}</td>
-                    <td className="py-1.5 text-right font-mono text-gray-300">{p.currentPrice?.toFixed(2) ?? '—'}</td>
+                    <td className="py-1.5 text-right font-mono text-gray-300">{fmtPrice(p.averagePrice)}</td>
+                    <td className="py-1.5 text-right font-mono text-gray-300">{fmtPrice(p.currentPrice)}</td>
                     <td className={`py-1.5 text-right font-mono ${
                       pnl === undefined ? 'text-gray-500' : pnl >= 0 ? 'text-emerald-400' : 'text-red-400'
                     }`}>
@@ -195,7 +210,7 @@ export function HoldingsPanel() {
                     'bg-gray-700 text-gray-200'
                   }`}>{s.action}</span>
                   <span className="rounded bg-gray-800 px-1.5 py-0.5 text-[10px] uppercase text-gray-300">
-                    {s.lifecycleResolved}
+                    {SignalLifecycle[s.lifecycleResolved] ?? s.lifecycleResolved}
                   </span>
                 </div>
                 <div className="flex items-center gap-3 text-gray-400">
