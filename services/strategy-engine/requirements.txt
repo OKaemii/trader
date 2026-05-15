@@ -9,3 +9,10 @@ cvxpy==1.5.3
 prometheus-client==0.20.0
 motor==3.5.1
 pymongo==4.7.0
+httpx==0.27.2
+
+# Test-only — kept in the same requirements file for simplicity. Split into a
+# requirements-dev.txt + multi-stage Dockerfile if image size becomes a concern.
+pytest==8.3.3
+pytest-asyncio==0.24.0
+respx==0.21.1

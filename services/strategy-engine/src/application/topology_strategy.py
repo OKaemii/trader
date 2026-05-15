@@ -1,7 +1,7 @@
 import time
 import numpy as np
 from typing import Optional
-from .base_strategy import BaseStrategy
+from .base_strategy import BaseStrategy, PriceHistoryLookup
 from .covariance import shrunk_covariance
 from .regime_engine import RegimeEngine
 from .diffusion import laplacian_diffusion
@@ -26,7 +26,6 @@ class TopologyStrategy(BaseStrategy):
     """
 
     def __init__(self) -> None:
-        self._price_history: dict[str, list[float]] = {}
         self._sectors: dict[str, str] = {}
         self._regime_engine = RegimeEngine()
 
@@ -38,19 +37,23 @@ class TopologyStrategy(BaseStrategy):
     def min_universe_size(self) -> int:
         return 10   # topology requires a minimum universe for meaningful Betti curves
 
-    def update(self, bars: list[OHLCVBar]) -> Optional[StrategyOutput]:
-        for bar in bars:
-            if bar.ticker not in self._price_history:
-                self._price_history[bar.ticker] = []
-            self._price_history[bar.ticker].append(bar.close)
-            if len(self._price_history[bar.ticker]) > MIN_HISTORY + 2:
-                self._price_history[bar.ticker].pop(0)
+    @property
+    def rolling_window(self) -> int:
+        # Topology needs more history than the other strategies — Betti curves stabilize
+        # with at least MIN_HISTORY observations. Engine host fetches this many bars.
+        return MIN_HISTORY
 
-        tickers = [t for t, hist in self._price_history.items() if len(hist) >= MIN_HISTORY]
+    def update(
+        self,
+        bars: list[OHLCVBar],
+        history: PriceHistoryLookup,
+    ) -> Optional[StrategyOutput]:
+        active = set(b.ticker for b in bars)
+        tickers = sorted(t for t in active if len(history(t)) >= MIN_HISTORY)
         if len(tickers) < self.min_universe_size:
             return None
 
-        prices = np.array([self._price_history[t] for t in tickers])
+        prices = np.array([history(t)[-MIN_HISTORY:] for t in tickers])
         returns = np.diff(np.log(prices), axis=1)    # (n_assets, n_periods - 1)
 
         if returns.shape[1] < ROLLING_WINDOW:
