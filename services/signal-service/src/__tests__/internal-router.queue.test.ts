@@ -16,18 +16,19 @@ import { createInternalRouter } from '../infrastructure/http/internal-router.ts'
 import type { ISignalRepository } from '../domain/interfaces/ISignalRepository.ts';
 import { TradeSignal } from '../domain/entities/TradeSignal.ts';
 import type { ISignalPublisher } from '../domain/interfaces/ISignalPublisher.ts';
+import { SignalLifecycle, SignalFailureReason } from '@trader/shared-types';
 
 class StubRepo implements ISignalRepository {
   public claimed: TradeSignal | null = null;
   public requeuedIds: string[] = [];
-  public failedCalls: Array<{ id: string; reason: string; detail?: string }> = [];
+  public failedCalls: Array<{ id: string; reason: SignalFailureReason; detail?: string }> = [];
   public sweptCount = 0;
 
   async save() {}
   async findById(id: string) {
     return new TradeSignal({
       id, timestamp: 0, ticker: 'X', strategy_id: 's', action: 'BUY',
-      confidence: 0.5, targetWeight: 0.01, rationale: '{}', lifecycle: 'failed',
+      confidence: 0.5, targetWeight: 0.01, rationale: '{}', lifecycle: SignalLifecycle.Failed,
     });
   }
   async findRecent() { return []; }
@@ -98,7 +99,7 @@ describe('queue endpoints', () => {
       repo.claimed = new TradeSignal({
         id: 'sig-1', timestamp: 12345, ticker: 'AAPL_US_EQ', strategy_id: 'test',
         action: 'BUY', confidence: 0.5, targetWeight: 0.01, rationale: '{}',
-        entryPrice: 100, lifecycle: 'executing', attempts: 1,
+        entryPrice: 100, lifecycle: SignalLifecycle.Executing, attempts: 1,
       });
       const res = await app.request('/internal/queue/claim', {
         method: 'POST',
@@ -135,17 +136,17 @@ describe('queue endpoints', () => {
       const res = await app.request('/internal/queue/xyz/failed', {
         method: 'POST',
         headers: { 'X-Internal-Token': tradingToken(), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ reason: 'market_drift', detail: 'delta=2.5%' }),
+        body: JSON.stringify({ reason: SignalFailureReason.MarketDrift, detail: 'delta=2.5%' }),
       });
       expect(res.status).toBe(200);
-      expect(repo.failedCalls).toEqual([{ id: 'xyz', reason: 'market_drift', detail: 'delta=2.5%' }]);
+      expect(repo.failedCalls).toEqual([{ id: 'xyz', reason: SignalFailureReason.MarketDrift, detail: 'delta=2.5%' }]);
     });
 
     it('rejects wrong caller', async () => {
       const res = await app.request('/internal/queue/xyz/failed', {
         method: 'POST',
         headers: { 'X-Internal-Token': generateInternalToken('signal-service'), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ reason: 'broker_rejected' }),
+        body: JSON.stringify({ reason: SignalFailureReason.BrokerRejected }),
       });
       expect(res.status).toBe(403);
     });

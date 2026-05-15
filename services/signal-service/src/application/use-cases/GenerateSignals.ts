@@ -1,4 +1,4 @@
-import { TradeSignal, type Action } from '../../domain/entities/TradeSignal.ts';
+import { TradeSignal, SignalLifecycle, type Action } from '../../domain/entities/TradeSignal.ts';
 import type { ISignalRepository } from '../../domain/interfaces/ISignalRepository.ts';
 import type { ISignalPublisher } from '../../domain/interfaces/ISignalPublisher.ts';
 import type { IPortfolioState } from '../../domain/interfaces/IPortfolioState.ts';
@@ -120,7 +120,7 @@ export class GenerateSignalsUseCase {
             targetWeight: w,
             rationale: JSON.stringify(rationale),
             entryPrice: entry && entry > 0 ? entry : undefined,
-            lifecycle: 'pending',
+            lifecycle: SignalLifecycle.Pending,
           });
         } catch { return null; }
       })

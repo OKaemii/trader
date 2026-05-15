@@ -1,6 +1,7 @@
 import type { Collection, Db } from 'mongodb';
 import type { RedisClientType } from 'redis';
 import { COLLECTIONS } from '@trader/shared-mongo';
+import { SignalLifecycle } from '@trader/shared-types';
 
 export type StrategyHealth = 'healthy' | 'warning' | 'degraded' | 'suspended';
 
@@ -67,7 +68,7 @@ export class StrategyDecayMonitor {
     const recentSignals = await this.signals
       .find({
         timestamp: { $gte: new Date(thirtyDaysAgo) },
-        lifecycle: { $in: ['executed', 'closed'] },
+        lifecycle: { $in: [SignalLifecycle.Executed, SignalLifecycle.Closed] },
       })
       .sort({ timestamp: -1 })
       .limit(500)

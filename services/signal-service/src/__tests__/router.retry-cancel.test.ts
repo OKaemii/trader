@@ -15,7 +15,7 @@ import { Hono } from 'hono';
 import { signAccessToken } from '@trader/shared-auth/jwt';
 import { createRouter } from '../infrastructure/http/router.ts';
 import type { ISignalRepository } from '../domain/interfaces/ISignalRepository.ts';
-import { TradeSignal, type SignalLifecycle } from '../domain/entities/TradeSignal.ts';
+import { TradeSignal, SignalLifecycle, SignalFailureReason } from '../domain/entities/TradeSignal.ts';
 
 let adminJWT: string;
 beforeAll(async () => {
@@ -28,7 +28,7 @@ function adminHeaders() {
 
 class StubRepo implements ISignalRepository {
   public retried: string[] = [];
-  public markedFailed: Array<{ id: string; reason: string; detail?: string }> = [];
+  public markedFailed: Array<{ id: string; reason: SignalFailureReason; detail?: string }> = [];
 
   constructor(private fixture: TradeSignal | null) {}
 
@@ -81,7 +81,7 @@ describe('POST /api/admin/signals/retry/:id', () => {
   });
 
   it('400s when the signal is not in lifecycle=failed', async () => {
-    const repo = new StubRepo(signal('s1', 'executed'));
+    const repo = new StubRepo(signal('s1', SignalLifecycle.Executed));
     const app  = buildApp(repo);
     const res  = await app.request('/api/admin/signals/retry/s1', {
       method: 'POST',
@@ -92,7 +92,7 @@ describe('POST /api/admin/signals/retry/:id', () => {
   });
 
   it('delegates to repo.retry when signal is in lifecycle=failed', async () => {
-    const repo = new StubRepo(signal('s1', 'failed'));
+    const repo = new StubRepo(signal('s1', SignalLifecycle.Failed));
     const app  = buildApp(repo);
     const res  = await app.request('/api/admin/signals/retry/s1', {
       method: 'POST',
@@ -115,7 +115,13 @@ describe('POST /api/admin/signals/cancel/:id', () => {
   });
 
   it('400s when the signal is in a terminal state (executed/closed/failed/cancelled)', async () => {
-    for (const lc of ['executed', 'closed', 'failed', 'cancelled', 'pending'] as SignalLifecycle[]) {
+    for (const lc of [
+      SignalLifecycle.Executed,
+      SignalLifecycle.Closed,
+      SignalLifecycle.Failed,
+      SignalLifecycle.Cancelled,
+      SignalLifecycle.Pending,
+    ]) {
       const repo = new StubRepo(signal('s1', lc));
       const app  = buildApp(repo);
       const res  = await app.request('/api/admin/signals/cancel/s1', {
@@ -127,7 +133,11 @@ describe('POST /api/admin/signals/cancel/:id', () => {
   });
 
   it('delegates to repo.markFailed(manual_cancel) for queued/executing/approved', async () => {
-    for (const lc of ['queued', 'executing', 'approved'] as SignalLifecycle[]) {
+    for (const lc of [
+      SignalLifecycle.Queued,
+      SignalLifecycle.Executing,
+      SignalLifecycle.Approved,
+    ]) {
       const repo = new StubRepo(signal('s1', lc));
       const app  = buildApp(repo);
       const res  = await app.request('/api/admin/signals/cancel/s1', {
@@ -135,7 +145,7 @@ describe('POST /api/admin/signals/cancel/:id', () => {
         headers: adminHeaders(),
       });
       expect(res.status).toBe(200);
-      expect(repo.markedFailed[0]).toMatchObject({ id: 's1', reason: 'manual_cancel' });
+      expect(repo.markedFailed[0]).toMatchObject({ id: 's1', reason: SignalFailureReason.ManualCancel });
     }
   });
 });

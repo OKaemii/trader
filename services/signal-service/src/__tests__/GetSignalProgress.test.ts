@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'bun:test';
 import { GetSignalProgressUseCase } from '../application/use-cases/GetSignalProgress.ts';
 import { TradeSignal } from '../domain/entities/TradeSignal.ts';
+import { SignalLifecycle } from '@trader/shared-types';
 import type { ISignalRepository } from '../domain/interfaces/ISignalRepository.ts';
 import type { IPortfolioState } from '../domain/interfaces/IPortfolioState.ts';
 import type { IPriceLookup } from '../domain/interfaces/IPriceLookup.ts';
@@ -41,7 +42,7 @@ class StubPrices implements IPriceLookup {
   }
 }
 
-const sig = (overrides: Partial<{ ticker: string; action: 'BUY' | 'SELL'; entry: number; ts: number; lifecycle: 'pending' | 'approved' | 'executed' | 'closed' }>) =>
+const sig = (overrides: Partial<{ ticker: string; action: 'BUY' | 'SELL'; entry: number; ts: number; lifecycle: SignalLifecycle }>) =>
   new TradeSignal({
     id: overrides.ticker ?? 'id1',
     timestamp: overrides.ts ?? Date.now() - 1000,
@@ -135,6 +136,6 @@ describe('GetSignalProgressUseCase', () => {
       new StubPrices({ AAPL: 100 }),
     );
     const [row] = await uc.execute(50);
-    expect(row.lifecycleResolved).toBe('pending');
+    expect(row.lifecycleResolved).toBe(SignalLifecycle.Pending);
   });
 });

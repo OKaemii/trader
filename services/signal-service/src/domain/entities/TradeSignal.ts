@@ -1,7 +1,7 @@
-import type { SignalLifecycle, SignalFailureReason } from '@trader/shared-types';
+import { SignalLifecycle, SignalFailureReason } from '@trader/shared-types';
 
 export type Action = 'BUY' | 'SELL' | 'HOLD';
-export type { SignalLifecycle, SignalFailureReason };
+export { SignalLifecycle, SignalFailureReason };
 
 export class TradeSignal {
   public readonly id: string;
@@ -75,12 +75,14 @@ export class TradeSignal {
     this.rationale = params.rationale;
     this.approved = params.approved ?? false;
     this.entryPrice = params.entryPrice;
-    // Derive default lifecycle from existing fields so old persisted docs still resolve sensibly.
+    // Derive default lifecycle from existing fields so old persisted docs still resolve
+    // sensibly. The lifecycle field on the entity itself is the numeric enum; values
+    // coming from JSON / Mongo are integers (no string coercion needed).
     this.lifecycle = params.lifecycle
-      ?? (params.closedAt ? 'closed'
-        : params.executedAt ? 'executed'
-        : (params.approved ?? false) ? 'approved'
-        : 'pending');
+      ?? (params.closedAt ? SignalLifecycle.Closed
+        : params.executedAt ? SignalLifecycle.Executed
+        : (params.approved ?? false) ? SignalLifecycle.Approved
+        : SignalLifecycle.Pending);
     this.approvedAt = params.approvedAt;
     this.executedAt = params.executedAt;
     this.closedAt = params.closedAt;
