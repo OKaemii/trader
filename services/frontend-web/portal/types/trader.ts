@@ -32,23 +32,35 @@ export interface ProviderInfo {
   allowedPollIntervals: PollIntervalOption[]
 }
 
-export type SignalLifecycle =
-  | 'pending'
-  | 'approved'
-  | 'queued'
-  | 'executing'
-  | 'executed'
-  | 'closed'
-  | 'failed'
-  | 'cancelled';
+// OrderType — mirrors services/trading-service/src/domain/entities/Order.ts. Numeric;
+// 0 = Limit, 1 = Market. Reorder = silent data corruption.
+export enum OrderType {
+  Limit,
+  Market,
+}
 
-export type SignalFailureReason =
-  | 'cash_insufficient'
-  | 'market_drift'
-  | 'queue_expired'
-  | 'broker_rejected'
-  | 'retries_exhausted'
-  | 'manual_cancel';
+// MUST mirror the member order of packages/shared-types/src/index.ts SignalLifecycle.
+// Numeric values are the wire format — the portal receives `{lifecycle: 4}` from the
+// API and compares against `SignalLifecycle.Executed`. Reorder = silent data corruption.
+export enum SignalLifecycle {
+  Pending,
+  Approved,
+  Queued,
+  Executing,
+  Executed,
+  Closed,
+  Failed,
+  Cancelled,
+}
+
+export enum SignalFailureReason {
+  CashInsufficient,
+  MarketDrift,
+  QueueExpired,
+  BrokerRejected,
+  RetriesExhausted,
+  ManualCancel,
+}
 
 export interface TradeSignalDTO {
   id: string;
