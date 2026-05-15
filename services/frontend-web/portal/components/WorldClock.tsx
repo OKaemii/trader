@@ -38,7 +38,22 @@ function timeInTz(now: Date, tz: string): { h: number; m: number; weekday: numbe
   return { h, m, weekday, display: `${get('hour')}:${get('minute')}` }
 }
 
-function sessionStatus(now: Date, s: SessionState): { open: boolean; nextLabel: string; nextMs: number } {
+interface SessionStatusReport {
+  open: boolean
+  // What happens next: 'opens' or 'closes', and when (relative + absolute).
+  nextLabel: string
+  nextMs: number
+  // Local-time strings for the session's regular open/close on the trading day this
+  // status refers to. When the market is open: today's close. When closed: next open
+  // and the close that follows it. Surfaces in the hover tooltip for operator context.
+  todayOpen: string
+  todayClose: string
+  nextOpenLocal: string
+  nextCloseLocal: string
+  reasonClosed: 'weekend' | 'after-hours' | 'pre-open' | null
+}
+
+function sessionStatus(now: Date, s: SessionState): SessionStatusReport {
   const t = timeInTz(now, s.tz)
   const isWeekend = t.weekday >= 5
 
@@ -47,28 +62,49 @@ function sessionStatus(now: Date, s: SessionState): { open: boolean; nextLabel: 
   const nowMin   = t.h * 60 + t.m
   const isOpen   = !isWeekend && nowMin >= openMin && nowMin < closeMin
 
-  // Compute minutes until next open/close. Approximate (ignores holidays).
+  const fmtHM = (h: number, m: number) =>
+    `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`
+  const todayOpen  = fmtHM(s.open.h,  s.open.m)
+  const todayClose = fmtHM(s.close.h, s.close.m)
+  const nextOpenLocal  = todayOpen
+  const nextCloseLocal = todayClose
+
   let nextMin: number
   let nextLabel: string
+  let reasonClosed: SessionStatusReport['reasonClosed'] = null
   if (isOpen) {
     nextMin = closeMin - nowMin
     nextLabel = 'closes'
   } else {
     if (isWeekend) {
-      // Days until Monday + open offset
       const daysToMon = (7 - t.weekday) % 7 || 1
       nextMin = daysToMon * 24 * 60 - nowMin + openMin
       nextLabel = 'opens'
+      reasonClosed = 'weekend'
     } else if (nowMin < openMin) {
       nextMin = openMin - nowMin
       nextLabel = 'opens'
+      reasonClosed = 'pre-open'
     } else {
-      // After close, before next day
       nextMin = (24 * 60 - nowMin) + openMin
       nextLabel = 'opens'
+      reasonClosed = 'after-hours'
     }
   }
-  return { open: isOpen, nextLabel, nextMs: nextMin * 60_000 }
+
+  return {
+    open: isOpen,
+    nextLabel,
+    nextMs: nextMin * 60_000,
+    todayOpen, todayClose, nextOpenLocal, nextCloseLocal, reasonClosed,
+  }
+}
+
+function reasonLabel(r: SessionStatusReport['reasonClosed']): string {
+  if (r === 'weekend')     return 'Weekend'
+  if (r === 'pre-open')    return 'Pre-open'
+  if (r === 'after-hours') return 'After hours'
+  return ''
 }
 
 function fmtCountdown(ms: number): string {
@@ -104,13 +140,59 @@ export function WorldClock() {
           <div key={s.label} className="flex items-center gap-1.5">
             <span className="text-gray-500">{s.label}</span>
             <span className="text-gray-200">{t.display}</span>
-            <span
-              className={`rounded px-1 py-0.5 text-[9px] font-semibold uppercase ${
-                status.open ? 'bg-emerald-900/60 text-emerald-300' : 'bg-gray-800 text-gray-500'
-              }`}
-              title={`${status.nextLabel} in ${fmtCountdown(status.nextMs)}`}
-            >
-              {status.open ? 'open' : 'closed'}
+            {/* group wrapper enables the rich CSS-only tooltip on hover. We keep the
+                native title attribute as an accessibility fallback so keyboard / screen-
+                reader users still see the countdown. */}
+            <span className="group relative inline-block">
+              <span
+                className={`cursor-help rounded px-1 py-0.5 text-[9px] font-semibold uppercase ${
+                  status.open ? 'bg-emerald-900/60 text-emerald-300' : 'bg-gray-800 text-gray-500'
+                }`}
+                title={`${status.nextLabel} in ${fmtCountdown(status.nextMs)}`}
+              >
+                {status.open ? 'open' : 'closed'}
+              </span>
+              <span
+                role="tooltip"
+                className="pointer-events-none invisible absolute right-0 top-full z-50 mt-1 w-60 rounded border border-gray-700 bg-gray-950 p-2 text-[11px] text-gray-200 opacity-0 shadow-lg transition-opacity duration-100 group-hover:visible group-hover:opacity-100"
+              >
+                <div className="mb-1 flex items-center justify-between font-semibold">
+                  <span className="uppercase tracking-wide text-gray-400">{s.label} session</span>
+                  <span className={status.open ? 'text-emerald-300' : 'text-gray-500'}>
+                    {status.open ? 'open' : 'closed'}
+                  </span>
+                </div>
+                <div className="space-y-0.5 text-gray-300">
+                  <div className="flex justify-between">
+                    <span className="text-gray-500">Trading hours</span>
+                    <span className="font-mono">{status.todayOpen}–{status.todayClose}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-gray-500">Local time</span>
+                    <span className="font-mono">{t.display}</span>
+                  </div>
+                  {!status.open && status.reasonClosed && (
+                    <div className="flex justify-between">
+                      <span className="text-gray-500">Reason</span>
+                      <span>{reasonLabel(status.reasonClosed)}</span>
+                    </div>
+                  )}
+                  <div className="mt-1 border-t border-gray-800 pt-1">
+                    <div className="flex justify-between">
+                      <span className="text-gray-500">
+                        {status.open ? 'Closes' : `Next ${status.nextLabel}`}
+                      </span>
+                      <span className="font-mono text-gray-100">{fmtCountdown(status.nextMs)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-gray-500">At</span>
+                      <span className="font-mono">
+                        {status.open ? status.todayClose : status.nextOpenLocal} {s.tz.split('/')[1] === 'New_York' ? 'ET' : 'BST/GMT'}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </span>
             </span>
           </div>
         )
