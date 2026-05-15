@@ -23,6 +23,16 @@
         "typescript": "^5.4.0",
       },
     },
+    "packages/shared-bars": {
+      "name": "@trader/shared-bars",
+      "version": "0.0.1",
+      "dependencies": {
+        "@trader/shared-mongo": "*",
+        "@trader/shared-types": "*",
+        "mongodb": "^6.5.0",
+        "redis": "^4.6.13",
+      },
+    },
     "packages/shared-data": {
       "name": "@trader/shared-data",
       "version": "0.0.1",
@@ -95,6 +105,7 @@
       "version": "0.0.1",
       "dependencies": {
         "@trader/shared-auth": "workspace:*",
+        "@trader/shared-bars": "workspace:*",
         "@trader/shared-mongo": "workspace:*",
         "@trader/shared-redis": "workspace:*",
         "@trader/shared-types": "workspace:*",
@@ -142,6 +153,7 @@
       "version": "0.0.1",
       "dependencies": {
         "@trader/shared-auth": "workspace:*",
+        "@trader/shared-bars": "workspace:*",
         "@trader/shared-mongo": "workspace:*",
         "@trader/shared-redis": "workspace:*",
         "@trader/shared-types": "workspace:*",
@@ -231,6 +243,8 @@
     "@trader/portfolio-service": ["@trader/portfolio-service@workspace:services/portfolio-service"],
 
     "@trader/shared-auth": ["@trader/shared-auth@workspace:packages/shared-auth"],
+
+    "@trader/shared-bars": ["@trader/shared-bars@workspace:packages/shared-bars"],
 
     "@trader/shared-data": ["@trader/shared-data@workspace:packages/shared-data"],
 

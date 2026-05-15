@@ -1,6 +1,54 @@
+// Canonical poll-interval enum. The portal renders these as a dropdown (no free-form
+// ms input — operators can't accidentally set 1ms and DDOS Yahoo). Each provider
+// declares which subset it supports via `allowedPollIntervals`, so swapping providers
+// reshapes the dropdown automatically. `tier` is purely cosmetic — drives chip colour
+// on the portal so intraday vs daily are visually distinct.
+export const POLL_INTERVALS = {
+  '10s':  10_000,
+  '1m':   60_000,
+  '5m':   300_000,
+  '15m':  900_000,
+  '1h':   3_600_000,
+  '24h':  86_400_000,
+} as const satisfies Record<string, number>;
+
+export type PollIntervalKey = keyof typeof POLL_INTERVALS;
+export type PollIntervalMs  = typeof POLL_INTERVALS[PollIntervalKey];
+
+export interface PollIntervalOption {
+  key:   PollIntervalKey;
+  ms:    number;
+  label: string;                                // dropdown copy: "Every 5 minutes"
+  tier:  'intraday' | 'hourly' | 'daily';      // portal chip colour bucket
+}
+
+export const POLL_INTERVAL_OPTIONS: Record<PollIntervalKey, PollIntervalOption> = {
+  '10s':  { key: '10s',  ms: POLL_INTERVALS['10s'],  label: 'Every 10 seconds', tier: 'intraday' },
+  '1m':   { key: '1m',   ms: POLL_INTERVALS['1m'],   label: 'Every minute',     tier: 'intraday' },
+  '5m':   { key: '5m',   ms: POLL_INTERVALS['5m'],   label: 'Every 5 minutes',  tier: 'intraday' },
+  '15m':  { key: '15m',  ms: POLL_INTERVALS['15m'],  label: 'Every 15 minutes', tier: 'intraday' },
+  '1h':   { key: '1h',   ms: POLL_INTERVALS['1h'],   label: 'Every hour',       tier: 'hourly'   },
+  '24h':  { key: '24h',  ms: POLL_INTERVALS['24h'],  label: 'Every day',        tier: 'daily'    },
+};
+
+export function pollIntervalKeyForMs(ms: number): PollIntervalKey | null {
+  for (const k of Object.keys(POLL_INTERVALS) as PollIntervalKey[]) {
+    if (POLL_INTERVALS[k] === ms) return k;
+  }
+  return null;
+}
+
+// Granularity tag for OHLCV bars. The same ticker can hold rows at multiple intervals
+// (e.g. daily for strategy warmup, 5m for intraday testing) without colliding — the
+// (ticker, timestamp, interval) compound index dedups within an interval while letting
+// the cache serve different cadences. Older rows that pre-date this field default to
+// 'daily' in the Mongo reader since that's what market-data-service was emitting.
+export type BarInterval = 'daily' | '5m' | '15m' | '1h';
+
 export interface OHLCVBar {
   ticker: string;
-  timestamp: number;    // Unix ms
+  timestamp: number;    // Unix ms — bar START time. Daily bars use 00:00:00Z of the trading day.
+  interval?: BarInterval;
   open: number;
   high: number;
   low: number;
