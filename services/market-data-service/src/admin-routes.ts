@@ -4,8 +4,13 @@
 import { Hono } from 'hono';
 import { requireInternalToken } from '@trader/shared-auth/middleware';
 import { getMongoDb, COLLECTIONS } from '@trader/shared-mongo';
+import { getRedisClient, xAdd } from '@trader/shared-redis';
 import { getLiveConfig, invalidateLiveConfig, _envDefaultsForTest } from './live-config.ts';
 import type { UniverseManager } from './universe-manager.ts';
+import type { MarketDataProvider } from './providers/market-data-provider.ts';
+import { aggregateBars, getBars, invalidateBars, type RangeKey } from '@trader/shared-bars';
+import { backfillTickers, CACHE_INVALIDATED_TOPIC } from './backfill.ts';
+import { REDIS_STREAMS, POLL_INTERVAL_OPTIONS, type BarInterval, type OHLCVBar, type PollIntervalKey } from '@trader/shared-types';
 
 interface UniverseOverridesDoc {
   _id: 'singleton';
@@ -26,7 +31,13 @@ interface MarketConfigDoc {
 const MIN_POLL_MS = 5_000;
 const MAX_POLL_MS = 24 * 60 * 60_000;
 
-export function createAdminRouter(universeManager: UniverseManager): Hono {
+const VALID_INTERVALS: BarInterval[] = ['5m', '15m', '1h', 'daily'];
+const VALID_RANGES: RangeKey[]     = ['30d', '60d', '90d'];
+
+export function createAdminRouter(
+  universeManager: UniverseManager,
+  provider: MarketDataProvider,
+): Hono {
   const r = new Hono();
   r.use('*', requireInternalToken('api-gateway'));
 
@@ -121,8 +132,20 @@ export function createAdminRouter(universeManager: UniverseManager): Hono {
     if (body.barFrequency != null && !['daily', 'intraday'].includes(body.barFrequency)) {
       return c.json({ error: 'invalid barFrequency' }, 400);
     }
-    if (body.pollIntervalMs != null && (body.pollIntervalMs < MIN_POLL_MS || body.pollIntervalMs > MAX_POLL_MS)) {
-      return c.json({ error: `pollIntervalMs out of range (${MIN_POLL_MS}..${MAX_POLL_MS})` }, 400);
+    if (body.pollIntervalMs != null) {
+      if (body.pollIntervalMs < MIN_POLL_MS || body.pollIntervalMs > MAX_POLL_MS) {
+        return c.json({ error: `pollIntervalMs out of range (${MIN_POLL_MS}..${MAX_POLL_MS})` }, 400);
+      }
+      // Defence-in-depth: even if the portal renders the dropdown correctly, a stale
+      // tab or direct API hit could submit any value. Reject anything not in the
+      // active provider's allowedPollIntervals.
+      const allowedMs = provider.allowedPollIntervals.map((k) => POLL_INTERVAL_OPTIONS[k].ms);
+      if (!allowedMs.includes(body.pollIntervalMs)) {
+        return c.json({
+          error: `pollIntervalMs not allowed by provider ${provider.name}`,
+          allowed: allowedMs,
+        }, 400);
+      }
     }
     const db = await getMongoDb();
     await db.collection(COLLECTIONS.PORTAL_MARKET_CONFIG).updateOne(
@@ -137,6 +160,205 @@ export function createAdminRouter(universeManager: UniverseManager): Hono {
     );
     invalidateLiveConfig();
     return c.json({ ok: true });
+  });
+
+  // ── Backfill 5m history ────────────────────────────────────────────────────
+  // POST /api/admin/market-data/backfill
+  // body: { tickers?: string[], days?: number }
+  //   tickers omitted → use active universe.
+  //   days defaults to 60 (matches Yahoo 5m lookback cap).
+  // Persists 5m bars (upsert), invalidates the shared-bars cache, and publishes a
+  // cache-invalidated message per ticker so subscribers (signal-service, portal) drop
+  // their derived state. Returns per-ticker upsert counts.
+  r.post('/api/admin/market-data/backfill', async (c) => {
+    const body = await c.req.json<{ tickers?: string[]; days?: number }>().catch(() => ({}));
+    const tickers = body.tickers && body.tickers.length > 0
+      ? body.tickers
+      : universeManager.activeTickers;
+    if (tickers.length === 0) return c.json({ error: 'no tickers (universe empty and no body.tickers)' }, 400);
+    const days = body.days && body.days > 0 && body.days <= 60 ? body.days : 60;
+    const db = await getMongoDb();
+    const redis = await getRedisClient();
+    const results = await backfillTickers(db, redis, provider, tickers, {
+      windowMs: days * 24 * 60 * 60_000,
+    });
+    return c.json({
+      tickers: results.length,
+      bars:    results.reduce((acc, r) => acc + r.upserted, 0),
+      failures: results.filter((r) => r.error).length,
+      results,
+    });
+  });
+
+  // ── Clear cached bars ──────────────────────────────────────────────────────
+  // POST /api/admin/market-data/clear-cache
+  // body: { interval?: BarInterval, beforeTimestamp?: number (ms), dryRun?: boolean }
+  //   No args (with dryRun=false) → wipes the entire ohlcv_bars collection.
+  //   Operator-driven; default dryRun=true returns counts without deleting.
+  // Use this to clean up the existing duplicate intraday-snapshot rows that the buggy
+  // insertMany loop persisted before the upsert switch. Also drops shared-bars Redis
+  // cache entries for matching (ticker, interval) pairs.
+  r.post('/api/admin/market-data/clear-cache', async (c) => {
+    const body = await c.req.json<{
+      interval?: BarInterval;
+      beforeTimestamp?: number;
+      dryRun?: boolean;
+    }>().catch(() => ({}));
+    const dryRun = body.dryRun !== false;
+    if (body.interval && !VALID_INTERVALS.includes(body.interval)) {
+      return c.json({ error: `invalid interval (one of ${VALID_INTERVALS.join(',')})` }, 400);
+    }
+
+    const filter: Record<string, unknown> = {};
+    if (body.interval)        filter.interval  = body.interval;
+    if (body.beforeTimestamp) filter.timestamp = { $lt: new Date(body.beforeTimestamp) };
+
+    const db = await getMongoDb();
+    const collection = db.collection(COLLECTIONS.OHLCV_BARS);
+    const matchCount = await collection.countDocuments(filter);
+    if (dryRun) {
+      return c.json({ dryRun: true, wouldDelete: matchCount, filter });
+    }
+
+    const res = await collection.deleteMany(filter);
+
+    // Best-effort cache invalidation. We don't know which (ticker, interval) pairs the
+    // delete touched without an extra aggregation; the simplest correct behaviour is
+    // to publish a wildcard cache-invalidated message and let subscribers refresh on
+    // next read. shared-bars consumers re-read from Mongo on cache miss.
+    const redis = await getRedisClient();
+    try {
+      await redis.publish(CACHE_INVALIDATED_TOPIC, JSON.stringify({ scope: 'bulk', filter, deleted: res.deletedCount, ts: Date.now() }));
+    } catch (err) {
+      console.warn('[admin] clear-cache publish failed:', err);
+    }
+    return c.json({ deleted: res.deletedCount, filter });
+  });
+
+  // ── Provider info ──────────────────────────────────────────────────────────
+  // GET /api/admin/market-data/provider-info
+  // Returns the active provider's identity + lookback cap + the poll-interval keys
+  // it's willing to serve. The portal calls this once on mount to populate the
+  // poll-cadence dropdown and to show which provider is active.
+  r.get('/api/admin/market-data/provider-info', (c) => {
+    return c.json({
+      name:          provider.name,
+      maxLookbackMs: provider.maxLookbackMs,
+      // Hydrate each allowed key with its full PollIntervalOption so the portal
+      // doesn't have to import shared-types — keeps the FE single-package-deep on
+      // its own types/trader.ts copy.
+      allowedPollIntervals: provider.allowedPollIntervals
+        .map((k) => POLL_INTERVAL_OPTIONS[k])
+        .filter(Boolean),
+    });
+  });
+
+  // ── Which tickers actually have cached 5m history ──────────────────────────
+  // GET /api/admin/market-data/coverage
+  // Returns { ticker: count } for every ticker in ohlcv_bars with at least one 5m bar.
+  // Used by the portal to badge unresolvable tickers in the history picker so an
+  // operator can see at a glance which entries are empty before clicking through.
+  r.get('/api/admin/market-data/coverage', async (c) => {
+    const db = await getMongoDb();
+    const agg = await db
+      .collection(COLLECTIONS.OHLCV_BARS)
+      .aggregate([
+        { $match: { interval: '5m' } },
+        { $group: { _id: '$ticker', count: { $sum: 1 } } },
+      ])
+      .toArray();
+    const coverage: Record<string, number> = {};
+    for (const row of agg) coverage[row._id as string] = (row as any).count ?? 0;
+    return c.json({ coverage });
+  });
+
+  // ── Read bars (downsampled view) ───────────────────────────────────────────
+  // GET /api/admin/market-data/bars/:ticker?interval=daily&range=60d
+  // Returns the cached 5m series for the ticker, downsampled to the requested interval
+  // and trimmed to the requested range. Cache miss reads Mongo via shared-bars.getBars
+  // and populates the cache.
+  r.get('/api/admin/market-data/bars/:ticker', async (c) => {
+    const ticker   = c.req.param('ticker');
+    const interval = (c.req.query('interval') ?? 'daily') as BarInterval;
+    const range    = (c.req.query('range')    ?? '30d')   as RangeKey;
+    if (!VALID_INTERVALS.includes(interval)) {
+      return c.json({ error: `invalid interval (one of ${VALID_INTERVALS.join(',')})` }, 400);
+    }
+    if (!VALID_RANGES.includes(range)) {
+      return c.json({ error: `invalid range (one of ${VALID_RANGES.join(',')})` }, 400);
+    }
+    const db    = await getMongoDb();
+    const redis = await getRedisClient();
+    // getBars currently keys cache by storedInterval — storage is always 5m, so we
+    // fetch the 5m series and downsample here. Returning the downsampled view keeps
+    // the cache compact (one entry per ticker/range), not bloated per requested-interval.
+    const base = await getBars(redis as any, db, ticker, '5m', range);
+    const out  = aggregateBars(base, interval);
+    return c.json({ ticker, interval, range, bars: out });
+  });
+
+  return r;
+}
+
+// ─── Internal bars endpoint, separate from the admin router ─────────────────────
+//
+// Mounted at the same app level but with its own internal-token caller — strategy-engine
+// calls this every cycle to hydrate its rolling window from Mongo (read-through cached
+// in shared-bars). Kept separate from createAdminRouter so the wildcard 'api-gateway'
+// middleware on that router doesn't bleed onto these routes.
+//
+// Batch endpoint (POST with tickers[]) is the hot path during boot: strategy-engine
+// fetches the full universe's history in one HTTP round-trip per cycle rather than
+// N round-trips. Single-ticker GET stays for ad-hoc tooling.
+export function createInternalBarsRouter(): Hono {
+  const r = new Hono();
+  const requireStrategy = requireInternalToken('strategy-engine');
+
+  r.get('/internal/bars/:ticker', requireStrategy, async (c) => {
+    const ticker   = c.req.param('ticker');
+    const interval = (c.req.query('interval') ?? 'daily') as BarInterval;
+    const range    = (c.req.query('range')    ?? '30d')   as RangeKey;
+    if (!VALID_INTERVALS.includes(interval)) {
+      return c.json({ error: `invalid interval (one of ${VALID_INTERVALS.join(',')})` }, 400);
+    }
+    if (!VALID_RANGES.includes(range)) {
+      return c.json({ error: `invalid range (one of ${VALID_RANGES.join(',')})` }, 400);
+    }
+    const db    = await getMongoDb();
+    const redis = await getRedisClient();
+    const base = await getBars(redis as any, db, ticker, '5m', range);
+    const out  = aggregateBars(base, interval);
+    return c.json({ ticker, interval, range, bars: out });
+  });
+
+  r.post('/internal/bars', requireStrategy, async (c) => {
+    const body = await c.req.json<{
+      tickers:  string[];
+      interval?: BarInterval;
+      range?:    RangeKey;
+    }>().catch(() => ({ tickers: [] } as any));
+    const tickers  = Array.isArray(body.tickers) ? body.tickers : [];
+    const interval = (body.interval ?? 'daily') as BarInterval;
+    const range    = (body.range    ?? '30d')   as RangeKey;
+    if (!VALID_INTERVALS.includes(interval)) {
+      return c.json({ error: `invalid interval (one of ${VALID_INTERVALS.join(',')})` }, 400);
+    }
+    if (!VALID_RANGES.includes(range)) {
+      return c.json({ error: `invalid range (one of ${VALID_RANGES.join(',')})` }, 400);
+    }
+    if (tickers.length === 0) return c.json({ bars: {} });
+
+    const db    = await getMongoDb();
+    const redis = await getRedisClient();
+    const out: Record<string, OHLCVBar[]> = {};
+    // Per-ticker fetch is cheap because getBars hits Redis on the second-onwards
+    // call within a TTL window. We could parallelise with Promise.all if the cache
+    // miss path proves slow in production; for now serial is simpler and predictable.
+    for (const ticker of tickers) {
+      const base = await getBars(redis as any, db, ticker, '5m', range);
+      out[ticker] = aggregateBars(base, interval);
+    }
+    return c.json({ interval, range, bars: out });
   });
 
   return r;

@@ -23,7 +23,11 @@ const envBarFrequency = (): 'daily' | 'intraday' =>
   (process.env.BAR_FREQUENCY === 'intraday' ? 'intraday' : 'daily');
 
 const envPollMs = (): number => {
-  const def = envBarFrequency() === 'daily' ? 20 * 60_000 : 60_000;
+  // Code defaults — used only when POLL_INTERVAL_MS env is unset (dev / standalone).
+  // Helm provides the production value (currently 24h). The daily default here was
+  // 20m back when the live-poll loop did EOD retries; the new fetchRecent windowed
+  // poll covers 24h per call, so a 24h cadence is the matching default.
+  const def = envBarFrequency() === 'daily' ? 24 * 60 * 60_000 : 15 * 60_000;
   return parseInt(process.env.POLL_INTERVAL_MS ?? String(def));
 };
 
