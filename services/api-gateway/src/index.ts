@@ -100,6 +100,20 @@ admin.put('/api/admin/universe/overrides',            (c) => proxy('http://marke
 admin.post('/api/admin/universe/refresh',             (c) => proxy('http://market-data-service:3002', c));
 admin.get('/api/admin/market-data/config',            (c) => proxy('http://market-data-service:3002', c));
 admin.put('/api/admin/market-data/config',            (c) => proxy('http://market-data-service:3002', c));
+admin.post('/api/admin/market-data/backfill',         (c) => proxy('http://market-data-service:3002', c));
+admin.post('/api/admin/market-data/clear-cache',      (c) => proxy('http://market-data-service:3002', c));
+admin.get('/api/admin/market-data/bars/:ticker',      (c) => proxy('http://market-data-service:3002', c));
+admin.get('/api/admin/market-data/coverage',          (c) => proxy('http://market-data-service:3002', c));
+// market-data /health surfaces next_poll_ts + universe size etc. proxy() rewrites the
+// request path 1:1 to the upstream, so to hit the upstream's /health we forward to a
+// direct fetch. The portal needs the full payload (not just OK/error) to render the
+// next-poll countdown.
+admin.get('/api/admin/market-data/health', async (c) => {
+  const r = await fetch('http://market-data-service:3002/health');
+  const body = await r.text();
+  return new Response(body, { status: r.status, headers: { 'content-type': r.headers.get('content-type') ?? 'application/json' } });
+});
+admin.get('/api/admin/market-data/provider-info',     (c) => proxy('http://market-data-service:3002', c));
 admin.get('/api/admin/system/status', async (c) => {
   const token = generateInternalToken('api-gateway');
   const headers = { 'X-Internal-Token': token };
