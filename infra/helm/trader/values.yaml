@@ -6,8 +6,8 @@ global:
     # Single source of truth for all service-tunable env vars. Lives under `global` so subchart
     # deployment templates can read `.Values.global.env.*` directly. Bump these and redeploy —
     # no code change required for any of the toggles documented in CLAUDE.md.
-    tradingMode: demo                   # paper (notify only) | demo (demo.trading212) | live (trading212; admin gate required)
-    executionMode: t212                 # t212 (limit, weekly) | unrestricted (market, daily)
+    tradingMode: Demo                   # Paper (notify only) | Demo (demo.trading212) | Live (trading212; admin gate required)
+    signalOrderType: Limit              # Limit (T212-friendly, weekly) | Market (immediate fill, daily). Risk-exits always Market.
     barFrequency: daily                 # daily | intraday
     # Default polling cadence for market-data-service live polling. Must be one of the
     # active provider's allowedPollIntervals (Yahoo: 15m / 1h / 24h). The portal renders
