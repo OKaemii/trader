@@ -62,13 +62,19 @@ async def run_backtest(req: BacktestRequest):
     # Generate synthetic validation data from MongoDB signals collection
     # In production: replay historical bars through strategy for each ablation variant
     signals_col = _db['signals']
-    # Filter to lifecycle ∈ {executed, closed} so the validation report reflects what
+    # Filter to lifecycle ∈ {Executed, Closed} so the validation report reflects what
     # actually traded. Failed/queued/pending signals are excluded — they did not result
     # in real broker activity and would otherwise inflate the validation sample size.
+    #
+    # Numeric enum values must mirror packages/shared-types/src/index.ts SignalLifecycle.
+    # Executed=4, Closed=5. Reordering the enum on the TS side without bumping these is
+    # a silent data-corruption hazard — write a migration if the order ever shifts.
+    LIFECYCLE_EXECUTED = 4
+    LIFECYCLE_CLOSED   = 5
     recent = await signals_col.find(
         {'timestamp': {'$gte': datetime.utcfromtimestamp(req.data_start_ms / 1000),
                        '$lt':  datetime.utcfromtimestamp(req.data_end_ms   / 1000)},
-         'lifecycle': {'$in': ['executed', 'closed']}}
+         'lifecycle': {'$in': [LIFECYCLE_EXECUTED, LIFECYCLE_CLOSED]}}
     ).sort('timestamp', 1).to_list(length=10_000)
 
     if len(recent) < 20:
