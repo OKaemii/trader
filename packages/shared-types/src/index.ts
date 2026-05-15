@@ -93,36 +93,42 @@ export interface TopologyFeatures {
 }
 
 // Lifecycle states for a TradeSignal — see TradeSignal entity for transitions.
-//   pending   → just emitted, awaiting approval (paper mode default for SELL/BUY)
-//   approved  → admin approved (or auto-approved in unrestricted mode)
-//   queued    → handed to trading-service dispatcher; awaiting send to T212. Retries
+//   Pending   → just emitted, awaiting approval (paper mode default for SELL/BUY)
+//   Approved  → admin approved (or auto-approved by AutoApprovalGate)
+//   Queued    → handed to trading-service dispatcher; awaiting send to T212. Retries
 //               also live in this state — `attempts > 0` indicates a retry-in-progress.
-//   executing → claimed by the dispatcher, in-flight to T212 (short-lived; reverted to
-//               `queued` by the boot sweep if a pod crashes mid-call).
-//   executed  → T212 accepted the order (submit/fill confirmed by FillsPoller).
-//   closed    → round-trip closed (exitPrice + closedAt populated).
-//   failed    → terminal: conditions changed (drift, cash, expiry), broker rejected, or
+//   Executing → claimed by the dispatcher, in-flight to T212 (short-lived; reverted to
+//               Queued by the boot sweep if a pod crashes mid-call).
+//   Executed  → T212 accepted the order (submit/fill confirmed by FillsPoller).
+//   Closed    → round-trip closed (exitPrice + closedAt populated).
+//   Failed    → terminal: conditions changed (drift, cash, expiry), broker rejected, or
 //               attempts cap reached. Excluded from strategy/portfolio accounting — the
 //               order is treated as if it never happened.
-//   cancelled → terminal: explicit cancel from broker history (T212 CANCELLED/REJECTED/EXPIRED).
-export type SignalLifecycle =
-  | 'pending'
-  | 'approved'
-  | 'queued'
-  | 'executing'
-  | 'executed'
-  | 'closed'
-  | 'failed'
-  | 'cancelled';
+//   Cancelled → terminal: explicit cancel from broker history (T212 CANCELLED/REJECTED/EXPIRED).
+//
+// Numeric enum: persisted to Mongo as integer; reverse-lookup via `SignalLifecycle[x]`
+// gives the member name for logs/UI. Member order is the canonical position — appending
+// new states is safe; reordering breaks every persisted doc.
+export enum SignalLifecycle {
+  Pending,
+  Approved,
+  Queued,
+  Executing,
+  Executed,
+  Closed,
+  Failed,
+  Cancelled,
+}
 
-// Why a signal landed in `failed`. Surfaced in the portal next to the row.
-export type SignalFailureReason =
-  | 'cash_insufficient'      // computed quantity rounded to zero against current cash
-  | 'market_drift'           // mid-price moved past PRICE_DRIFT_TOLERANCE since emission
-  | 'queue_expired'          // aged past QUEUE_TTL_MS before successful send
-  | 'broker_rejected'        // T212 returned a non-retryable 4xx
-  | 'retries_exhausted'      // hit ORDER_MAX_ATTEMPTS on transient errors (429 / network)
-  | 'manual_cancel';         // admin clicked Cancel in the portal
+// Why a signal landed in `Failed`. Surfaced in the portal next to the row.
+export enum SignalFailureReason {
+  CashInsufficient,      // computed quantity rounded to zero against current cash
+  MarketDrift,           // mid-price moved past PRICE_DRIFT_TOLERANCE since emission
+  QueueExpired,          // aged past QUEUE_TTL_MS before successful send
+  BrokerRejected,        // T212 returned a non-retryable 4xx
+  RetriesExhausted,      // hit ORDER_MAX_ATTEMPTS on transient errors (429 / network)
+  ManualCancel,          // admin clicked Cancel in the portal
+}
 
 // TradeSignalDTO — wire format for MongoDB storage and notifications.
 // Domain entity (TradeSignal class) has the same fields; this is the plain-object form.
