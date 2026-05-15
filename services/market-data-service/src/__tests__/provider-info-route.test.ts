@@ -44,13 +44,19 @@ mock.module('@trader/shared-mongo', () => ({
 }));
 
 // Redis mock — admin routes touch it for cache invalidation pubsub. Only the methods
-// we actually call need to exist.
+// we actually call need to exist. publishCalls captures (channel, payload) tuples so
+// the executionMode test can assert the live-config invalidation fan-out without
+// reaching into module internals.
+const publishCalls: Array<{ channel: string; payload: string }> = [];
 mock.module('@trader/shared-redis', () => ({
   getRedisClient: async () => ({
     get: async () => null,
     setEx: async () => 'OK',
     del: async () => 0,
-    publish: async () => 0,
+    publish: async (channel: string, payload: string) => {
+      publishCalls.push({ channel, payload });
+      return 0;
+    },
   }),
   xAdd: async () => '',
   ensureConsumerGroup: async () => {},
@@ -129,5 +135,58 @@ describe('PUT /api/admin/market-data/config (allowlist enforcement)', () => {
     expect(Array.isArray(body.allowed)).toBe(true);
     // Validation must reject BEFORE the Mongo write — no row should be touched.
     expect(updateOneCalls).toBe(before);
+  });
+});
+
+describe('PUT /api/admin/market-data/config (signalOrderType hot-swap)', () => {
+  it('persists signalOrderType=Market (1) and publishes the config-invalidated pubsub', async () => {
+    publishCalls.length = 0;
+    const before = updateOneCalls;
+    const app = buildApp();
+    const res = await app.request('/api/admin/market-data/config', {
+      method: 'PUT',
+      headers: { 'X-Internal-Token': gatewayToken(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ signalOrderType: 1 }),  // OrderType.Market
+    });
+    expect(res.status).toBe(200);
+    expect(updateOneCalls).toBe(before + 1);
+
+    const stored = mongoStore.get(JSON.stringify({ _id: 'singleton' }));
+    expect(stored?.signalOrderType).toBe(1);
+
+    // The invalidation fan-out is what makes the hot-swap feel instant on the operator's
+    // side — trading-service subscribes to this topic and drops its 15s cache when it fires.
+    const invalidations = publishCalls.filter((p) => p.channel === 'config:invalidated');
+    expect(invalidations.length).toBe(1);
+    const payload = JSON.parse(invalidations[0].payload);
+    expect(payload.signalOrderType).toBe(1);
+  });
+
+  it('rejects an out-of-enum signalOrderType value with 400 and does not persist', async () => {
+    publishCalls.length = 0;
+    const before = updateOneCalls;
+    const app = buildApp();
+    const res = await app.request('/api/admin/market-data/config', {
+      method: 'PUT',
+      headers: { 'X-Internal-Token': gatewayToken(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ signalOrderType: 99 }),
+    });
+    expect(res.status).toBe(400);
+    expect(updateOneCalls).toBe(before);
+    expect(publishCalls.filter((p) => p.channel === 'config:invalidated').length).toBe(0);
+  });
+
+  it('accepts a save that explicitly clears signalOrderType (null = no override)', async () => {
+    publishCalls.length = 0;
+    const app = buildApp();
+    const res = await app.request('/api/admin/market-data/config', {
+      method: 'PUT',
+      headers: { 'X-Internal-Token': gatewayToken(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ signalOrderType: null }),
+    });
+    expect(res.status).toBe(200);
+    const stored = mongoStore.get(JSON.stringify({ _id: 'singleton' }));
+    expect(stored?.signalOrderType).toBeNull();
+    expect(publishCalls.filter((p) => p.channel === 'config:invalidated').length).toBe(1);
   });
 });

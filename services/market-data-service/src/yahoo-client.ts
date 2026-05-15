@@ -119,10 +119,17 @@ function parseT212Ticker(t212Ticker: string): {
   const rawSymbol = parts[0];
   const symbol = normalizeBaseSymbol(rawSymbol);
 
-  const exchange =
-    parts.length >= 3
-      ? parts[1]
-      : null;
+  // Three-part tickers carry an explicit exchange (e.g. `AAPL_US_EQ`).
+  // Two-part tickers ending in `l_EQ` are T212's London convention (e.g. `HSBAl_EQ`,
+  // `BARCl_EQ`) — the lowercase `l` on the symbol is the LSE marker, not the CFD
+  // synthetic that `normalizeBaseSymbol` strips for US instruments. Without tagging
+  // these as 'UK' we'd drop the `.L` Yahoo suffix and 404 every FTSE constituent.
+  let exchange: string | null = null;
+  if (parts.length >= 3) {
+    exchange = parts[1];
+  } else if (parts.length === 2 && parts[1] === 'EQ' && /l$/.test(rawSymbol)) {
+    exchange = 'UK';
+  }
 
   return {
     rawSymbol,

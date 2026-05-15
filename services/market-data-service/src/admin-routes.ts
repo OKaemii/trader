@@ -20,13 +20,31 @@ interface UniverseOverridesDoc {
   updatedAt: Date;
 }
 
+// Numeric enum constants for OrderType — mirrored from
+// services/trading-service/src/domain/entities/Order.ts. Defined inline rather than
+// imported across services to keep admin-routes peer-service-agnostic. Values MUST
+// match (Limit=0, Market=1) or the live-config layer will read the wrong field.
+const ORDER_TYPE_LIMIT  = 0;
+const ORDER_TYPE_MARKET = 1;
+const ORDER_TYPE_VALUES = [ORDER_TYPE_LIMIT, ORDER_TYPE_MARKET];
+
 interface MarketConfigDoc {
   _id: 'singleton';
   barFrequency: 'daily' | 'intraday' | null;
   pollIntervalMs: number | null;
+  // OrderType override consumed live by trading-service (and by strategy-engine, which
+  // exits cleanly so k8s restarts it when the bar regime flips). Stored as the numeric
+  // enum value (0=Limit, 1=Market) alongside the bar/poll knobs so a single doc + single
+  // PUT propagates everything from one save.
+  signalOrderType: 0 | 1 | null;
   updatedBy: string;
   updatedAt: Date;
 }
+
+// Pubsub topic that trading-service + strategy-engine subscribe to so they drop their
+// 15s live-config caches the instant the doc changes — without it, the operator would
+// see up to 15s of stale behaviour after a portal save before the cache TTL expired.
+export const CONFIG_INVALIDATED_TOPIC = 'config:invalidated';
 
 const MIN_POLL_MS = 5_000;
 const MAX_POLL_MS = 24 * 60 * 60_000;
@@ -39,7 +57,13 @@ export function createAdminRouter(
   provider: MarketDataProvider,
 ): Hono {
   const r = new Hono();
-  r.use('*', requireInternalToken('api-gateway'));
+  // Path-scoped, NOT `r.use('*', mw)`. A wildcard `use('*', mw)` on a subapp mounted
+  // via `app.route('/', subapp)` bleeds the middleware onto every route registered
+  // afterward on the PARENT app — including createInternalBarsRouter's /internal/bars
+  // routes, which then 403 because they expect caller='strategy-engine' not 'api-gateway'.
+  // Same regression that bit trading-service routing; see services/trading-service
+  // routing.test.ts for the fixture that pins it.
+  r.use('/api/admin/*', requireInternalToken('api-gateway'));
 
   // ── Universe overrides ────────────────────────────────────────────────────
   r.get('/api/admin/universe/overrides', async (c) => {
@@ -111,13 +135,29 @@ export function createAdminRouter(
     const doc = await db.collection<MarketConfigDoc>(COLLECTIONS.PORTAL_MARKET_CONFIG)
       .findOne({ _id: 'singleton' });
     const effective = await getLiveConfig();
+    // signalOrderType isn't consumed by market-data-service itself; we surface the env
+    // fallback so the portal's "Helm defaults" panel renders symmetrically with the
+    // bar/poll columns. Override is whatever the doc says (null = no override). Env is
+    // parsed both ways — accept the enum-member name ('Limit' / 'Market') for human
+    // readability in Helm AND the integer value for parameterised setups.
+    const envSignalOrderType: 0 | 1 =
+      process.env.SIGNAL_ORDER_TYPE === 'Market' || process.env.SIGNAL_ORDER_TYPE === String(ORDER_TYPE_MARKET)
+        ? ORDER_TYPE_MARKET
+        : ORDER_TYPE_LIMIT;
     return c.json({
       override: {
         barFrequency: doc?.barFrequency ?? null,
         pollIntervalMs: doc?.pollIntervalMs ?? null,
+        signalOrderType: doc?.signalOrderType ?? null,
       },
-      effective,
-      defaults: _envDefaultsForTest(),
+      effective: {
+        ...effective,
+        signalOrderType: doc?.signalOrderType ?? envSignalOrderType,
+      },
+      defaults: {
+        ..._envDefaultsForTest(),
+        signalOrderType: envSignalOrderType,
+      },
       updatedBy: doc?.updatedBy ?? null,
       updatedAt: doc?.updatedAt ?? null,
     });
@@ -127,10 +167,14 @@ export function createAdminRouter(
     const body = await c.req.json<{
       barFrequency?: 'daily' | 'intraday' | null;
       pollIntervalMs?: number | null;
+      signalOrderType?: 0 | 1 | null;
       userId?: string;
     }>();
     if (body.barFrequency != null && !['daily', 'intraday'].includes(body.barFrequency)) {
       return c.json({ error: 'invalid barFrequency' }, 400);
+    }
+    if (body.signalOrderType != null && !ORDER_TYPE_VALUES.includes(body.signalOrderType)) {
+      return c.json({ error: `invalid signalOrderType (expected ${ORDER_TYPE_LIMIT}=Limit or ${ORDER_TYPE_MARKET}=Market)` }, 400);
     }
     if (body.pollIntervalMs != null) {
       if (body.pollIntervalMs < MIN_POLL_MS || body.pollIntervalMs > MAX_POLL_MS) {
@@ -153,12 +197,27 @@ export function createAdminRouter(
       { $set: {
         barFrequency: body.barFrequency ?? null,
         pollIntervalMs: body.pollIntervalMs ?? null,
+        signalOrderType: body.signalOrderType ?? null,
         updatedBy: body.userId ?? 'unknown',
         updatedAt: new Date(),
       }},
       { upsert: true },
     );
     invalidateLiveConfig();
+    // Best-effort: tell trading-service + strategy-engine to drop their caches now
+    // rather than wait up to 15s for TTL. Failing to publish doesn't block the save —
+    // subscribers will pick up the change on their next cache refresh either way.
+    try {
+      const redis = await getRedisClient();
+      await redis.publish(CONFIG_INVALIDATED_TOPIC, JSON.stringify({
+        barFrequency:   body.barFrequency   ?? null,
+        signalOrderType:  body.signalOrderType  ?? null,
+        pollIntervalMs: body.pollIntervalMs ?? null,
+        ts: Date.now(),
+      }));
+    } catch (err) {
+      console.warn('[admin] config-invalidated publish failed:', err);
+    }
     return c.json({ ok: true });
   });
 
