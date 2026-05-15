@@ -1,5 +1,5 @@
 import type { Db } from 'mongodb';
-import type { Order } from '../domain/entities/Order.ts';
+import { type Order, OrderStatus } from '../domain/entities/Order.ts';
 import type { IOrderRepository } from '../domain/interfaces/IOrderRepository.ts';
 import { COLLECTIONS } from '@trader/shared-mongo';
 
@@ -31,7 +31,7 @@ export class MongoOrderRepository implements IOrderRepository {
 
   async findOpen(): Promise<Order[]> {
     const docs = await this.col.find({
-      status: 'submitted',
+      status: OrderStatus.Submitted,
       t212OrderId: { $exists: true, $ne: '' },
     }).toArray();
     return docs.map((d) => this._fromDoc(d));

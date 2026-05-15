@@ -10,6 +10,8 @@ process.env.INTERNAL_SECRET = 'test-internal-secret';
 import { describe, it, expect, beforeEach, mock } from 'bun:test';
 import { OrderDispatcher, type ClaimedSignal, type OrderDispatcherDeps } from '../infrastructure/order-dispatcher.ts';
 import { AccountCache } from '../infrastructure/account-cache.ts';
+import { TradingMode } from '../domain/entities/Order.ts';
+import { SignalFailureReason } from '@trader/shared-types';
 
 function makeSignal(overrides: Partial<ClaimedSignal> = {}): ClaimedSignal {
   return {
@@ -44,7 +46,7 @@ function makeDeps(overrides: Partial<OrderDispatcherDeps> = {}): OrderDispatcher
   );
   return {
     signalServiceUrl:    'http://signal-service:3003',
-    tradingMode:         'paper',
+    tradingMode:         TradingMode.Paper,
     client:              {} as any,
     accountCache:        cache,
     getDb:               async () => ({}) as any,
@@ -63,7 +65,7 @@ describe('OrderDispatcher', () => {
   it('paper mode short-circuits to executed without calling T212', async () => {
     const fetchSpy = installFetch();
     try {
-      const deps = makeDeps({ tradingMode: 'paper' });
+      const deps = makeDeps({ tradingMode: TradingMode.Paper });
       const d    = new OrderDispatcher(deps);
       await (d as any).processOne(makeSignal());
       // expect a /executed POST and no /failed or /requeue
@@ -85,7 +87,7 @@ describe('OrderDispatcher', () => {
       await (d as any).processOne(makeSignal({ timestamp: now - 5000 }));
       const failedCall = fetchSpy.calls.find((c) => c.url.includes('/failed'));
       expect(failedCall).toBeDefined();
-      expect(failedCall!.body.reason).toBe('queue_expired');
+      expect(failedCall!.body.reason).toBe(SignalFailureReason.QueueExpired);
     } finally {
       fetchSpy.restore();
     }
@@ -99,7 +101,7 @@ describe('OrderDispatcher', () => {
       await (d as any).processOne(makeSignal({ attempts: 6 }));
       const failedCall = fetchSpy.calls.find((c) => c.url.includes('/failed'));
       expect(failedCall).toBeDefined();
-      expect(failedCall!.body.reason).toBe('retries_exhausted');
+      expect(failedCall!.body.reason).toBe(SignalFailureReason.RetriesExhausted);
     } finally {
       fetchSpy.restore();
     }

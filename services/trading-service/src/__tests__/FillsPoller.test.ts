@@ -16,7 +16,7 @@ process.env.INTERNAL_SECRET = 'test-internal-secret';
 
 import { describe, it, expect, beforeEach, mock } from 'bun:test';
 import { FillsPoller } from '../application/services/FillsPoller.ts';
-import type { Order } from '../domain/entities/Order.ts';
+import { type Order, OrderSide, OrderType, OrderStatus } from '../domain/entities/Order.ts';
 import type { IOrderRepository } from '../domain/interfaces/IOrderRepository.ts';
 import type { Trading212Client, T212HistoryItem } from '../infrastructure/t212.ts';
 
@@ -24,10 +24,10 @@ function makeOrder(o: Partial<Order> = {}): Order {
   return {
     id:            'order-' + (o.id ?? 'x'),
     ticker:        o.ticker ?? 'AAPL_US_EQ',
-    side:          o.side ?? 'buy',
-    orderType:     o.orderType ?? 'market',
+    side:          o.side ?? OrderSide.Buy,
+    orderType:     o.orderType ?? OrderType.Market,
     quantity:      o.quantity ?? 2,
-    status:        o.status ?? 'submitted',
+    status:        o.status ?? OrderStatus.Submitted,
     t212OrderId:   o.t212OrderId ?? '111',
     signalId:      o.signalId ?? 'signal-1',
     targetWeight:  o.targetWeight ?? 0.01,
@@ -132,7 +132,7 @@ describe('FillsPoller.tick', () => {
   });
 
   it('marks a BUY filled with fill.price, fill.filledAt and notifies executed with quantity', async () => {
-    const repo = new StubRepo([makeOrder({ t212OrderId: '222', side: 'buy', signalId: 'buy-sig' })]);
+    const repo = new StubRepo([makeOrder({ t212OrderId: '222', side: OrderSide.Buy, signalId: 'buy-sig' })]);
     const t212 = makeT212({
       active:  [],
       history: [filledItem({ id: 222, side: 'BUY', price: 250.25, qty: 5, filledAt: '2026-05-13T22:19:18.000Z' })],
@@ -143,7 +143,7 @@ describe('FillsPoller.tick', () => {
 
     expect(repo.saved).toHaveLength(1);
     const saved = repo.saved[0];
-    expect(saved.status).toBe('filled');
+    expect(saved.status).toBe(OrderStatus.Filled);
     expect(saved.fillPrice).toBe(250.25);
     expect(saved.filledQuantity).toBe(5);
     expect(saved.filledAt).toBe(Date.parse('2026-05-13T22:19:18.000Z'));
@@ -156,7 +156,7 @@ describe('FillsPoller.tick', () => {
   });
 
   it('marks a SELL filled, closes the SELL signal, and walks open BUYs FIFO to close them', async () => {
-    const repo = new StubRepo([makeOrder({ t212OrderId: '333', side: 'sell', signalId: 'sell-sig', ticker: 'AAPL_US_EQ' })]);
+    const repo = new StubRepo([makeOrder({ t212OrderId: '333', side: OrderSide.Sell, signalId: 'sell-sig', ticker: 'AAPL_US_EQ' })]);
     const t212 = makeT212({
       active:  [],
       history: [filledItem({ id: 333, side: 'SELL', price: 305.0, qty: 5, ticker: 'AAPL_US_EQ' })],
@@ -176,7 +176,7 @@ describe('FillsPoller.tick', () => {
     await (poller as unknown as { tick: () => Promise<void> }).tick();
 
     // Order updated to filled
-    expect(repo.saved[0].status).toBe('filled');
+    expect(repo.saved[0].status).toBe(OrderStatus.Filled);
     expect(repo.saved[0].fillPrice).toBe(305.0);
 
     // SELL signal itself closed
@@ -202,7 +202,7 @@ describe('FillsPoller.tick', () => {
   });
 
   it('on SELL with exact match closes all matching BUYs (no decrement)', async () => {
-    const repo = new StubRepo([makeOrder({ t212OrderId: '334', side: 'sell', signalId: 'sell-sig-2', ticker: 'TSLA_US_EQ' })]);
+    const repo = new StubRepo([makeOrder({ t212OrderId: '334', side: OrderSide.Sell, signalId: 'sell-sig-2', ticker: 'TSLA_US_EQ' })]);
     const t212 = makeT212({
       active:  [],
       history: [filledItem({ id: 334, side: 'SELL', price: 200, qty: 6, ticker: 'TSLA_US_EQ' })],
@@ -224,7 +224,7 @@ describe('FillsPoller.tick', () => {
   });
 
   it('on SELL with no open BUYs warns but does not error', async () => {
-    const repo = new StubRepo([makeOrder({ t212OrderId: '335', side: 'sell', signalId: 'sell-sig-3', ticker: 'NVDA_US_EQ' })]);
+    const repo = new StubRepo([makeOrder({ t212OrderId: '335', side: OrderSide.Sell, signalId: 'sell-sig-3', ticker: 'NVDA_US_EQ' })]);
     const t212 = makeT212({
       active:  [],
       history: [filledItem({ id: 335, side: 'SELL', price: 100, qty: 1, ticker: 'NVDA_US_EQ' })],
@@ -242,7 +242,7 @@ describe('FillsPoller.tick', () => {
   });
 
   it('marks a cancelled order without notifying signal-service', async () => {
-    const repo = new StubRepo([makeOrder({ t212OrderId: '444', side: 'sell' })]);
+    const repo = new StubRepo([makeOrder({ t212OrderId: '444', side: OrderSide.Sell })]);
     const t212 = makeT212({
       active:  [],
       history: [terminalItem(444, 'CANCELLED')],
@@ -251,7 +251,7 @@ describe('FillsPoller.tick', () => {
     const poller = new FillsPoller(repo, t212, 60_000);
     await (poller as unknown as { tick: () => Promise<void> }).tick();
 
-    expect(repo.saved[0].status).toBe('cancelled');
+    expect(repo.saved[0].status).toBe(OrderStatus.Cancelled);
     expect(repo.saved[0].filledQuantity).toBe(0);
     expect(calls).toHaveLength(0);
   });
@@ -267,7 +267,7 @@ describe('FillsPoller.tick', () => {
     });
     const poller = new FillsPoller(repo, t212, 60_000);
     await (poller as unknown as { tick: () => Promise<void> }).tick();
-    expect(repo.saved.map((o) => o.status)).toEqual(['cancelled', 'cancelled']);
+    expect(repo.saved.map((o) => o.status)).toEqual([OrderStatus.Cancelled, OrderStatus.Cancelled]);
   });
 
   it('leaves an order submitted when it is missing from both active and history (race)', async () => {
