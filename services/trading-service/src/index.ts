@@ -23,6 +23,11 @@ export interface AppDeps {
   getRedis: () => Promise<Pick<RedisClientType, 'get' | 'set' | 'del'>>;
   getDb:    () => Promise<Db>;
   client:   () => Trading212Client;
+  // Shared AccountCache for `/internal/trading/cash` and `/internal/trading/positions`.
+  // Optional so the existing test deps (paper mode) keep working — when omitted, the
+  // routes fall back to direct T212 calls. Production wiring at the bottom of this
+  // file constructs one cache for both the dispatcher and the HTTP routes.
+  accountCache?: AccountCache;
 }
 
 export function buildApp(deps: AppDeps): Hono {
@@ -41,12 +46,24 @@ export function buildApp(deps: AppDeps): Hono {
   // pro-rate pass (compute scale = freeCash / totalBuyNotional before approving signals).
   const requirePortfolioOrSignal = requireInternalToken('portfolio-service', 'signal-service');
 
+  // Both routes serve from AccountCache when one is configured. Coalesces concurrent
+  // callers (portfolio-service polling + signal-service AutoApprovalGate) onto a single
+  // T212 fetch, and serves stale-fallback on 429 — without this, the two services'
+  // independent poll cadences burst past T212's rate limit and every cycle 429s.
   app.get('/internal/trading/positions', requirePortfolio, async (c) => {
+    if (deps.accountCache) {
+      const snap = await deps.accountCache.get();
+      return c.json({ positions: snap.positions });
+    }
     const positions = await deps.client().getPositions();
     return c.json({ positions });
   });
 
   app.get('/internal/trading/cash', requirePortfolioOrSignal, async (c) => {
+    if (deps.accountCache) {
+      const snap = await deps.accountCache.get();
+      return c.json({ free: snap.free, total: snap.total });
+    }
     const cash = await deps.client().getCash();
     return c.json(cash);
   });
@@ -172,13 +189,6 @@ function productionClient(): Trading212Client {
 
 // Production wiring — only runs when this file is the process entrypoint (not when imported by tests).
 const tradingMode = (process.env.TRADING_MODE ?? 'paper') as TradingMode;
-const productionDeps: AppDeps = {
-  tradingMode,
-  getRedis: () => getRedisClient() as unknown as Promise<Pick<RedisClientType, 'get' | 'set' | 'del'>>,
-  getDb:    () => getMongoDb(),
-  client:   productionClient,
-};
-const app = buildApp(productionDeps);
 
 const FILL_POLL_INTERVAL_MS = parseInt(process.env.FILL_POLL_INTERVAL_MS ?? '30000', 10);
 
@@ -190,24 +200,37 @@ const ACCOUNT_CACHE_TTL_MS    = parseInt(process.env.ACCOUNT_CACHE_TTL_MS    ?? 
 const PRICE_DRIFT_TOLERANCE   = parseFloat(process.env.PRICE_DRIFT_TOLERANCE ?? '0.01');         // 1%
 const SIGNAL_SERVICE_URL      = process.env.SIGNAL_SERVICE_URL ?? 'http://signal-service:3003';
 
+// One AccountCache instance for the whole process. Shared between:
+//   - HTTP routes /internal/trading/{cash,positions}  (portfolio-service + signal-service callers)
+//   - OrderDispatcher's per-signal cash/positions reads
+// Without this sharing, portfolio-service's poll cadence + AutoApprovalGate's bursts +
+// the dispatcher's own reads each hit T212 independently and burst past the rate limit.
+const sharedClient       = productionClient();
+const sharedAccountCache = new AccountCache(sharedClient, { ttlMs: ACCOUNT_CACHE_TTL_MS });
+
+const productionDeps: AppDeps = {
+  tradingMode,
+  getRedis: () => getRedisClient() as unknown as Promise<Pick<RedisClientType, 'get' | 'set' | 'del'>>,
+  getDb:    () => getMongoDb(),
+  client:   () => sharedClient,
+  accountCache: sharedAccountCache,
+};
+const app = buildApp(productionDeps);
+
 if (import.meta.main) {
   (async () => {
     if (tradingMode !== 'paper') {
       const db = await getMongoDb();
       const orderRepo = new MongoOrderRepository(db);
-      new FillsPoller(orderRepo, productionClient(), FILL_POLL_INTERVAL_MS).start();
+      new FillsPoller(orderRepo, sharedClient, FILL_POLL_INTERVAL_MS).start();
       console.log(`[trading-service] fills poller started (${FILL_POLL_INTERVAL_MS}ms, mode=${tradingMode})`);
     }
 
-    // Order-dispatcher loop runs in ALL modes including paper — in paper it drains the
-    // queue by marking signals as executed without calling T212 (see dispatcher code).
-    const client       = productionClient();
-    const accountCache = new AccountCache(client, { ttlMs: ACCOUNT_CACHE_TTL_MS });
     const dispatcher = new OrderDispatcher({
       signalServiceUrl:    SIGNAL_SERVICE_URL,
       tradingMode,
-      client,
-      accountCache,
+      client:              sharedClient,
+      accountCache:        sharedAccountCache,
       getDb:               () => getMongoDb(),
       getRedis:            () => getRedisClient() as unknown as Promise<Pick<RedisClientType, 'get'>>,
       minIntervalMs:       ORDER_MIN_INTERVAL_MS,

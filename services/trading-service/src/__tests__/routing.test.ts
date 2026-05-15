@@ -18,6 +18,7 @@ process.env.INTERNAL_SECRET = 'test-internal-secret';
 
 import { describe, it, expect, beforeAll } from 'bun:test';
 import { buildApp, type AppDeps } from '../index.ts';
+import { AccountCache } from '../infrastructure/account-cache.ts';
 import { signAccessToken } from '@trader/shared-auth/jwt';
 import { generateInternalToken } from '@trader/shared-auth/internal-token';
 
@@ -133,12 +134,87 @@ describe('trading-service routing', () => {
       expect(res.status).toBe(403);
     });
 
-    it('returns 403 on /cash when the caller in the token is wrong', async () => {
+    it('returns 200 on /cash with the signal-service token — AutoApprovalGate cash pro-rate path', async () => {
+      // /internal/trading/cash deliberately accepts BOTH portfolio-service AND signal-service
+      // callers — signal-service hits it during AutoApprovalGate.process to scale BUY weights
+      // to fit free cash. See requirePortfolioOrSignal wiring in index.ts.
       const app = buildApp(paperDeps());
       const res = await app.request('/internal/trading/cash', {
         headers: { 'X-Internal-Token': generateInternalToken('signal-service') },
       });
+      expect(res.status).toBe(200);
+    });
+
+    it('returns 403 on /cash when the caller in the token is neither portfolio nor signal', async () => {
+      const app = buildApp(paperDeps());
+      const res = await app.request('/internal/trading/cash', {
+        headers: { 'X-Internal-Token': generateInternalToken('trading-service') },
+      });
       expect(res.status).toBe(403);
+    });
+  });
+
+  // Regression for the deploy-time bug: /internal/trading/cash and /positions called
+  // deps.client() directly per request, bypassing the AccountCache the dispatcher uses.
+  // Result: portfolio-service polls + signal-service AutoApprovalGate bursts hit T212
+  // independently of the dispatcher and burst past T212's rate limit. The fix threads
+  // a shared AccountCache through deps so all callers coalesce on one cached read.
+  describe('AccountCache shared with HTTP routes', () => {
+    function countingClient() {
+      let cashCalls = 0;
+      let posCalls  = 0;
+      const client = {
+        getCash:      async () => { cashCalls++; return { free: 500, total: 1500 }; },
+        getPositions: async () => { posCalls++;  return [{ ticker: 'AAPL_US_EQ', quantity: 5 }] as unknown[]; },
+        getPortfolio:    () => { throw new Error('unused'); },
+        placeLimitOrder: () => { throw new Error('unused'); },
+        placeMarketOrder:() => { throw new Error('unused'); },
+        listActiveOrders:() => { throw new Error('unused'); },
+      } as never;
+      return { client, get cashCalls() { return cashCalls; }, get posCalls() { return posCalls; } };
+    }
+
+    it('serves /cash from the AccountCache, coalescing concurrent requests onto ONE T212 call', async () => {
+      const cc = countingClient();
+      const accountCache = new AccountCache(cc.client as any, { ttlMs: 60_000 });
+      const app = buildApp({
+        ...paperDeps(),
+        client: () => cc.client,
+        accountCache,
+      });
+
+      // Three concurrent /cash requests — without coalescing this would be 3 T212 hits.
+      const results = await Promise.all([
+        app.request('/internal/trading/cash', { headers: { 'X-Internal-Token': generateInternalToken('portfolio-service') } }),
+        app.request('/internal/trading/cash', { headers: { 'X-Internal-Token': generateInternalToken('portfolio-service') } }),
+        app.request('/internal/trading/cash', { headers: { 'X-Internal-Token': generateInternalToken('signal-service') } }),
+      ]);
+      for (const r of results) expect(r.status).toBe(200);
+      const bodies = await Promise.all(results.map((r) => r.json()));
+      for (const body of bodies) expect(body).toEqual({ free: 500, total: 1500 });
+
+      // The whole point: ONE T212 fetch despite three callers.
+      expect(cc.cashCalls).toBe(1);
+    });
+
+    it('serves /positions from the AccountCache (positions field of the same snapshot)', async () => {
+      const cc = countingClient();
+      const accountCache = new AccountCache(cc.client as any, { ttlMs: 60_000 });
+      const app = buildApp({
+        ...paperDeps(),
+        client: () => cc.client,
+        accountCache,
+      });
+
+      const res = await app.request('/internal/trading/positions', {
+        headers: { 'X-Internal-Token': generateInternalToken('portfolio-service') },
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.positions).toHaveLength(1);
+      expect(body.positions[0].ticker).toBe('AAPL_US_EQ');
+      // First-touch fetched both cash and positions; subsequent /positions would coalesce.
+      expect(cc.posCalls).toBe(1);
     });
   });
 
@@ -147,7 +223,11 @@ describe('trading-service routing', () => {
       signalId: 'test-1', ticker: 'AAPL_US_EQ', action: 'BUY', targetWeight: 0.01, confidence: 0.5,
     });
 
-    it('returns 200 in paper mode with the signal-service internal token', async () => {
+    it('returns 200 skipped/deprecated — signals now flow through the order-dispatcher queue', async () => {
+      // The synchronous execute path was retired when the queue + dispatcher landed.
+      // The endpoint remains for backwards compatibility with old callers; it always
+      // returns {skipped:true} so a stale signal-service that still POSTs here doesn't
+      // hard-fail. New signals enter the dispatcher via lifecycle='queued', not here.
       const app = buildApp(paperDeps());
       const res = await app.request('/internal/signals/trading/execute', {
         method: 'POST',
@@ -157,7 +237,7 @@ describe('trading-service routing', () => {
       expect(res.status).toBe(200);
       const payload = await res.json();
       expect(payload.skipped).toBe(true);
-      expect(payload.reason).toBe('TRADING_MODE=paper');
+      expect(payload.reason).toMatch(/deprecated/i);
     });
 
     it('returns 403 with the portfolio-service token (wrong caller)', async () => {
