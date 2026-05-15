@@ -2,8 +2,22 @@ import { Hono } from 'hono';
 import { requireAuth, generateInternalToken } from '@trader/shared-auth';
 import { getMongoDb } from '@trader/shared-mongo';
 import { COLLECTIONS } from '@trader/shared-mongo';
+import { getRedisClient } from '@trader/shared-redis';
+import { type Money, type Currency, BASE_CURRENCY } from '@trader/shared-types';
+import { FxClient, YahooFxProvider } from '@trader/shared-fx';
 
 const app = new Hono();
+
+// Lazy FxClient singleton — used to convert each position's instrument-currency value
+// into BASE_CURRENCY (GBP) once per sync, so RiskEngine and the portal can sum NAV
+// without doing FX in the hot path.
+let _fxClient: FxClient | null = null;
+async function getFxClient(): Promise<FxClient> {
+  if (_fxClient) return _fxClient;
+  const redis = await getRedisClient();
+  _fxClient = new FxClient(redis as any, new YahooFxProvider());
+  return _fxClient;
+}
 
 // Sync positions from trading-service on schedule
 let tradingServiceUnreachableLogged = false;
@@ -17,37 +31,74 @@ async function syncPositions(): Promise<void> {
     if (!posRes.ok) return;
     tradingServiceUnreachableLogged = false;
 
-    const { positions } = await posRes.json() as { positions: Array<Record<string, unknown>> };
+    // Wire format post-FX-fix: positions carry Money fields keyed by currency.
+    interface IncomingPosition {
+      ticker: string;
+      quantity: number;
+      averagePrice?: Money;
+      currentPrice?: Money;
+      currentValue?: Money;
+    }
+    const { positions } = await posRes.json() as { positions: IncomingPosition[] };
 
-    // Compute portfolio weights so signal-service's optimiser sees current exposure.
-    // Weight basis is total NAV (cash + holdings), not just invested value — otherwise
-    // weights sum to 1 by construction and the optimiser can't decide to deploy fresh cash.
-    // Cash fetch is best-effort: if it fails we still write positions but skip the weight
-    // field so MongoPortfolioState ignores stale weights instead of acting on bad ones.
-    let totalNAV: number | undefined;
+    // Cash is GBP per T212 UK base. Used as denominator for portfolio weights — total
+    // NAV (cash + holdings) so weights sum to <1 when there's free cash to deploy.
+    let cashGBP: number | undefined;
     if (cashRes.ok) {
-      const cash = await cashRes.json() as { total?: number; free?: number };
-      totalNAV = cash.total ?? cash.free;
+      const raw = await cashRes.json() as {
+        free?:  { amount?: number; currency?: string };
+        total?: { amount?: number; currency?: string };
+      };
+      const totalAmt = raw.total?.amount ?? raw.free?.amount;
+      if (typeof totalAmt === 'number' && (raw.total?.currency ?? raw.free?.currency) === 'GBP') {
+        cashGBP = totalAmt;
+      }
     }
 
-    const positionsValue = positions.reduce((acc, p) => {
+    const fx = await getFxClient();
+
+    // First pass: compute each position's GBP value via FX. Done in one pass so we can
+    // sum positionsGBP for the weight denominator before the second pass writes weights.
+    const sized = await Promise.all(positions.map(async (p) => {
       const q = typeof p.quantity === 'number' ? p.quantity : 0;
-      const px = typeof p.currentPrice === 'number' ? p.currentPrice : 0;
-      return acc + q * px;
-    }, 0);
-    // Fallback NAV: if cash endpoint is unavailable, weight against holdings-only value
-    // so SELLs can still fire on the largest positions. Surface this in logs once.
-    const navBasis = totalNAV && totalNAV > 0 ? totalNAV : positionsValue;
+      const ccy: Currency = (p.currentPrice?.currency
+        ?? p.averagePrice?.currency
+        ?? BASE_CURRENCY) as Currency;
+      const priceNative = p.currentPrice?.amount ?? 0;
+      const valueNative = q * priceNative;
+      let valueGBP = valueNative;
+      if (ccy !== BASE_CURRENCY && valueNative > 0) {
+        try {
+          valueGBP = await fx.toGBP({ amount: valueNative, currency: ccy });
+        } catch (err) {
+          console.warn(`[portfolio] FX conversion failed for ${p.ticker} (${ccy}); falling back to native value:`, err);
+        }
+      }
+      return { p, q, ccy, priceNative, valueNative, valueGBP };
+    }));
+
+    const positionsGBP = sized.reduce((acc, s) => acc + s.valueGBP, 0);
+    // Fallback NAV: cash endpoint unavailable → weight against holdings-only value so
+    // SELLs can still fire on the largest positions. Surface in logs once.
+    const navBasisGBP = cashGBP && cashGBP > 0 ? cashGBP : positionsGBP;
 
     const db = await getMongoDb();
-    for (const pos of positions) {
-      const q = typeof pos.quantity === 'number' ? pos.quantity : 0;
-      const px = typeof pos.currentPrice === 'number' ? pos.currentPrice : 0;
-      const value = q * px;
-      const weight = navBasis > 0 ? value / navBasis : 0;
+    for (const { p, q, ccy, priceNative, valueNative, valueGBP } of sized) {
+      const weight = navBasisGBP > 0 ? valueGBP / navBasisGBP : 0;
+      // Persist BOTH native (instrument currency) and GBP. RiskEngine sums currentValueGBP;
+      // the portal can show either. weight is dimensionless.
       await db.collection(COLLECTIONS.POSITIONS).updateOne(
-        { ticker: pos.ticker },
-        { $set: { ...pos, currentValue: value, weight, updatedAt: new Date() } },
+        { ticker: p.ticker },
+        { $set: {
+          ticker: p.ticker,
+          quantity: q,
+          currency: ccy,
+          currentPrice: priceNative,
+          currentValue: valueNative,        // instrument currency
+          currentValueGBP: valueGBP,        // BASE_CURRENCY
+          weight,
+          updatedAt: new Date(),
+        }},
         { upsert: true },
       );
     }
@@ -93,12 +144,18 @@ authed.get('/api/portfolio', async (c) => {
 authed.get('/api/portfolio/pnl', async (c) => {
   const db = await getMongoDb();
   const positions = await db.collection(COLLECTIONS.POSITIONS).find({}).toArray();
-  const totalValue = positions.reduce((a: number, p: any) => a + (p.currentValue ?? 0), 0);
-  const totalCost  = positions.reduce((a: number, p: any) => a + (p.costBasis ?? 0), 0);
+  // P&L sums in GBP (the only common currency across mixed-market positions). Falls
+  // back to currentValue for legacy rows pre-FX-fix that don't have currentValueGBP yet.
+  const totalValueGBP = positions.reduce((a: number, p: any) =>
+    a + (typeof p.currentValueGBP === 'number' ? p.currentValueGBP : (p.currentValue ?? 0)),
+  0);
+  const totalCostGBP  = positions.reduce((a: number, p: any) =>
+    a + (typeof p.costBasisGBP === 'number' ? p.costBasisGBP : (p.costBasis ?? 0)),
+  0);
   return c.json({
-    totalValue,
-    totalCost,
-    unrealisedPnL: totalValue - totalCost,
+    totalValueGBP,
+    totalCostGBP,
+    unrealisedPnLGBP: totalValueGBP - totalCostGBP,
     positions: positions.length,
   });
 });
