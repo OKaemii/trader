@@ -1,11 +1,30 @@
 'use client'
 
 import { useState, useTransition } from 'react'
-import { saveMarketDataConfig, type MarketDataConfig } from '@/app/actions/admin'
+import {
+  saveMarketDataConfig,
+  backfillMarketData,
+  clearMarketDataCache,
+  type MarketDataConfig,
+  type ProviderInfo,
+  type PollIntervalOption,
+} from '@/app/actions/admin'
 
 type BarFreq = 'daily' | 'intraday'
 
-export function MarketDataEditor({ initial }: { initial: MarketDataConfig }) {
+const TIER_STYLES: Record<PollIntervalOption['tier'], string> = {
+  intraday: 'bg-purple-900/40 border-purple-700 text-purple-200',
+  hourly:   'bg-amber-900/40  border-amber-700  text-amber-200',
+  daily:    'bg-emerald-900/40 border-emerald-700 text-emerald-200',
+}
+
+export function MarketDataEditor({
+  initial,
+  providerInfo,
+}: {
+  initial: MarketDataConfig
+  providerInfo: ProviderInfo | null
+}) {
   const [data, setData] = useState<MarketDataConfig>(initial)
   const [flash, setFlash] = useState<string | null>(null)
   const [pending, startTransition] = useTransition()
@@ -123,17 +142,47 @@ export function MarketDataEditor({ initial }: { initial: MarketDataConfig }) {
             />
             Use Helm default poll interval
           </label>
-          <input
-            type="number"
-            min={5000}
-            max={86_400_000}
-            step={1000}
-            value={pollMs}
-            disabled={pollUseDefault}
-            onChange={(e) => setPollMs(parseInt(e.target.value || '0'))}
-            className="w-48 rounded border border-gray-700 bg-gray-950 px-2 py-1 text-sm text-gray-100 disabled:opacity-50"
-          />
-          <span className="ml-2 text-xs text-gray-500">milliseconds (5_000 – 86_400_000)</span>
+          {providerInfo && providerInfo.allowedPollIntervals.length > 0 ? (
+            <div className="flex flex-wrap gap-2">
+              {providerInfo.allowedPollIntervals.map((opt) => {
+                const selected = !pollUseDefault && pollMs === opt.ms
+                return (
+                  <button
+                    key={opt.key}
+                    type="button"
+                    onClick={() => setPollMs(opt.ms)}
+                    disabled={pollUseDefault}
+                    className={`rounded border px-3 py-1.5 text-xs font-medium transition ${
+                      selected
+                        ? TIER_STYLES[opt.tier] + ' ring-2 ring-indigo-500'
+                        : TIER_STYLES[opt.tier] + ' opacity-60 hover:opacity-100'
+                    } disabled:opacity-30`}
+                  >
+                    {opt.label}
+                    <span className="ml-2 text-[10px] uppercase tracking-wide opacity-70">{opt.tier}</span>
+                  </button>
+                )
+              })}
+              <span className="self-center text-[10px] text-gray-500">
+                provider: <code>{providerInfo.name}</code> · max history{' '}
+                {Math.round(providerInfo.maxLookbackMs / 86_400_000)}d
+              </span>
+            </div>
+          ) : (
+            <>
+              <input
+                type="number"
+                min={5000}
+                max={86_400_000}
+                step={1000}
+                value={pollMs}
+                disabled={pollUseDefault}
+                onChange={(e) => setPollMs(parseInt(e.target.value || '0'))}
+                className="w-48 rounded border border-gray-700 bg-gray-950 px-2 py-1 text-sm text-gray-100 disabled:opacity-50"
+              />
+              <span className="ml-2 text-xs text-gray-500">milliseconds (5_000 – 86_400_000)</span>
+            </>
+          )}
         </div>
 
         <button
@@ -149,7 +198,138 @@ export function MarketDataEditor({ initial }: { initial: MarketDataConfig }) {
           </span>
         )}
       </section>
+
+      <HistorySection />
     </div>
+  )
+}
+
+// Backfill + clear-cache controls. Storage is always 5m; backfill pulls 5m history
+// from the active provider and upserts. Clear-cache wipes rows (with dry-run preview)
+// and is the operator path for cleaning up legacy duplicate-row state.
+function HistorySection() {
+  const [days, setDays] = useState(60)
+  const [tickers, setTickers] = useState('')
+  const [backfillMsg, setBackfillMsg] = useState<string | null>(null)
+  const [clearMsg, setClearMsg] = useState<string | null>(null)
+  const [clearInterval, setClearInterval] = useState<'all' | '5m' | '15m' | '1h' | 'daily'>('all')
+  const [pending, startTransition] = useTransition()
+
+  function runBackfill() {
+    startTransition(async () => {
+      setBackfillMsg(null)
+      const list = tickers.split(',').map((t) => t.trim()).filter(Boolean)
+      const r = await backfillMarketData(list.length > 0 ? list : null, days)
+      if (r.ok) setBackfillMsg(`Backfilled ${r.data.tickers} ticker(s), ${r.data.bars} bars upserted, ${r.data.failures} failures.`)
+      else      setBackfillMsg(`Failed (${r.status})${r.error ? ': ' + r.error : ''}.`)
+    })
+  }
+
+  function runClear(dryRun: boolean) {
+    startTransition(async () => {
+      setClearMsg(null)
+      const interval = clearInterval === 'all' ? null : clearInterval
+      const r = await clearMarketDataCache(interval, null, dryRun)
+      if (r.ok) {
+        const { dryRun: wasDry, wouldDelete, deleted } = r.data
+        setClearMsg(wasDry
+          ? `Dry run: would delete ${wouldDelete ?? 0} row(s). Click "Clear (commit)" to delete.`
+          : `Deleted ${deleted ?? 0} row(s).`)
+      } else {
+        setClearMsg(`Failed (${r.status})${r.error ? ': ' + r.error : ''}.`)
+      }
+    })
+  }
+
+  return (
+    <>
+      <section className="rounded border border-gray-800 bg-gray-900 p-4">
+        <h2 className="mb-1 text-sm font-medium text-gray-300">Backfill 5m history</h2>
+        <p className="mb-3 text-xs text-gray-500">
+          Pulls historical 5m bars from the active provider (Yahoo: 60-day cap). Bars are upserted
+          on (ticker, timestamp, &apos;5m&apos;); re-running is idempotent. Leaving Tickers empty uses the
+          active universe.
+        </p>
+
+        <div className="mb-3 flex flex-wrap items-center gap-3">
+          <label className="flex items-center gap-2 text-xs text-gray-400">
+            Days
+            <input
+              type="number"
+              min={1}
+              max={60}
+              step={1}
+              value={days}
+              onChange={(e) => setDays(parseInt(e.target.value || '60'))}
+              className="w-20 rounded border border-gray-700 bg-gray-950 px-2 py-1 text-sm text-gray-100"
+            />
+          </label>
+          <label className="flex flex-1 items-center gap-2 text-xs text-gray-400">
+            Tickers (comma-separated, optional)
+            <input
+              type="text"
+              value={tickers}
+              onChange={(e) => setTickers(e.target.value)}
+              placeholder="AAPL_US_EQ,MSFT_US_EQ"
+              className="min-w-0 flex-1 rounded border border-gray-700 bg-gray-950 px-2 py-1 text-sm text-gray-100"
+            />
+          </label>
+        </div>
+
+        <button
+          onClick={runBackfill}
+          disabled={pending}
+          className="rounded bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-500 disabled:opacity-50"
+        >
+          {pending ? 'Running…' : 'Run backfill'}
+        </button>
+        {backfillMsg && <p className="mt-2 text-xs text-gray-400">{backfillMsg}</p>}
+      </section>
+
+      <section className="rounded border border-red-900 bg-gray-900 p-4">
+        <h2 className="mb-1 text-sm font-medium text-red-300">Clear bar cache</h2>
+        <p className="mb-3 text-xs text-gray-500">
+          Wipes rows from <code>ohlcv_bars</code>. Use dry-run first to preview the count. Filtering
+          by interval lets you target just the legacy duplicate-row state (interval=daily) without
+          touching freshly backfilled 5m bars.
+        </p>
+
+        <div className="mb-3 flex items-center gap-3 text-sm">
+          <span className="text-xs text-gray-400">Interval</span>
+          {(['all', '5m', '15m', '1h', 'daily'] as const).map((opt) => (
+            <label key={opt} className="flex items-center gap-1 text-gray-200">
+              <input
+                type="radio"
+                name="clear-interval"
+                checked={clearInterval === opt}
+                onChange={() => setClearInterval(opt)}
+              />
+              {opt}
+            </label>
+          ))}
+        </div>
+
+        <div className="flex gap-2">
+          <button
+            onClick={() => runClear(true)}
+            disabled={pending}
+            className="rounded bg-gray-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-gray-600 disabled:opacity-50"
+          >
+            Dry run
+          </button>
+          <button
+            onClick={() => {
+              if (window.confirm('Permanently delete matching ohlcv_bars rows?')) runClear(false)
+            }}
+            disabled={pending}
+            className="rounded bg-red-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-600 disabled:opacity-50"
+          >
+            Clear (commit)
+          </button>
+        </div>
+        {clearMsg && <p className="mt-2 text-xs text-gray-400">{clearMsg}</p>}
+      </section>
+    </>
   )
 }
 

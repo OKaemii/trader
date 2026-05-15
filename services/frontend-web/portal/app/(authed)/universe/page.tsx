@@ -1,6 +1,7 @@
 import { getUniverseOverrides } from '@/app/actions/admin'
 import { UniverseEditor } from './UniverseEditor'
 import { UniverseOverview } from '@/components/UniverseOverview'
+import { BarHistoryExplorer } from '@/components/BarHistoryExplorer'
 
 export default async function UniversePage() {
   const result = await getUniverseOverrides()
@@ -41,6 +42,7 @@ export default async function UniversePage() {
         </p>
       </div>
       <UniverseOverview instruments={detailed} updatedAt={result.data.updatedAt} />
+      <BarHistoryExplorer tickers={result.data.activeUniverse} />
       <UniverseEditor initial={result.data} />
     </div>
   )
