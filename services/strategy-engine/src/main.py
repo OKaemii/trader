@@ -10,6 +10,7 @@ from .application.topology_strategy import TopologyStrategy
 from .application.sector_momentum_strategy import SectorMomentumStrategy
 from .application.factor_rank_strategy import FactorRankStrategy
 from .domain.dataclasses import OHLCVBar
+from .infrastructure.market_data_client import MarketDataClient
 
 STRATEGY_REGISTRY = {
     'topology_v1':        TopologyStrategy,
@@ -55,16 +56,18 @@ CONSUMER_GROUP = "strategy-engine"
 CONSUMER_NAME  = f"strategy-engine-{os.getenv('POD_NAME', 'local')}"
 
 # Shared state exposed by /status — written by process_loop, read by HTTP handlers.
+# `ticker_bars`/`ready_tickers` used to be derived from arrivals counting; now they
+# reflect Mongo-backed history. Population happens after each cycle's batch fetch.
 _engine_state: dict = {
-    "strategy":        ACTIVE_STRATEGY,
-    "rolling_window":  ROLLING_WINDOW_BARS,
-    "bars_needed":     ROLLING_WINDOW_BARS,
-    "cycles":          0,
-    "signals_emitted": 0,
-    "last_cycle_ts":   None,
-    "ticker_bars":     {},   # ticker -> bar count accumulated
-    "ready_tickers":   [],   # tickers with >= ROLLING_WINDOW_BARS bars
-    "last_signal":     None,
+    "strategy":         ACTIVE_STRATEGY,
+    "rolling_window":   ROLLING_WINDOW_BARS,
+    "bars_needed":      ROLLING_WINDOW_BARS,
+    "cycles":           0,
+    "signals_emitted":  0,
+    "last_cycle_ts":    None,
+    "active_universe":  [],   # tickers that arrived on the stream this cycle
+    "ready_tickers":    [],   # tickers with >= rolling_window bars in Mongo this cycle
+    "last_signal":      None,
 }
 
 
@@ -87,8 +90,8 @@ def list_strategies():
 def status():
     s = _engine_state
     ready   = len(s["ready_tickers"])
-    total   = len(s["ticker_bars"])
-    warming = {t: {"have": n, "need": s["bars_needed"]} for t, n in s["ticker_bars"].items() if n < s["bars_needed"]}
+    total   = len(s["active_universe"])
+    warming = [t for t in s["active_universe"] if t not in s["ready_tickers"]]
     return {
         "strategy":        s["strategy"],
         "rolling_window":  s["rolling_window"],
@@ -140,6 +143,25 @@ async def process_loop() -> None:
         raise RuntimeError(f"Unknown strategy: {ACTIVE_STRATEGY}")
     strategy = strategy_cls()
 
+    # Single client across the loop — its per-cycle cache clears on start_cycle.
+    bars_client = MarketDataClient()
+
+    # Range key the HTTP endpoint accepts. shared-bars currently supports 30d/60d/90d.
+    # 30d is enough for the 20-bar daily window with weekend/holiday margin; topology
+    # needs 30 bars so we ask for 60d there. We pick based on the strategy's declared
+    # rolling_window, falling back to 30d.
+    #
+    # TODO: guard against rolling_window > what 90d at the chosen interval can supply.
+    # Today no strategy declares one that large (factor_rank=20 daily, topology=30 daily,
+    # both fit in 60d). If someone sets BAR_FREQUENCY=intraday with ROLLING_WINDOW_BARS=60
+    # and a 15m interval, 60 bars × 15m = 15h of history — well inside 30d, so still fine.
+    # The hole is only exposed if rolling_window > ~8500 (15m bars in 90d) or > 90 (daily
+    # bars in 90d). Add an explicit assertion + expand shared-bars range keys when that
+    # becomes real.
+    needed = getattr(strategy, "rolling_window", ROLLING_WINDOW_BARS)
+    history_range = "30d" if needed <= 25 else "60d"
+    history_interval = "daily" if BAR_FREQUENCY == "daily" else "15m"
+
     # Persist regime state across pod restarts so the engine doesn't spend ~21 cycles
     # in the warm-up sentinel after every redeploy. Only strategies that expose their
     # regime engine via `regime_engine_for_persistence` participate.
@@ -167,25 +189,42 @@ async def process_loop() -> None:
                     import time as _time
                     _engine_state["cycles"] += 1
                     _engine_state["last_cycle_ts"] = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
-                    for bar in bars:
-                        _engine_state["ticker_bars"][bar.ticker] = _engine_state["ticker_bars"].get(bar.ticker, 0) + 1
-                    _engine_state["ready_tickers"] = [
-                        t for t, n in _engine_state["ticker_bars"].items() if n >= ROLLING_WINDOW_BARS
-                    ]
 
-                    output = strategy.update(bars)
+                    # Batch-fetch rolling-window history for every ticker arriving this
+                    # cycle. ONE HTTP round-trip per cycle, regardless of universe size.
+                    # market-data-service serves from its read-through Redis cache, so
+                    # the steady-state path is sub-millisecond on the strategy side.
+                    cycle_id = f"{_engine_state['cycles']}:{entry_id.decode() if isinstance(entry_id, bytes) else entry_id}"
+                    bars_client.start_cycle(cycle_id)
+                    active_tickers = sorted(set(b.ticker for b in bars))
+                    history_map = await bars_client.fetch_bars_batch(
+                        tickers=active_tickers,
+                        interval=history_interval,
+                        range_key=history_range,
+                    )
+                    # Strategy lookup: returns closes oldest-first for any ticker. Tickers
+                    # missing from history_map (e.g. brand-new universe additions before
+                    # backfill catches up) get an empty list — strategies treat that as
+                    # "skip" via their min-length check.
+                    def _lookup(t: str, _m=history_map) -> list[float]:
+                        return [b.close for b in _m.get(t, [])]
+
+                    _engine_state["active_universe"] = active_tickers
+                    _engine_state["ready_tickers"]   = [t for t in active_tickers if len(_lookup(t)) >= needed]
+
+                    output = strategy.update(bars, _lookup)
 
                     # Persist regime state out-of-band so warm-up survives restarts. The
                     # strategy.update() path is synchronous; this hook fires after each cycle.
                     if hasattr(strategy, "regime_engine_for_persistence"):
                         await strategy.regime_engine_for_persistence()._persist()
 
-                    # Log warmup progress every cycle until ready, then only on signals
+                    # Log readiness state every cycle until signals start, then only on signals
                     ready  = len(_engine_state["ready_tickers"])
-                    total  = len(_engine_state["ticker_bars"])
+                    total  = len(_engine_state["active_universe"])
                     if output is None:
-                        print(f"[strategy-engine] warming up — cycle {_engine_state['cycles']}: "
-                              f"{ready}/{total} tickers ready ({ROLLING_WINDOW_BARS} bars needed)")
+                        print(f"[strategy-engine] no signal — cycle {_engine_state['cycles']}: "
+                              f"{ready}/{total} tickers have {needed}+ bars in Mongo (min_universe={strategy.min_universe_size})")
                     else:
                         payload = json.dumps(dataclasses.asdict(output))
                         await r.xadd("signals:strategy", {"data": payload})

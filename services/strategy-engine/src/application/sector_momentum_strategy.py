@@ -1,7 +1,7 @@
 import time
 import numpy as np
 from typing import Optional
-from .base_strategy import BaseStrategy
+from .base_strategy import BaseStrategy, PriceHistoryLookup
 from .covariance import shrunk_covariance
 from .regime_engine import RegimeEngine
 from ..domain.dataclasses import OHLCVBar, StrategyOutput
@@ -16,6 +16,10 @@ class SectorMomentumStrategy(BaseStrategy):
     Ranks assets by 20-day return relative to their sector's average.
     Sector-adjusted momentum reduces the impact of broad sector rotations
     and focusses on stock-specific relative strength.
+
+    History is fetched by the engine host from Mongo via market-data-service; this
+    class is stateless across cycles (the only state it holds is sector metadata
+    and the regime engine).
     """
 
     @property
@@ -26,24 +30,30 @@ class SectorMomentumStrategy(BaseStrategy):
     def min_universe_size(self) -> int:
         return 5
 
+    @property
+    def rolling_window(self) -> int:
+        return ROLLING_WINDOW
+
     def __init__(self) -> None:
-        self._price_history: dict[str, list[float]] = {}
         self._sectors: dict[str, str] = {}
         self._regime_engine = RegimeEngine()
 
-    def update(self, bars: list[OHLCVBar]) -> Optional[StrategyOutput]:
-        for bar in bars:
-            if bar.ticker not in self._price_history:
-                self._price_history[bar.ticker] = []
-            self._price_history[bar.ticker].append(bar.close)
-            if len(self._price_history[bar.ticker]) > ROLLING_WINDOW + 2:
-                self._price_history[bar.ticker].pop(0)
-
-        tickers = [t for t, hist in self._price_history.items() if len(hist) >= ROLLING_WINDOW]
+    def update(
+        self,
+        bars: list[OHLCVBar],
+        history: PriceHistoryLookup,
+    ) -> Optional[StrategyOutput]:
+        # Tickers "active" this cycle = union of bar batch and any ticker we already
+        # have enough history for. The bar batch can be smaller than the universe
+        # (e.g. a single fresh bar per ticker per poll) but we score every ticker
+        # whose history meets the window — that's what makes the engine stateless.
+        active = set(b.ticker for b in bars)
+        candidates = {t for t in active if len(history(t)) >= ROLLING_WINDOW}
+        tickers = sorted(candidates)
         if len(tickers) < self.min_universe_size:
             return None
 
-        prices = np.array([self._price_history[t] for t in tickers])
+        prices = np.array([history(t)[-ROLLING_WINDOW - 1:] for t in tickers])
         returns = np.diff(np.log(prices), axis=1)
         if returns.shape[1] < ROLLING_WINDOW:
             return None

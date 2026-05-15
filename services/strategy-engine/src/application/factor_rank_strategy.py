@@ -3,7 +3,7 @@ import time
 import dataclasses
 import numpy as np
 from typing import Optional
-from .base_strategy import BaseStrategy
+from .base_strategy import BaseStrategy, PriceHistoryLookup
 from .covariance import shrunk_covariance
 from .regime_engine import RegimeEngine
 from .feature_stability import FeatureStabilityAnalyser
@@ -32,12 +32,17 @@ class FactorRankStrategy(BaseStrategy):
 
     LOOKBACK = ROLLING_WINDOW
 
+    @property
+    def rolling_window(self) -> int:
+        return self.LOOKBACK
+
     def __init__(self) -> None:
-        self._price_history: dict[str, list[float]] = {}
         self._sectors: dict[str, str] = {}
         self._regime_engine = RegimeEngine()
         self._stability_analyser = FeatureStabilityAnalyser()
-        # Rolling history for stability analysis: feature_name → list of cross-sectional mean values
+        # Rolling history for stability analysis: feature_name → list of cross-sectional mean values.
+        # This IS cycle-to-cycle state — it tracks how feature means evolve over time, not bars.
+        # Survives across cycles to detect drift; reset only on a pod restart.
         self._feature_history: dict[str, list[float]] = {
             'momentum': [], 'reversal': [], 'low_vol': [],
         }
@@ -54,23 +59,21 @@ class FactorRankStrategy(BaseStrategy):
     def min_universe_size(self) -> int:
         return 5
 
-    def update(self, bars: list[OHLCVBar]) -> Optional[StrategyOutput]:
-        # Accumulate price history
-        for bar in bars:
-            if bar.ticker not in self._price_history:
-                self._price_history[bar.ticker] = []
-                self._sectors[bar.ticker] = 'Unknown'
-            self._price_history[bar.ticker].append(bar.close)
-            if len(self._price_history[bar.ticker]) > self.LOOKBACK + 2:
-                self._price_history[bar.ticker].pop(0)
+    def update(
+        self,
+        bars: list[OHLCVBar],
+        history: PriceHistoryLookup,
+    ) -> Optional[StrategyOutput]:
+        active = set(b.ticker for b in bars)
+        for t in active:
+            self._sectors.setdefault(t, 'Unknown')
 
-        tickers = [t for t, hist in self._price_history.items() if len(hist) >= self.LOOKBACK]
+        tickers = sorted(t for t in active if len(history(t)) >= self.LOOKBACK)
         if len(tickers) < self.min_universe_size:
             return None
 
-        # Histories can drift to LOOKBACK..LOOKBACK+2 entries (see cap above), so slice
-        # to a uniform tail before stacking — np.array on ragged lists raises.
-        prices = np.array([self._price_history[t][-self.LOOKBACK:] for t in tickers])
+        # Take the most recent LOOKBACK closes per ticker. history() returns oldest-first.
+        prices = np.array([history(t)[-self.LOOKBACK:] for t in tickers])
         returns = np.diff(np.log(prices), axis=1)   # (n_assets, n_periods - 1)
 
         if returns.shape[1] < 2:
