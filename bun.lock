@@ -41,6 +41,14 @@
         "redis": "^4.7.0",
       },
     },
+    "packages/shared-fx": {
+      "name": "@trader/shared-fx",
+      "version": "0.0.1",
+      "dependencies": {
+        "@trader/shared-types": "*",
+        "redis": "^4.6.13",
+      },
+    },
     "packages/shared-mongo": {
       "name": "@trader/shared-mongo",
       "version": "0.0.1",
@@ -106,6 +114,7 @@
       "dependencies": {
         "@trader/shared-auth": "workspace:*",
         "@trader/shared-bars": "workspace:*",
+        "@trader/shared-fx": "workspace:*",
         "@trader/shared-mongo": "workspace:*",
         "@trader/shared-redis": "workspace:*",
         "@trader/shared-types": "workspace:*",
@@ -247,6 +256,8 @@
     "@trader/shared-bars": ["@trader/shared-bars@workspace:packages/shared-bars"],
 
     "@trader/shared-data": ["@trader/shared-data@workspace:packages/shared-data"],
+
+    "@trader/shared-fx": ["@trader/shared-fx@workspace:packages/shared-fx"],
 
     "@trader/shared-mongo": ["@trader/shared-mongo@workspace:packages/shared-mongo"],
 

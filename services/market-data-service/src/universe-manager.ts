@@ -4,8 +4,17 @@
 
 import { getMongoDb } from '@trader/shared-mongo';
 import { COLLECTIONS } from '@trader/shared-mongo';
+import type { Currency } from '@trader/shared-types';
 import { fetchT212Instruments } from './t212-client.ts';
 import { fetchYahooLiquidity } from './yahoo-client.ts';
+
+// FX converter callback; same shape as the one we pass to YahooProvider. Provided by
+// the bootstrap (index.ts) so the manager stays independent of @trader/shared-fx.
+export type FxToGBP = (amount: number, currency: Currency) => Promise<number>;
+// Identity converter — used when no FX is wired (tests, legacy fallback). Liquidity
+// ranks within a single currency stay correct; cross-currency comparisons under this
+// path are off by an FX factor.
+const IDENTITY_FX: FxToGBP = async (amount) => amount;
 
 const MAX_UNIVERSE_SIZE   = parseInt(process.env.UNIVERSE_MAX_SIZE   ?? '150');
 const INCLUDE_US          = (process.env.UNIVERSE_INCLUDE_US  ?? '').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
@@ -85,6 +94,7 @@ export function applyUniverseOverrides(
  */
 async function selectCurated(
   rawInstruments: Awaited<ReturnType<typeof fetchT212Instruments>>,
+  fxToGBP: FxToGBP,
 ): Promise<InstrumentMeta[]> {
   // Build a shortName-indexed lookup, choosing the best T212 ticker per (symbol, market).
   // T212 lists multiple cross-listings per symbol (e.g. VFEM has VFEMl_EQ, VFEMs_EQ, VFEMa_EQ);
@@ -146,8 +156,10 @@ async function selectCurated(
   }
   console.log(`[universe] curated candidates: ${candidates.length} (US: ${INCLUDE_US.length - unresolvedUS}, LSE: ${INCLUDE_LSE.length - unresolvedLSE})`);
 
-  // Yahoo liquidity rank. Candidates that fail Yahoo resolution get ADV=0 and rank last.
-  const advMap = await fetchYahooLiquidity(candidates.map((c) => c.ticker));
+  // Yahoo liquidity rank. ADV values are normalised to GBP (the base currency) so a
+  // USD-denominated $1M ADV and a GBP-denominated £1M ADV are no longer treated as
+  // equal-sized — fxToGBP applies the live rate before ranking.
+  const advMap = await fetchYahooLiquidity(candidates.map((c) => c.ticker), fxToGBP);
   for (const c of candidates) c.adv = advMap[c.ticker] ?? 0;
   candidates.sort((a, b) => (b.adv ?? 0) - (a.adv ?? 0));
 
@@ -170,6 +182,12 @@ async function selectCurated(
 export class UniverseManager {
   private _activeUniverse: string[] = [];
   private _sectorMap: Record<string, string> = {};
+
+  // Optional FX converter for liquidity ranking. Default (identity) keeps tests and
+  // any caller that doesn't supply FX working — at the cost of incorrect cross-currency
+  // ranking. Production wiring (services/market-data-service/src/index.ts) always
+  // injects the live Yahoo-backed FxClient.
+  constructor(private readonly fxToGBP: FxToGBP = IDENTITY_FX) {}
 
   /** Call once at startup, then monthly. */
   async refresh(): Promise<string[]> {
@@ -208,7 +226,7 @@ export class UniverseManager {
       // dropped — the log line reports how many. Liquidity comes from a one-shot Yahoo call
       // per candidate; ranking ensures stable selection across refreshes when the candidate
       // pool exceeds MAX_UNIVERSE_SIZE.
-      selected = await selectCurated(rawInstruments);
+      selected = await selectCurated(rawInstruments, this.fxToGBP);
     } else {
       // ── 2. Fetch OHLCV stats for Section 29b eligibility filters ─────────────
       const allTickers = instruments.map((i) => i.ticker);

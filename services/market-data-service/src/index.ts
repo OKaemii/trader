@@ -9,6 +9,7 @@ import { UniverseManager } from './universe-manager.ts';
 import { getLiveConfig } from './live-config.ts';
 import { createAdminRouter, createInternalBarsRouter } from './admin-routes.ts';
 import { YahooProvider } from './providers/yahoo-provider.ts';
+import { FxClient, YahooFxProvider } from '@trader/shared-fx';
 import { aggregateBars } from '@trader/shared-bars';
 import { backfillTickers, tickersMissingHistory, healMissingHistory } from './backfill.ts';
 import { msUntilNextTick } from './poll-scheduling.ts';
@@ -42,7 +43,10 @@ const INITIAL_POLL_MS = parseInt(process.env.POLL_INTERVAL_MS ?? String(
 ));
 const gapDetector = new GapDetector(INITIAL_POLL_MS);
 const staleDetector = new StaleDetector(INITIAL_POLL_MS * 3);
-const universeManager = new UniverseManager();
+const universeManager = new UniverseManager(async (amount, currency) => {
+  const fx = await getFxClient();
+  return fx.toGBP({ amount, currency });
+});
 
 // Each insert is an upsert on (ticker, timestamp, interval) so re-polling the same EOD
 // bar — which used to happen every 20m for the entire day and bloat the collection with
@@ -136,10 +140,24 @@ async function ensureBarIndexes(): Promise<void> {
   });
 }
 
+// FxClient: lazy-singleton, shared across the service. Backed by Yahoo GBPUSD=X with
+// 1h hot cache + 24h stale-fallback. Used here for liquidity ranking and (transitively
+// via the provider) anywhere ADV needs to be expressed in BASE_CURRENCY.
+let _fxClient: FxClient | null = null;
+async function getFxClient(): Promise<FxClient> {
+  if (_fxClient) return _fxClient;
+  const redis = await getRedisClient();
+  _fxClient = new FxClient(redis as any, new YahooFxProvider());
+  return _fxClient;
+}
+
 // Provider is swappable: pass a different MarketDataProvider here once a paid feed
 // or broker-native source is wired. The pollLoop / admin-routes / universe-manager
 // all consume the abstraction, never Yahoo-specific functions directly.
-const provider = new YahooProvider();
+const provider = new YahooProvider(async (amount, currency) => {
+  const fx = await getFxClient();
+  return fx.toGBP({ amount, currency });
+});
 
 async function pollLoop(): Promise<void> {
   const redis = await getRedisClient();

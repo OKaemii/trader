@@ -21,10 +21,11 @@ function installFetch(payload: any): { calls: FetchCall[]; restore: () => void }
   return { calls, restore: () => { globalThis.fetch = original; } };
 }
 
-function yahooPayload(timestamps: number[], closes: number[]): any {
+function yahooPayload(timestamps: number[], closes: number[], currency?: string): any {
   return {
     chart: {
       result: [{
+        ...(currency ? { meta: { currency } } : {}),
         timestamp: timestamps,
         indicators: { quote: [{
           open:   closes,
@@ -131,5 +132,50 @@ describe('YahooProvider', () => {
       console.warn = originalWarn;
     }
     expect(warnings.some((w) => w.includes('truncated'))).toBe(true);
+  });
+
+  // FX-correctness: pence quotes ('GBp' on Yahoo) must be normalised to GBP at the
+  // boundary so downstream consumers (Mongo, strategy, sizing) never see pence.
+  describe('FX normalisation', () => {
+    it('tags USD bars with currency=USD and leaves prices at face value', async () => {
+      const baseSec = Math.floor(Date.now() / 1000) - 300;
+      spy = installFetch(yahooPayload([baseSec], [250.25], 'USD'));
+      const p = new YahooProvider();
+      const bars = await p.fetchHistory('AAPL_US_EQ', baseSec * 1000);
+      expect(bars).toHaveLength(1);
+      expect(bars[0].currency).toBe('USD');
+      expect(bars[0].close).toBeCloseTo(250.25, 4);
+    });
+
+    it('scales GBp (pence) by 1/100 and tags currency=GBP', async () => {
+      const baseSec = Math.floor(Date.now() / 1000) - 300;
+      // HSBA on Yahoo quotes ~870 pence (≈£8.70). After normalisation should be 8.70 GBP.
+      spy = installFetch(yahooPayload([baseSec], [870], 'GBp'));
+      const p = new YahooProvider();
+      const bars = await p.fetchHistory('HSBAl_EQ', baseSec * 1000);
+      expect(bars).toHaveLength(1);
+      expect(bars[0].currency).toBe('GBP');
+      expect(bars[0].close).toBeCloseTo(8.70, 4);
+      expect(bars[0].open).toBeCloseTo(8.70, 4);
+      expect(bars[0].volume).toBe(1000);  // volume is share count, unaffected
+    });
+
+    it('handles GBX (alternate pence label) identically to GBp', async () => {
+      const baseSec = Math.floor(Date.now() / 1000) - 300;
+      spy = installFetch(yahooPayload([baseSec], [1234], 'GBX'));
+      const p = new YahooProvider();
+      const bars = await p.fetchHistory('XYZl_EQ', baseSec * 1000);
+      expect(bars[0].currency).toBe('GBP');
+      expect(bars[0].close).toBeCloseTo(12.34, 4);
+    });
+
+    it('omits currency tag when Yahoo returns no meta (legacy bars compat)', async () => {
+      const baseSec = Math.floor(Date.now() / 1000) - 300;
+      spy = installFetch(yahooPayload([baseSec], [100]));  // no currency field
+      const p = new YahooProvider();
+      const bars = await p.fetchHistory('UNKNOWN', baseSec * 1000);
+      expect(bars[0].currency).toBeUndefined();
+      expect(bars[0].close).toBe(100);
+    });
   });
 });

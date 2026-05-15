@@ -14,13 +14,14 @@
 //   becomes useful if a future provider raises the per-request cap below its lookback
 //   cap — kept as an internal helper for that case but unused today.
 
-import type { OHLCVBar, BarInterval, PollIntervalKey } from '@trader/shared-types';
+import type { OHLCVBar, BarInterval, Currency, PollIntervalKey } from '@trader/shared-types';
 import type { MarketDataProvider } from './market-data-provider.ts';
 import {
   fetchYahooPrices,
   fetchYahooLiquidity,
   toYahooSymbol,
   isBlacklisted,
+  normaliseYahooCurrency,
 } from '../yahoo-client.ts';
 
 const FIVE_MIN_LOOKBACK_DAYS = 60;
@@ -33,6 +34,7 @@ const YAHOO_BATCH_DELAY_MS  = 500;
 interface YahooResponse {
   chart: {
     result: Array<{
+      meta?: { currency?: string };
       timestamp: number[];
       indicators: { quote: Array<{
         open:   (number | null)[];
@@ -53,6 +55,11 @@ export class YahooProvider implements MarketDataProvider {
   // means 200 /chart calls (one per ticker), so cadences finer than 15m start brushing
   // that ceiling. We deliberately omit 10s/1m/5m here; a paid feed would add them back.
   readonly allowedPollIntervals: readonly PollIntervalKey[] = ['15m', '1h', '24h'];
+
+  // FX is injected so the provider stays free of @trader/shared-fx as a dependency
+  // direction. Universe ranking (fetchLiquidity) needs it; everything else just tags
+  // bars with their native currency and lets downstream NAV/sizing code FX-convert.
+  constructor(private readonly fxToGBP?: (amount: number, currency: Currency) => Promise<number>) {}
 
   async fetchLatest(tickers: string[], _fetchTime?: number): Promise<OHLCVBar[]> {
     // fetchYahooPrices already stamps each bar with Date.now() internally. The
@@ -90,7 +97,13 @@ export class YahooProvider implements MarketDataProvider {
   }
 
   async fetchLiquidity(tickers: string[]): Promise<Record<string, number>> {
-    return fetchYahooLiquidity(tickers);
+    if (!this.fxToGBP) {
+      // Tests + admin-route stubs build a YahooProvider() without injecting FX. In that
+      // path liquidity ranking is degraded to "ranks within currency are correct, mixing
+      // currencies will be wrong by an FX factor" — acceptable for tests.
+      return fetchYahooLiquidity(tickers, async (amount) => amount);
+    }
+    return fetchYahooLiquidity(tickers, this.fxToGBP);
   }
 
   async fetchHistory(
@@ -146,17 +159,23 @@ export class YahooProvider implements MarketDataProvider {
     const quote = result.indicators.quote?.[0];
     if (!quote) return [];
 
+    // Pence-normalisation + currency tagging at the boundary. After this point the bar
+    // is GBP/USD only — no consumer needs to know about pence.
+    const { currency, priceScale } = normaliseYahooCurrency(result.meta?.currency);
+
     const bars: OHLCVBar[] = [];
     for (let i = 0; i < result.timestamp.length; i++) {
-      const close = quote.close[i];
-      if (close == null || close <= 0) continue;
+      const rawClose = quote.close[i];
+      if (rawClose == null || rawClose <= 0) continue;
+      const close = rawClose * priceScale;
       bars.push({
         ticker,
         timestamp: result.timestamp[i] * 1000,
         interval:  HISTORY_GRANULARITY,
-        open:      quote.open[i]  ?? close,
-        high:      quote.high[i]  ?? close,
-        low:       quote.low[i]   ?? close,
+        ...(currency ? { currency } : {}),
+        open:      (quote.open[i]  ?? rawClose) * priceScale,
+        high:      (quote.high[i]  ?? rawClose) * priceScale,
+        low:       (quote.low[i]   ?? rawClose) * priceScale,
         close,
         volume:    quote.volume[i] ?? 0,
       });
