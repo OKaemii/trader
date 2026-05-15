@@ -7,6 +7,9 @@ import { MongoOrderRepository } from './MongoOrderRepository.ts';
 import { MongoPriceLookup } from './MongoPriceLookup.ts';
 import { T212OrderExecutor } from './T212OrderExecutor.ts';
 import { PlaceOrderUseCase } from '../application/use-cases/PlaceOrderUseCase.ts';
+import { getSignalOrderType } from './live-config.ts';
+import { TradingMode, OrderStatus } from '../domain/entities/Order.ts';
+import { SignalFailureReason } from '@trader/shared-types';
 
 // OrderDispatcher — the durable-queue worker. Replaces the synchronous "approve →
 // trading-service POST /internal/signals/trading/execute → T212" path that previously
@@ -46,7 +49,7 @@ export interface ClaimedSignal {
 
 export interface OrderDispatcherDeps {
   signalServiceUrl: string;
-  tradingMode:      'paper' | 'demo' | 'live';
+  tradingMode:      TradingMode;
   client:           Trading212Client;
   accountCache:     AccountCache;
   getDb:            () => Promise<Db>;
@@ -60,13 +63,8 @@ export interface OrderDispatcherDeps {
   now?:                 () => number;
 }
 
-type FailureReason =
-  | 'cash_insufficient'
-  | 'market_drift'
-  | 'queue_expired'
-  | 'broker_rejected'
-  | 'retries_exhausted'
-  | 'manual_cancel';
+// Local alias for readability — the dispatcher only mints reasons via the enum, never raw integers.
+type FailureReason = SignalFailureReason;
 
 export class OrderDispatcher {
   private readonly minIntervalMs: number;
@@ -111,23 +109,23 @@ export class OrderDispatcher {
   private async processOne(signal: ClaimedSignal): Promise<void> {
     // Skip HOLD (defensive — ApproveSignal already filters it).
     if (signal.action === 'HOLD') {
-      await this.markFailed(signal.id, 'broker_rejected', 'HOLD action cannot be placed');
+      await this.markFailed(signal.id, SignalFailureReason.BrokerRejected, 'HOLD action cannot be placed');
       return;
     }
 
     // Attempts cap. The claim already incremented attempts to N; if N > max, give up.
     if (signal.attempts > this.maxAttempts) {
-      await this.markFailed(signal.id, 'retries_exhausted', `exceeded ${this.maxAttempts} attempts`);
+      await this.markFailed(signal.id, SignalFailureReason.RetriesExhausted, `exceeded ${this.maxAttempts} attempts`);
       return;
     }
 
     // Queue TTL: if the signal sat in the queue past its freshness window, abandon it.
     if (this.now() - signal.timestamp > this.queueTtlMs) {
-      await this.markFailed(signal.id, 'queue_expired', `age=${this.now() - signal.timestamp}ms > ttl=${this.queueTtlMs}ms`);
+      await this.markFailed(signal.id, SignalFailureReason.QueueExpired, `age=${this.now() - signal.timestamp}ms > ttl=${this.queueTtlMs}ms`);
       return;
     }
 
-    if (this.deps.tradingMode === 'paper') {
+    if (this.deps.tradingMode === TradingMode.Paper) {
       // In paper mode the dispatcher still drains the queue, but never calls T212.
       // Mark signals as executed at the queue stage so notifications still fire and
       // the portal reflects "would have placed."
@@ -141,7 +139,7 @@ export class OrderDispatcher {
       snapshot = await this.deps.accountCache.get();
     } catch (err) {
       console.warn(`[order-dispatcher] account snapshot failed for ${signal.id}:`, err);
-      await this.transientFailureOrRequeue(signal, 'broker_rejected', `account fetch: ${this.errStr(err)}`);
+      await this.transientFailureOrRequeue(signal, SignalFailureReason.BrokerRejected, `account fetch: ${this.errStr(err)}`);
       return;
     }
 
@@ -157,7 +155,7 @@ export class OrderDispatcher {
       if (movement > this.drift) {
         await this.markFailed(
           signal.id,
-          'market_drift',
+          SignalFailureReason.MarketDrift,
           `entry=${signal.entryPrice.toFixed(4)} current=${currentPrice.toFixed(4)} delta=${(movement * 100).toFixed(2)}%`,
         );
         return;
@@ -180,7 +178,7 @@ export class OrderDispatcher {
 
     const executor = new T212OrderExecutor(this.deps.client);
     const liveApproved = async () => !!(await redis.get(LIVE_GATE_KEY));
-    const useCase = new PlaceOrderUseCase(orderRepo, executor, liveApproved);
+    const useCase = new PlaceOrderUseCase(orderRepo, executor, liveApproved, getSignalOrderType);
 
     try {
       const order = await useCase.execute({
@@ -198,13 +196,13 @@ export class OrderDispatcher {
         // PlaceOrderUseCase returns null for: paper mode (handled above), live gate
         // closed, negative weight, or quantity=0. In all cases, the conditions changed
         // since emission — cash_insufficient is the catch-all reason for the portal.
-        await this.markFailed(signal.id, 'cash_insufficient', 'PlaceOrderUseCase returned null (zero qty or gate closed)');
+        await this.markFailed(signal.id, SignalFailureReason.CashInsufficient, 'PlaceOrderUseCase returned null (zero qty or gate closed)');
         return;
       }
 
-      if (order.status === 'failed') {
+      if (order.status === OrderStatus.Failed) {
         // Inner T212 call threw. Decide retry vs terminal based on error shape.
-        await this.transientFailureOrRequeue(signal, 'broker_rejected', order.errorMessage ?? 'unknown broker error');
+        await this.transientFailureOrRequeue(signal, SignalFailureReason.BrokerRejected, order.errorMessage ?? 'unknown broker error');
         return;
       }
 
@@ -213,7 +211,7 @@ export class OrderDispatcher {
       this.deps.accountCache.invalidate();
     } catch (err) {
       console.warn(`[order-dispatcher] place-order threw for ${signal.id}:`, err);
-      await this.transientFailureOrRequeue(signal, 'broker_rejected', this.errStr(err));
+      await this.transientFailureOrRequeue(signal, SignalFailureReason.BrokerRejected, this.errStr(err));
     }
   }
 
@@ -224,7 +222,7 @@ export class OrderDispatcher {
       await this.requeue(signal.id);
       return;
     }
-    const reason: FailureReason = transient ? 'retries_exhausted' : terminalReason;
+    const reason: FailureReason = transient ? SignalFailureReason.RetriesExhausted : terminalReason;
     await this.markFailed(signal.id, reason, detail);
   }
 

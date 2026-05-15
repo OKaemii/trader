@@ -1,5 +1,8 @@
+// Helm passes TRADING_MODE as the enum member name ('Live'/'Demo'/'Paper'). We compare
+// against the string here rather than importing TradingMode to keep this file dependency-
+// free — it's the lowest-level infrastructure module.
 function t212Base(): string {
-  return process.env.TRADING_MODE === 'live'
+  return process.env.TRADING_MODE === 'Live'
     ? 'https://live.trading212.com/api/v0'
     : 'https://demo.trading212.com/api/v0';
 }

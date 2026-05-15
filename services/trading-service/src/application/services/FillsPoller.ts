@@ -1,5 +1,5 @@
 import { generateInternalToken } from '@trader/shared-auth';
-import type { Order } from '../../domain/entities/Order.ts';
+import { type Order, OrderSide, OrderStatus } from '../../domain/entities/Order.ts';
 import type { IOrderRepository } from '../../domain/interfaces/IOrderRepository.ts';
 import type { Trading212Client, T212HistoryItem } from '../../infrastructure/t212.ts';
 
@@ -100,9 +100,9 @@ export class FillsPoller {
       const filledAt = Date.parse(item.fill.filledAt);
       const fillPrice = item.fill.price;
       const filledQuantity = item.fill.quantity;
-      await this.orderRepo.save({ ...order, status: 'filled', filledAt, fillPrice, filledQuantity });
+      await this.orderRepo.save({ ...order, status: OrderStatus.Filled, filledAt, fillPrice, filledQuantity });
 
-      if (order.side === 'buy') {
+      if (order.side === OrderSide.Buy) {
         // Record the real fill quantity on the BUY signal so future SELLs can FIFO it.
         await this.notifyExecuted(order.signalId, filledAt, filledQuantity);
       } else {
@@ -110,13 +110,13 @@ export class FillsPoller {
         await this.notifyClosed(order.signalId, filledAt, fillPrice);
         await this.attributeSellToBuys(order.ticker, filledAt, fillPrice, filledQuantity);
       }
-      console.log(`[FillsPoller] ${order.ticker} ${order.side} t212=${order.t212OrderId} → filled ${filledQuantity} @ ${fillPrice}`);
+      console.log(`[FillsPoller] ${order.ticker} ${OrderSide[order.side]} t212=${order.t212OrderId} → filled ${filledQuantity} @ ${fillPrice}`);
       return;
     }
 
     if (status === 'CANCELLED' || status === 'REJECTED' || status === 'EXPIRED') {
-      await this.orderRepo.save({ ...order, status: 'cancelled', filledQuantity: item.order.filledQuantity });
-      console.log(`[FillsPoller] ${order.ticker} ${order.side} t212=${order.t212OrderId} → ${status.toLowerCase()}`);
+      await this.orderRepo.save({ ...order, status: OrderStatus.Cancelled, filledQuantity: item.order.filledQuantity });
+      console.log(`[FillsPoller] ${order.ticker} ${OrderSide[order.side]} t212=${order.t212OrderId} → ${status.toLowerCase()}`);
       return;
     }
 

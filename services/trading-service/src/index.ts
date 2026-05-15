@@ -3,7 +3,7 @@ import type { Db } from 'mongodb';
 import type { RedisClientType } from 'redis';
 import { requireAuth, requireRole, requireInternalToken } from '@trader/shared-auth/middleware';
 import { getMongoDb } from '@trader/shared-mongo';
-import { getRedisClient } from '@trader/shared-redis';
+import { getRedisClient, subscribe } from '@trader/shared-redis';
 import { Trading212Client } from './infrastructure/t212.ts';
 import { MongoOrderRepository } from './infrastructure/MongoOrderRepository.ts';
 import { T212OrderExecutor } from './infrastructure/T212OrderExecutor.ts';
@@ -11,8 +11,8 @@ import { PlaceOrderUseCase } from './application/use-cases/PlaceOrderUseCase.ts'
 import { FillsPoller } from './application/services/FillsPoller.ts';
 import { AccountCache } from './infrastructure/account-cache.ts';
 import { OrderDispatcher } from './infrastructure/order-dispatcher.ts';
-
-export type TradingMode = 'paper' | 'demo' | 'live';
+import { getSignalOrderType, invalidateSignalOrderType } from './infrastructure/live-config.ts';
+import { TradingMode, parseTradingMode } from './domain/entities/Order.ts';
 
 // Live-trading admin approval gate. Stored in Redis so it survives restarts (intentional:
 // prevents accidental live trading after a reboot without deliberate re-approval).
@@ -30,11 +30,16 @@ export interface AppDeps {
   accountCache?: AccountCache;
 }
 
+// Wire format for the `mode` field returned on HTTP responses — keep the member name
+// (Paper/Demo/Live) rather than the integer so the portal can render it without a
+// reverse-lookup table. The internal type is the enum.
+const modeName = (m: TradingMode) => TradingMode[m];
+
 export function buildApp(deps: AppDeps): Hono {
   const app = new Hono();
   const { tradingMode } = deps;
 
-  app.get('/health', (c) => c.json({ status: 'ok', trading_mode: tradingMode }));
+  app.get('/health', (c) => c.json({ status: 'ok', trading_mode: modeName(tradingMode) }));
 
   // Internal routes use per-route `requireInternalToken` rather than `subapp.use('*', mw)` +
   // `app.route('/', subapp)`. The subapp+wildcard pattern bleeds the middleware onto every
@@ -87,14 +92,14 @@ export function buildApp(deps: AppDeps): Hono {
 
   admin.post('/api/admin/trading/toggle', (c) => {
     return c.json({
-      mode: tradingMode,
+      mode: modeName(tradingMode),
       message: 'Change TRADING_MODE env var and redeploy to switch modes',
     });
   });
 
   admin.post('/api/admin/trading/approve-live', async (c) => {
-    if (tradingMode !== 'live') {
-      return c.json({ error: 'TRADING_MODE is not set to live — change in Helm values and redeploy first' }, 400);
+    if (tradingMode !== TradingMode.Live) {
+      return c.json({ error: 'TRADING_MODE is not set to Live — change in Helm values and redeploy first' }, 400);
     }
     const redis = await deps.getRedis();
     await redis.set(LIVE_GATE_KEY, '1');
@@ -112,7 +117,7 @@ export function buildApp(deps: AppDeps): Hono {
   admin.get('/api/admin/trading/status', async (c) => {
     const redis = await deps.getRedis();
     const approved = !!(await redis.get(LIVE_GATE_KEY));
-    return c.json({ trading_mode: tradingMode, live_gate_approved: approved });
+    return c.json({ trading_mode: modeName(tradingMode), live_gate_approved: approved });
   });
 
   admin.post('/api/admin/trading/execute', async (c) => {
@@ -134,7 +139,7 @@ export function buildApp(deps: AppDeps): Hono {
     const executor  = new T212OrderExecutor(deps.client());
     const liveApproved = async () => !!(await redis.get(LIVE_GATE_KEY));
 
-    const useCase = new PlaceOrderUseCase(orderRepo, executor, liveApproved);
+    const useCase = new PlaceOrderUseCase(orderRepo, executor, liveApproved, getSignalOrderType);
     const order   = await useCase.execute(body);
 
     if (!order) {
@@ -154,26 +159,26 @@ export function buildApp(deps: AppDeps): Hono {
   // T212 client isn't authenticated, so we return an empty payload instead of erroring —
   // the portal renders "no broker connection" rather than 500.
   admin.get('/api/admin/trading/cash', async (c) => {
-    if (tradingMode === 'paper') {
-      return c.json({ free: 0, total: 0, mode: tradingMode });
+    if (tradingMode === TradingMode.Paper) {
+      return c.json({ free: 0, total: 0, mode: modeName(tradingMode) });
     }
     try {
       const cash = await deps.client().getCash();
-      return c.json({ ...cash, mode: tradingMode });
+      return c.json({ ...cash, mode: modeName(tradingMode) });
     } catch (e) {
-      return c.json({ error: e instanceof Error ? e.message : 'cash fetch failed', mode: tradingMode }, 502);
+      return c.json({ error: e instanceof Error ? e.message : 'cash fetch failed', mode: modeName(tradingMode) }, 502);
     }
   });
 
   admin.get('/api/admin/trading/positions', async (c) => {
-    if (tradingMode === 'paper') {
-      return c.json({ positions: [], mode: tradingMode });
+    if (tradingMode === TradingMode.Paper) {
+      return c.json({ positions: [], mode: modeName(tradingMode) });
     }
     try {
       const positions = await deps.client().getPositions();
-      return c.json({ positions, mode: tradingMode });
+      return c.json({ positions, mode: modeName(tradingMode) });
     } catch (e) {
-      return c.json({ error: e instanceof Error ? e.message : 'positions fetch failed', mode: tradingMode }, 502);
+      return c.json({ error: e instanceof Error ? e.message : 'positions fetch failed', mode: modeName(tradingMode) }, 502);
     }
   });
 
@@ -181,14 +186,15 @@ export function buildApp(deps: AppDeps): Hono {
 }
 
 function productionClient(): Trading212Client {
-  const isLive = process.env.TRADING_MODE === 'live';
+  const mode = parseTradingMode(process.env.TRADING_MODE);
+  const isLive = mode === TradingMode.Live;
   const key   = isLive ? (process.env.T212_API_KEY    ?? '') : (process.env.T212_API_KEY_DEMO    ?? '');
   const keyId = isLive ? (process.env.T212_API_KEY_ID ?? '') : (process.env.T212_API_KEY_ID_DEMO ?? '');
   return new Trading212Client(key, keyId);
 }
 
 // Production wiring — only runs when this file is the process entrypoint (not when imported by tests).
-const tradingMode = (process.env.TRADING_MODE ?? 'paper') as TradingMode;
+const tradingMode = parseTradingMode(process.env.TRADING_MODE);
 
 const FILL_POLL_INTERVAL_MS = parseInt(process.env.FILL_POLL_INTERVAL_MS ?? '30000', 10);
 
@@ -219,11 +225,11 @@ const app = buildApp(productionDeps);
 
 if (import.meta.main) {
   (async () => {
-    if (tradingMode !== 'paper') {
+    if (tradingMode !== TradingMode.Paper) {
       const db = await getMongoDb();
       const orderRepo = new MongoOrderRepository(db);
       new FillsPoller(orderRepo, sharedClient, FILL_POLL_INTERVAL_MS).start();
-      console.log(`[trading-service] fills poller started (${FILL_POLL_INTERVAL_MS}ms, mode=${tradingMode})`);
+      console.log(`[trading-service] fills poller started (${FILL_POLL_INTERVAL_MS}ms, mode=${modeName(tradingMode)})`);
     }
 
     const dispatcher = new OrderDispatcher({
@@ -251,6 +257,20 @@ if (import.meta.main) {
     }
 
     dispatcher.start().catch((e) => console.error('[trading-service] dispatcher crashed:', e));
+
+    // Subscribe to portal config-invalidated pubsub so a Save in the portal drops our
+    // live-config cache within the round-trip rather than waiting up to 15s for the TTL.
+    // Topic name is hard-coded to avoid pulling a market-data-service export into a peer
+    // service — kept in sync via the comment in admin-routes.ts CONFIG_INVALIDATED_TOPIC.
+    try {
+      const redis = await getRedisClient();
+      await subscribe(redis as unknown as RedisClientType, 'config:invalidated', () => {
+        invalidateSignalOrderType();
+        console.log('[trading-service] live-config cache invalidated via pubsub');
+      });
+    } catch (err) {
+      console.warn('[trading-service] config-invalidated subscribe failed (TTL still applies):', err);
+    }
   })().catch((e) => console.error('[trading-service] bootstrap failed:', e));
 }
 

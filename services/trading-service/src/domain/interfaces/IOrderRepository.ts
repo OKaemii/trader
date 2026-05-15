@@ -5,5 +5,5 @@ export interface IOrderRepository {
   findById(id: string): Promise<Order | null>;
   findBySignalId(signalId: string): Promise<Order | null>;
   findRecent(limit: number): Promise<Order[]>;
-  findOpen(): Promise<Order[]>;   // status === 'submitted' AND has a t212OrderId
+  findOpen(): Promise<Order[]>;   // status === OrderStatus.Submitted AND has a t212OrderId
 }

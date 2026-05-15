@@ -21,6 +21,7 @@ import { buildApp, type AppDeps } from '../index.ts';
 import { AccountCache } from '../infrastructure/account-cache.ts';
 import { signAccessToken } from '@trader/shared-auth/jwt';
 import { generateInternalToken } from '@trader/shared-auth/internal-token';
+import { TradingMode } from '../domain/entities/Order.ts';
 
 // Minimal in-memory Redis stub — only the three methods the routes actually call.
 function makeRedis() {
@@ -47,7 +48,7 @@ function makeT212() {
 
 function paperDeps(): AppDeps {
   return {
-    tradingMode: 'paper',
+    tradingMode: TradingMode.Paper,
     getRedis: async () => makeRedis(),
     getDb:    async () => { throw new Error('db should not be needed in paper-mode routing tests'); },
     client:   () => makeT212(),
@@ -81,7 +82,8 @@ describe('trading-service routing', () => {
       });
       expect(res.status).toBe(200);
       const body = await res.json();
-      expect(body).toEqual({ trading_mode: 'paper', live_gate_approved: false });
+      // mode is serialised as the enum member name (TradingMode[Paper]) for portal readability.
+      expect(body).toEqual({ trading_mode: 'Paper', live_gate_approved: false });
     });
 
     it('returns 200 on /orders with an admin JWT', async () => {
