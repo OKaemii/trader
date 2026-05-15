@@ -102,10 +102,14 @@ describe('GenerateSignalsUseCase', () => {
     expect(signals.every((s) => s.action === 'BUY')).toBe(true);
   });
 
-  it('saves and publishes every emitted signal', async () => {
+  it('saves every emitted signal; publish is deferred to executed transition (policy b)', async () => {
+    // Emails now fire only on lifecycle='executed' (via the internal-router /executed
+    // callback), not at emission. GenerateSignals saves to Mongo and stops — the
+    // publisher is no longer called here. signal-service/internal/trading/signals/:id/executed
+    // owns the publish-to-TRADE_SIGNALS hop.
     const signals = await useCase.execute(baseFeatures());
     expect(repo.saved).toHaveLength(signals.length);
-    expect(publisher.published).toHaveLength(signals.length);
+    expect(publisher.published).toHaveLength(0);
   });
 
   it('all targetWeights are in [0, 1] — long-only invariant', async () => {
