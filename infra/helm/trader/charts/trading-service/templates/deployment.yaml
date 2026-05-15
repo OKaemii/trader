@@ -36,13 +36,13 @@ spec:
             - name: REDIS_URL
               value: "redis://:$(REDIS_PASSWORD)@redis-master:6379"
             - name: MONGODB_URL
-              value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb:27017/trader"
+              value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb-headless:27017/trader?authSource=trader&directConnection=true"
             - name: TRADING_MODE
-              value: {{ .Values.global.env.tradingMode | default "paper" | quote }}
+              value: {{ .Values.global.env.tradingMode | default "Paper" | quote }}
             - name: ACTIVE_STRATEGY
               value: {{ .Values.global.env.activeStrategy | default "factor_rank_v1" | quote }}
-            - name: EXECUTION_MODE
-              value: {{ .Values.global.env.executionMode | default "t212" | quote }}
+            - name: SIGNAL_ORDER_TYPE
+              value: {{ .Values.global.env.signalOrderType | default "Limit" | quote }}
             - name: FILL_POLL_INTERVAL_MS
               value: {{ .Values.global.env.fillPollIntervalMs | default "30000" | quote }}
             - name: ORDER_MIN_INTERVAL_MS

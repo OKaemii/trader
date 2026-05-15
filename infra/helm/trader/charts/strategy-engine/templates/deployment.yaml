@@ -32,10 +32,21 @@ spec:
                 secretKeyRef:
                   name: trader-secrets
                   key: INTERNAL_SECRET
+            - name: MONGODB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: MONGODB_PASSWORD
+            # Used by infrastructure/live_config.py to read portal_market_config for
+            # the bar-frequency hot-swap (via the config:invalidated pubsub). Without
+            # this, motor falls back to localhost and silently fails — engine keeps
+            # running on env defaults but loses the portal-override path.
+            - name: MONGODB_URL
+              value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb-headless:27017/trader?authSource=trader&directConnection=true"
             - name: BAR_FREQUENCY
               value: {{ .Values.global.env.barFrequency | default "daily" | quote }}
-            - name: EXECUTION_MODE
-              value: {{ .Values.global.env.executionMode | default "t212" | quote }}
+            - name: SIGNAL_ORDER_TYPE
+              value: {{ .Values.global.env.signalOrderType | default "Limit" | quote }}
             - name: ACTIVE_STRATEGY
               value: {{ .Values.global.env.activeStrategy | default "factor_rank_v1" | quote }}
           livenessProbe:

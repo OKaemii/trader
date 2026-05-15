@@ -36,9 +36,9 @@ spec:
             - name: REDIS_URL
               value: "redis://:$(REDIS_PASSWORD)@redis-master:6379"
             - name: MONGODB_URL
-              value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb:27017/trader"
+              value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb-headless:27017/trader?authSource=trader&directConnection=true"
             - name: TRADING_MODE
-              value: {{ .Values.global.env.tradingMode | default "paper" | quote }}
+              value: {{ .Values.global.env.tradingMode | default "Paper" | quote }}
             - name: ACTIVE_STRATEGY
               value: {{ .Values.global.env.activeStrategy | default "factor_rank_v1" | quote }}
           livenessProbe:
