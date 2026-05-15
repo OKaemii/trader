@@ -86,7 +86,14 @@ build_and_load() {
 
   rm -f "${tmpfile}"
   echo "--> Done: ${tag}"
+  echo "BUILD_OK ${tag}"
 }
+
+# Wrap calls so a pipefail-less caller (e.g. `./build-images.sh foo 2>&1 | tail`) still
+# sees an unmissable failure marker. The script body has `set -e` and aborts on the first
+# failing command, but stdout's last lines may not surface "ALL BUILDS COMPLETE" — the
+# `BUILD_OK <tag>` line per successful image is the source of truth.
+
 
 verify_images() {
   echo ""
