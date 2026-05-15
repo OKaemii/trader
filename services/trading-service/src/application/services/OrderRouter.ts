@@ -1,11 +1,19 @@
-export type OrderType     = 'limit' | 'market';
-export type ExecutionMode = 't212' | 'unrestricted';
-export type OrderReason   = 'signal' | 'risk_exit';
+import { OrderType } from '../../domain/entities/Order.ts';
 
+export enum OrderReason {
+  Signal,
+  RiskExit,
+}
+
+// The system has exactly two order types (see OrderType in Order.ts). For Signal
+// reasons the type comes from the portal-driven `SIGNAL_ORDER_TYPE` knob (live-config);
+// for RiskExit we always cross the spread immediately, regardless of how signals are
+// configured — sitting on a limit during a stop-loss is the failure mode this enforces
+// against.
 export class OrderRouter {
-  selectOrderType(reason: OrderReason, executionMode: ExecutionMode): OrderType {
-    if (reason === 'risk_exit') return 'market';    // urgent — fill at any price
-    if (executionMode === 't212') return 'limit';   // spread matters — limit for all signals
-    return 'market';                                 // unrestricted mode allows market orders
+  selectOrderType(reason: OrderReason, signalOrderType: OrderType): OrderType {
+    return reason === OrderReason.RiskExit ? OrderType.Market : signalOrderType;
   }
 }
+
+export { OrderType } from '../../domain/entities/Order.ts';
