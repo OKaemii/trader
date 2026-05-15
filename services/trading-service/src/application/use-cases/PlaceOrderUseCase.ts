@@ -48,8 +48,14 @@ export interface PlaceOrderInput {
   action:       'BUY' | 'SELL';
   targetWeight: number;         // [0,1] — from TradeSignal; must be >= 0 (long-only)
   confidence:   number;
-  totalNAV?:    number;         // if provided, used to compute quantity
-  currentPrice?: number;
+  // FX contract (2026-05-15): `totalNAV` and `currentPrice` MUST be expressed in the
+  // instrument's listing currency. Caller is responsible for FX-converting account-level
+  // NAV (which sits in BASE_CURRENCY = GBP) into the instrument's currency before
+  // passing — the dispatcher does this via FxClient. Mixing currencies here is the
+  // class of bug that caused 100x position-sizing errors on LSE pence-quoted stocks
+  // before pence normalisation landed.
+  totalNAV?:    number;         // instrument currency
+  currentPrice?: number;        // instrument currency (already pence-normalised at the market-data boundary)
   currentQuantity?: number;
 }
 

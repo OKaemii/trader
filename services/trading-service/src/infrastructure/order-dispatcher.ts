@@ -9,7 +9,8 @@ import { T212OrderExecutor } from './T212OrderExecutor.ts';
 import { PlaceOrderUseCase } from '../application/use-cases/PlaceOrderUseCase.ts';
 import { getSignalOrderType } from './live-config.ts';
 import { TradingMode, OrderStatus } from '../domain/entities/Order.ts';
-import { SignalFailureReason } from '@trader/shared-types';
+import { type Currency, SignalFailureReason } from '@trader/shared-types';
+import { currencyOfTicker } from './t212.ts';
 
 // OrderDispatcher — the durable-queue worker. Replaces the synchronous "approve →
 // trading-service POST /internal/signals/trading/execute → T212" path that previously
@@ -54,6 +55,11 @@ export interface OrderDispatcherDeps {
   accountCache:     AccountCache;
   getDb:            () => Promise<Db>;
   getRedis:         () => Promise<Pick<RedisClientType, 'get'>>;
+  // FX-converter for sizing orders: account NAV lives in GBP (T212 UK base) but every
+  // order quantity must be computed in the instrument's listing currency. Required for
+  // any USD-listed ticker to be sized correctly. Optional so tests can inject a no-op
+  // (e.g. identity for GBP-only fixtures).
+  fxFromGBP?:       (amount: number, target: Currency) => Promise<number>;
   // Knobs — all default-on-undefined so a partial config still boots sensibly.
   minIntervalMs?:       number;  // sleep between claims (rate limit floor)
   idleSleepMs?:         number;  // sleep when queue empty
@@ -180,6 +186,15 @@ export class OrderDispatcher {
     const liveApproved = async () => !!(await redis.get(LIVE_GATE_KEY));
     const useCase = new PlaceOrderUseCase(orderRepo, executor, liveApproved, getSignalOrderType);
 
+    // FX-convert account NAV from GBP (T212 base) into the instrument's listing
+    // currency so PlaceOrderUseCase can compute share count without unit confusion.
+    // For GBP-listed tickers this is identity; for USD-listed it's GBP / (GBP-per-USD).
+    const instrumentCcy = currencyOfTicker(signal.ticker);
+    const navGBP        = snapshot.total.amount;   // T212 cash already tagged GBP
+    const totalNAVInstr = this.deps.fxFromGBP
+      ? await this.deps.fxFromGBP(navGBP, instrumentCcy)
+      : navGBP;   // identity fallback for tests / GBP-only fixtures
+
     try {
       const order = await useCase.execute({
         signalId:        signal.id,
@@ -187,7 +202,7 @@ export class OrderDispatcher {
         action:          signal.action,
         targetWeight:    signal.targetWeight,
         confidence:      signal.confidence,
-        totalNAV:        snapshot.total,
+        totalNAV:        totalNAVInstr,
         currentPrice,
         currentQuantity,
       });

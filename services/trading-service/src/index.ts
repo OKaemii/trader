@@ -13,6 +13,8 @@ import { AccountCache } from './infrastructure/account-cache.ts';
 import { OrderDispatcher } from './infrastructure/order-dispatcher.ts';
 import { getSignalOrderType, invalidateSignalOrderType } from './infrastructure/live-config.ts';
 import { TradingMode, parseTradingMode } from './domain/entities/Order.ts';
+import { money, BASE_CURRENCY } from '@trader/shared-types';
+import { FxClient, YahooFxProvider } from '@trader/shared-fx';
 
 // Live-trading admin approval gate. Stored in Redis so it survives restarts (intentional:
 // prevents accidental live trading after a reboot without deliberate re-approval).
@@ -160,7 +162,11 @@ export function buildApp(deps: AppDeps): Hono {
   // the portal renders "no broker connection" rather than 500.
   admin.get('/api/admin/trading/cash', async (c) => {
     if (tradingMode === TradingMode.Paper) {
-      return c.json({ free: 0, total: 0, mode: modeName(tradingMode) });
+      return c.json({
+        free:  money(0, BASE_CURRENCY),
+        total: money(0, BASE_CURRENCY),
+        mode:  modeName(tradingMode),
+      });
     }
     try {
       const cash = await deps.client().getCash();
@@ -214,6 +220,16 @@ const SIGNAL_SERVICE_URL      = process.env.SIGNAL_SERVICE_URL ?? 'http://signal
 const sharedClient       = productionClient();
 const sharedAccountCache = new AccountCache(sharedClient, { ttlMs: ACCOUNT_CACHE_TTL_MS });
 
+// FxClient is lazy-singleton: built on first use against the shared Redis. Used by
+// the dispatcher to convert GBP NAV → instrument currency before sizing each order.
+let _fxClient: FxClient | null = null;
+async function getFxClient(): Promise<FxClient> {
+  if (_fxClient) return _fxClient;
+  const redis = await getRedisClient();
+  _fxClient = new FxClient(redis as any, new YahooFxProvider());
+  return _fxClient;
+}
+
 const productionDeps: AppDeps = {
   tradingMode,
   getRedis: () => getRedisClient() as unknown as Promise<Pick<RedisClientType, 'get' | 'set' | 'del'>>,
@@ -239,6 +255,7 @@ if (import.meta.main) {
       accountCache:        sharedAccountCache,
       getDb:               () => getMongoDb(),
       getRedis:            () => getRedisClient() as unknown as Promise<Pick<RedisClientType, 'get'>>,
+      fxFromGBP:           async (amount, target) => (await getFxClient()).fromGBP(amount, target),
       minIntervalMs:       ORDER_MIN_INTERVAL_MS,
       maxAttempts:         ORDER_MAX_ATTEMPTS,
       queueTtlMs:          QUEUE_TTL_MS,

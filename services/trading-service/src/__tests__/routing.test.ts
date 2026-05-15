@@ -35,9 +35,13 @@ function makeRedis() {
 
 // Trading212Client stub. Returns enough shape for /cash and /positions; the execute path
 // in paper mode short-circuits before touching it, so other methods can throw if hit.
+// Cash is Money-shaped (GBP) to match the production T212Client contract post-FX work.
 function makeT212() {
   return {
-    getCash:      async () => ({ free: 1000, total: 1000 }),
+    getCash:      async () => ({
+      free:  { amount: 1000, currency: 'GBP' as const },
+      total: { amount: 1000, currency: 'GBP' as const },
+    }),
     getPositions: async () => [] as unknown[],
     getPortfolio:    () => { throw new Error('unused in tests'); },
     placeLimitOrder: () => { throw new Error('unused in tests'); },
@@ -166,8 +170,16 @@ describe('trading-service routing', () => {
       let cashCalls = 0;
       let posCalls  = 0;
       const client = {
-        getCash:      async () => { cashCalls++; return { free: 500, total: 1500 }; },
-        getPositions: async () => { posCalls++;  return [{ ticker: 'AAPL_US_EQ', quantity: 5 }] as unknown[]; },
+        getCash:      async () => { cashCalls++; return {
+          free:  { amount: 500,  currency: 'GBP' as const },
+          total: { amount: 1500, currency: 'GBP' as const },
+        }; },
+        getPositions: async () => { posCalls++;  return [{
+          ticker: 'AAPL_US_EQ', quantity: 5,
+          averagePrice: { amount: 100, currency: 'USD' as const },
+          currentPrice: { amount: 110, currency: 'USD' as const },
+          currentValue: { amount: 550, currency: 'USD' as const },
+        }]; },
         getPortfolio:    () => { throw new Error('unused'); },
         placeLimitOrder: () => { throw new Error('unused'); },
         placeMarketOrder:() => { throw new Error('unused'); },
@@ -193,7 +205,10 @@ describe('trading-service routing', () => {
       ]);
       for (const r of results) expect(r.status).toBe(200);
       const bodies = await Promise.all(results.map((r) => r.json()));
-      for (const body of bodies) expect(body).toEqual({ free: 500, total: 1500 });
+      for (const body of bodies) expect(body).toEqual({
+        free:  { amount: 500,  currency: 'GBP' },
+        total: { amount: 1500, currency: 'GBP' },
+      });
 
       // The whole point: ONE T212 fetch despite three callers.
       expect(cc.cashCalls).toBe(1);

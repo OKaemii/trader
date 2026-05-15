@@ -1,3 +1,5 @@
+import { type Currency, type Money, money } from '@trader/shared-types';
+
 // Helm passes TRADING_MODE as the enum member name ('Live'/'Demo'/'Paper'). We compare
 // against the string here rather than importing TradingMode to keep this file dependency-
 // free — it's the lowest-level infrastructure module.
@@ -5,6 +7,30 @@ function t212Base(): string {
   return process.env.TRADING_MODE === 'Live'
     ? 'https://live.trading212.com/api/v0'
     : 'https://demo.trading212.com/api/v0';
+}
+
+// T212 quotes positions in the instrument's listing currency. We derive that from the
+// T212 ticker suffix because T212's portfolio response doesn't include currency on each
+// position. `_US_EQ` → USD, `l_EQ` (lowercase l) → GBP. Anything else falls back to GBP
+// since the account base is GBP and broker-side conversion has already happened.
+export function currencyOfTicker(ticker: string): Currency {
+  if (/_US_EQ$/.test(ticker)) return 'USD';
+  return 'GBP';
+}
+
+export interface T212Position {
+  ticker: string;
+  quantity: number;
+  averagePrice: Money;        // entry price, instrument currency
+  currentPrice: Money;        // last quote, instrument currency
+  currentValue: Money;        // currentPrice × quantity, instrument currency
+}
+
+export interface T212Cash {
+  // T212 UK accounts always report cash in GBP. We carry the currency tag explicitly
+  // so consumers don't have to remember "T212 = GBP" — the type system enforces it.
+  free: Money;
+  total: Money;
 }
 
 export class Trading212Client {
@@ -21,16 +47,33 @@ export class Trading212Client {
     return res.json();
   }
 
-  async getCash(): Promise<{ free: number; total: number }> {
+  async getCash(): Promise<T212Cash> {
     const res = await fetch(`${t212Base()}/equity/account/cash`, { headers: this.headers });
     if (!res.ok) throw new Error(`T212 cash: ${res.status}`);
-    return res.json();
+    const raw = await res.json() as { free?: number; total?: number };
+    const free  = Number(raw.free  ?? 0);
+    const total = Number(raw.total ?? raw.free ?? 0);
+    return { free: money(free, 'GBP'), total: money(total, 'GBP') };
   }
 
-  async getPositions(): Promise<unknown[]> {
+  async getPositions(): Promise<T212Position[]> {
     const res = await fetch(`${t212Base()}/equity/portfolio`, { headers: this.headers });
     if (!res.ok) throw new Error(`T212 positions: ${res.status}`);
-    return res.json();
+    const raw = await res.json() as Array<Record<string, unknown>>;
+    return (raw ?? []).map((p) => {
+      const ticker = String(p.ticker ?? '');
+      const ccy = currencyOfTicker(ticker);
+      const quantity     = Number(p.quantity ?? 0);
+      const avgPriceNum  = Number(p.averagePrice ?? 0);
+      const currPriceNum = Number(p.currentPrice ?? 0);
+      return {
+        ticker,
+        quantity,
+        averagePrice: money(avgPriceNum, ccy),
+        currentPrice: money(currPriceNum, ccy),
+        currentValue: money(currPriceNum * quantity, ccy),
+      };
+    });
   }
 
   async placeMarketOrder(ticker: string, quantity: number): Promise<{ orderId: string }> {
