@@ -1,4 +1,4 @@
-import type { OHLCVBar, BarInterval } from '@trader/shared-types';
+import type { OHLCVBar, BarInterval, Currency } from '@trader/shared-types';
 
 interface YahooQuote {
   open: (number | null)[];
@@ -8,9 +8,17 @@ interface YahooQuote {
   volume: (number | null)[];
 }
 
+// Yahoo's response carries metadata we need for currency tagging. We model only the
+// bits we actually consume; missing fields fall through to a conservative default.
+interface YahooMeta {
+  currency?: string;     // 'GBP' | 'GBp' | 'GBX' | 'USD' | …
+  exchangeName?: string;
+}
+
 interface YahooResponse {
   chart: {
     result: Array<{
+      meta?: YahooMeta;
       timestamp: number[];
       indicators: {
         quote: YahooQuote[];
@@ -18,6 +26,28 @@ interface YahooResponse {
     }> | null;
     error: unknown;
   };
+}
+
+// Pence ('GBp' on Yahoo, sometimes 'GBX' on other feeds) is killed at the boundary:
+// we divide every price field by 100 and persist the bar as GBP. After this point in
+// the system, currency is strictly 'GBP' or 'USD' — pence does not exist.
+//
+// Returns:
+//   - normalised currency (always 'GBP' / 'USD' / null)
+//   - scale factor to multiply prices by (1.0 for GBP/USD, 0.01 for pence)
+export function normaliseYahooCurrency(raw: string | undefined): {
+  currency: Currency | null;
+  priceScale: number;
+} {
+  if (!raw) return { currency: null, priceScale: 1 };
+  // Pence FIRST (case-sensitive): Yahoo's 'GBp' uppercases to 'GBP' and would otherwise
+  // be misclassified as already-pounds. The two flavours we've seen are 'GBp' (Yahoo)
+  // and 'GBX' (alternate market data vendors); both mean "divide by 100".
+  if (raw === 'GBp' || raw === 'GBX' || raw === 'gbx') return { currency: 'GBP', priceScale: 0.01 };
+  const c = raw.toUpperCase();
+  if (c === 'GBP') return { currency: 'GBP', priceScale: 1 };
+  if (c === 'USD') return { currency: 'USD', priceScale: 1 };
+  return { currency: null, priceScale: 1 };
 }
 
 const BATCH_SIZE = 20;
@@ -229,15 +259,25 @@ function extractOHLCV(
     );
   }
 
-  const close = quote.close[i]!;
-  const open = quote.open[i] ?? close;
-  const high = quote.high[i] ?? close;
-  const low = quote.low[i] ?? close;
+  const rawClose = quote.close[i]!;
+  const rawOpen = quote.open[i] ?? rawClose;
+  const rawHigh = quote.high[i] ?? rawClose;
+  const rawLow = quote.low[i] ?? rawClose;
   const volume = quote.volume[i] ?? 0;
+
+  // Currency normalisation + pence kill-switch. LSE listings frequently quote in GBp
+  // (pence); after this scale-down they're indistinguishable from GBP-quoted assets
+  // downstream — including in the Mongo `ohlcv_bars` rows.
+  const { currency, priceScale } = normaliseYahooCurrency(result.meta?.currency);
+  const close = rawClose * priceScale;
+  const open  = rawOpen  * priceScale;
+  const high  = rawHigh  * priceScale;
+  const low   = rawLow   * priceScale;
 
   return {
     ticker,
     timestamp: fetchTime,
+    ...(currency ? { currency } : {}),
     open,
     high,
     low,
@@ -339,16 +379,23 @@ async function fetchWithFallbacks(
 }
 
 /**
- * Compute the 5-day average dollar volume per T212 ticker. Used by UniverseManager to
- * rank curated candidate pools (S&P 100 + FTSE 100) by liquidity before applying the
- * top-N cap. Re-uses fetchWithFallbacks so suffix resolution is identical to price polling.
- * Returns 0 for any ticker Yahoo can't resolve — caller treats 0 as "skip".
+ * Compute the 5-day average daily volume per T212 ticker, denominated in BASE_CURRENCY
+ * (GBP). Used by UniverseManager to rank curated candidate pools (S&P 100 + FTSE 100)
+ * by liquidity before applying the top-N cap.
  *
- * Reuses the same /chart endpoint and 5d range fetchYahooChart already requests; we just
- * average over the returned series instead of taking the last valid bar.
+ * FX-correctness:
+ *   - LSE pence quotes are scaled to GBP at the boundary via normaliseYahooCurrency.
+ *   - USD price × volume (USD-denominated) is converted to GBP via the supplied fxToGBP.
+ *   - Tickers with unknown currency (no Yahoo meta) default to whatever face value
+ *     they had — this is rare and only affects pre-existing oddballs; they rank as if
+ *     in base currency, which can over- or under-rank by a single FX factor.
+ *
+ * fxToGBP is injected to keep this module independent of @trader/shared-fx (and to
+ * make the test path mockable). Caller passes (amount, currency) → GBP amount.
  */
 export async function fetchYahooLiquidity(
   t212Tickers: string[],
+  fxToGBP: (amount: number, currency: Currency) => Promise<number>,
 ): Promise<Record<string, number>> {
   const out: Record<string, number> = {};
   for (let i = 0; i < t212Tickers.length; i += BATCH_SIZE) {
@@ -363,17 +410,29 @@ export async function fetchYahooLiquidity(
         const result = chart.chart?.result?.[0];
         const quote = result?.indicators?.quote?.[0];
         if (!result || !quote) return { ticker, adv: 0 };
-        let sum = 0;
+        const { currency, priceScale } = normaliseYahooCurrency(result.meta?.currency);
+
+        let sumNative = 0;
         let count = 0;
         for (let k = 0; k < result.timestamp.length; k++) {
           const c = quote.close[k];
           const v = quote.volume[k];
           if (c != null && c > 0 && v != null && v > 0) {
-            sum += c * v;
+            // Pence-normalised price × native-share count = native-currency notional.
+            sumNative += (c * priceScale) * v;
             count++;
           }
         }
-        return { ticker, adv: count > 0 ? sum / count : 0 };
+        if (count === 0) return { ticker, adv: 0 };
+        const advNative = sumNative / count;
+
+        // Convert to GBP base. If we couldn't identify a currency (legacy / weird
+        // listing), pass through as-is — the alternative (assuming USD or GBP) would
+        // mis-rank by a constant factor.
+        const advGBP = currency
+          ? await fxToGBP(advNative, currency)
+          : advNative;
+        return { ticker, adv: advGBP };
       }),
     );
     for (const r of results) {
