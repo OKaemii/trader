@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useTransition } from 'react'
+import { useEffect, useState, useTransition } from 'react'
 import {
   saveMarketDataConfig,
   backfillMarketData,
@@ -9,6 +9,7 @@ import {
   type ProviderInfo,
   type PollIntervalOption,
 } from '@/app/actions/admin'
+import { OrderType } from '@/types/trader'
 
 type BarFreq = 'daily' | 'intraday'
 
@@ -16,6 +17,23 @@ const TIER_STYLES: Record<PollIntervalOption['tier'], string> = {
   intraday: 'bg-purple-900/40 border-purple-700 text-purple-200',
   hourly:   'bg-amber-900/40  border-amber-700  text-amber-200',
   daily:    'bg-emerald-900/40 border-emerald-700 text-emerald-200',
+}
+
+// 'default' = no override; OrderType.Limit/Market = explicit override. We can't put
+// 'default' inside the OrderType enum (it isn't a real order type), so the union below
+// keeps the sentinel separate from the wire-format integer.
+type ExecChoice = 'default' | OrderType
+
+// Render labels for the radio. Limit = T212-friendly (low rate-limit churn); Market
+// crosses the spread for immediate fills.
+function execLabel(c: ExecChoice): string {
+  if (c === 'default') return 'Use Helm default'
+  if (c === OrderType.Limit)  return 'Limit (T212-friendly)'
+  return 'Market (immediate fill)'
+}
+
+function orderTypeName(t: OrderType): string {
+  return OrderType[t]   // 'Limit' / 'Market'
 }
 
 export function MarketDataEditor({
@@ -36,6 +54,27 @@ export function MarketDataEditor({
   const [pollMs, setPollMs] = useState<number>(
     initial.override.pollIntervalMs ?? initial.defaults.pollIntervalMs,
   )
+  const [execChoice, setExecChoice] = useState<ExecChoice>(
+    initial.override.signalOrderType ?? 'default',
+  )
+  // Touched-flag so the auto-pair only fires when the user hasn't already expressed a
+  // preference. Without this the radio would snap back every time the user toggled bar
+  // frequency, which is surprising.
+  const [execTouched, setExecTouched] = useState(false)
+
+  // Auto-suggest: intraday pairs with Market orders (no time to wait on limit fills).
+  // Daily pairs with Limit (cheaper on the spread). We only nudge when the operator
+  // hasn't explicitly touched the execution radio.
+  useEffect(() => {
+    if (execTouched) return
+    if (barChoice === 'intraday' && execChoice !== OrderType.Market) {
+      setExecChoice(OrderType.Market)
+    } else if (barChoice === 'daily' && execChoice === OrderType.Market) {
+      setExecChoice(OrderType.Limit)
+    } else if (barChoice === 'default' && execChoice !== 'default') {
+      setExecChoice('default')
+    }
+  }, [barChoice, execChoice, execTouched])
 
   function onSave() {
     startTransition(async () => {
@@ -43,14 +82,20 @@ export function MarketDataEditor({
       const r = await saveMarketDataConfig(
         barChoice === 'default' ? null : barChoice,
         pollUseDefault ? null : pollMs,
+        execChoice === 'default' ? null : execChoice,
       )
       if (r.ok) {
-        setFlash('Saved. Effective on next poll iteration.')
+        setFlash(
+          execChoice === 'default'
+            ? 'Saved. Effective on next poll iteration.'
+            : `Saved. trading-service picks up signal order type = ${orderTypeName(execChoice)} on the next order; strategy-engine self-restarts (~10s) if bar frequency changed.`,
+        )
         setData((d) => ({
           ...d,
           override: {
-            barFrequency: barChoice === 'default' ? null : barChoice,
-            pollIntervalMs: pollUseDefault ? null : pollMs,
+            barFrequency:    barChoice === 'default'  ? null : barChoice,
+            pollIntervalMs:  pollUseDefault ? null : pollMs,
+            signalOrderType: execChoice === 'default' ? null : execChoice,
           },
           updatedAt: new Date().toISOString(),
         }))
@@ -60,7 +105,8 @@ export function MarketDataEditor({
     })
   }
 
-  const intradayWarning = barChoice === 'intraday'
+  const effectiveExec: OrderType = execChoice === 'default' ? data.defaults.signalOrderType : execChoice
+  const intradayNeedsMarket = barChoice === 'intraday' && effectiveExec !== OrderType.Market
 
   return (
     <div className="space-y-6 p-6">
@@ -89,6 +135,7 @@ export function MarketDataEditor({
                 ? `${data.override.pollIntervalMs} ms`
                 : '— (default)',
             ],
+            ['Signal order type', data.override.signalOrderType == null ? '— (default)' : orderTypeName(data.override.signalOrderType)],
           ]}
         />
         <InfoCard
@@ -96,6 +143,7 @@ export function MarketDataEditor({
           rows={[
             ['Bar frequency', data.effective.barFrequency],
             ['Poll interval', `${data.effective.pollIntervalMs} ms`],
+            ['Signal order type', orderTypeName(data.effective.signalOrderType)],
           ]}
         />
         <InfoCard
@@ -103,6 +151,7 @@ export function MarketDataEditor({
           rows={[
             ['Bar frequency', data.defaults.barFrequency],
             ['Poll interval', `${data.defaults.pollIntervalMs} ms`],
+            ['Signal order type', orderTypeName(data.defaults.signalOrderType)],
           ]}
         />
       </div>
@@ -125,10 +174,38 @@ export function MarketDataEditor({
               </label>
             ))}
           </div>
-          {intradayWarning && (
+          <p className="mt-2 text-xs text-gray-500">
+            Saving propagates live: market-data-service picks up the new poll cadence and bar
+            granularity on the next iteration; trading-service swaps order routing per the
+            execution mode below; strategy-engine self-restarts (~10s) if bar frequency changed,
+            so its rolling-window constant (20 daily → 60 intraday) is recomputed with the new env.
+          </p>
+        </div>
+
+        <div className="mb-4">
+          <div className="mb-1 text-xs text-gray-400">Signal order type (trading-service)</div>
+          <div className="flex gap-3 text-sm">
+            {(['default', OrderType.Limit, OrderType.Market] as const).map((opt) => (
+              <label key={opt} className="flex items-center gap-2 text-gray-200">
+                <input
+                  type="radio"
+                  name="exec"
+                  checked={execChoice === opt}
+                  onChange={() => { setExecChoice(opt); setExecTouched(true) }}
+                />
+                {execLabel(opt)}
+              </label>
+            ))}
+          </div>
+          <p className="mt-1 text-[11px] text-gray-500">
+            <strong>Limit</strong> = priced at last close, kinder on T212's rate limit, can sit unfilled while price drifts.
+            <strong> Market</strong> = crosses the spread immediately, no fill delay.
+            Risk-exits always use Market regardless of this setting. Trading-service reads this live (15s cache; portal save invalidates immediately).
+          </p>
+          {intradayNeedsMarket && (
             <div className="mt-2 rounded border border-amber-900 bg-amber-950 px-3 py-2 text-xs text-amber-300">
-              Intraday mode requires <code>EXECUTION_MODE=unrestricted</code> on strategy-engine.
-              The override will be saved, but strategy/signal services must be configured separately.
+              Intraday bar frequency pairs with Market orders — signals firing every 15m can't wait
+              on limit fills. The current selection still uses Limit; consider switching above.
             </div>
           )}
         </div>

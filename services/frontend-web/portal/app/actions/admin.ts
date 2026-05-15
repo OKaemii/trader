@@ -20,10 +20,25 @@ export interface UniverseOverrides {
   updatedAt: string | null
 }
 
+import type { OrderType } from '@/types/trader'
+
 export interface MarketDataConfig {
-  override: { barFrequency: 'daily' | 'intraday' | null; pollIntervalMs: number | null }
-  effective: { barFrequency: 'daily' | 'intraday'; pollIntervalMs: number }
-  defaults: { barFrequency: 'daily' | 'intraday'; pollIntervalMs: number }
+  override: {
+    barFrequency: 'daily' | 'intraday' | null
+    pollIntervalMs: number | null
+    // Numeric enum value (0 = Limit, 1 = Market). null = no override, use Helm default.
+    signalOrderType: OrderType | null
+  }
+  effective: {
+    barFrequency: 'daily' | 'intraday'
+    pollIntervalMs: number
+    signalOrderType: OrderType
+  }
+  defaults: {
+    barFrequency: 'daily' | 'intraday'
+    pollIntervalMs: number
+    signalOrderType: OrderType
+  }
   updatedBy: string | null
   updatedAt: string | null
 }
@@ -95,11 +110,12 @@ export async function getMarketDataProviderInfo(): Promise<
 export async function saveMarketDataConfig(
   barFrequency: 'daily' | 'intraday' | null,
   pollIntervalMs: number | null,
+  signalOrderType: OrderType | null,
 ): Promise<{ ok: boolean; status: number; error?: string }> {
   const r = await authedFetch('/api/admin/market-data/config', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ barFrequency, pollIntervalMs }),
+    body: JSON.stringify({ barFrequency, pollIntervalMs, signalOrderType }),
   })
   if (r.ok) {
     revalidatePath('/market-data')
