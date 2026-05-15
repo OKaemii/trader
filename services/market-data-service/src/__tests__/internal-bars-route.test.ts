@@ -165,3 +165,29 @@ describe('POST /internal/bars (batch)', () => {
     expect(body.range).toBe('30d');
   });
 });
+
+// Regression: when both routers are mounted on the same app (production wiring in
+// services/market-data-service/src/index.ts), the admin router's path-scoped middleware
+// MUST NOT bleed onto the internal-bars routes. A previous version used `r.use('*', mw)`
+// on the admin subapp, which Hono propagates to every later-registered route on the
+// PARENT app — making /internal/bars 403 because it expected caller='strategy-engine' but
+// the bled middleware demanded caller='api-gateway'. This test fails if that pattern returns.
+describe('admin + internal-bars on the same app (mounting regression)', () => {
+  it('strategy-engine token is accepted on /internal/bars when both routers are mounted', async () => {
+    const { createAdminRouter } = await import('../admin-routes.ts');
+    const { YahooProvider } = await import('../providers/yahoo-provider.ts');
+    const stubUM: any = { activeTickers: [], sectorMap: {}, refresh: async () => [] };
+
+    const app = new Hono();
+    // Admin first, then internal — same order as production wiring (index.ts).
+    app.route('/', createAdminRouter(stubUM, new YahooProvider()));
+    app.route('/', createInternalBarsRouter());
+
+    const res = await app.request('/internal/bars', {
+      method: 'POST',
+      headers: { 'X-Internal-Token': strategyToken(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tickers: [] }),
+    });
+    expect(res.status).toBe(200);
+  });
+});
