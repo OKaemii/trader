@@ -132,3 +132,4 @@ kubectl
 tmp/
 temp/
 .cache/
+mongo-backup-*/
