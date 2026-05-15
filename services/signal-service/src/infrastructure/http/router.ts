@@ -4,6 +4,7 @@ import type { ApproveSignalUseCase } from '../../application/use-cases/ApproveSi
 import type { GetSignalProgressUseCase } from '../../application/use-cases/GetSignalProgress.ts';
 import type { AutoApprovalGate } from '../../application/services/AutoApprovalGate.ts';
 import type { ISignalRepository } from '../../domain/interfaces/ISignalRepository.ts';
+import { SignalLifecycle, SignalFailureReason } from '@trader/shared-types';
 
 interface Deps {
   findRecent: { execute: (limit: number) => Promise<unknown[]> };
@@ -64,24 +65,26 @@ export function createRouter(deps: Deps): Hono {
     const id = c.req.param('id');
     const signal = await deps.signalRepo.findById(id);
     if (!signal) return c.json({ error: 'not found' }, 404);
-    if (signal.lifecycle !== 'failed') {
-      return c.json({ error: `cannot retry signal in lifecycle=${signal.lifecycle}` }, 400);
+    if (signal.lifecycle !== SignalLifecycle.Failed) {
+      return c.json({ error: `cannot retry signal in lifecycle=${SignalLifecycle[signal.lifecycle]}` }, 400);
     }
     await deps.signalRepo.retry(id);
-    return c.json({ id, lifecycle: 'queued', attempts: 0 });
+    return c.json({ id, lifecycle: SignalLifecycle.Queued, attempts: 0 });
   });
 
-  // Cancel a queued / executing signal: transitions to failed/manual_cancel. The strategy
+  // Cancel a queued / executing signal: transitions to Failed/ManualCancel. The strategy
   // treats it as if it never happened (no entry in the FIFO BUY ledger).
   router.post('/api/admin/signals/cancel/:id', requireRole('admin'), async (c) => {
     const id = c.req.param('id');
     const signal = await deps.signalRepo.findById(id);
     if (!signal) return c.json({ error: 'not found' }, 404);
-    if (signal.lifecycle !== 'queued' && signal.lifecycle !== 'executing' && signal.lifecycle !== 'approved') {
-      return c.json({ error: `cannot cancel signal in lifecycle=${signal.lifecycle}` }, 400);
+    if (signal.lifecycle !== SignalLifecycle.Queued
+      && signal.lifecycle !== SignalLifecycle.Executing
+      && signal.lifecycle !== SignalLifecycle.Approved) {
+      return c.json({ error: `cannot cancel signal in lifecycle=${SignalLifecycle[signal.lifecycle]}` }, 400);
     }
-    await deps.signalRepo.markFailed(id, 'manual_cancel', 'cancelled by admin from portal');
-    return c.json({ id, lifecycle: 'failed', reason: 'manual_cancel' });
+    await deps.signalRepo.markFailed(id, SignalFailureReason.ManualCancel, 'cancelled by admin from portal');
+    return c.json({ id, lifecycle: SignalLifecycle.Failed, reason: SignalFailureReason.ManualCancel });
   });
 
   return router;

@@ -6,7 +6,7 @@ import type { ISignalPublisher } from '../domain/interfaces/ISignalPublisher.ts'
 import type { IPortfolioState } from '../domain/interfaces/IPortfolioState.ts';
 import type { IPriceLookup } from '../domain/interfaces/IPriceLookup.ts';
 import type { RiskEngine } from '../application/services/RiskEngine.ts';
-import type { StrategyOutput } from '@trader/shared-types';
+import { SignalLifecycle, type StrategyOutput } from '@trader/shared-types';
 
 // ── Mocks ─────────────────────────────────────────────────────────────────────
 
@@ -230,7 +230,7 @@ describe('GenerateSignalsUseCase', () => {
 
   it('emitted signals start with lifecycle="pending"', async () => {
     const signals = await useCase.execute(baseFeatures());
-    for (const s of signals) expect(s.lifecycle).toBe('pending');
+    for (const s of signals) expect(s.lifecycle).toBe(SignalLifecycle.Pending);
   });
 });
 

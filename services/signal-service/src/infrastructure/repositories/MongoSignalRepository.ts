@@ -1,6 +1,6 @@
 import type { Collection } from 'mongodb';
 import type { ISignalRepository } from '../../domain/interfaces/ISignalRepository.ts';
-import { TradeSignal, type SignalFailureReason, type SignalLifecycle } from '../../domain/entities/TradeSignal.ts';
+import { TradeSignal, SignalFailureReason, SignalLifecycle } from '../../domain/entities/TradeSignal.ts';
 import type { IDataManager } from '@trader/shared-data/interfaces/IDataManager';
 import type { ICache } from '@trader/shared-data/interfaces/ICache';
 import type { ICacheInvalidationBus } from '@trader/shared-data/interfaces/ICacheInvalidationBus';
@@ -35,7 +35,7 @@ export class MongoSignalRepository implements ISignalRepository {
     await this.manager.update(id, {
       approved: true,
       approvedAt: new Date(),
-      lifecycle: 'approved',
+      lifecycle: SignalLifecycle.Approved,
     });
     await this.invalidate(id);
   }
@@ -43,7 +43,7 @@ export class MongoSignalRepository implements ISignalRepository {
   async markExecuted(id: string, at: number, executedQuantity?: number): Promise<void> {
     const changes: Record<string, unknown> = {
       executedAt: new Date(at),
-      lifecycle: 'executed',
+      lifecycle: SignalLifecycle.Executed,
     };
     if (typeof executedQuantity === 'number') changes.executedQuantity = executedQuantity;
     await this.manager.update(id, changes);
@@ -54,14 +54,14 @@ export class MongoSignalRepository implements ISignalRepository {
     await this.manager.update(id, {
       closedAt: new Date(at),
       exitPrice,
-      lifecycle: 'closed',
+      lifecycle: SignalLifecycle.Closed,
     });
     await this.invalidate(id);
   }
 
   async findOpenBuysByTicker(ticker: string): Promise<TradeSignal[]> {
     return this.manager.findMany({
-      filter: { ticker, action: 'BUY', lifecycle: 'executed' },
+      filter: { ticker, action: 'BUY', lifecycle: SignalLifecycle.Executed },
       sortBy: 'executedAt',
       sortDir: 'asc',
       limit: 200,
@@ -84,7 +84,7 @@ export class MongoSignalRepository implements ISignalRepository {
   }
 
   async markQueued(id: string): Promise<void> {
-    await this.manager.update(id, { lifecycle: 'queued' });
+    await this.manager.update(id, { lifecycle: SignalLifecycle.Queued });
     await this.invalidate(id);
   }
 
@@ -95,9 +95,9 @@ export class MongoSignalRepository implements ISignalRepository {
     // so retry exhaustion is counted correctly even if a worker dies mid-call.
     const now = new Date();
     const res = await this.collection.findOneAndUpdate(
-      { lifecycle: 'queued' },
+      { lifecycle: SignalLifecycle.Queued },
       {
-        $set: { lifecycle: 'executing', lastAttemptAt: now },
+        $set: { lifecycle: SignalLifecycle.Executing, lastAttemptAt: now },
         $inc: { attempts: 1 },
       },
       { sort: { timestamp: 1 }, returnDocument: 'after' },
@@ -110,13 +110,13 @@ export class MongoSignalRepository implements ISignalRepository {
   }
 
   async requeue(id: string): Promise<void> {
-    await this.manager.update(id, { lifecycle: 'queued' });
+    await this.manager.update(id, { lifecycle: SignalLifecycle.Queued });
     await this.invalidate(id);
   }
 
   async markFailed(id: string, reason: SignalFailureReason, detail?: string): Promise<void> {
     const changes: Record<string, unknown> = {
-      lifecycle: 'failed',
+      lifecycle: SignalLifecycle.Failed,
       failureReason: reason,
     };
     if (detail) changes.failureDetail = detail;
@@ -126,7 +126,7 @@ export class MongoSignalRepository implements ISignalRepository {
 
   async retry(id: string): Promise<void> {
     await this.manager.update(id, {
-      lifecycle: 'queued',
+      lifecycle: SignalLifecycle.Queued,
       attempts: 0,
       failureReason: null,
       failureDetail: null,
@@ -138,8 +138,8 @@ export class MongoSignalRepository implements ISignalRepository {
     if (!this.collection) throw new Error('sweepStaleExecuting requires raw collection handle');
     const cutoff = new Date(Date.now() - thresholdMs);
     const res = await this.collection.updateMany(
-      { lifecycle: 'executing', lastAttemptAt: { $lt: cutoff } },
-      { $set: { lifecycle: 'queued' } },
+      { lifecycle: SignalLifecycle.Executing, lastAttemptAt: { $lt: cutoff } },
+      { $set: { lifecycle: SignalLifecycle.Queued } },
     );
     // Cache invalidation is best-effort: a wildcard publish notifies subscribers to drop
     // their per-id entries. The dispatcher reads via claimNextQueued which goes direct to

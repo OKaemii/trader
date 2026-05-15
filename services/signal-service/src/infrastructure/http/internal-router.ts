@@ -4,6 +4,7 @@ import type { ApproveSignalUseCase } from '../../application/use-cases/ApproveSi
 import type { RiskEngine } from '../../application/services/RiskEngine.ts';
 import type { ISignalRepository } from '../../domain/interfaces/ISignalRepository.ts';
 import type { ISignalPublisher } from '../../domain/interfaces/ISignalPublisher.ts';
+import { SignalLifecycle, SignalFailureReason } from '@trader/shared-types';
 
 interface Deps {
   findRecent: { execute: (limit: number) => Promise<unknown[]> };
@@ -114,7 +115,7 @@ export function createInternalRouter(deps: Deps): Hono {
     async (c) => {
       const id = c.req.param('id');
       await deps.signalRepo.requeue(id);
-      return c.json({ id, lifecycle: 'queued' });
+      return c.json({ id, lifecycle: SignalLifecycle.Queued });
     },
   );
 
@@ -123,11 +124,15 @@ export function createInternalRouter(deps: Deps): Hono {
     requireInternalToken('trading-service'),
     async (c) => {
       const id = c.req.param('id');
-      const body = await c.req.json<{ reason: string; detail?: string }>();
-      // Cast — the type narrowing happens at the repository level since the union is
-      // defined in shared-types and the body is unvalidated wire data.
-      await deps.signalRepo.markFailed(id, body.reason as any, body.detail);
-      return c.json({ id, lifecycle: 'failed', reason: body.reason });
+      const body = await c.req.json<{ reason: number; detail?: string }>();
+      // Reason arrives as the integer enum value (caller sends SignalFailureReason.X). We
+      // validate range so a malformed body can't silently set an out-of-enum reason.
+      const reason = body.reason;
+      if (typeof reason !== 'number' || SignalFailureReason[reason] === undefined) {
+        return c.json({ error: `invalid reason (expected SignalFailureReason enum integer)` }, 400);
+      }
+      await deps.signalRepo.markFailed(id, reason, body.detail);
+      return c.json({ id, lifecycle: SignalLifecycle.Failed, reason });
     },
   );
 

@@ -14,6 +14,7 @@ import { describe, it, expect } from 'bun:test';
 import { MongoSignalRepository } from '../infrastructure/repositories/MongoSignalRepository.ts';
 import { TradeSignal } from '../domain/entities/TradeSignal.ts';
 import { toSignalDoc } from '../infrastructure/data.ts';
+import { SignalLifecycle, SignalFailureReason } from '@trader/shared-types';
 
 // Minimal in-memory IDataManager + invalidation bus + cache stubs.
 
@@ -97,11 +98,11 @@ class MemCollection {
   }
 }
 
-function makeSignal(id: string, ts: number, lifecycle = 'queued', attempts = 0): TradeSignal {
+function makeSignal(id: string, ts: number, lifecycle: SignalLifecycle = SignalLifecycle.Queued, attempts = 0): TradeSignal {
   return new TradeSignal({
     id, timestamp: ts, ticker: 'AAPL_US_EQ', strategy_id: 'test',
     action: 'BUY', confidence: 0.5, targetWeight: 0.01, rationale: '{}',
-    lifecycle: lifecycle as any, attempts,
+    lifecycle, attempts,
   });
 }
 
@@ -128,25 +129,25 @@ describe('MongoSignalRepository queue methods', () => {
     await manager.insert(makeSignal('c', 300));
     const got = await repo.claimNextQueued();
     expect(got?.id).toBe('b');
-    expect(manager.rows.get('b').lifecycle).toBe('executing');
+    expect(manager.rows.get('b').lifecycle).toBe(SignalLifecycle.Executing);
     expect(manager.rows.get('b').attempts).toBe(1);
   });
 
   it('markFailed records reason + detail', async () => {
     const { repo, manager } = wire();
     await manager.insert(makeSignal('x', 1));
-    await repo.markFailed('x', 'market_drift', 'delta=2.5%');
-    expect(manager.rows.get('x').lifecycle).toBe('failed');
-    expect(manager.rows.get('x').failureReason).toBe('market_drift');
+    await repo.markFailed('x', SignalFailureReason.MarketDrift, 'delta=2.5%');
+    expect(manager.rows.get('x').lifecycle).toBe(SignalLifecycle.Failed);
+    expect(manager.rows.get('x').failureReason).toBe(SignalFailureReason.MarketDrift);
     expect(manager.rows.get('x').failureDetail).toBe('delta=2.5%');
   });
 
   it('retry clears attempts and flips failed → queued', async () => {
     const { repo, manager } = wire();
-    await manager.insert(makeSignal('y', 1, 'failed', 5));
-    manager.rows.get('y').failureReason = 'cash_insufficient';
+    await manager.insert(makeSignal('y', 1, SignalLifecycle.Failed, 5));
+    manager.rows.get('y').failureReason = SignalFailureReason.CashInsufficient;
     await repo.retry('y');
-    expect(manager.rows.get('y').lifecycle).toBe('queued');
+    expect(manager.rows.get('y').lifecycle).toBe(SignalLifecycle.Queued);
     expect(manager.rows.get('y').attempts).toBe(0);
     expect(manager.rows.get('y').failureReason).toBeNull();
   });
@@ -155,13 +156,13 @@ describe('MongoSignalRepository queue methods', () => {
     const { repo, manager } = wire();
     const recent = new Date();
     const old    = new Date(Date.now() - 5 * 60_000);
-    await manager.insert(makeSignal('fresh', 1, 'executing'));
+    await manager.insert(makeSignal('fresh', 1, SignalLifecycle.Executing));
     manager.rows.get('fresh').lastAttemptAt = recent;
-    await manager.insert(makeSignal('stale', 1, 'executing'));
+    await manager.insert(makeSignal('stale', 1, SignalLifecycle.Executing));
     manager.rows.get('stale').lastAttemptAt = old;
     const reverted = await repo.sweepStaleExecuting(60_000);
     expect(reverted).toBe(1);
-    expect(manager.rows.get('stale').lifecycle).toBe('queued');
-    expect(manager.rows.get('fresh').lifecycle).toBe('executing');
+    expect(manager.rows.get('stale').lifecycle).toBe(SignalLifecycle.Queued);
+    expect(manager.rows.get('fresh').lifecycle).toBe(SignalLifecycle.Executing);
   });
 });
