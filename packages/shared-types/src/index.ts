@@ -45,10 +45,32 @@ export function pollIntervalKeyForMs(ms: number): PollIntervalKey | null {
 // 'daily' in the Mongo reader since that's what market-data-service was emitting.
 export type BarInterval = 'daily' | '5m' | '15m' | '1h';
 
+// ── Currency / Money ─────────────────────────────────────────────────────────
+// Two-currency system today (US + LSE listings). `BASE_CURRENCY` is what NAV, HWM,
+// position weights and every aggregated reporting figure resolve to. Pence ('GBp' /
+// 'GBX') is killed at the market-data boundary by dividing by 100 and tagging GBP —
+// downstream code never sees pence.
+export type Currency = 'GBP' | 'USD';
+export const BASE_CURRENCY: Currency = 'GBP';
+
+// Currency-tagged amount. Used at every API boundary (HTTP responses, Mongo docs that
+// hold currency-bearing values). Internal arithmetic that mixes currencies must go
+// through @trader/shared-fx FxClient — the type system can't enforce that, but every
+// `m.amount` access without an FxClient call should be reviewed.
+export interface Money {
+  readonly amount: number;
+  readonly currency: Currency;
+}
+export const money = (amount: number, currency: Currency): Money => ({ amount, currency });
+
+// Bars carry the listing currency so consumers that need to FX-convert (NAV, position
+// sizing) can. Strategy math reads `close` directly because returns are scale-invariant
+// (np.diff(np.log(prices)) is dimensionless), so currency doesn't enter that path.
 export interface OHLCVBar {
   ticker: string;
   timestamp: number;    // Unix ms — bar START time. Daily bars use 00:00:00Z of the trading day.
   interval?: BarInterval;
+  currency?: Currency;  // Set by the provider; absent on legacy rows pre-FX work.
   open: number;
   high: number;
   low: number;
