@@ -7,7 +7,7 @@
 
 process.env.INTERNAL_SECRET = 'test-internal-secret';
 
-import { describe, it, expect, beforeEach, mock } from 'bun:test';
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { OrderDispatcher, type ClaimedSignal, type OrderDispatcherDeps } from '../infrastructure/order-dispatcher.ts';
 import { AccountCache } from '../infrastructure/account-cache.ts';
 import { TradingMode } from '../domain/entities/Order.ts';

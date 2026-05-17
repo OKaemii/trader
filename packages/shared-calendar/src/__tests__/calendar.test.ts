@@ -1,7 +1,7 @@
 // Calendar logic tests. Avoids the HolidayCache infrastructure by passing a stub
 // that returns a hardcoded HolidayTable.
 
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect } from "vitest";
 import {
   marketStateOf, shouldPollMarket, partitionByMarket, nextOpen, nextClose,
   expectedLatestBarMs, scheduleBetween, localTimeToUtc, formatLocalDate, dayOfWeekIn,

@@ -19,7 +19,7 @@
   },
   "scripts": {
     "typecheck": "tsc -b --noEmit",
-    "test": "bun test",
+    "test": "vitest run",
     "build": "tsc -b",
     "lint": "eslint src"
   }

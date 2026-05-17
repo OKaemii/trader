@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect } from "vitest";
 import { parseIcal, icalDateToIso, icalDateYear, parseEarlyCloseFromDescription } from '../ical-parser.ts';
 
 // Realistic NYSE iCal fixture — captured from the live feed structure. Full closures

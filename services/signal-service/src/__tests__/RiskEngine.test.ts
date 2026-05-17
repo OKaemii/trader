@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect } from "vitest";
 import { RiskEngine, TurnoverBudget, OrderRouter } from '../application/services/RiskEngine.ts';
 import { RISK_LIMITS } from '../application/services/LongOnlyOptimiser.ts';
 import { PortfolioConstructor } from '../application/services/PortfolioConstructor.ts';

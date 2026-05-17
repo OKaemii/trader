@@ -11,7 +11,7 @@
 
 process.env.INTERNAL_SECRET = 'test-internal-secret';
 
-import { describe, it, expect, mock } from 'bun:test';
+import { describe, it, expect, vi } from "vitest";
 
 // Stub Mongo: every collection.find returns three 5m bars for any ticker, sorted oldest-first.
 // We use this to verify that aggregation to 'daily' yields ONE bar per ticker (all three 5m
@@ -24,7 +24,7 @@ const stubDocs = (ticker: string) => [
   { ticker, timestamp: new Date(dayStart + 2 * fiveMin),    interval: '5m', open: 102, high: 105, low: 101, close: 104, volume: 30 },
 ];
 
-mock.module('@trader/shared-mongo', () => ({
+vi.mock('@trader/shared-mongo', () => ({
   COLLECTIONS: {
     OHLCV_BARS:                 'ohlcv_bars',
     PORTAL_MARKET_CONFIG:       'portal_market_config',
@@ -46,7 +46,7 @@ mock.module('@trader/shared-mongo', () => ({
   }),
 }));
 
-mock.module('@trader/shared-redis', () => ({
+vi.mock('@trader/shared-redis', () => ({
   getRedisClient: async () => ({
     get:   async () => null,    // force cache miss so we exercise the Mongo path
     setEx: async () => 'OK',

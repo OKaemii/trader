@@ -7,11 +7,12 @@
     "dev": "bun run --watch src/index.ts",
     "start": "bun run src/index.ts",
     "typecheck": "tsc -b --noEmit",
-    "test": "bun test",
+    "test": "vitest run",
     "build": "tsc -b",
     "lint": "eslint src"
   },
   "dependencies": {
+    "@hono/node-server": "^2.0.2",
     "@trader/shared-auth": "workspace:*",
     "@trader/shared-fx": "workspace:*",
     "@trader/shared-mongo": "workspace:*",

@@ -9,7 +9,7 @@
 
 process.env.INTERNAL_SECRET = 'test-internal-secret';
 
-import { describe, it, expect, beforeEach } from 'bun:test';
+import { describe, it, expect, beforeEach } from "vitest";
 import { Hono } from 'hono';
 import { generateInternalToken } from '@trader/shared-auth';
 import { createInternalRouter } from '../infrastructure/http/internal-router.ts';

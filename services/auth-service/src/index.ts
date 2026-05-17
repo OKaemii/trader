@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { serve } from '@hono/node-server';
 import { MongoUserRepository } from './infrastructure/repositories/MongoUserRepository.ts';
 import { RedisRefreshTokenStore } from './infrastructure/repositories/RedisRefreshTokenStore.ts';
 import { LoginUseCase } from './application/use-cases/LoginUseCase.ts';
@@ -27,4 +28,7 @@ app.get('/health', (c) => c.json({ status: 'ok' }));
 app.route('/', createPublicRouter(loginUseCase, registerUseCase, users));
 app.route('/', createInternalRouter());
 
-export default { port: 3001, fetch: app.fetch };
+const port = Number(process.env.PORT ?? 3001);
+serve({ fetch: app.fetch, port }, (info) => {
+  console.log(`[auth-service] listening on :${info.port}`);
+});

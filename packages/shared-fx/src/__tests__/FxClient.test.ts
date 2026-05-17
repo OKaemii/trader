@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, mock } from 'bun:test';
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { FxClient, type FxRateProvider } from '../FxClient.ts';
 import { money } from '@trader/shared-types';
 

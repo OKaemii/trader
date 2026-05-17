@@ -3,7 +3,7 @@
 // the function always advances strictly past `nowMs` even when nowMs sits exactly
 // on a tick, otherwise the loop would never sleep.
 
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect } from "vitest";
 import { nextAlignedTick, msUntilNextTick } from '../poll-scheduling.ts';
 
 const HOUR = 3_600_000;

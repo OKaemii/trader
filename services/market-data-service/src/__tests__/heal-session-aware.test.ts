@@ -2,7 +2,7 @@
 // gapped when their latest bar matches the most recent session close (the
 // closed-window-resume case), and DOES flag tickers with bars older than that.
 
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { healMissingHistory } from '../backfill.ts';
 import type { MarketDataProvider } from '../providers/market-data-provider.ts';
 

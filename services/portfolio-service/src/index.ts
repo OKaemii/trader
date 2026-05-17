@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { serve } from '@hono/node-server';
 import { requireAuth, generateInternalToken } from '@trader/shared-auth';
 import { getMongoDb } from '@trader/shared-mongo';
 import { COLLECTIONS } from '@trader/shared-mongo';
@@ -189,4 +190,7 @@ app.route('/', authed);
 setInterval(syncPositions, 5 * 60 * 1000);
 syncPositions();
 
-export default { port: 3006, fetch: app.fetch };
+const port = Number(process.env.PORT ?? 3006);
+serve({ fetch: app.fetch, port }, (info) => {
+  console.log(`[portfolio-service] listening on :${info.port}`);
+});

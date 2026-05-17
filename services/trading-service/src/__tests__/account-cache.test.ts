@@ -4,7 +4,7 @@
 // claims should coalesce on a single fetch, and a transient broker error should not
 // drop the dispatcher to its knees if a recent snapshot exists.
 
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect } from "vitest";
 import { AccountCache } from '../infrastructure/account-cache.ts';
 
 class FakeClient {

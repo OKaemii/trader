@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect } from "vitest";
 import { sumPositionsGBP, type FxConverter, type PositionDoc } from '../nav.ts';
 import type { Money } from '@trader/shared-types';
 

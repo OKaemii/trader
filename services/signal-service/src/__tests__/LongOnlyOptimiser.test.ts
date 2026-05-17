@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect } from "vitest";
 import { solveLongOnly, RISK_LIMITS, type RankingInput } from '../application/services/LongOnlyOptimiser.ts';
 
 const baseInput = (overrides: Partial<RankingInput> = {}): RankingInput => ({
