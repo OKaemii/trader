@@ -26,16 +26,10 @@ export function createInternalRouter(deps: Deps): Hono {
     '/internal/trading/signals/:id/executed',
     requireInternalToken('trading-service'),
     async (c) => {
-      const id = c.req.param('id');
-      const body = await c.req.json<{ at?: number; quantity?: number }>().catch(() => ({}));
+      const id = c.req.param('id')!;
+      const body = await c.req.json<{ at?: number; quantity?: number }>().catch(() => ({} as { at?: number; quantity?: number }));
       const at = typeof body.at === 'number' ? body.at : Date.now();
-      // `quantity` is the actual filled share count (sent from FillsPoller). Optional so
-      // older callers (PlaceOrderUseCase notify-on-submit) keep working — they don't know
-      // the fill quantity yet and pass undefined.
       await deps.signalRepo.markExecuted(id, at, body.quantity);
-      // Publish to TRADE_SIGNALS only on executed — this is the email trigger. The signal
-      // is reloaded so the published payload reflects the post-update state (lifecycle,
-      // executedAt, etc) rather than the wire-input.
       const signal = await deps.signalRepo.findById(id);
       if (signal) {
         try { await deps.publisher.publish(signal); }
@@ -49,7 +43,7 @@ export function createInternalRouter(deps: Deps): Hono {
     '/internal/trading/signals/:id/closed',
     requireInternalToken('trading-service'),
     async (c) => {
-      const id = c.req.param('id');
+      const id = c.req.param('id')!;
       const body = await c.req.json<{ at?: number; exitPrice: number }>();
       const at = typeof body.at === 'number' ? body.at : Date.now();
       await deps.signalRepo.markClosed(id, at, body.exitPrice);
@@ -57,25 +51,21 @@ export function createInternalRouter(deps: Deps): Hono {
     },
   );
 
-  // Round-trip closure helper: list executed BUYs for a ticker, oldest-first. Used by
-  // FillsPoller to FIFO-attribute SELL fills back to entry signals.
   router.get(
     '/internal/trading/signals/open-buys/:ticker',
     requireInternalToken('trading-service'),
     async (c) => {
-      const ticker = c.req.param('ticker');
+      const ticker = c.req.param('ticker')!;
       const signals = await deps.signalRepo.findOpenBuysByTicker(ticker);
       return c.json({ signals });
     },
   );
 
-  // Decrement an executed BUY's remaining share count without closing it (partial SELL
-  // consumption). Caller sends the amount to subtract; signal-service clamps at 0.
   router.post(
     '/internal/trading/signals/:id/decrement-quantity',
     requireInternalToken('trading-service'),
     async (c) => {
-      const id = c.req.param('id');
+      const id = c.req.param('id')!;
       const body = await c.req.json<{ by: number }>();
       await deps.signalRepo.decrementExecutedQuantity(id, body.by);
       return c.json({ id, decrementedBy: body.by });
@@ -113,7 +103,7 @@ export function createInternalRouter(deps: Deps): Hono {
     '/internal/queue/:id/requeue',
     requireInternalToken('trading-service'),
     async (c) => {
-      const id = c.req.param('id');
+      const id = c.req.param('id')!;
       await deps.signalRepo.requeue(id);
       return c.json({ id, lifecycle: SignalLifecycle.Queued });
     },
@@ -123,10 +113,8 @@ export function createInternalRouter(deps: Deps): Hono {
     '/internal/queue/:id/failed',
     requireInternalToken('trading-service'),
     async (c) => {
-      const id = c.req.param('id');
+      const id = c.req.param('id')!;
       const body = await c.req.json<{ reason: number; detail?: string }>();
-      // Reason arrives as the integer enum value (caller sends SignalFailureReason.X). We
-      // validate range so a malformed body can't silently set an out-of-enum reason.
       const reason = body.reason;
       if (typeof reason !== 'number' || SignalFailureReason[reason] === undefined) {
         return c.json({ error: `invalid reason (expected SignalFailureReason enum integer)` }, 400);
@@ -140,7 +128,7 @@ export function createInternalRouter(deps: Deps): Hono {
     '/internal/queue/sweep',
     requireInternalToken('trading-service'),
     async (c) => {
-      const body = await c.req.json<{ thresholdMs?: number }>().catch(() => ({}));
+      const body = await c.req.json<{ thresholdMs?: number }>().catch(() => ({} as { thresholdMs?: number }));
       const ms   = typeof body.thresholdMs === 'number' ? body.thresholdMs : 60_000;
       const reverted = await deps.signalRepo.sweepStaleExecuting(ms);
       return c.json({ reverted });
@@ -159,7 +147,7 @@ export function createInternalRouter(deps: Deps): Hono {
   });
 
   router.post('/internal/signals/approve/:id', requireGateway, async (c) => {
-    const id = c.req.param('id');
+    const id = c.req.param('id')!;
     await deps.approveSignal.execute(id);
     return c.json({ approved: id });
   });

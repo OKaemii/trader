@@ -15,26 +15,18 @@ export class TradeSignal {
   public readonly approved: boolean;
 
   // Progress / lifecycle — optional, populated as the signal flows through the system.
-  public readonly entryPrice?: number;
+  public readonly entryPrice?: number | undefined;
   public readonly lifecycle: SignalLifecycle;
-  public readonly approvedAt?: number;
-  public readonly executedAt?: number;
-  public readonly closedAt?: number;
-  public readonly exitPrice?: number;
-  // Real share count attributed to this signal at fill time (BUYs only). Set by FillsPoller
-  // when a BUY order fills, then decremented as later SELLs FIFO-consume the position.
-  // Used for round-trip closure: a SELL fill walks open BUYs oldest-first and closes them
-  // until executedQuantity is fully consumed.
-  public readonly executedQuantity?: number;
+  public readonly approvedAt?: number | undefined;
+  public readonly executedAt?: number | undefined;
+  public readonly closedAt?: number | undefined;
+  public readonly exitPrice?: number | undefined;
+  public readonly executedQuantity?: number | undefined;
 
-  // Dispatcher bookkeeping. attempts increments on every claim by order-dispatcher;
-  // reaching ORDER_MAX_ATTEMPTS transitions the signal to lifecycle='failed' with
-  // reason='retries_exhausted'. failureReason/failureDetail are populated on any
-  // failed transition so the portal can display why the order didn't go through.
   public readonly attempts: number;
-  public readonly lastAttemptAt?: number;
-  public readonly failureReason?: SignalFailureReason;
-  public readonly failureDetail?: string;
+  public readonly lastAttemptAt?: number | undefined;
+  public readonly failureReason?: SignalFailureReason | undefined;
+  public readonly failureDetail?: string | undefined;
 
   constructor(params: {
     id: string;

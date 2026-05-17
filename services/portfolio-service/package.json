@@ -2,11 +2,13 @@
   "name": "@trader/portfolio-service",
   "version": "0.0.1",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "bun run --watch src/index.ts",
     "start": "bun run src/index.ts",
-    "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "typecheck": "tsc -b --noEmit",
+    "test": "bun test",
+    "build": "tsc -b"
   },
   "dependencies": {
     "@trader/shared-auth": "workspace:*",

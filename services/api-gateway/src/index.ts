@@ -140,7 +140,7 @@ admin.get('/api/admin/system/status', async (c) => {
 // / signal:auto_approve / regime warm-up keys. Requires a typed confirmation phrase to
 // guard against accidental clicks. Real T212 broker state is NOT touched (external).
 admin.post('/api/admin/system/reset', async (c) => {
-  const body = await c.req.json<{ confirm?: string }>().catch(() => ({}));
+  const body = await c.req.json<{ confirm?: string }>().catch(() => ({} as { confirm?: string }));
   if (body.confirm !== 'RESET') {
     return c.json({ error: 'confirmation phrase mismatch (expected "RESET")' }, 400);
   }

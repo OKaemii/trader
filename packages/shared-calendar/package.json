@@ -2,6 +2,7 @@
   "name": "@trader/shared-calendar",
   "version": "0.0.1",
   "private": true,
+  "type": "module",
   "main": "./src/index.ts",
   "dependencies": {
     "@trader/shared-mongo": "workspace:*",
@@ -9,6 +10,8 @@
     "mongodb": "^6.5.0"
   },
   "scripts": {
-    "test": "bun test"
+    "test": "bun test",
+    "build": "tsc -b",
+    "typecheck": "tsc -b --noEmit"
   }
 }

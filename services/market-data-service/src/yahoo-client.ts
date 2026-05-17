@@ -1,3 +1,4 @@
+import { setTimeout as sleep } from 'node:timers/promises';
 import type { OHLCVBar, BarInterval, Currency } from '@trader/shared-types';
 
 interface YahooQuote {
@@ -146,16 +147,11 @@ function parseT212Ticker(t212Ticker: string): {
 } {
   const parts = t212Ticker.split('_');
 
-  const rawSymbol = parts[0];
+  const rawSymbol = parts[0] ?? t212Ticker;
   const symbol = normalizeBaseSymbol(rawSymbol);
 
-  // Three-part tickers carry an explicit exchange (e.g. `AAPL_US_EQ`).
-  // Two-part tickers ending in `l_EQ` are T212's London convention (e.g. `HSBAl_EQ`,
-  // `BARCl_EQ`) — the lowercase `l` on the symbol is the LSE marker, not the CFD
-  // synthetic that `normalizeBaseSymbol` strips for US instruments. Without tagging
-  // these as 'UK' we'd drop the `.L` Yahoo suffix and 404 every FTSE constituent.
   let exchange: string | null = null;
-  if (parts.length >= 3) {
+  if (parts.length >= 3 && parts[1] !== undefined) {
     exchange = parts[1];
   } else if (parts.length === 2 && parts[1] === 'EQ' && /l$/.test(rawSymbol)) {
     exchange = 'UK';
@@ -476,6 +472,7 @@ export async function fetchYahooPrices(
     for (let j = 0; j < results.length; j++) {
       const result = results[j];
       const t212Ticker = batch[j];
+      if (!result || !t212Ticker) continue;
 
       if (result.status === 'fulfilled') {
         bars.push(result.value);
@@ -498,7 +495,7 @@ export async function fetchYahooPrices(
     }
 
     if (i + BATCH_SIZE < t212Tickers.length) {
-      await Bun.sleep(BATCH_DELAY_MS);
+      await sleep(BATCH_DELAY_MS);
     }
   }
 

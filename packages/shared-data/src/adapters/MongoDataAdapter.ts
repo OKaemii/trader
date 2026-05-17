@@ -29,7 +29,7 @@ export class MongoDataAdapter<T, TDoc extends Document = Document> implements ID
   }
 
   async update(id: string, changes: Record<string, unknown>): Promise<void> {
-    await this.collection.updateOne({ _id: id } as any, { $set: changes });
+    await this.collection.updateOne({ _id: id } as any, { $set: changes as any });
   }
 
   async delete(id: string): Promise<void> {

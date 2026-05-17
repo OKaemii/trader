@@ -1,4 +1,4 @@
-import Expo from 'expo-server-sdk';
+import { Expo, type ExpoPushMessage } from 'expo-server-sdk';
 import type { TradeSignalDTO } from '@trader/shared-types';
 import { getRedisClient } from '@trader/shared-redis';
 
@@ -25,5 +25,5 @@ export async function sendPush(signal: TradeSignalDTO): Promise<void> {
     }));
 
   const chunks = expo.chunkPushNotifications(messages);
-  await Promise.all(chunks.map((chunk) => expo.sendPushNotificationsAsync(chunk)));
+  await Promise.all(chunks.map((chunk: ExpoPushMessage[]) => expo.sendPushNotificationsAsync(chunk)));
 }

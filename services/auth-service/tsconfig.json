@@ -8,5 +8,9 @@
     },
     "include": ["src/**/*"],
     "exclude": ["**/__tests__/**", "**/*.test.ts", "tests/**", "dist"],
-    "references": []
+    "references": [
+        { "path": "../../packages/shared-auth" },
+        { "path": "../../packages/shared-mongo" },
+        { "path": "../../packages/shared-redis" }
+    ]
 }

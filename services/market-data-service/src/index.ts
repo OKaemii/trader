@@ -1,3 +1,4 @@
+import { setTimeout as sleep } from 'node:timers/promises';
 import { Hono } from 'hono';
 import { getRedisClient, xAdd, ensureConsumerGroup } from '@trader/shared-redis';
 import { getMongoDb } from '@trader/shared-mongo';
@@ -105,7 +106,8 @@ export function latestPerTicker(bars: OHLCVBar[], targetInterval: BarInterval): 
   const out: OHLCVBar[] = [];
   for (const list of byTicker.values()) {
     const aggregated = aggregateBars(list, targetInterval);
-    if (aggregated.length > 0) out.push(aggregated[aggregated.length - 1]);
+    const last = aggregated[aggregated.length - 1];
+    if (last) out.push(last);
   }
   return out;
 }
@@ -236,7 +238,7 @@ async function pollLoop(): Promise<void> {
       pollStats.lastGateSkipTs = Date.now();
       const sleepMs = msUntilNextTick(pollIntervalMs, POLL_ANCHOR_OFFSET_MS);
       console.log(`[market-data] next poll in ${(sleepMs / 1000).toFixed(0)}s at ${new Date(Date.now() + sleepMs).toISOString()}`);
-      await Bun.sleep(sleepMs);
+      await sleep(sleepMs);
       continue;
     }
 
@@ -252,7 +254,7 @@ async function pollLoop(): Promise<void> {
         try {
           const db = await getMongoDb();
           const redis2 = await getRedisClient();
-          const heal = await healMissingHistory(db, redis2, provider, decision.tickers, { expectedLatestMs });
+          const heal = await healMissingHistory(db, redis2, provider, decision.tickers, expectedLatestMs !== undefined ? { expectedLatestMs } : {});
           if (heal.healed > 0) {
             console.warn(`[market-data] heal (${decision.market}): ${heal.healed} ticker(s), ${heal.barsAdded} bars filled, ${heal.unrecoverable} unrecoverable`);
           }
@@ -315,7 +317,7 @@ async function pollLoop(): Promise<void> {
     // on the same wall-clock minutes regardless of when the pod started.
     const sleepMs = msUntilNextTick(pollIntervalMs, POLL_ANCHOR_OFFSET_MS);
     console.log(`[market-data] next poll in ${(sleepMs / 1000).toFixed(0)}s at ${new Date(Date.now() + sleepMs).toISOString()}`);
-    await Bun.sleep(sleepMs);
+    await sleep(sleepMs);
   }
 }
 
@@ -456,11 +458,8 @@ async function bootstrap(): Promise<void> {
   });
 }
 
-// Only run side-effecting boot when this file is the entrypoint. Tests import helpers
-// like `latestPerTicker` from this module — running bootstrap then would trigger
-// real Yahoo + Mongo I/O at module-load time.
-if (import.meta.main) {
-  bootstrap();
-}
+// Bootstrap runs unconditionally for prod runtime (node dist/main.js). Tests import
+// helpers from this module via vitest's module loader, which uses a separate process.
+bootstrap();
 
 export default { port: 3002, fetch: app.fetch };

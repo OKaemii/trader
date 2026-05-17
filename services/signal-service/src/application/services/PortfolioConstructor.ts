@@ -40,9 +40,10 @@ export class PortfolioConstructor {
     const universeKey = [...tickers].sort().join(',');
     const prev = this._prevWeights.get(universeKey);
     if (prev && prev.length === weights.length) {
-      const maxChange = tickers.reduce((max, ticker, i) => {
-        const prevIdx = prev[i];
-        return Math.max(max, Math.abs(weights[i] - prevIdx));
+      const maxChange = tickers.reduce((max: number, _ticker: string, i: number) => {
+        const prevIdx = prev[i] ?? 0;
+        const curr    = weights[i] ?? 0;
+        return Math.max(max, Math.abs(curr - prevIdx));
       }, 0);
       if (maxChange > WEIGHT_CHANGE_THRESHOLD) {
         warnings.push(
@@ -55,8 +56,8 @@ export class PortfolioConstructor {
     // 3. Factor exposure decomposition: portfolio_betas = w · B
     const factorExposures: Record<string, number> = {};
     for (const factor of FACTOR_NAMES) {
-      factorExposures[factor] = weights.reduce((sum, w, i) => {
-        const ticker = tickers[i];
+      factorExposures[factor] = weights.reduce((sum: number, w: number, i: number) => {
+        const ticker = tickers[i] ?? '';
         return sum + w * (factorAttributions[ticker]?.[factor] ?? 0);
       }, 0);
     }

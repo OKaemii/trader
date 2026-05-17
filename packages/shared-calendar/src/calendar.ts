@@ -82,8 +82,13 @@ export function localTimeToUtc(
   hhmm: string,                                      // 'HH:MM'
   tz: ExchangeCalendar['timezone'],
 ): number {
-  const [year, month, day] = date.split('-').map((s) => parseInt(s, 10));
-  const [hour, min] = hhmm.split(':').map((s) => parseInt(s, 10));
+  const dateParts = date.split('-').map((s) => parseInt(s, 10));
+  const timeParts = hhmm.split(':').map((s) => parseInt(s, 10));
+  const year  = dateParts[0] ?? 0;
+  const month = dateParts[1] ?? 1;
+  const day   = dateParts[2] ?? 1;
+  const hour  = timeParts[0] ?? 0;
+  const min   = timeParts[1] ?? 0;
   // Start with a UTC guess, then correct by the actual offset for that instant in tz.
   const utcGuess = Date.UTC(year, month - 1, day, hour, min, 0, 0);
   const offsetMs = utcGuess - tzMsAtUtc(utcGuess, tz);

@@ -2,17 +2,22 @@
   "name": "@trader/auth-service",
   "version": "0.0.1",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "bun run --watch src/index.ts",
     "start": "bun run src/index.ts",
-    "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "typecheck": "tsc -b --noEmit",
+    "test": "bun test",
+    "build": "tsc -b"
   },
   "dependencies": {
     "@trader/shared-auth": "workspace:*",
     "@trader/shared-mongo": "workspace:*",
     "@trader/shared-redis": "workspace:*",
-    "hono": "^4.3.0",
-    "bcryptjs": "^2.4.3"
+    "bcryptjs": "^2.4.3",
+    "hono": "^4.3.0"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6"
   }
 }

@@ -163,23 +163,21 @@ export interface TradeSignalDTO {
   confidence: number;                  // 0-1
   targetWeight: number;                // [0,1] portfolio weight; 0 = exit position
   rationale: string;                   // JSON-serialised SignalRationale
-  features_snapshot?: StrategyOutput;
-  approved?: boolean;
+  features_snapshot?: StrategyOutput | undefined;
+  approved?: boolean | undefined;
   // Progress / lifecycle fields — populated as the signal flows through approve / execute / close.
   // All optional for backwards compatibility with signals written before these fields existed.
-  entryPrice?: number;                 // close-of-bar price at emission, used for P&L
-  lifecycle?: SignalLifecycle;
-  approvedAt?: number;                 // unix ms
-  executedAt?: number;                 // unix ms — set by trading-service after fill
-  closedAt?: number;                   // unix ms — set when position is exited
-  exitPrice?: number;                  // price at close, paired with closedAt
-  executedQuantity?: number;           // shares actually filled (for FIFO round-trip)
-  // Queue / failure bookkeeping. `attempts` increments on every dispatcher claim; if it
-  // reaches ORDER_MAX_ATTEMPTS the signal is moved to `failed` with reason `retries_exhausted`.
-  attempts?: number;
-  lastAttemptAt?: number;              // unix ms — set whenever the dispatcher claims the row
-  failureReason?: SignalFailureReason;
-  failureDetail?: string;              // free-text from the underlying error / context
+  entryPrice?: number | undefined;                 // close-of-bar price at emission
+  lifecycle?: SignalLifecycle | undefined;
+  approvedAt?: number | undefined;                 // unix ms
+  executedAt?: number | undefined;                 // unix ms — set by trading-service after fill
+  closedAt?: number | undefined;                   // unix ms — set when position is exited
+  exitPrice?: number | undefined;                  // price at close, paired with closedAt
+  executedQuantity?: number | undefined;           // shares actually filled (for FIFO round-trip)
+  attempts?: number | undefined;
+  lastAttemptAt?: number | undefined;              // unix ms — set whenever the dispatcher claims the row
+  failureReason?: SignalFailureReason | undefined;
+  failureDetail?: string | undefined;
 }
 
 // SignalProgressDTO — enriched view served by /api/signals/progress for the portal.

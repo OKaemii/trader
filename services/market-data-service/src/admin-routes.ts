@@ -89,7 +89,7 @@ export function createAdminRouter(
       .find({ ticker: { $in: activeTickers }, activeTo: null })
       .project({ _id: 0, ticker: 1, name: 1, sector: 1, market: 1, adv: 1 })
       .toArray();
-    const byTicker = new Map<string, RegistryDoc>(registry.map((r) => [r.ticker, r]));
+    const byTicker = new Map<string, RegistryDoc>(registry.map((r) => [r.ticker, r as RegistryDoc] as const));
     const activeUniverseDetailed = activeTickers.map((t) => {
       const reg = byTicker.get(t);
       const inferredMarket: 'US' | 'LSE' | 'OTHER' =
@@ -125,7 +125,7 @@ export function createAdminRouter(
     const removes = norm(body.removes);
     const db = await getMongoDb();
     await db.collection(COLLECTIONS.PORTAL_UNIVERSE_OVERRIDES).updateOne(
-      { _id: 'singleton' },
+      { _id: 'singleton' as any },
       { $set: { adds, removes, updatedBy: body.userId ?? 'unknown', updatedAt: new Date() } },
       { upsert: true },
     );
@@ -201,7 +201,7 @@ export function createAdminRouter(
     }
     const db = await getMongoDb();
     await db.collection(COLLECTIONS.PORTAL_MARKET_CONFIG).updateOne(
-      { _id: 'singleton' },
+      { _id: 'singleton' as any },
       { $set: {
         barFrequency: body.barFrequency ?? null,
         pollIntervalMs: body.pollIntervalMs ?? null,
@@ -238,7 +238,7 @@ export function createAdminRouter(
   // cache-invalidated message per ticker so subscribers (signal-service, portal) drop
   // their derived state. Returns per-ticker upsert counts.
   r.post('/api/admin/market-data/backfill', async (c) => {
-    const body = await c.req.json<{ tickers?: string[]; days?: number }>().catch(() => ({}));
+    const body = await c.req.json<{ tickers?: string[]; days?: number }>().catch(() => ({} as { tickers?: string[]; days?: number }));
     const tickers = body.tickers && body.tickers.length > 0
       ? body.tickers
       : universeManager.activeTickers;
@@ -270,7 +270,7 @@ export function createAdminRouter(
       interval?: BarInterval;
       beforeTimestamp?: number;
       dryRun?: boolean;
-    }>().catch(() => ({}));
+    }>().catch(() => ({} as { interval?: BarInterval; beforeTimestamp?: number; dryRun?: boolean }));
     const dryRun = body.dryRun !== false;
     if (body.interval && !VALID_INTERVALS.includes(body.interval)) {
       return c.json({ error: `invalid interval (one of ${VALID_INTERVALS.join(',')})` }, 400);
@@ -422,7 +422,7 @@ export function createInternalBarsRouter(): Hono {
   const requireStrategy = requireInternalToken('strategy-engine');
 
   r.get('/internal/bars/:ticker', requireStrategy, async (c) => {
-    const ticker   = c.req.param('ticker');
+    const ticker   = c.req.param('ticker')!;
     const interval = (c.req.query('interval') ?? 'daily') as BarInterval;
     const range    = (c.req.query('range')    ?? '30d')   as RangeKey;
     if (!VALID_INTERVALS.includes(interval)) {
