@@ -33,6 +33,15 @@
         "redis": "^4.6.13",
       },
     },
+    "packages/shared-calendar": {
+      "name": "@trader/shared-calendar",
+      "version": "0.0.1",
+      "dependencies": {
+        "@trader/shared-mongo": "*",
+        "@trader/shared-types": "*",
+        "mongodb": "^6.5.0",
+      },
+    },
     "packages/shared-data": {
       "name": "@trader/shared-data",
       "version": "0.0.1",
@@ -54,6 +63,13 @@
       "version": "0.0.1",
       "dependencies": {
         "mongodb": "^6.5.0",
+      },
+    },
+    "packages/shared-portfolio": {
+      "name": "@trader/shared-portfolio",
+      "version": "0.0.1",
+      "dependencies": {
+        "@trader/shared-types": "*",
       },
     },
     "packages/shared-redis": {
@@ -114,6 +130,7 @@
       "dependencies": {
         "@trader/shared-auth": "workspace:*",
         "@trader/shared-bars": "workspace:*",
+        "@trader/shared-calendar": "workspace:*",
         "@trader/shared-fx": "workspace:*",
         "@trader/shared-mongo": "workspace:*",
         "@trader/shared-redis": "workspace:*",
@@ -141,6 +158,7 @@
         "@trader/shared-auth": "workspace:*",
         "@trader/shared-fx": "workspace:*",
         "@trader/shared-mongo": "workspace:*",
+        "@trader/shared-portfolio": "workspace:*",
         "@trader/shared-redis": "workspace:*",
         "@trader/shared-types": "workspace:*",
         "hono": "^4.3.0",
@@ -152,7 +170,9 @@
       "dependencies": {
         "@trader/shared-auth": "workspace:*",
         "@trader/shared-data": "workspace:*",
+        "@trader/shared-fx": "workspace:*",
         "@trader/shared-mongo": "workspace:*",
+        "@trader/shared-portfolio": "workspace:*",
         "@trader/shared-redis": "workspace:*",
         "@trader/shared-types": "workspace:*",
         "hono": "^4.3.0",
@@ -257,11 +277,15 @@
 
     "@trader/shared-bars": ["@trader/shared-bars@workspace:packages/shared-bars"],
 
+    "@trader/shared-calendar": ["@trader/shared-calendar@workspace:packages/shared-calendar"],
+
     "@trader/shared-data": ["@trader/shared-data@workspace:packages/shared-data"],
 
     "@trader/shared-fx": ["@trader/shared-fx@workspace:packages/shared-fx"],
 
     "@trader/shared-mongo": ["@trader/shared-mongo@workspace:packages/shared-mongo"],
+
+    "@trader/shared-portfolio": ["@trader/shared-portfolio@workspace:packages/shared-portfolio"],
 
     "@trader/shared-redis": ["@trader/shared-redis@workspace:packages/shared-redis"],
 
