@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "bun run --watch src/index.ts",
-    "start": "bun run src/index.ts",
+    "dev": "tsx watch src/main.ts",
+    "start": "node dist/main.js",
     "typecheck": "tsc -b --noEmit",
     "build": "tsc -b",
     "lint": "eslint src",
@@ -13,12 +13,14 @@
   },
   "dependencies": {
     "@hono/node-server": "^1.19.14",
+    "@trader/core": "workspace:*",
     "@trader/shared-auth": "workspace:*",
     "@trader/shared-mongo": "workspace:*",
     "@trader/shared-redis": "workspace:*",
     "@trader/shared-types": "workspace:*",
     "expo-server-sdk": "^3.10.0",
     "hono": "^4.3.0",
-    "resend": "^3.2.0"
+    "resend": "^3.2.0",
+    "zod": "^3.23.0"
   }
 }
