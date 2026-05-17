@@ -367,6 +367,9 @@ importers:
       '@hono/node-server':
         specifier: ^1.19.14
         version: 1.19.14(hono@4.12.19)
+      '@trader/core':
+        specifier: workspace:*
+        version: link:../../packages/core
       '@trader/shared-auth':
         specifier: workspace:*
         version: link:../../packages/shared-auth
@@ -394,6 +397,9 @@ importers:
       redis:
         specifier: ^4.7.0
         version: 4.7.1
+      zod:
+        specifier: ^3.23.0
+        version: 3.25.76
 
 packages:
 
