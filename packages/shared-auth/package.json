@@ -3,12 +3,24 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "main": "./src/index.ts",
+  "main": "./dist/index.js",
   "exports": {
-    ".": "./src/index.ts",
-    "./jwt": "./src/jwt.ts",
-    "./middleware": "./src/middleware.ts",
-    "./internal-token": "./src/internal-token.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./jwt": {
+      "types": "./dist/jwt.d.ts",
+      "import": "./dist/jwt.js"
+    },
+    "./middleware": {
+      "types": "./dist/middleware.d.ts",
+      "import": "./dist/middleware.js"
+    },
+    "./internal-token": {
+      "types": "./dist/internal-token.d.ts",
+      "import": "./dist/internal-token.js"
+    }
   },
   "dependencies": {
     "jose": "^5.2.0",
@@ -22,5 +34,6 @@
     "test": "vitest run",
     "build": "tsc -b",
     "lint": "eslint src"
-  }
+  },
+  "types": "./dist/index.d.ts"
 }
