@@ -2,7 +2,7 @@
 // the api-gateway is the only authorized caller and enforces user-level admin auth.
 
 import { Hono } from 'hono';
-import { requireInternalAny } from '@trader/shared-auth/middleware';
+import { requireInternal, requireCaller } from '@trader/shared-auth/middleware';
 import { getMongoDb, COLLECTIONS } from '@trader/shared-mongo';
 import { getRedisClient, xAdd } from '@trader/shared-redis';
 import { getLiveConfig, invalidateLiveConfig, _envDefaultsForTest } from './live-config.ts';
@@ -71,7 +71,7 @@ export function createAdminRouter(
   // routes, which then 403 because they expect caller='strategy-engine' not 'api-gateway'.
   // Same regression that bit trading-service routing; see services/trading-service
   // routing.test.ts for the fixture that pins it.
-  r.use('/api/admin/*', requireInternalAny('api-gateway'));
+  r.use('/api/admin/*', requireInternal, requireCaller('api-gateway'));
 
   // ── Universe overrides ────────────────────────────────────────────────────
   r.get('/api/admin/universe/overrides', async (c) => {
@@ -419,9 +419,9 @@ export function createAdminRouter(
 // N round-trips. Single-ticker GET stays for ad-hoc tooling.
 export function createInternalBarsRouter(): Hono {
   const r = new Hono();
-  const requireStrategy = requireInternalAny('strategy-engine');
+  const requireStrategy = requireCaller('strategy-engine');
 
-  r.get('/internal/bars/:ticker', requireStrategy, async (c) => {
+  r.get('/internal/bars/:ticker', requireInternal, requireStrategy, async (c) => {
     const ticker   = c.req.param('ticker')!;
     const interval = (c.req.query('interval') ?? 'daily') as BarInterval;
     const range    = (c.req.query('range')    ?? '30d')   as RangeKey;
@@ -438,7 +438,7 @@ export function createInternalBarsRouter(): Hono {
     return c.json({ ticker, interval, range, bars: out });
   });
 
-  r.post('/internal/bars', requireStrategy, async (c) => {
+  r.post('/internal/bars', requireInternal, requireStrategy, async (c) => {
     const body = await c.req.json<{
       tickers:  string[];
       interval?: BarInterval;

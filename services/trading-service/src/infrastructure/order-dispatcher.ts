@@ -1,4 +1,4 @@
-import { generateInternalToken, mintInternalJwt } from '@trader/shared-auth';
+import { mintInternalJwt } from '@trader/shared-auth';
 import type { Db } from 'mongodb';
 import type { RedisClientType } from 'redis';
 import type { Trading212Client } from './t212.ts';
@@ -295,7 +295,7 @@ export class OrderDispatcher {
 
   private async signalFetch(path: string, init: RequestInit = {}): Promise<Response> {
     const headers = new Headers(init.headers);
-    headers.set('X-Internal-Token', generateInternalToken('trading-service'));
+    headers.set('Authorization',     `Bearer ${await mintInternalJwt('trading-service')}`);
     return fetch(`${this.deps.signalServiceUrl}${path}`, { ...init, headers });
   }
 

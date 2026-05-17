@@ -7,11 +7,11 @@
 // The repository is stubbed with the queue-method signatures we care about — we're
 // not retesting the atomic claim itself here (covered by MongoSignalRepository.queue.test.ts).
 
-process.env.INTERNAL_SECRET = 'test-internal-secret';
+process.env.JWT_SECRET = 'test-jwt-secret-min-16-chars';
 
 import { describe, it, expect, beforeEach } from "vitest";
 import { Hono } from 'hono';
-import { generateInternalToken } from '@trader/shared-auth';
+import { mintInternalJwt } from '@trader/shared-auth';
 import { createInternalRouter } from '../infrastructure/http/internal-router.ts';
 import type { ISignalRepository } from '../domain/interfaces/ISignalRepository.ts';
 import { TradeSignal } from '../domain/entities/TradeSignal.ts';
@@ -64,7 +64,11 @@ function buildApp(repo: StubRepo) {
   return app;
 }
 
-const tradingToken = () => generateInternalToken('trading-service');
+// Bearer helpers — Phase 4 audience-JWT migration. requireInternal returns 401 (Unauthorized)
+// when no token is present, 401 when the audience doesn't match. requireCaller returns 403
+// (Forbidden) when the JWT is valid but the `sub` doesn't match any allowed caller.
+const tradingBearer = async (): Promise<string> => `Bearer ${await mintInternalJwt('trading-service')}`;
+const signalBearer  = async (): Promise<string> => `Bearer ${await mintInternalJwt('signal-service')}`;
 
 describe('queue endpoints', () => {
   let repo: StubRepo;
@@ -72,15 +76,15 @@ describe('queue endpoints', () => {
   beforeEach(() => { repo = new StubRepo(); app = buildApp(repo); });
 
   describe('POST /internal/queue/claim', () => {
-    it('rejects no-token requests with 403', async () => {
+    it('rejects no-token requests with 401', async () => {
       const res = await app.request('/internal/queue/claim', { method: 'POST' });
-      expect(res.status).toBe(403);
+      expect(res.status).toBe(401);
     });
 
     it('rejects wrong-caller tokens with 403 (only trading-service)', async () => {
       const res = await app.request('/internal/queue/claim', {
         method: 'POST',
-        headers: { 'X-Internal-Token': generateInternalToken('signal-service') },
+        headers: { Authorization: await signalBearer() },
       });
       expect(res.status).toBe(403);
     });
@@ -88,7 +92,7 @@ describe('queue endpoints', () => {
     it('returns {signal:null} when queue is empty', async () => {
       const res = await app.request('/internal/queue/claim', {
         method: 'POST',
-        headers: { 'X-Internal-Token': tradingToken() },
+        headers: { Authorization: await tradingBearer() },
       });
       expect(res.status).toBe(200);
       const body = await res.json();
@@ -103,10 +107,9 @@ describe('queue endpoints', () => {
       });
       const res = await app.request('/internal/queue/claim', {
         method: 'POST',
-        headers: { 'X-Internal-Token': tradingToken() },
+        headers: { Authorization: await tradingBearer() },
       });
       const body = await res.json();
-      // Wire contract — these are the fields OrderDispatcher.ClaimedSignal expects.
       expect(body.signal.id).toBe('sig-1');
       expect(body.signal.ticker).toBe('AAPL_US_EQ');
       expect(body.signal.action).toBe('BUY');
@@ -116,15 +119,15 @@ describe('queue endpoints', () => {
   });
 
   describe('POST /internal/queue/:id/requeue', () => {
-    it('requires trading-service caller', async () => {
+    it('rejects missing token with 401', async () => {
       const res = await app.request('/internal/queue/abc/requeue', { method: 'POST' });
-      expect(res.status).toBe(403);
+      expect(res.status).toBe(401);
     });
 
     it('delegates to repo.requeue with the path id', async () => {
       const res = await app.request('/internal/queue/abc/requeue', {
         method: 'POST',
-        headers: { 'X-Internal-Token': tradingToken() },
+        headers: { Authorization: await tradingBearer() },
       });
       expect(res.status).toBe(200);
       expect(repo.requeuedIds).toEqual(['abc']);
@@ -135,17 +138,17 @@ describe('queue endpoints', () => {
     it('delegates reason + detail to repo.markFailed', async () => {
       const res = await app.request('/internal/queue/xyz/failed', {
         method: 'POST',
-        headers: { 'X-Internal-Token': tradingToken(), 'Content-Type': 'application/json' },
+        headers: { Authorization: await tradingBearer(), 'Content-Type': 'application/json' },
         body: JSON.stringify({ reason: SignalFailureReason.MarketDrift, detail: 'delta=2.5%' }),
       });
       expect(res.status).toBe(200);
       expect(repo.failedCalls).toEqual([{ id: 'xyz', reason: SignalFailureReason.MarketDrift, detail: 'delta=2.5%' }]);
     });
 
-    it('rejects wrong caller', async () => {
+    it('rejects wrong caller with 403', async () => {
       const res = await app.request('/internal/queue/xyz/failed', {
         method: 'POST',
-        headers: { 'X-Internal-Token': generateInternalToken('signal-service'), 'Content-Type': 'application/json' },
+        headers: { Authorization: await signalBearer(), 'Content-Type': 'application/json' },
         body: JSON.stringify({ reason: SignalFailureReason.BrokerRejected }),
       });
       expect(res.status).toBe(403);
@@ -157,7 +160,7 @@ describe('queue endpoints', () => {
       repo.sweptCount = 3;
       const res = await app.request('/internal/queue/sweep', {
         method: 'POST',
-        headers: { 'X-Internal-Token': tradingToken(), 'Content-Type': 'application/json' },
+        headers: { Authorization: await tradingBearer(), 'Content-Type': 'application/json' },
         body: JSON.stringify({ thresholdMs: 60_000 }),
       });
       expect(res.status).toBe(200);
@@ -168,7 +171,7 @@ describe('queue endpoints', () => {
     it('tolerates empty body — defaults thresholdMs to 60s', async () => {
       const res = await app.request('/internal/queue/sweep', {
         method: 'POST',
-        headers: { 'X-Internal-Token': tradingToken() },
+        headers: { Authorization: await tradingBearer() },
       });
       expect(res.status).toBe(200);
     });

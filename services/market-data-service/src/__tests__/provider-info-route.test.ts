@@ -7,8 +7,7 @@
 // the implementation (forgetting to declare allowedPollIntervals, mismatched key
 // names) shows up immediately.
 
-process.env.INTERNAL_SECRET = 'test-internal-secret';
-
+process.env.JWT_SECRET = 'test-jwt-secret-min-16-chars';
 import { describe, it, expect, vi } from "vitest";
 
 // Mock @trader/shared-mongo BEFORE importing the admin router, so the route's
@@ -63,7 +62,7 @@ vi.mock('@trader/shared-redis', () => ({
 }));
 
 const { Hono } = await import('hono');
-const { generateInternalToken } = await import('@trader/shared-auth');
+const { mintInternalJwt } = await import('@trader/shared-auth');
 const { createAdminRouter } = await import('../admin-routes.ts');
 const { YahooProvider } = await import('../providers/yahoo-provider.ts');
 
@@ -76,19 +75,19 @@ function buildApp() {
   return app;
 }
 
-const gatewayToken = () => generateInternalToken('api-gateway');
+const gatewayToken = async () => `Bearer ${await mintInternalJwt('api-gateway')}`;
 
 describe('GET /api/admin/market-data/provider-info', () => {
-  it('requires the api-gateway internal token (403 without)', async () => {
+  it('requires the api-gateway internal token (401 without)', async () => {
     const app = buildApp();
     const res = await app.request('/api/admin/market-data/provider-info');
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(401);
   });
 
   it('returns provider name, max lookback, and the allowed poll intervals', async () => {
     const app = buildApp();
     const res = await app.request('/api/admin/market-data/provider-info', {
-      headers: { 'X-Internal-Token': gatewayToken() },
+      headers: { Authorization: await gatewayToken() },
     });
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -112,7 +111,7 @@ describe('PUT /api/admin/market-data/config (allowlist enforcement)', () => {
     const app = buildApp();
     const res = await app.request('/api/admin/market-data/config', {
       method: 'PUT',
-      headers: { 'X-Internal-Token': gatewayToken(), 'Content-Type': 'application/json' },
+      headers: { Authorization: await gatewayToken(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ pollIntervalMs: 60 * 60_000 }),  // 1h, in Yahoo's list
     });
     expect(res.status).toBe(200);
@@ -126,7 +125,7 @@ describe('PUT /api/admin/market-data/config (allowlist enforcement)', () => {
     const app = buildApp();
     const res = await app.request('/api/admin/market-data/config', {
       method: 'PUT',
-      headers: { 'X-Internal-Token': gatewayToken(), 'Content-Type': 'application/json' },
+      headers: { Authorization: await gatewayToken(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ pollIntervalMs: 7000 }),  // 7s — not in any provider's list
     });
     expect(res.status).toBe(400);
@@ -145,7 +144,7 @@ describe('PUT /api/admin/market-data/config (signalOrderType hot-swap)', () => {
     const app = buildApp();
     const res = await app.request('/api/admin/market-data/config', {
       method: 'PUT',
-      headers: { 'X-Internal-Token': gatewayToken(), 'Content-Type': 'application/json' },
+      headers: { Authorization: await gatewayToken(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ signalOrderType: 1 }),  // OrderType.Market
     });
     expect(res.status).toBe(200);
@@ -168,7 +167,7 @@ describe('PUT /api/admin/market-data/config (signalOrderType hot-swap)', () => {
     const app = buildApp();
     const res = await app.request('/api/admin/market-data/config', {
       method: 'PUT',
-      headers: { 'X-Internal-Token': gatewayToken(), 'Content-Type': 'application/json' },
+      headers: { Authorization: await gatewayToken(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ signalOrderType: 99 }),
     });
     expect(res.status).toBe(400);
@@ -181,7 +180,7 @@ describe('PUT /api/admin/market-data/config (signalOrderType hot-swap)', () => {
     const app = buildApp();
     const res = await app.request('/api/admin/market-data/config', {
       method: 'PUT',
-      headers: { 'X-Internal-Token': gatewayToken(), 'Content-Type': 'application/json' },
+      headers: { Authorization: await gatewayToken(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ signalOrderType: null }),
     });
     expect(res.status).toBe(200);

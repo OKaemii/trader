@@ -4,7 +4,7 @@ import { serve } from '@hono/node-server';
 import { createNodeWebSocket } from '@hono/node-ws';
 import { getRedisClient, subscribe } from '@trader/shared-redis';
 import { getMongoDb } from '@trader/shared-mongo';
-import { requireAuth, requireRole, generateInternalToken, verifyAccessToken, mintInternalJwt } from '@trader/shared-auth';
+import { requireAuth, requireRole, verifyAccessToken, mintInternalJwt } from '@trader/shared-auth';
 
 const app = new Hono();
 const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
@@ -12,16 +12,12 @@ const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
 app.use('*', cors({ origin: ['http://trader.local', 'http://localhost:3007'] }));
 
 // ── Internal token helper ────────────────────────────────────────────────────
-// Forwards both:
-//   - a short-lived audience-internal JWT (sub='api-gateway') as the new primitive
-//   - the legacy HMAC X-Internal-Token header during the Phase 4 transition window
-// Downstream services use `requireInternalAny` which accepts either. The legacy HMAC
-// branch is dropped in the final commit of Phase 4 once every caller is on Bearer.
+// Mints a short-lived audience='internal' JWT (sub='api-gateway') for downstream
+// peer calls. Downstream services verify via `requireInternal`.
 async function withInternalHeaders(headers: Headers): Promise<Headers> {
   const out = new Headers(headers);
   const jwt = await mintInternalJwt('api-gateway');
   out.set('Authorization', `Bearer ${jwt}`);
-  out.set('X-Internal-Token', generateInternalToken('api-gateway'));
   return out;
 }
 
@@ -140,8 +136,8 @@ admin.get('/api/admin/market-data/calendar',          (c) => proxy('http://marke
 admin.get('/api/admin/market-data/holiday-sources',   (c) => proxy('http://market-data-service:3002', c));
 admin.post('/api/admin/market-data/holiday-refresh',  (c) => proxy('http://market-data-service:3002', c));
 admin.get('/api/admin/system/status', async (c) => {
-  const token = generateInternalToken('api-gateway');
-  const headers = { 'X-Internal-Token': token };
+  const jwt = await mintInternalJwt('api-gateway');
+  const headers = { Authorization: `Bearer ${jwt}` };
   const [marketRes, strategyRes] = await Promise.allSettled([
     fetch('http://market-data-service:3002/health', { headers }).then(r => r.json()),
     fetch('http://strategy-engine:8000/status',     { headers }).then(r => r.json()),
@@ -223,10 +219,10 @@ admin.get('/api/admin/system/health', async (c) => {
     ['portfolio',     'http://portfolio-service:3006/health'],
     ['backtest',      'http://backtest-engine:8001/health'],
   ] as const;
-  const token = generateInternalToken('api-gateway');
+  const jwt = await mintInternalJwt('api-gateway');
   const results = await Promise.allSettled(
     services.map(async ([name, url]) => {
-      const r = await fetch(url, { headers: { 'X-Internal-Token': token } });
+      const r = await fetch(url, { headers: { Authorization: `Bearer ${jwt}` } });
       return { name, ok: r.ok, status: r.status };
     }),
   );

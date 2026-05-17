@@ -22,7 +22,7 @@ import type { RedisClientType } from 'redis';
 import type { TradeSignal } from '../../domain/entities/TradeSignal.ts';
 import type { ISignalRepository } from '../../domain/interfaces/ISignalRepository.ts';
 import type { ApproveSignalUseCase } from '../use-cases/ApproveSignal.ts';
-import { generateInternalToken, mintInternalJwt } from '@trader/shared-auth';
+import { mintInternalJwt } from '@trader/shared-auth';
 
 const REDIS_KEY = 'signal:auto_approve';
 const TRADING_SERVICE = process.env.TRADING_SERVICE_URL ?? 'http://trading-service:3005';
@@ -73,8 +73,7 @@ export class AutoApprovalGate {
     let cash: { freeGBP: number; totalGBP: number } | null = null;
     try {
       const res = await fetch(`${TRADING_SERVICE}/internal/trading/cash`, {
-        headers: { 'X-Internal-Token': generateInternalToken('signal-service'),
-          'Authorization':     `Bearer ${await mintInternalJwt('signal-service')}` },
+        headers: { Authorization: `Bearer ${await mintInternalJwt('signal-service')}` },
       });
       if (res.ok) {
         const raw = await res.json() as {

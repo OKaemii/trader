@@ -17,10 +17,6 @@
       "types": "./dist/middleware.d.ts",
       "import": "./dist/middleware.js"
     },
-    "./internal-token": {
-      "types": "./dist/internal-token.d.ts",
-      "import": "./dist/internal-token.js"
-    },
     "./audiences": {
       "types": "./dist/audiences.d.ts",
       "import": "./dist/audiences.js"
