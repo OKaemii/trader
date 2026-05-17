@@ -1,15 +1,19 @@
 {
   "name": "trader",
   "private": true,
-  "workspaces": [
-    "services/*",
-    "packages/*",
-    "infra/scripts"
-  ],
+  "packageManager": "pnpm@9.12.0",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
-    "dev":       "bun run --filter '*' dev",
-    "build":     "bun run --filter '*' build",
-    "typecheck": "bun run --filter '*' typecheck",
-    "test":      "bun run --filter '*' test"
+    "dev":       "pnpm -r run dev",
+    "build":     "pnpm -r run build",
+    "typecheck": "pnpm -r run typecheck",
+    "lint":      "pnpm -r run lint",
+    "test":      "pnpm -r run test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.5",
+    "typescript": "^5.5.4"
   }
 }

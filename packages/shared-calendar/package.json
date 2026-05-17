@@ -4,8 +4,8 @@
   "private": true,
   "main": "./src/index.ts",
   "dependencies": {
-    "@trader/shared-mongo": "*",
-    "@trader/shared-types": "*",
+    "@trader/shared-mongo": "workspace:*",
+    "@trader/shared-types": "workspace:*",
     "mongodb": "^6.5.0"
   },
   "scripts": {
