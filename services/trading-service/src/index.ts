@@ -129,10 +129,21 @@ export function buildApp(deps: AppDeps): Hono {
       action: 'BUY' | 'SELL';
       targetWeight: number;
       confidence: number;
-      totalNAV?: number;
-      currentPrice?: number;
+      totalNAV?:     { amount: number; currency: 'GBP' | 'USD' };
+      currentPrice?: { amount: number; currency: 'GBP' | 'USD' };
       currentQuantity?: number;
     }>();
+
+    // Hono doesn't validate against the TS type at runtime. Reject legacy raw-scalar
+    // bodies up-front rather than letting them silently produce a 100x sizing error.
+    if (body.totalNAV !== undefined &&
+        (typeof body.totalNAV.amount !== 'number' || !body.totalNAV.currency)) {
+      return c.json({ message: 'totalNAV must be { amount, currency }' }, 400);
+    }
+    if (body.currentPrice !== undefined &&
+        (typeof body.currentPrice.amount !== 'number' || !body.currentPrice.currency)) {
+      return c.json({ message: 'currentPrice must be { amount, currency }' }, 400);
+    }
 
     const db    = await deps.getDb();
     const redis = await deps.getRedis();
@@ -145,7 +156,7 @@ export function buildApp(deps: AppDeps): Hono {
     const order   = await useCase.execute(body);
 
     if (!order) {
-      return c.json({ message: 'Order skipped — check TRADING_MODE and live gate status' }, 200);
+      return c.json({ message: 'Order skipped — check TRADING_MODE, live gate, currency match' }, 200);
     }
     return c.json({ order });
   });
