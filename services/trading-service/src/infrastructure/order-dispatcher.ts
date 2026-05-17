@@ -9,8 +9,7 @@ import { T212OrderExecutor } from './T212OrderExecutor.ts';
 import { PlaceOrderUseCase } from '../application/use-cases/PlaceOrderUseCase.ts';
 import { getSignalOrderType } from './live-config.ts';
 import { TradingMode, OrderStatus } from '../domain/entities/Order.ts';
-import { type Currency, SignalFailureReason } from '@trader/shared-types';
-import { currencyOfTicker } from './t212.ts';
+import { type Currency, type Money, SignalFailureReason } from '@trader/shared-types';
 
 // OrderDispatcher — the durable-queue worker. Replaces the synchronous "approve →
 // trading-service POST /internal/signals/trading/execute → T212" path that previously
@@ -149,20 +148,24 @@ export class OrderDispatcher {
       return;
     }
 
-    // Current price for drift gate + quantity sizing. Falls back to last-close from Mongo.
+    // Current price for drift gate + quantity sizing. Money-typed: carries the
+    // instrument's listing currency from the bar, which becomes the single source of
+    // truth for `instrumentCcy` below (was previously derived from ticker suffix —
+    // two sources, easy to drift).
     const db = await this.deps.getDb();
     const priceLookup = new MongoPriceLookup(db);
-    const currentPrice = (await priceLookup.lastClose(signal.ticker)) ?? undefined;
+    const currentPrice = await priceLookup.lastCloseMoney(signal.ticker);
 
-    // Drift gate: if we have both an entry price (set at emission) and a current price,
-    // compare. >drift% movement either way = "this is no longer the same trade" → failed.
+    // Drift gate: scalar comparison in the instrument's currency. Both currentPrice.amount
+    // and signal.entryPrice are recorded at emission in the instrument currency, so the
+    // comparison stays valid without any FX hop.
     if (signal.entryPrice && currentPrice && signal.entryPrice > 0) {
-      const movement = Math.abs(currentPrice - signal.entryPrice) / signal.entryPrice;
+      const movement = Math.abs(currentPrice.amount - signal.entryPrice) / signal.entryPrice;
       if (movement > this.drift) {
         await this.markFailed(
           signal.id,
           SignalFailureReason.MarketDrift,
-          `entry=${signal.entryPrice.toFixed(4)} current=${currentPrice.toFixed(4)} delta=${(movement * 100).toFixed(2)}%`,
+          `entry=${signal.entryPrice.toFixed(4)} current=${currentPrice.amount.toFixed(4)} delta=${(movement * 100).toFixed(2)}%`,
         );
         return;
       }
@@ -188,12 +191,16 @@ export class OrderDispatcher {
 
     // FX-convert account NAV from GBP (T212 base) into the instrument's listing
     // currency so PlaceOrderUseCase can compute share count without unit confusion.
-    // For GBP-listed tickers this is identity; for USD-listed it's GBP / (GBP-per-USD).
-    const instrumentCcy = currencyOfTicker(signal.ticker);
-    const navGBP        = snapshot.total.amount;   // T212 cash already tagged GBP
-    const totalNAVInstr = this.deps.fxFromGBP
+    // Single source of truth for the instrument currency: the price lookup itself.
+    // If currentPrice is null we can't size — _computeQuantity returns 0, dispatcher
+    // marks the signal failed below. Sentinel GBP totalNAV is safe because the use
+    // case rejects zero-price inputs before touching currency arithmetic.
+    const instrumentCcy: Currency = currentPrice?.currency ?? 'GBP';
+    const navGBP                  = snapshot.total.amount;
+    const navInstrAmt             = this.deps.fxFromGBP
       ? await this.deps.fxFromGBP(navGBP, instrumentCcy)
-      : navGBP;   // identity fallback for tests / GBP-only fixtures
+      : navGBP;
+    const totalNAV: Money = { amount: navInstrAmt, currency: instrumentCcy };
 
     try {
       const order = await useCase.execute({
@@ -202,8 +209,8 @@ export class OrderDispatcher {
         action:          signal.action,
         targetWeight:    signal.targetWeight,
         confidence:      signal.confidence,
-        totalNAV:        totalNAVInstr,
-        currentPrice,
+        totalNAV,
+        currentPrice:    currentPrice ?? undefined,
         currentQuantity,
       });
 

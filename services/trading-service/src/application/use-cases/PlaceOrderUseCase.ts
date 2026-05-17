@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { generateInternalToken } from '@trader/shared-auth';
+import type { Money } from '@trader/shared-types';
 import {
   type Order,
   OrderSide,
@@ -12,7 +13,11 @@ import type { IOrderRepository } from '../../domain/interfaces/IOrderRepository.
 import type { IOrderExecutor } from '../../domain/interfaces/IOrderExecutor.ts';
 import { OrderRouter, OrderReason } from '../services/OrderRouter.ts';
 
-const TRADING_MODE     = parseTradingMode(process.env.TRADING_MODE);
+// TRADING_MODE is read per-call (not module-load) so the same process can host
+// multiple test modes and parent processes can flip the env before constructing
+// a use case. In production this is set once and never changes; the function-call
+// cost is a single object lookup + string compare.
+const tradingMode = (): TradingMode => parseTradingMode(process.env.TRADING_MODE);
 const SIGNAL_SERVICE   = process.env.SIGNAL_SERVICE_URL ?? 'http://signal-service:3003';
 
 // SIGNAL_ORDER_TYPE is consumed via an injected getter (see live-config.ts) so a portal
@@ -48,14 +53,14 @@ export interface PlaceOrderInput {
   action:       'BUY' | 'SELL';
   targetWeight: number;         // [0,1] — from TradeSignal; must be >= 0 (long-only)
   confidence:   number;
-  // FX contract (2026-05-15): `totalNAV` and `currentPrice` MUST be expressed in the
-  // instrument's listing currency. Caller is responsible for FX-converting account-level
-  // NAV (which sits in BASE_CURRENCY = GBP) into the instrument's currency before
-  // passing — the dispatcher does this via FxClient. Mixing currencies here is the
-  // class of bug that caused 100x position-sizing errors on LSE pence-quoted stocks
-  // before pence normalisation landed.
-  totalNAV?:    number;         // instrument currency
-  currentPrice?: number;        // instrument currency (already pence-normalised at the market-data boundary)
+  // totalNAV and currentPrice MUST be in the same currency — typically the instrument's
+  // listing currency. _computeQuantity asserts equality and rejects mismatches with
+  // zero-qty + a logged error. Callers holding NAV in a different currency (the
+  // dispatcher, with GBP account NAV) MUST FX-convert before constructing this input;
+  // the type system now carries the currency tag through every call site, so the
+  // 100x position-sizing bug class (GBP NAV against USD price) cannot compile.
+  totalNAV?:        Money;
+  currentPrice?:    Money;
   currentQuantity?: number;
 }
 
@@ -80,12 +85,13 @@ export class PlaceOrderUseCase {
     //   Paper → no broker call; notifications only.
     //   Demo  → real orders to demo.trading212 with demo API keys; no live-gate required.
     //   Live  → real orders to trading212 with live API keys; live-gate must be approved.
-    if (TRADING_MODE === TradingMode.Paper) {
+    const mode = tradingMode();
+    if (mode === TradingMode.Paper) {
       console.log(`[PlaceOrder] TRADING_MODE=Paper — skipping order for ${input.ticker}`);
       return null;
     }
 
-    if (TRADING_MODE === TradingMode.Live) {
+    if (mode === TradingMode.Live) {
       const approved = await this.liveApproved();
       if (!approved) {
         console.warn(`[PlaceOrder] live trading gate not approved — rejecting order for ${input.ticker}. Call POST /api/admin/trading/approve-live first.`);
@@ -120,7 +126,7 @@ export class PlaceOrderUseCase {
       side,
       orderType,
       quantity,
-      limitPrice:   orderType === OrderType.Limit ? input.currentPrice : undefined,
+      limitPrice:   orderType === OrderType.Limit ? input.currentPrice?.amount : undefined,
       status:       OrderStatus.Pending,
       signalId:     input.signalId,
       targetWeight: input.targetWeight,
@@ -161,13 +167,24 @@ export class PlaceOrderUseCase {
 
   private _computeQuantity(input: PlaceOrderInput): number {
     const { totalNAV, currentPrice, currentQuantity = 0, targetWeight, action } = input;
-    if (!totalNAV || !currentPrice || currentPrice <= 0) {
+    if (!totalNAV || !currentPrice || currentPrice.amount <= 0) {
       // Cannot size without price data — caller must supply these or quantity defaults to 0
       return 0;
     }
-    const targetValue  = targetWeight * totalNAV;
-    const currentValue = currentQuantity * currentPrice;
-    const delta        = (targetValue - currentValue) / currentPrice;
+    if (totalNAV.currency !== currentPrice.currency) {
+      // Currency mismatch is the 100x bug class — refuse to size and log loudly so the
+      // operator can grep the offending caller. Returning 0 (rather than throwing) keeps
+      // the dispatcher's terminal-failure path: zero qty → markFailed(CashInsufficient).
+      console.error(
+        `[PlaceOrder] currency mismatch for ${input.ticker}: ` +
+        `totalNAV=${totalNAV.currency} currentPrice=${currentPrice.currency}. ` +
+        `Caller must FX-convert before sizing.`,
+      );
+      return 0;
+    }
+    const targetValue  = targetWeight * totalNAV.amount;
+    const currentValue = currentQuantity * currentPrice.amount;
+    const delta        = (targetValue - currentValue) / currentPrice.amount;
 
     if (action === 'BUY'  && delta > 0) return Math.floor(delta);
     if (action === 'SELL' && delta < 0) return Math.floor(Math.abs(delta));
