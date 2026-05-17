@@ -7,6 +7,7 @@ RUN corepack enable && corepack prepare pnpm@9.12.0 --activate
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 
 # Copy all package manifests to satisfy --frozen-lockfile workspace validation
+COPY packages/core/package.json               ./packages/core/
 COPY packages/shared-auth/package.json        ./packages/shared-auth/
 COPY packages/shared-bars/package.json        ./packages/shared-bars/
 COPY packages/shared-calendar/package.json    ./packages/shared-calendar/
