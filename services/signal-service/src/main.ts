@@ -1,4 +1,5 @@
 import { createServer, createLogger, listen, registerGracefulShutdown } from "@trader/core";
+import { startTracer, traceMixin } from "@trader/telemetry";
 
 import { loadSignalEnv } from "./env.ts";
 import { wireDependencies, type SignalDeps } from "./wiring.ts";
@@ -7,7 +8,10 @@ import { createInternalRouter } from "./infrastructure/http/internal-router.ts";
 
 async function main(): Promise<void> {
     const env    = loadSignalEnv();
-    const logger = createLogger({ service: "signal-service", level: env.LOG_LEVEL });
+    // Tracer first — must boot before any auto-instrumented HTTP / DB clients are loaded.
+    // No-op when OTLP_ENDPOINT is unset (dev / homeserver without collector).
+    startTracer({ service: "signal-service", otlpEndpoint: env.OTLP_ENDPOINT });
+    const logger = createLogger({ service: "signal-service", level: env.LOG_LEVEL, traceMixin });
     const deps   = await wireDependencies(env, logger);
 
     const app = await createServer<SignalDeps>({

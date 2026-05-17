@@ -25,6 +25,7 @@
     "hono": "^4.3.0",
     "mongodb": "^6.5.0",
     "redis": "^4.7.0",
-    "zod": "^3.23.0"
+    "zod": "^3.23.0",
+    "@trader/telemetry": "workspace:*"
   }
 }
