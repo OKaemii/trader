@@ -1,11 +1,13 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { upgradeWebSocket, websocket } from 'hono/bun';
+import { serve } from '@hono/node-server';
+import { createNodeWebSocket } from '@hono/node-ws';
 import { getRedisClient, subscribe } from '@trader/shared-redis';
 import { getMongoDb } from '@trader/shared-mongo';
 import { requireAuth, requireRole, generateInternalToken, verifyAccessToken } from '@trader/shared-auth';
 
 const app = new Hono();
+const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
 
 app.use('*', cors({ origin: ['http://trader.local', 'http://localhost:3007'] }));
 
@@ -214,6 +216,8 @@ admin.get('/api/admin/system/health', async (c) => {
 
 app.route('/', admin);
 
-// idleTimeout raised from Bun's 10s default so the gateway's proxy of slow downstream
-// admin endpoints (e.g. approve → trading-service → T212) doesn't hit a premature reset.
-export default { port: 3000, idleTimeout: 60, fetch: app.fetch, websocket };
+const port = Number(process.env.PORT ?? 3000);
+const server = serve({ fetch: app.fetch, port }, (info) => {
+  console.log(`[api-gateway] listening on :${info.port}`);
+});
+injectWebSocket(server);

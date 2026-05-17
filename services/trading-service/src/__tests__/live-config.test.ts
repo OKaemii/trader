@@ -1,10 +1,10 @@
-import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 // Mock shared-mongo BEFORE importing the module under test so the dynamic mongo
 // lookup inside live-config is captured.
 let findOneImpl: () => Promise<any> = async () => null;
 
-mock.module('@trader/shared-mongo', () => ({
+vi.mock('@trader/shared-mongo', () => ({
   COLLECTIONS: { PORTAL_MARKET_CONFIG: 'portal_market_config' },
   getMongoDb: async () => ({
     collection: () => ({ findOne: () => findOneImpl() }),

@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { serve } from '@hono/node-server';
 import { getRedisClient } from '@trader/shared-redis';
 import { getMongoDb } from '@trader/shared-mongo';
 import { FxClient, YahooFxProvider } from '@trader/shared-fx';
@@ -107,7 +108,7 @@ main().catch((err) => {
   process.exit(1);
 });
 
-// idleTimeout raised from Bun's 10s default. Even though ApproveSignal is now fire-and-forget,
-// other handlers (notably the trading-service callback chain) can stall on slow downstream
-// systems; a higher ceiling avoids spurious 502s under rate-limit-induced lag.
-export default { port: 3003, idleTimeout: 60, fetch: app.fetch };
+const port = Number(process.env.PORT ?? 3003);
+serve({ fetch: app.fetch, port }, (info) => {
+  console.log(`[signal-service] listening on :${info.port}`);
+});

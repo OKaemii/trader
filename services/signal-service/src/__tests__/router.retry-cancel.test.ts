@@ -10,7 +10,7 @@
 process.env.INTERNAL_SECRET = 'test-internal-secret';
 process.env.JWT_SECRET      = 'test-jwt-secret';
 
-import { describe, it, expect, beforeAll } from 'bun:test';
+import { describe, it, expect, beforeAll } from "vitest";
 import { Hono } from 'hono';
 import { signAccessToken } from '@trader/shared-auth/jwt';
 import { createRouter } from '../infrastructure/http/router.ts';

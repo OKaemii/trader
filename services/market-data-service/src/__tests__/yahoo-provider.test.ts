@@ -6,7 +6,7 @@
 // avoid duplicating those tests; here we focus on the provider layer's added logic
 // (chunk dispatch, truncation, timestamp normalisation).
 
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { YahooProvider } from '../providers/yahoo-provider.ts';
 
 interface FetchCall { url: string }

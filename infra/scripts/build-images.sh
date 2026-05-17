@@ -26,7 +26,7 @@ printf '%b' "${HOMESERVER_SSH_KEY}" > "${TMPKEY}"
 chmod 600 "${TMPKEY}"
 trap 'rm -f "${TMPKEY}"' EXIT
 
-BUN_SERVICES=(
+TS_SERVICES=(
   api-gateway
   auth-service
   market-data-service
@@ -67,7 +67,7 @@ build_and_load() {
       ;;
     *)
       docker build \
-        -f infra/docker/bun-service.Dockerfile \
+        -f infra/docker/node-service.Dockerfile \
         --build-arg SERVICE="${service}" \
         -t "${tag}" \
         "${REPO_ROOT}"
@@ -107,7 +107,7 @@ cd "${REPO_ROOT}"
 TARGET="${1:-all}"
 
 if [[ "${TARGET}" == "all" ]]; then
-  for svc in "${BUN_SERVICES[@]}"; do
+  for svc in "${TS_SERVICES[@]}"; do
     build_and_load "${svc}"
   done
   build_and_load "strategy-engine"

@@ -6,7 +6,7 @@
 // trading day fold into the same daily bucket even though their bar timestamps differ
 // by several hours.
 
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect } from "vitest";
 import { aggregateBars } from '../index.ts';
 import type { OHLCVBar } from '@trader/shared-types';
 

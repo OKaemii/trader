@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect } from "vitest";
 import { NyseIcalProvider } from '../providers/ical-provider.ts';
 import { UkGovBankHolidayProvider } from '../providers/uk-gov-provider.ts';
 import { StaticFallbackProvider, STATIC_FALLBACK } from '../providers/static-fallback.ts';

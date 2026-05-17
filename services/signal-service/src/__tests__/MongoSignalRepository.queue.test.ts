@@ -10,7 +10,7 @@
 //   - markFailed: writes lifecycle, failureReason, failureDetail
 //   - retry: failed → queued, attempts reset to 0
 
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect } from "vitest";
 import { MongoSignalRepository } from '../infrastructure/repositories/MongoSignalRepository.ts';
 import { TradeSignal } from '../domain/entities/TradeSignal.ts';
 import { toSignalDoc } from '../infrastructure/data.ts';

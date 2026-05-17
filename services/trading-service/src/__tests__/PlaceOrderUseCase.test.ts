@@ -4,7 +4,7 @@
 // TRADING_MODE is read per-call inside execute(), so tests can flip it before
 // invoking the use case without coordinating module load order.
 
-import { describe, it, expect, mock, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { PlaceOrderUseCase, type PlaceOrderInput } from '../application/use-cases/PlaceOrderUseCase.ts';
 import { OrderStatus, OrderType } from '../domain/entities/Order.ts';
 import type { Order } from '../domain/entities/Order.ts';
@@ -47,7 +47,7 @@ function makeExecutor() {
 
 describe('PlaceOrderUseCase', () => {
   it('returns null and logs on currency mismatch (GBP NAV vs USD price)', async () => {
-    const errorSpy = mock(() => {});
+    const errorSpy = vi.fn(() => {});
     const origError = console.error;
     console.error = errorSpy;
     try {

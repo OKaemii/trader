@@ -6,7 +6,7 @@
 //     impossible — there is no longer a code path that substitutes a native scalar
 //     into a GBP-named column)
 
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect } from "vitest";
 import { buildPositionUpdate } from '../sync.ts';
 import { sumPositionsGBP, type FxConverter, type PositionDoc } from '@trader/shared-portfolio';
 import type { Money } from '@trader/shared-types';

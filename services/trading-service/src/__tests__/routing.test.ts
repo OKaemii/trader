@@ -16,7 +16,7 @@
 process.env.JWT_SECRET      = 'test-jwt-secret';
 process.env.INTERNAL_SECRET = 'test-internal-secret';
 
-import { describe, it, expect, beforeAll } from 'bun:test';
+import { describe, it, expect, beforeAll } from "vitest";
 import { buildApp, type AppDeps } from '../index.ts';
 import { AccountCache } from '../infrastructure/account-cache.ts';
 import { signAccessToken } from '@trader/shared-auth/jwt';

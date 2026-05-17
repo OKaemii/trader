@@ -1,5 +1,6 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import { Hono } from 'hono';
+import { serve } from '@hono/node-server';
 import { getRedisClient, xAdd, ensureConsumerGroup } from '@trader/shared-redis';
 import { getMongoDb } from '@trader/shared-mongo';
 import { COLLECTIONS } from '@trader/shared-mongo';
@@ -462,4 +463,7 @@ async function bootstrap(): Promise<void> {
 // helpers from this module via vitest's module loader, which uses a separate process.
 bootstrap();
 
-export default { port: 3002, fetch: app.fetch };
+const port = Number(process.env.PORT ?? 3002);
+serve({ fetch: app.fetch, port }, (info) => {
+  console.log(`[market-data-service] listening on :${info.port}`);
+});

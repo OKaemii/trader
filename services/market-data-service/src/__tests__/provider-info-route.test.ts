@@ -9,7 +9,7 @@
 
 process.env.INTERNAL_SECRET = 'test-internal-secret';
 
-import { describe, it, expect, mock } from 'bun:test';
+import { describe, it, expect, vi } from "vitest";
 
 // Mock @trader/shared-mongo BEFORE importing the admin router, so the route's
 // updateOne / findOne calls hit our in-memory stub instead of trying to reach a
@@ -17,7 +17,7 @@ import { describe, it, expect, mock } from 'bun:test';
 // module's exported helper.
 const mongoStore = new Map<string, any>();
 let updateOneCalls = 0;
-mock.module('@trader/shared-mongo', () => ({
+vi.mock('@trader/shared-mongo', () => ({
   COLLECTIONS: {
     PORTAL_MARKET_CONFIG:       'portal_market_config',
     PORTAL_UNIVERSE_OVERRIDES:  'portal_universe_overrides',
@@ -48,7 +48,7 @@ mock.module('@trader/shared-mongo', () => ({
 // the executionMode test can assert the live-config invalidation fan-out without
 // reaching into module internals.
 const publishCalls: Array<{ channel: string; payload: string }> = [];
-mock.module('@trader/shared-redis', () => ({
+vi.mock('@trader/shared-redis', () => ({
   getRedisClient: async () => ({
     get: async () => null,
     setEx: async () => 'OK',

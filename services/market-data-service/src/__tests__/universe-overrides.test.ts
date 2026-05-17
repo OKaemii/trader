@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect } from "vitest";
 import { applyUniverseOverrides, type InstrumentMeta } from '../universe-manager.ts';
 
 function inst(ticker: string, sector = 'Tech'): InstrumentMeta {

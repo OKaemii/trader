@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { serve } from '@hono/node-server';
 import type { Db } from 'mongodb';
 import type { RedisClientType } from 'redis';
 import { requireAuth, requireRole, requireInternalToken } from '@trader/shared-auth/middleware';
@@ -250,58 +251,49 @@ const productionDeps: AppDeps = {
 };
 const app = buildApp(productionDeps);
 
-if (import.meta.main) {
-  (async () => {
-    if (tradingMode !== TradingMode.Paper) {
-      const db = await getMongoDb();
-      const orderRepo = new MongoOrderRepository(db);
-      new FillsPoller(orderRepo, sharedClient, FILL_POLL_INTERVAL_MS).start();
-      console.log(`[trading-service] fills poller started (${FILL_POLL_INTERVAL_MS}ms, mode=${modeName(tradingMode)})`);
-    }
+(async () => {
+  if (tradingMode !== TradingMode.Paper) {
+    const db = await getMongoDb();
+    const orderRepo = new MongoOrderRepository(db);
+    new FillsPoller(orderRepo, sharedClient, FILL_POLL_INTERVAL_MS).start();
+    console.log(`[trading-service] fills poller started (${FILL_POLL_INTERVAL_MS}ms, mode=${modeName(tradingMode)})`);
+  }
 
-    const dispatcher = new OrderDispatcher({
-      signalServiceUrl:    SIGNAL_SERVICE_URL,
-      tradingMode,
-      client:              sharedClient,
-      accountCache:        sharedAccountCache,
-      getDb:               () => getMongoDb(),
-      getRedis:            () => getRedisClient() as unknown as Promise<Pick<RedisClientType, 'get'>>,
-      fxFromGBP:           async (amount, target) => (await getFxClient()).fromGBP(amount, target),
-      minIntervalMs:       ORDER_MIN_INTERVAL_MS,
-      maxAttempts:         ORDER_MAX_ATTEMPTS,
-      queueTtlMs:          QUEUE_TTL_MS,
-      priceDriftTolerance: PRICE_DRIFT_TOLERANCE,
+  const dispatcher = new OrderDispatcher({
+    signalServiceUrl:    SIGNAL_SERVICE_URL,
+    tradingMode,
+    client:              sharedClient,
+    accountCache:        sharedAccountCache,
+    getDb:               () => getMongoDb(),
+    getRedis:            () => getRedisClient() as unknown as Promise<Pick<RedisClientType, 'get'>>,
+    fxFromGBP:           async (amount, target) => (await getFxClient()).fromGBP(amount, target),
+    minIntervalMs:       ORDER_MIN_INTERVAL_MS,
+    maxAttempts:         ORDER_MAX_ATTEMPTS,
+    queueTtlMs:          QUEUE_TTL_MS,
+    priceDriftTolerance: PRICE_DRIFT_TOLERANCE,
+  });
+
+  try {
+    const reverted = await dispatcher.sweepStaleExecuting(60_000);
+    if (reverted > 0) console.warn(`[trading-service] boot sweep reverted ${reverted} stale executing signal(s)`);
+  } catch (e) {
+    console.warn('[trading-service] boot sweep failed (signal-service likely not up yet):', e);
+  }
+
+  dispatcher.start().catch((e) => console.error('[trading-service] dispatcher crashed:', e));
+
+  try {
+    const redis = await getRedisClient();
+    await subscribe(redis as unknown as RedisClientType, 'config:invalidated', () => {
+      invalidateSignalOrderType();
+      console.log('[trading-service] live-config cache invalidated via pubsub');
     });
+  } catch (err) {
+    console.warn('[trading-service] config-invalidated subscribe failed (TTL still applies):', err);
+  }
+})().catch((e) => console.error('[trading-service] bootstrap failed:', e));
 
-    // Boot sweep: any signals stuck at lifecycle='executing' from a prior pod that
-    // crashed mid-flight get reverted to 'queued' so the new dispatcher picks them up.
-    // FillsPoller is the source of truth for whether the order actually reached T212;
-    // PlaceOrderUseCase's findBySignalId guard prevents duplicate placement.
-    try {
-      const reverted = await dispatcher.sweepStaleExecuting(60_000);
-      if (reverted > 0) console.warn(`[trading-service] boot sweep reverted ${reverted} stale executing signal(s)`);
-    } catch (e) {
-      console.warn('[trading-service] boot sweep failed (signal-service likely not up yet):', e);
-    }
-
-    dispatcher.start().catch((e) => console.error('[trading-service] dispatcher crashed:', e));
-
-    // Subscribe to portal config-invalidated pubsub so a Save in the portal drops our
-    // live-config cache within the round-trip rather than waiting up to 15s for the TTL.
-    // Topic name is hard-coded to avoid pulling a market-data-service export into a peer
-    // service — kept in sync via the comment in admin-routes.ts CONFIG_INVALIDATED_TOPIC.
-    try {
-      const redis = await getRedisClient();
-      await subscribe(redis as unknown as RedisClientType, 'config:invalidated', () => {
-        invalidateSignalOrderType();
-        console.log('[trading-service] live-config cache invalidated via pubsub');
-      });
-    } catch (err) {
-      console.warn('[trading-service] config-invalidated subscribe failed (TTL still applies):', err);
-    }
-  })().catch((e) => console.error('[trading-service] bootstrap failed:', e));
-}
-
-// idleTimeout raised from the Bun default (10s) so synchronous order-placement chains
-// involving T212 calls (which can stall on 429s or network) don't get reset mid-flight.
-export default { port: 3005, idleTimeout: 60, fetch: app.fetch };
+const port = Number(process.env.PORT ?? 3005);
+serve({ fetch: app.fetch, port }, (info) => {
+  console.log(`[trading-service] listening on :${info.port}`);
+});

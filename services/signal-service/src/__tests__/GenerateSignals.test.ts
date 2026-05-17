@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'bun:test';
+import { describe, it, expect, beforeEach } from "vitest";
 import { GenerateSignalsUseCase } from '../application/use-cases/GenerateSignals.ts';
 import { TradeSignal } from '../domain/entities/TradeSignal.ts';
 import type { ISignalRepository } from '../domain/interfaces/ISignalRepository.ts';

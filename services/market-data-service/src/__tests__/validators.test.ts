@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect } from "vitest";
 import { BarValidator } from '../bar-validator.ts';
 import { GapDetector } from '../gap-detector.ts';
 import { StaleDetector } from '../stale-detector.ts';

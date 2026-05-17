@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect } from "vitest";
 import { GetSignalProgressUseCase } from '../application/use-cases/GetSignalProgress.ts';
 import { TradeSignal } from '../domain/entities/TradeSignal.ts';
 import { SignalLifecycle } from '@trader/shared-types';

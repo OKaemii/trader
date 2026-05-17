@@ -14,7 +14,7 @@
 
 process.env.INTERNAL_SECRET = 'test-internal-secret';
 
-import { describe, it, expect, beforeEach, mock } from 'bun:test';
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { FillsPoller } from '../application/services/FillsPoller.ts';
 import { type Order, OrderSide, OrderType, OrderStatus } from '../domain/entities/Order.ts';
 import type { IOrderRepository } from '../domain/interfaces/IOrderRepository.ts';
@@ -96,7 +96,7 @@ const terminalItem = (id: number, status: 'CANCELLED' | 'REJECTED' | 'EXPIRED'):
 interface MockedFetchResponse { status?: number; body?: unknown }
 function installFetchMock(handlers: Record<string, MockedFetchResponse | ((url: string, init?: RequestInit) => MockedFetchResponse)>) {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
-  globalThis.fetch = mock(async (url: string | URL | Request, init?: RequestInit) => {
+  globalThis.fetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
     const u = String(url);
     calls.push({ url: u, init });
     for (const [pattern, handler] of Object.entries(handlers)) {
@@ -112,8 +112,8 @@ function installFetchMock(handlers: Record<string, MockedFetchResponse | ((url: 
 
 describe('FillsPoller.tick', () => {
   beforeEach(() => {
-    mock.restore();
-    globalThis.fetch = mock(async () => new Response('{}', { status: 200 })) as unknown as typeof fetch;
+    vi.restoreAllMocks();
+    globalThis.fetch = vi.fn(async () => new Response('{}', { status: 200 })) as unknown as typeof fetch;
   });
 
   it('does nothing when no orders are open', async () => {

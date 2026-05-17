@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { serve } from '@hono/node-server';
 import { getRedisClient } from '@trader/shared-redis';
 import { ensureConsumerGroup, xReadGroup, xAck } from '@trader/shared-redis';
 import { REDIS_STREAMS } from '@trader/shared-types';
@@ -81,4 +82,7 @@ notificationLoop().catch((err) => {
   process.exit(1);
 });
 
-export default { port: 3004, fetch: app.fetch };
+const port = Number(process.env.PORT ?? 3004);
+serve({ fetch: app.fetch, port }, (info) => {
+  console.log(`[notification-service] listening on :${info.port}`);
+});

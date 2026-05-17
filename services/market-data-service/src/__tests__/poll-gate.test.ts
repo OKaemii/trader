@@ -4,7 +4,7 @@
 // The pollLoop body itself is not exported; testing through the primitives keeps the
 // test deterministic and avoids real Yahoo / Mongo I/O.
 
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect } from "vitest";
 import {
   partitionByMarket, marketStateOf, shouldPollMarket,
   nyseCalendar, lseCalendar,

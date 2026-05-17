@@ -10,7 +10,7 @@
     "mongodb": "^6.5.0"
   },
   "scripts": {
-    "test": "bun test",
+    "test": "vitest run",
     "build": "tsc -b",
     "typecheck": "tsc -b --noEmit",
     "lint": "eslint src"

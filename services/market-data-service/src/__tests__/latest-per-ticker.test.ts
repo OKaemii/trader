@@ -7,7 +7,7 @@
 // Strategy-engine's rolling-window math treats every arrival as a discrete bar — these
 // invariants are load-bearing for downstream warmup + signal generation.
 
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect } from "vitest";
 import { latestPerTicker } from '../index.ts';
 import type { OHLCVBar } from '@trader/shared-types';
 

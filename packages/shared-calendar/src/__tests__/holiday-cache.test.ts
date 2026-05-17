@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect } from "vitest";
 import { HolidayCache, type HolidayProvider } from '../holiday-cache.ts';
 import type { HolidayTable, Market } from '../calendar.ts';
 

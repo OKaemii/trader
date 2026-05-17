@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'bun:test';
+import { describe, it, expect, beforeEach } from "vitest";
 import { LoginUseCase } from '../application/use-cases/LoginUseCase.ts';
 import { User } from '../domain/entities/User.ts';
 import type { IUserRepository } from '../domain/interfaces/IUserRepository.ts';
