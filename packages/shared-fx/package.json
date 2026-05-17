@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "main": "./src/index.ts",
+  "main": "./dist/index.js",
   "dependencies": {
     "@trader/shared-types": "workspace:*",
     "redis": "^4.6.13"
@@ -13,5 +13,12 @@
     "typecheck": "tsc -b --noEmit",
     "lint": "eslint src",
     "test": "vitest run"
+  },
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
   }
 }

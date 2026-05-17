@@ -3,15 +3,36 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "main": "./src/index.ts",
+  "main": "./dist/index.js",
   "exports": {
-    ".": "./src/index.ts",
-    "./adapters/MongoDataAdapter": "./src/adapters/MongoDataAdapter.ts",
-    "./adapters/RedisCacheAdapter": "./src/adapters/RedisCacheAdapter.ts",
-    "./adapters/RedisCacheInvalidationBus": "./src/adapters/RedisCacheInvalidationBus.ts",
-    "./interfaces/IDataManager": "./src/interfaces/IDataManager.ts",
-    "./interfaces/ICache": "./src/interfaces/ICache.ts",
-    "./interfaces/ICacheInvalidationBus": "./src/interfaces/ICacheInvalidationBus.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./adapters/MongoDataAdapter": {
+      "types": "./dist/adapters/MongoDataAdapter.d.ts",
+      "import": "./dist/adapters/MongoDataAdapter.js"
+    },
+    "./adapters/RedisCacheAdapter": {
+      "types": "./dist/adapters/RedisCacheAdapter.d.ts",
+      "import": "./dist/adapters/RedisCacheAdapter.js"
+    },
+    "./adapters/RedisCacheInvalidationBus": {
+      "types": "./dist/adapters/RedisCacheInvalidationBus.d.ts",
+      "import": "./dist/adapters/RedisCacheInvalidationBus.js"
+    },
+    "./interfaces/IDataManager": {
+      "types": "./dist/interfaces/IDataManager.d.ts",
+      "import": "./dist/interfaces/IDataManager.js"
+    },
+    "./interfaces/ICache": {
+      "types": "./dist/interfaces/ICache.d.ts",
+      "import": "./dist/interfaces/ICache.js"
+    },
+    "./interfaces/ICacheInvalidationBus": {
+      "types": "./dist/interfaces/ICacheInvalidationBus.d.ts",
+      "import": "./dist/interfaces/ICacheInvalidationBus.js"
+    }
   },
   "dependencies": {
     "mongodb": "^6.5.0",
@@ -22,5 +43,6 @@
     "typecheck": "tsc -b --noEmit",
     "lint": "eslint src",
     "test": "vitest run"
-  }
+  },
+  "types": "./dist/index.d.ts"
 }
