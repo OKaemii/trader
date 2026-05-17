@@ -1,5 +1,5 @@
 import { Hono } from 'hono';
-import { requireInternalToken } from '@trader/shared-auth/middleware';
+import { requireInternalAny } from '@trader/shared-auth/middleware';
 import type { ApproveSignalUseCase } from '../../application/use-cases/ApproveSignal.ts';
 import type { RiskEngine } from '../../application/services/RiskEngine.ts';
 import type { ISignalRepository } from '../../domain/interfaces/ISignalRepository.ts';
@@ -24,7 +24,7 @@ export function createInternalRouter(deps: Deps): Hono {
   // matches here first.
   router.post(
     '/internal/trading/signals/:id/executed',
-    requireInternalToken('trading-service'),
+    requireInternalAny('trading-service'),
     async (c) => {
       const id = c.req.param('id')!;
       const body = await c.req.json<{ at?: number; quantity?: number }>().catch(() => ({} as { at?: number; quantity?: number }));
@@ -41,7 +41,7 @@ export function createInternalRouter(deps: Deps): Hono {
 
   router.post(
     '/internal/trading/signals/:id/closed',
-    requireInternalToken('trading-service'),
+    requireInternalAny('trading-service'),
     async (c) => {
       const id = c.req.param('id')!;
       const body = await c.req.json<{ at?: number; exitPrice: number }>();
@@ -53,7 +53,7 @@ export function createInternalRouter(deps: Deps): Hono {
 
   router.get(
     '/internal/trading/signals/open-buys/:ticker',
-    requireInternalToken('trading-service'),
+    requireInternalAny('trading-service'),
     async (c) => {
       const ticker = c.req.param('ticker')!;
       const signals = await deps.signalRepo.findOpenBuysByTicker(ticker);
@@ -63,7 +63,7 @@ export function createInternalRouter(deps: Deps): Hono {
 
   router.post(
     '/internal/trading/signals/:id/decrement-quantity',
-    requireInternalToken('trading-service'),
+    requireInternalAny('trading-service'),
     async (c) => {
       const id = c.req.param('id')!;
       const body = await c.req.json<{ by: number }>();
@@ -80,7 +80,7 @@ export function createInternalRouter(deps: Deps): Hono {
 
   router.post(
     '/internal/queue/claim',
-    requireInternalToken('trading-service'),
+    requireInternalAny('trading-service'),
     async (c) => {
       const signal = await deps.signalRepo.claimNextQueued();
       if (!signal) return c.json({ signal: null }, 200);
@@ -101,7 +101,7 @@ export function createInternalRouter(deps: Deps): Hono {
 
   router.post(
     '/internal/queue/:id/requeue',
-    requireInternalToken('trading-service'),
+    requireInternalAny('trading-service'),
     async (c) => {
       const id = c.req.param('id')!;
       await deps.signalRepo.requeue(id);
@@ -111,7 +111,7 @@ export function createInternalRouter(deps: Deps): Hono {
 
   router.post(
     '/internal/queue/:id/failed',
-    requireInternalToken('trading-service'),
+    requireInternalAny('trading-service'),
     async (c) => {
       const id = c.req.param('id')!;
       const body = await c.req.json<{ reason: number; detail?: string }>();
@@ -126,7 +126,7 @@ export function createInternalRouter(deps: Deps): Hono {
 
   router.post(
     '/internal/queue/sweep',
-    requireInternalToken('trading-service'),
+    requireInternalAny('trading-service'),
     async (c) => {
       const body = await c.req.json<{ thresholdMs?: number }>().catch(() => ({} as { thresholdMs?: number }));
       const ms   = typeof body.thresholdMs === 'number' ? body.thresholdMs : 60_000;
@@ -139,7 +139,7 @@ export function createInternalRouter(deps: Deps): Hono {
   // because Hono applies wildcard middleware to routes registered before it on the same
   // router, which previously double-gated the trading-service callbacks above and made them
   // 401 with the wrong caller — see PROGRESS.md for the regression.
-  const requireGateway = requireInternalToken('api-gateway');
+  const requireGateway = requireInternalAny('api-gateway');
 
   router.get('/internal/signals/latest', requireGateway, async (c) => {
     const signals = await deps.findRecent.execute(50);

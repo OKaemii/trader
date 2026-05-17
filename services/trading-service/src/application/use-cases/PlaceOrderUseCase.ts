@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { generateInternalToken } from '@trader/shared-auth';
+import { generateInternalToken, mintInternalJwt } from '@trader/shared-auth';
 import type { Money } from '@trader/shared-types';
 import {
   type Order,
@@ -35,6 +35,7 @@ async function notifySignalExecuted(signalId: string, at: number): Promise<void>
       headers: {
         'Content-Type': 'application/json',
         'X-Internal-Token': generateInternalToken('trading-service'),
+          'Authorization':     `Bearer ${await mintInternalJwt('trading-service')}`,
       },
       body: JSON.stringify({ at }),
     });

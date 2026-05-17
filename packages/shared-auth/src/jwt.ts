@@ -1,4 +1,5 @@
 import { SignJWT, jwtVerify, type JWTPayload as JosePayload } from 'jose';
+import type { Audience } from './audiences.ts';
 
 export type UserRole = 'admin' | 'user';
 
@@ -7,7 +8,16 @@ export interface AppJWTPayload extends JosePayload {
   role: UserRole;
 }
 
-const secret = () => new TextEncoder().encode(process.env.JWT_SECRET ?? 'dev-secret-change-me');
+export interface TokenClaims {
+  sub: string;
+  aud: Audience;
+  role?: UserRole | undefined;
+  exp: number;
+  iat: number;
+}
+
+const secret = (): Uint8Array =>
+  new TextEncoder().encode(process.env.JWT_SECRET ?? 'dev-secret-change-me');
 const ACCESS_TTL  = '15m';
 const REFRESH_TTL = '7d';
 
@@ -36,4 +46,14 @@ export async function verifyRefreshToken(token: string): Promise<{ sub: string }
   const { payload } = await jwtVerify(token, secret());
   if ((payload as Record<string, unknown>).type !== 'refresh') throw new Error('Not a refresh token');
   return { sub: payload.sub as string };
+}
+
+/**
+ * Audience-scoped verify. Pass the audience the route requires; jose throws if the token's
+ * `aud` claim doesn't match. Returns the typed claims so the caller can read `sub` for
+ * per-peer access decisions.
+ */
+export async function verifyTokenForAudience(token: string, audience: Audience): Promise<TokenClaims> {
+  const { payload } = await jwtVerify(token, secret(), { audience });
+  return payload as unknown as TokenClaims;
 }

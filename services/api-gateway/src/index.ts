@@ -4,7 +4,7 @@ import { serve } from '@hono/node-server';
 import { createNodeWebSocket } from '@hono/node-ws';
 import { getRedisClient, subscribe } from '@trader/shared-redis';
 import { getMongoDb } from '@trader/shared-mongo';
-import { requireAuth, requireRole, generateInternalToken, verifyAccessToken } from '@trader/shared-auth';
+import { requireAuth, requireRole, generateInternalToken, verifyAccessToken, mintInternalJwt } from '@trader/shared-auth';
 
 const app = new Hono();
 const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
@@ -12,12 +12,15 @@ const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
 app.use('*', cors({ origin: ['http://trader.local', 'http://localhost:3007'] }));
 
 // ── Internal token helper ────────────────────────────────────────────────────
-// Keep the user's Authorization header intact when forwarding — downstream services use
-// `requireAuth` on user-facing routes and validate the same JWT. Cookies are forwarded too
-// (the same JWT can also arrive as the `at` cookie). The X-Internal-Token attests that the
-// request came through the gateway and unlocks `requireInternalToken('api-gateway')` routes.
-function withInternalHeaders(headers: Headers): Headers {
+// Forwards both:
+//   - a short-lived audience-internal JWT (sub='api-gateway') as the new primitive
+//   - the legacy HMAC X-Internal-Token header during the Phase 4 transition window
+// Downstream services use `requireInternalAny` which accepts either. The legacy HMAC
+// branch is dropped in the final commit of Phase 4 once every caller is on Bearer.
+async function withInternalHeaders(headers: Headers): Promise<Headers> {
   const out = new Headers(headers);
+  const jwt = await mintInternalJwt('api-gateway');
+  out.set('Authorization', `Bearer ${jwt}`);
   out.set('X-Internal-Token', generateInternalToken('api-gateway'));
   return out;
 }
@@ -31,9 +34,10 @@ async function proxy(upstream: string, c: any): Promise<Response> {
   // looser. Read the body into a Buffer up front so the body is plain bytes and undici won't
   // complain about half-duplex streaming.
   const body = hasBody ? await c.req.raw.arrayBuffer() : undefined;
+  const headers = await withInternalHeaders(new Headers(c.req.raw.headers));
   const upstreamRes = await fetch(url, {
     method: c.req.method,
-    headers: withInternalHeaders(new Headers(c.req.raw.headers)),
+    headers,
     body,
   });
   // Hono's downstream cors middleware mutates `c.res.headers` via Context.header(). Returning

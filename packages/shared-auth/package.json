@@ -20,6 +20,14 @@
     "./internal-token": {
       "types": "./dist/internal-token.d.ts",
       "import": "./dist/internal-token.js"
+    },
+    "./audiences": {
+      "types": "./dist/audiences.d.ts",
+      "import": "./dist/audiences.js"
+    },
+    "./internal-jwt": {
+      "types": "./dist/internal-jwt.d.ts",
+      "import": "./dist/internal-jwt.js"
     }
   },
   "dependencies": {
@@ -30,7 +38,7 @@
     "typescript": "^5.4.0"
   },
   "scripts": {
-    "typecheck": "tsc -b --noEmit",
+    "typecheck": "tsc -b",
     "test": "vitest run",
     "build": "tsc -b",
     "lint": "eslint src"

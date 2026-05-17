@@ -1,4 +1,4 @@
-import { generateInternalToken } from '@trader/shared-auth';
+import { generateInternalToken, mintInternalJwt } from '@trader/shared-auth';
 import type { Db } from 'mongodb';
 import type { RedisClientType } from 'redis';
 import type { Trading212Client } from './t212.ts';

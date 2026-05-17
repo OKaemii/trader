@@ -12,7 +12,7 @@
   "scripts": {
     "test": "vitest run",
     "build": "tsc -b",
-    "typecheck": "tsc -b --noEmit",
+    "typecheck": "tsc -b",
     "lint": "eslint src"
   },
   "types": "./dist/index.d.ts",
