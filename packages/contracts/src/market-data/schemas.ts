@@ -1,6 +1,11 @@
 import { z } from "zod";
 
-// /api/admin/universe/overrides PUT
+export const BarIntervalSchema = z.enum(["5m", "15m", "1h", "daily"]);
+export type BarInterval = z.infer<typeof BarIntervalSchema>;
+
+export const RangeKeySchema = z.enum(["30d", "60d", "90d"]);
+export type RangeKey = z.infer<typeof RangeKeySchema>;
+
 export const UniverseOverridesRequestSchema = z.object({
     adds: z.array(z.string()).optional(),
     removes: z.array(z.string()).optional(),
@@ -8,22 +13,19 @@ export const UniverseOverridesRequestSchema = z.object({
 });
 export type UniverseOverridesRequest = z.infer<typeof UniverseOverridesRequestSchema>;
 
-// /api/admin/market-data/backfill POST
 export const BackfillRequestSchema = z.object({
     tickers: z.array(z.string()).optional(),
     days: z.number().int().min(1).max(60).optional(),
 });
 export type BackfillRequest = z.infer<typeof BackfillRequestSchema>;
 
-// /api/admin/market-data/clear-cache POST
 export const ClearCacheRequestSchema = z.object({
-    interval: z.enum(["5m", "15m", "1h", "daily"]).optional(),
+    interval: BarIntervalSchema.optional(),
     beforeTimestamp: z.number().int().positive().optional(),
     dryRun: z.boolean().optional(),
 });
 export type ClearCacheRequest = z.infer<typeof ClearCacheRequestSchema>;
 
-// /api/admin/market-data/config PUT
 export const MarketConfigRequestSchema = z.object({
     barFrequency: z.enum(["daily", "intraday"]).nullable().optional(),
     pollIntervalMs: z.number().int().positive().nullable().optional(),
@@ -31,3 +33,29 @@ export const MarketConfigRequestSchema = z.object({
     userId: z.string().optional(),
 });
 export type MarketConfigRequest = z.infer<typeof MarketConfigRequestSchema>;
+
+export const OHLCVBarSchema = z.object({
+    ticker: z.string(),
+    timestamp: z.number(),
+    interval: BarIntervalSchema.optional(),
+    open: z.number(),
+    high: z.number(),
+    low: z.number(),
+    close: z.number(),
+    volume: z.number(),
+});
+export type OHLCVBar = z.infer<typeof OHLCVBarSchema>;
+
+export const InternalBarsRequestSchema = z.object({
+    tickers: z.array(z.string().min(1)).min(1),
+    interval: BarIntervalSchema.optional(),
+    range: RangeKeySchema.optional(),
+});
+export type InternalBarsRequest = z.infer<typeof InternalBarsRequestSchema>;
+
+export const InternalBarsResponseSchema = z.object({
+    interval: BarIntervalSchema,
+    range: RangeKeySchema,
+    bars: z.record(z.string(), z.array(OHLCVBarSchema)),
+});
+export type InternalBarsResponse = z.infer<typeof InternalBarsResponseSchema>;
