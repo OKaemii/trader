@@ -166,11 +166,12 @@ export class YahooProvider implements MarketDataProvider {
     const bars: OHLCVBar[] = [];
     for (let i = 0; i < result.timestamp.length; i++) {
       const rawClose = quote.close[i];
-      if (rawClose == null || rawClose <= 0) continue;
+      const ts = result.timestamp[i];
+      if (rawClose == null || rawClose <= 0 || ts === undefined) continue;
       const close = rawClose * priceScale;
       bars.push({
         ticker,
-        timestamp: result.timestamp[i] * 1000,
+        timestamp: ts * 1000,
         interval:  HISTORY_GRANULARITY,
         ...(currency ? { currency } : {}),
         open:      (quote.open[i]  ?? rawClose) * priceScale,

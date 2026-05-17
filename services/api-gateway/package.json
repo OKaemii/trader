@@ -2,13 +2,16 @@
   "name": "@trader/api-gateway",
   "version": "0.0.1",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "bun run --watch src/index.ts",
     "start": "bun run src/index.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc -b --noEmit",
+    "build": "tsc -b"
   },
   "dependencies": {
     "@trader/shared-auth": "workspace:*",
+    "@trader/shared-mongo": "workspace:*",
     "@trader/shared-redis": "workspace:*",
     "@trader/shared-types": "workspace:*",
     "hono": "^4.3.0",

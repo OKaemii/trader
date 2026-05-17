@@ -27,7 +27,7 @@ const HISTORY_PAGE_SIZE = 50;
 //      entryPrice, so a BUY split across two SELLs reports one exit (the one that closed
 //      it). Acceptable until per-leg fills become a requirement.
 export class FillsPoller {
-  private timer?: ReturnType<typeof setInterval>;
+  private timer?: ReturnType<typeof setInterval> | undefined;
 
   constructor(
     private readonly orderRepo:  IOrderRepository,
@@ -81,7 +81,10 @@ export class FillsPoller {
     let cursor: string | undefined;
 
     for (let page = 0; page < MAX_HISTORY_PAGES; page++) {
-      const { items, nextPagePath } = await this.t212.getHistoricalOrders({ cursor, limit: HISTORY_PAGE_SIZE });
+      const { items, nextPagePath } = await this.t212.getHistoricalOrders({
+        ...(cursor !== undefined ? { cursor } : {}),
+        limit: HISTORY_PAGE_SIZE,
+      });
       for (const item of items) {
         const id = String(item.order.id);
         if (wantedIds.has(id)) out.set(id, item);

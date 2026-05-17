@@ -41,9 +41,10 @@ export function parseIcal(text: string): IcalEvent[] {
     const line = raw.trim();
     if (line === 'BEGIN:VEVENT') { cur = {}; continue; }
     if (line === 'END:VEVENT') {
-      if (cur && cur.dtStart) {
+      const dtStart = cur?.dtStart;
+      if (cur && dtStart) {
         events.push({
-          dtStart:     cur.dtStart,
+          dtStart,
           summary:     cur.summary ?? '',
           description: cur.description ?? '',
         });
@@ -61,7 +62,7 @@ export function parseIcal(text: string): IcalEvent[] {
     // than silently truncating to the date part.
     if (line.startsWith('DTSTART')) {
       const m = line.match(/^DTSTART(?:;[^:]+)?:(\d{8})$/);
-      if (!m) throw new Error(`[ical-parser] unsupported DTSTART form: ${line}. Parser only handles VALUE=DATE.`);
+      if (!m || !m[1]) throw new Error(`[ical-parser] unsupported DTSTART form: ${line}. Parser only handles VALUE=DATE.`);
       cur.dtStart = m[1];
       continue;
     }
@@ -96,9 +97,9 @@ export function parseEarlyCloseFromDescription(desc: string): string | null {
   // Capture e.g. "1:00 PM", "11:30 AM". Case-insensitive, allows no minutes.
   const m = desc.match(/(\d{1,2})(?::(\d{2}))?\s*(AM|PM)/i);
   if (!m) return null;
-  let hour = parseInt(m[1], 10);
+  let hour = parseInt(m[1]!, 10);
   const min = m[2] ? parseInt(m[2], 10) : 0;
-  const meridiem = m[3].toUpperCase();
+  const meridiem = m[3]!.toUpperCase();
   if (meridiem === 'PM' && hour !== 12) hour += 12;
   if (meridiem === 'AM' && hour === 12) hour = 0;
   return `${String(hour).padStart(2, '0')}:${String(min).padStart(2, '0')}`;

@@ -1,3 +1,4 @@
+import { setTimeout as sleep } from 'node:timers/promises';
 import type { OHLCVBar } from '@trader/shared-types';
 
 function t212Base(): string {
@@ -55,11 +56,11 @@ export async function fetchT212Instruments(): Promise<T212Instrument[]> {
   // Retry with exponential backoff — 429s accumulate when pods restart frequently during debugging.
   for (let attempt = 0; attempt < 3; attempt++) {
     const res = await fetch(`${t212Base()}/equity/metadata/instruments`, { headers });
-    if (res.ok) return res.json();
+    if (res.ok) return res.json() as Promise<T212Instrument[]>;
     if (res.status === 429) {
       const wait = 30_000 * 2 ** attempt;
       console.warn(`[t212] instruments rate-limited, retrying in ${wait / 1000}s`);
-      await Bun.sleep(wait);
+      await sleep(wait);
       continue;
     }
     throw new Error(`T212 instruments: ${res.status}`);

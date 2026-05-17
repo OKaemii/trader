@@ -2,9 +2,14 @@
   "name": "@trader/shared-fx",
   "version": "0.0.1",
   "private": true,
+  "type": "module",
   "main": "./src/index.ts",
   "dependencies": {
     "@trader/shared-types": "workspace:*",
     "redis": "^4.6.13"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b --noEmit"
   }
 }

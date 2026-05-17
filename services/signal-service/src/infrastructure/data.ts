@@ -12,7 +12,7 @@ import type { RedisClientType } from 'redis';
 const toMs = (v: unknown): number | undefined =>
   v instanceof Date ? v.getTime() : typeof v === 'number' ? v : undefined;
 
-const toSignalDoc = (s: TradeSignal) => ({
+const toSignalDoc = (s: TradeSignal): any => ({
   _id: s.id,
   ticker: s.ticker,
   strategy_id: s.strategy_id,
@@ -35,8 +35,8 @@ const toSignalDoc = (s: TradeSignal) => ({
   failureDetail: s.failureDetail,
 });
 
-const fromSignalDoc = (doc: any): TradeSignal =>
-  new TradeSignal({
+const fromSignalDoc = (doc: any): TradeSignal => {
+  const params: any = {
     id: String(doc._id),
     timestamp: toMs(doc.timestamp) ?? Date.now(),
     ticker: doc.ticker,
@@ -46,18 +46,20 @@ const fromSignalDoc = (doc: any): TradeSignal =>
     targetWeight: doc.targetWeight,
     rationale: doc.rationale,
     approved: doc.approved ?? false,
-    entryPrice: typeof doc.entryPrice === 'number' ? doc.entryPrice : undefined,
     lifecycle: doc.lifecycle,
-    approvedAt: toMs(doc.approvedAt),
-    executedAt: toMs(doc.executedAt),
-    closedAt:   toMs(doc.closedAt),
-    exitPrice: typeof doc.exitPrice === 'number' ? doc.exitPrice : undefined,
-    executedQuantity: typeof doc.executedQuantity === 'number' ? doc.executedQuantity : undefined,
     attempts: typeof doc.attempts === 'number' ? doc.attempts : 0,
-    lastAttemptAt: toMs(doc.lastAttemptAt),
-    failureReason: doc.failureReason,
-    failureDetail: typeof doc.failureDetail === 'string' ? doc.failureDetail : undefined,
-  });
+  };
+  if (typeof doc.entryPrice === 'number')       params.entryPrice       = doc.entryPrice;
+  if (typeof doc.exitPrice === 'number')        params.exitPrice        = doc.exitPrice;
+  if (typeof doc.executedQuantity === 'number') params.executedQuantity = doc.executedQuantity;
+  if (typeof doc.failureDetail === 'string')    params.failureDetail    = doc.failureDetail;
+  if (doc.failureReason !== undefined)          params.failureReason    = doc.failureReason;
+  const approvedAt = toMs(doc.approvedAt);   if (approvedAt   !== undefined) params.approvedAt    = approvedAt;
+  const executedAt = toMs(doc.executedAt);   if (executedAt   !== undefined) params.executedAt    = executedAt;
+  const closedAt   = toMs(doc.closedAt);     if (closedAt     !== undefined) params.closedAt      = closedAt;
+  const lastAt     = toMs(doc.lastAttemptAt); if (lastAt      !== undefined) params.lastAttemptAt = lastAt;
+  return new TradeSignal(params);
+};
 
 export { toSignalDoc, fromSignalDoc };
 

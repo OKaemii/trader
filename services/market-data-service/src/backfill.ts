@@ -67,6 +67,7 @@ export async function backfillTickers(
     for (let j = 0; j < settled.length; j++) {
       const r = settled[j];
       const t = slice[j];
+      if (!r || !t) continue;
       if (r.status === 'fulfilled') results.push(r.value);
       else results.push({ ticker: t, fetched: 0, upserted: 0, error: r.reason instanceof Error ? r.reason.message : String(r.reason) });
     }

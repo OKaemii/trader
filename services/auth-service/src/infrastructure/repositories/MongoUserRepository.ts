@@ -11,14 +11,14 @@ export class MongoUserRepository implements IUserRepository {
 
   async findById(id: string): Promise<User | null> {
     const db = await getMongoDb();
-    const doc = await db.collection(COLLECTIONS.USERS).findOne({ _id: id });
+    const doc = await db.collection(COLLECTIONS.USERS).findOne({ _id: id as any });
     return doc ? this.toEntity(doc) : null;
   }
 
   async create(params: { id: string; email: string; passwordHash: string; role: 'admin' | 'user' }): Promise<User> {
     const db = await getMongoDb();
     const createdAt = new Date();
-    await db.collection(COLLECTIONS.USERS).insertOne({ _id: params.id, ...params, createdAt });
+    await db.collection(COLLECTIONS.USERS).insertOne({ _id: params.id as any, ...params, createdAt });
     return new User(params.id, params.email, params.passwordHash, params.role, createdAt);
   }
 

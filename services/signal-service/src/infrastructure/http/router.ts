@@ -40,7 +40,7 @@ export function createRouter(deps: Deps): Hono {
   // Admin approve: flips lifecycle to 'approved' and triggers trading-service auto-execute
   // (which itself decides whether to place the order based on TRADING_MODE).
   router.post('/api/admin/signals/approve/:id', requireRole('admin'), async (c) => {
-    const id = c.req.param('id');
+    const id = c.req.param('id')!;
     await deps.approveSignal.execute(id);
     return c.json({ approved: id });
   });
@@ -52,7 +52,7 @@ export function createRouter(deps: Deps): Hono {
     return c.json({ enabled: await deps.autoApprovalGate.isEnabled() });
   });
   router.post('/api/admin/signals/auto-approve', requireRole('admin'), async (c) => {
-    const body = await c.req.json<{ enabled?: boolean }>().catch(() => ({}));
+    const body = await c.req.json<{ enabled?: boolean }>().catch(() => ({} as { enabled?: boolean }));
     if (typeof body.enabled !== 'boolean') return c.json({ error: 'enabled (boolean) required' }, 400);
     await deps.autoApprovalGate.setEnabled(body.enabled);
     return c.json({ enabled: body.enabled });
@@ -62,7 +62,7 @@ export function createRouter(deps: Deps): Hono {
   // its next claim. Conditions (drift, cash, TTL) are re-evaluated then — a retry doesn't
   // guarantee execution, only another attempt.
   router.post('/api/admin/signals/retry/:id', requireRole('admin'), async (c) => {
-    const id = c.req.param('id');
+    const id = c.req.param('id')!;
     const signal = await deps.signalRepo.findById(id);
     if (!signal) return c.json({ error: 'not found' }, 404);
     if (signal.lifecycle !== SignalLifecycle.Failed) {
@@ -75,7 +75,7 @@ export function createRouter(deps: Deps): Hono {
   // Cancel a queued / executing signal: transitions to Failed/ManualCancel. The strategy
   // treats it as if it never happened (no entry in the FIFO BUY ledger).
   router.post('/api/admin/signals/cancel/:id', requireRole('admin'), async (c) => {
-    const id = c.req.param('id');
+    const id = c.req.param('id')!;
     const signal = await deps.signalRepo.findById(id);
     if (!signal) return c.json({ error: 'not found' }, 404);
     if (signal.lifecycle !== SignalLifecycle.Queued

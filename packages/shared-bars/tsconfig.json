@@ -8,5 +8,8 @@
     },
     "include": ["src/**/*"],
     "exclude": ["**/__tests__/**", "**/*.test.ts", "tests/**", "dist"],
-    "references": []
+    "references": [
+        { "path": "../shared-types" },
+        { "path": "../shared-mongo" }
+    ]
 }

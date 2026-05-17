@@ -55,8 +55,9 @@ const INTERVAL_MS: Record<BarInterval, number> = {
  * a single "day" of price action.
  */
 export function aggregateBars(source: OHLCVBar[], to: BarInterval): OHLCVBar[] {
-  if (source.length === 0) return [];
-  const fromInterval = source[0].interval ?? '5m';
+  const head = source[0];
+  if (!head) return [];
+  const fromInterval = head.interval ?? '5m';
   if (fromInterval === to) return source;
   const bucketMs = INTERVAL_MS[to];
 
@@ -69,11 +70,12 @@ export function aggregateBars(source: OHLCVBar[], to: BarInterval): OHLCVBar[] {
   }
 
   const out: OHLCVBar[] = [];
-  const ticker = source[0].ticker;
+  const ticker = head.ticker;
   for (const [bucketStart, list] of Array.from(buckets.entries()).sort((a, b) => a[0] - b[0])) {
     list.sort((a, b) => a.timestamp - b.timestamp);
     const first = list[0];
     const last  = list[list.length - 1];
+    if (!first || !last) continue;
     let high = first.high, low = first.low, volume = 0;
     for (const b of list) {
       if (b.high > high) high = b.high;
@@ -167,8 +169,8 @@ export async function getLastClose(
   interval: BarInterval = 'daily',
 ): Promise<number | null> {
   const bars = await getBars(redis, db, ticker, interval, '30d');
-  if (bars.length === 0) return null;
-  return bars[bars.length - 1].close;
+  const last = bars[bars.length - 1];
+  return last ? last.close : null;
 }
 
 /**
@@ -181,7 +183,7 @@ export async function invalidateBars(
   ticker: string,
   interval: BarInterval,
 ): Promise<number> {
-  const ranges: RangeKey[] = ['30d', '60d', '90d', '1y'];
+  const ranges: RangeKey[] = ['30d', '60d', '90d'];
   const keys = ranges.map((r) => cacheKey(ticker, interval, r));
   keys.push(metaKey(ticker, interval));
   // del accepts variadic keys; some clients want an array. The node-redis v4 API
@@ -212,17 +214,18 @@ export async function invalidateBarsBulk(
 function docToBar(doc: Record<string, unknown>): OHLCVBar {
   const ts = doc.timestamp;
   const tsMs = ts instanceof Date ? ts.getTime() : typeof ts === 'number' ? ts : 0;
-  return {
-    ticker:           String(doc.ticker ?? ''),
-    timestamp:        tsMs,
-    interval:         (doc.interval as BarInterval) ?? 'daily',
-    open:             Number(doc.open  ?? 0),
-    high:             Number(doc.high  ?? 0),
-    low:              Number(doc.low   ?? 0),
-    close:            Number(doc.close ?? 0),
-    volume:           Number(doc.volume ?? 0),
-    rawClose:         typeof doc.rawClose === 'number' ? doc.rawClose : undefined,
-    adjustedClose:    typeof doc.adjustedClose === 'number' ? doc.adjustedClose : undefined,
-    adjustmentFactor: typeof doc.adjustmentFactor === 'number' ? doc.adjustmentFactor : undefined,
+  const bar: OHLCVBar = {
+    ticker:    String(doc.ticker ?? ''),
+    timestamp: tsMs,
+    interval:  (doc.interval as BarInterval) ?? 'daily',
+    open:      Number(doc.open   ?? 0),
+    high:      Number(doc.high   ?? 0),
+    low:       Number(doc.low    ?? 0),
+    close:     Number(doc.close  ?? 0),
+    volume:    Number(doc.volume ?? 0),
   };
+  if (typeof doc.rawClose         === 'number') bar.rawClose         = doc.rawClose;
+  if (typeof doc.adjustedClose    === 'number') bar.adjustedClose    = doc.adjustedClose;
+  if (typeof doc.adjustmentFactor === 'number') bar.adjustmentFactor = doc.adjustmentFactor;
+  return bar;
 }

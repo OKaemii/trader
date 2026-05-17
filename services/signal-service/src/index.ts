@@ -54,7 +54,7 @@ async function main() {
   const getProgress     = new GetSignalProgressUseCase(signalRepo, portfolioState, priceLookup);
 
   await new RedisStrategySubscriber(redis).subscribe(
-    (features) => generateSignals.execute(features),
+    async (features) => { await generateSignals.execute(features); },
   );
 
   // Cross-service: clear market cache when market-data-service publishes new bars

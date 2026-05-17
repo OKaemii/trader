@@ -120,13 +120,14 @@ export class PlaceOrderUseCase {
       return null;
     }
 
+    const limitPrice = orderType === OrderType.Limit ? input.currentPrice?.amount : undefined;
     const order: Order = {
       id:           randomUUID(),
       ticker:       input.ticker,
       side,
       orderType,
       quantity,
-      limitPrice:   orderType === OrderType.Limit ? input.currentPrice?.amount : undefined,
+      ...(limitPrice !== undefined ? { limitPrice } : {}),
       status:       OrderStatus.Pending,
       signalId:     input.signalId,
       targetWeight: input.targetWeight,
@@ -141,7 +142,7 @@ export class PlaceOrderUseCase {
         side:       order.side,
         orderType:  order.orderType,
         quantity:   order.quantity,
-        limitPrice: order.limitPrice,
+        ...(order.limitPrice !== undefined ? { limitPrice: order.limitPrice } : {}),
       });
 
       order.status       = result.status;
@@ -158,7 +159,7 @@ export class PlaceOrderUseCase {
 
     // T212 returns Submitted on placement; fills are async and not yet polled, so we
     // mark the signal as executed at submit time. Re-evaluate once a fills poller exists.
-    if ((order.status === OrderStatus.Submitted || order.status === OrderStatus.Filled) && order.executedAt) {
+    if ((order.status === OrderStatus.Submitted || (order.status as OrderStatus) === OrderStatus.Filled) && order.executedAt) {
       await notifySignalExecuted(order.signalId, order.executedAt);
     }
 

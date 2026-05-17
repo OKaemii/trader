@@ -40,12 +40,14 @@ export function solveLongOnly(input: RankingInput): number[] {
   // Step 3: Sector neutrality — cap each GICS sector at maxSectorConcentration
   const sectorTotals: Record<string, number> = {};
   for (let i = 0; i < n; i++) {
-    sectorTotals[sectors[i]] = (sectorTotals[sectors[i]] ?? 0) + rawWeights[i];
+    const sector = sectors[i] ?? 'UNKNOWN';
+    sectorTotals[sector] = (sectorTotals[sector] ?? 0) + (rawWeights[i] ?? 0);
   }
   for (let i = 0; i < n; i++) {
-    const sectorTotal = sectorTotals[sectors[i]];
+    const sector = sectors[i] ?? 'UNKNOWN';
+    const sectorTotal = sectorTotals[sector] ?? 0;
     if (sectorTotal > RISK_LIMITS.maxSectorConcentration) {
-      rawWeights[i] *= RISK_LIMITS.maxSectorConcentration / sectorTotal;
+      rawWeights[i] = (rawWeights[i] ?? 0) * (RISK_LIMITS.maxSectorConcentration / sectorTotal);
     }
   }
 
@@ -54,10 +56,10 @@ export function solveLongOnly(input: RankingInput): number[] {
   const normalised = rawWeights.map((w) => (total > 0 ? w / total : 0));
 
   // Step 5: Turnover guard — blend toward current weights if turnover exceeds budget
-  const turnover = normalised.reduce((a, w, i) => a + Math.abs(w - currentWeights[i]), 0) / 2;
+  const turnover = normalised.reduce((a: number, w: number, i: number) => a + Math.abs(w - (currentWeights[i] ?? 0)), 0) / 2;
   if (turnover > RISK_LIMITS.maxWeeklyTurnover) {
     const blendFactor = RISK_LIMITS.maxWeeklyTurnover / turnover;
-    return normalised.map((w, i) => blendFactor * w + (1 - blendFactor) * currentWeights[i]);
+    return normalised.map((w: number, i: number) => blendFactor * w + (1 - blendFactor) * (currentWeights[i] ?? 0));
   }
 
   return normalised;

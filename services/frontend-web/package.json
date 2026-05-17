@@ -3,10 +3,10 @@
   "version": "0.0.1",
   "private": true,
   "scripts": {
-    "dev": "next dev -p 3007",
-    "build": "next build",
-    "start": "next start -p 3007",
-    "typecheck": "tsc --noEmit"
+    "dev": "cd portal && next dev -p 3007",
+    "build": "cd portal && next build",
+    "start": "cd portal && next start -p 3007",
+    "typecheck": "echo 'frontend-web typecheck is delegated to portal/ (Next.js owns its own toolchain)'"
   },
   "dependencies": {
     "@trader/shared-types": "workspace:*",

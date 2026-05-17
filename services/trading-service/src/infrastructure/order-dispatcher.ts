@@ -210,7 +210,7 @@ export class OrderDispatcher {
         targetWeight:    signal.targetWeight,
         confidence:      signal.confidence,
         totalNAV,
-        currentPrice:    currentPrice ?? undefined,
+        ...(currentPrice ? { currentPrice } : {}),
         currentQuantity,
       });
 

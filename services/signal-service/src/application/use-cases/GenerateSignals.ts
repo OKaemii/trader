@@ -83,7 +83,7 @@ export class GenerateSignalsUseCase {
     const p95 = (xs: number[]): number => {
       if (xs.length === 0) return 1.0;
       const sorted = xs.slice().sort((a, b) => a - b);
-      const v = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))];
+      const v = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))] ?? 1.0;
       return v > 0 ? v : 1.0;
     };
     const posScores = features.ticker_universe
@@ -103,8 +103,8 @@ export class GenerateSignalsUseCase {
       : {};
 
     const signals = features.ticker_universe
-      .map((ticker, i): TradeSignal | null => {
-        const w = weights[i];
+      .map((ticker: string, i: number): TradeSignal | null => {
+        const w = weights[i] ?? 0;
         const currentW = currentWeights[ticker] ?? 0;
         if (w < 0.01 && currentW < 0.01) return null;
 
@@ -131,7 +131,7 @@ export class GenerateSignalsUseCase {
             confidence: Math.min(Math.abs(score) / divisor, 1) * decayFactor,
             targetWeight: w,
             rationale: JSON.stringify(rationale),
-            entryPrice: entry && entry > 0 ? entry : undefined,
+            ...(entry && entry > 0 ? { entryPrice: entry } : {}),
             lifecycle: SignalLifecycle.Pending,
           });
         } catch { return null; }
