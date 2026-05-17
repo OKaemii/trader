@@ -6,11 +6,13 @@
     "node": ">=22"
   },
   "scripts": {
-    "dev": "pnpm -r run dev",
-    "build": "pnpm -r run build",
-    "typecheck": "pnpm -r run typecheck",
-    "lint": "pnpm -r run lint",
-    "test": "pnpm -r run test"
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "typecheck": "turbo run typecheck",
+    "lint": "turbo run lint -- --max-warnings 500",
+    "lint:fix": "turbo run lint -- --fix",
+    "test": "turbo run test",
+    "format": "prettier --write ."
   },
   "devDependencies": {
     "@eslint/js": "^9",
@@ -19,6 +21,7 @@
     "eslint-config-prettier": "^9",
     "eslint-plugin-import": "^2",
     "prettier": "^3",
+    "turbo": "^2",
     "typescript": "^5.5.4",
     "typescript-eslint": "^8"
   }
