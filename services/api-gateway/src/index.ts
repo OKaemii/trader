@@ -114,6 +114,10 @@ admin.get('/api/admin/market-data/health', async (c) => {
   return new Response(body, { status: r.status, headers: { 'content-type': r.headers.get('content-type') ?? 'application/json' } });
 });
 admin.get('/api/admin/market-data/provider-info',     (c) => proxy('http://market-data-service:3002', c));
+// Session calendar routes — see agent-docs/plans/session-aware-polling-gate.md.
+admin.get('/api/admin/market-data/calendar',          (c) => proxy('http://market-data-service:3002', c));
+admin.get('/api/admin/market-data/holiday-sources',   (c) => proxy('http://market-data-service:3002', c));
+admin.post('/api/admin/market-data/holiday-refresh',  (c) => proxy('http://market-data-service:3002', c));
 admin.get('/api/admin/system/status', async (c) => {
   const token = generateInternalToken('api-gateway');
   const headers = { 'X-Internal-Token': token };

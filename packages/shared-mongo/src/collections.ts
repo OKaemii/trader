@@ -16,6 +16,7 @@ export const COLLECTIONS = {
   RISK_STATE:            'risk_state',
   PORTAL_UNIVERSE_OVERRIDES: 'portal_universe_overrides',
   PORTAL_MARKET_CONFIG:      'portal_market_config',
+  MARKET_CALENDAR:           'market_calendar',
 } as const;
 
 export type CollectionName = typeof COLLECTIONS[keyof typeof COLLECTIONS];
