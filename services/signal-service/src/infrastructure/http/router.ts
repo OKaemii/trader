@@ -20,7 +20,7 @@ export function createRouter(deps: Deps): Hono {
   // Path-scoped, not wildcard. A wildcard `use('*', mw)` on a subapp mounted via
   // `app.route('/', subapp)` bleeds onto every route on the parent app — including the
   // /internal/* routes registered later via createInternalRouter, which then fail their
-  // own X-Internal-Token gate because the JWT requirement runs first. See PROGRESS.md.
+  // own internal-auth gate because the JWT requirement runs first. See PROGRESS.md.
   router.use('/api/*', requireAuth);
 
   router.get('/api/signals', async (c) => {
