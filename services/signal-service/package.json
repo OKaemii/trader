@@ -11,7 +11,9 @@
   "dependencies": {
     "@trader/shared-auth": "workspace:*",
     "@trader/shared-data": "workspace:*",
+    "@trader/shared-fx": "workspace:*",
     "@trader/shared-mongo": "workspace:*",
+    "@trader/shared-portfolio": "workspace:*",
     "@trader/shared-redis": "workspace:*",
     "@trader/shared-types": "workspace:*",
     "hono": "^4.3.0"

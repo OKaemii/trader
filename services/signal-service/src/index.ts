@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { getRedisClient } from '@trader/shared-redis';
 import { getMongoDb } from '@trader/shared-mongo';
+import { FxClient, YahooFxProvider } from '@trader/shared-fx';
 import { createSignalDataLayer } from './infrastructure/data.ts';
 import { MongoSignalRepository } from './infrastructure/repositories/MongoSignalRepository.ts';
 import { RedisSignalPublisher } from './infrastructure/messaging/RedisSignalPublisher.ts';
@@ -23,6 +24,11 @@ async function main() {
   const redis = await getRedisClient();
   const db    = await getMongoDb();
 
+  // Single FxClient instance shared by everything that needs to convert GBP↔USD.
+  // 1h Redis hot cache + 24h lastGood stale fallback live inside the client, so
+  // multiple consumers don't multiply Yahoo calls.
+  const fx = new FxClient(redis as any, new YahooFxProvider());
+
   // Data layer: configure adapters, subscribe to invalidations
   const { manager, cache, bus, collection } = createSignalDataLayer(db, redis);
   await bus.subscribe('signals', (key) => cache.invalidate(key));
@@ -31,15 +37,15 @@ async function main() {
   // collection handle is required for queue methods (atomic findOneAndUpdate claim).
   const signalRepo = new MongoSignalRepository(manager, cache, bus, collection);
 
-  // Risk engine: circuit breaker + audit log
-  const riskEngine = new RiskEngine(db, redis);
+  // Risk engine: circuit breaker + audit log. FxClient owns NAV's FX hops via sumPositionsGBP.
+  const riskEngine = new RiskEngine(db, redis, fx);
   await riskEngine.init();
 
   // Strategy decay monitor: runs after every rebalance, writes to strategy:health + strategy_health_log
   const decayMonitor = new StrategyDecayMonitor(db, redis);
 
   // Use cases receive only domain ports
-  const portfolioState  = new MongoPortfolioState(db.collection('positions'));
+  const portfolioState  = new MongoPortfolioState(db.collection('positions'), fx);
   const priceLookup     = new MongoPriceLookup(db);
   const approveSignal   = new ApproveSignalUseCase(signalRepo);
   const autoApprovalGate = new AutoApprovalGate(redis, signalRepo, approveSignal);

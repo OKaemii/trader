@@ -1,6 +1,7 @@
 import type { Collection, Db } from 'mongodb';
 import type { RedisClientType } from 'redis';
 import { generateInternalToken } from '@trader/shared-auth';
+import { sumPositionsGBP, type FxConverter, type PositionDoc } from '@trader/shared-portfolio';
 import { CircuitBreakerRedis } from '../../infrastructure/CircuitBreakerRedis.ts';
 import { RISK_LIMITS } from './LongOnlyOptimiser.ts';
 
@@ -66,7 +67,7 @@ export class RiskEngine {
 
   private _rejectionsToday = 0;
 
-  constructor(db: Db, redis: RedisClientType) {
+  constructor(db: Db, redis: RedisClientType, private readonly fx: FxConverter) {
     this.rejections = db.collection('risk_rejections');
     this.riskState  = db.collection<RiskState>('risk_state');
     this.positions  = db.collection('positions');
@@ -200,29 +201,25 @@ export class RiskEngine {
   // ── Private ──────────────────────────────────────────────────────────────────
 
   // NAV in BASE_CURRENCY (GBP). Includes BOTH cash and positions:
-  //   - positions: portfolio-service writes `currentValueGBP` (FX-converted at sync time)
-  //   - cash: HTTP-fetched from trading-service /internal/trading/cash; T212 reports GBP
+  //   - positions: stored canonically as Money in the instrument currency by
+  //     portfolio-service. GBP NAV is derived via sumPositionsGBP, which owns the
+  //     single FX call. No dual-write, no currentValueGBP cache to drift from reality.
+  //   - cash: HTTP-fetched from trading-service /internal/trading/cash; T212 reports GBP.
   //
-  // Pre-FX-fix (2026-05-15) this summed `currentValue` across positions in MIXED currencies
-  // and ignored cash entirely — caused phantom 42% drawdowns when cash dominated NAV (e.g.
-  // after a deploy with no positions yet) and silent 100x errors on LSE pence quotes that
-  // weren't normalised. The drawdown breaker tripped on bad numbers, not bad performance.
+  // If FX is unavailable past the 24h stale window, sumPositionsGBP throws and NAV
+  // degrades to cash-only with a warning. Better than blocking every signal during a
+  // transient Yahoo outage; the alternative (silently substituting native scalars for
+  // GBP) was the 2026-05-15 bug class this rewrite retires.
   //
-  // If cash fetch fails we degrade to positions-only with a warning. Better than blocking
-  // every signal during a transient trading-service outage; a rate-limited cash drift is
-  // bounded by the dispatcher's own retry semantics.
+  // If cash fetch fails we degrade to positions-only with a warning.
   private async _computeNav(): Promise<number> {
-    const positions = await this.positions.find({}).toArray();
-    // Prefer the explicit currentValueGBP field. Fall back to currentValue for legacy
-    // rows pre-dating the FX work — the pre-FX value was scalar, in instrument currency,
-    // which mis-counts but matches what the engine would have computed before. Fresh
-    // syncs overwrite within a few minutes.
-    const positionsGBP = positions.reduce((sum: number, p: any) => {
-      const v = typeof p.currentValueGBP === 'number'
-        ? p.currentValueGBP
-        : typeof p.currentValue === 'number' ? p.currentValue : 0;
-      return sum + v;
-    }, 0);
+    const positions = await this.positions.find({}).toArray() as unknown as PositionDoc[];
+    let positionsGBP = 0;
+    try {
+      positionsGBP = await sumPositionsGBP(positions, this.fx);
+    } catch (err) {
+      console.warn('[RiskEngine] FX unavailable for NAV, degrading to cash-only:', err);
+    }
 
     let cashGBP = 0;
     try {
