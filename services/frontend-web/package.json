@@ -3,9 +3,9 @@
   "version": "0.0.1",
   "private": true,
   "scripts": {
-    "dev": "cd portal && next dev -p 3007",
-    "build": "cd portal && next build",
-    "start": "cd portal && next start -p 3007",
+    "dev": "cd portal && pnpm install && pnpm dev -- -p 3007",
+    "build": "echo 'frontend-web build is delegated to portal/ (run pnpm --filter portal build directly)'",
+    "start": "cd portal && pnpm start -- -p 3007",
     "typecheck": "echo 'frontend-web typecheck is delegated to portal/ (Next.js owns its own toolchain)'"
   },
   "dependencies": {
