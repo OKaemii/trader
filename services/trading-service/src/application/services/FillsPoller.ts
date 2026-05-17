@@ -1,4 +1,4 @@
-import { generateInternalToken, mintInternalJwt } from '@trader/shared-auth';
+import { mintInternalJwt } from '@trader/shared-auth';
 import { type Order, OrderSide, OrderStatus } from '../../domain/entities/Order.ts';
 import type { IOrderRepository } from '../../domain/interfaces/IOrderRepository.ts';
 import type { Trading212Client, T212HistoryItem } from '../../infrastructure/t212.ts';
@@ -156,8 +156,7 @@ export class FillsPoller {
   private async fetchOpenBuys(ticker: string): Promise<Array<{ id: string; executedQuantity?: number; executedAt?: number }>> {
     try {
       const res = await fetch(`${SIGNAL_SERVICE}/internal/trading/signals/open-buys/${encodeURIComponent(ticker)}`, {
-        headers: { 'X-Internal-Token': generateInternalToken('trading-service'),
-          'Authorization':     `Bearer ${await mintInternalJwt('trading-service')}` },
+        headers: { Authorization: `Bearer ${await mintInternalJwt('trading-service')}` },
       });
       if (!res.ok) {
         console.warn(`[FillsPoller] open-buys ${ticker} → ${res.status}`);
@@ -177,7 +176,6 @@ export class FillsPoller {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Internal-Token': generateInternalToken('trading-service'),
           'Authorization':     `Bearer ${await mintInternalJwt('trading-service')}`,
         },
         body: JSON.stringify({ at, quantity }),
@@ -196,7 +194,6 @@ export class FillsPoller {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Internal-Token': generateInternalToken('trading-service'),
           'Authorization':     `Bearer ${await mintInternalJwt('trading-service')}`,
         },
         body: JSON.stringify({ by }),
@@ -215,7 +212,6 @@ export class FillsPoller {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Internal-Token': generateInternalToken('trading-service'),
           'Authorization':     `Bearer ${await mintInternalJwt('trading-service')}`,
         },
         body: JSON.stringify({ at, exitPrice }),

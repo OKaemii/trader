@@ -13,14 +13,13 @@
 // JWT_SECRET and INTERNAL_SECRET must be set before shared-auth modules are imported,
 // because both read process.env lazily inside helper functions but tokens generated with
 // one value won't validate against another. Pinning them keeps the test deterministic.
-process.env.JWT_SECRET      = 'test-jwt-secret';
-process.env.INTERNAL_SECRET = 'test-internal-secret';
+process.env.JWT_SECRET = 'test-jwt-secret-min-16-chars';
 
 import { describe, it, expect, beforeAll } from "vitest";
 import { buildApp, type AppDeps } from '../index.ts';
 import { AccountCache } from '../infrastructure/account-cache.ts';
 import { signAccessToken } from '@trader/shared-auth/jwt';
-import { generateInternalToken } from '@trader/shared-auth/internal-token';
+import { mintInternalJwt } from '@trader/shared-auth/internal-jwt';
 import { TradingMode } from '../domain/entities/Order.ts';
 
 // Minimal in-memory Redis stub — only the three methods the routes actually call.
@@ -129,15 +128,16 @@ describe('trading-service routing', () => {
     it('returns 200 on /cash with the portfolio-service internal token', async () => {
       const app = buildApp(paperDeps());
       const res = await app.request('/internal/trading/cash', {
-        headers: { 'X-Internal-Token': generateInternalToken('portfolio-service') },
+        headers: { Authorization: `Bearer ${await mintInternalJwt('portfolio-service')}` },
       });
       expect(res.status).toBe(200);
     });
 
-    it('returns 403 on /cash with no internal token', async () => {
+    it('returns 401 on /cash with no auth header', async () => {
+      // Phase 4: requireInternal returns 401 (no token) rather than the legacy 403.
       const app = buildApp(paperDeps());
       const res = await app.request('/internal/trading/cash');
-      expect(res.status).toBe(403);
+      expect(res.status).toBe(401);
     });
 
     it('returns 200 on /cash with the signal-service token — AutoApprovalGate cash pro-rate path', async () => {
@@ -146,7 +146,7 @@ describe('trading-service routing', () => {
       // to fit free cash. See requirePortfolioOrSignal wiring in index.ts.
       const app = buildApp(paperDeps());
       const res = await app.request('/internal/trading/cash', {
-        headers: { 'X-Internal-Token': generateInternalToken('signal-service') },
+        headers: { Authorization: `Bearer ${await mintInternalJwt('signal-service')}` },
       });
       expect(res.status).toBe(200);
     });
@@ -154,7 +154,7 @@ describe('trading-service routing', () => {
     it('returns 403 on /cash when the caller in the token is neither portfolio nor signal', async () => {
       const app = buildApp(paperDeps());
       const res = await app.request('/internal/trading/cash', {
-        headers: { 'X-Internal-Token': generateInternalToken('trading-service') },
+        headers: { Authorization: `Bearer ${await mintInternalJwt('trading-service')}` },
       });
       expect(res.status).toBe(403);
     });
@@ -199,9 +199,9 @@ describe('trading-service routing', () => {
 
       // Three concurrent /cash requests — without coalescing this would be 3 T212 hits.
       const results = await Promise.all([
-        app.request('/internal/trading/cash', { headers: { 'X-Internal-Token': generateInternalToken('portfolio-service') } }),
-        app.request('/internal/trading/cash', { headers: { 'X-Internal-Token': generateInternalToken('portfolio-service') } }),
-        app.request('/internal/trading/cash', { headers: { 'X-Internal-Token': generateInternalToken('signal-service') } }),
+        app.request('/internal/trading/cash', { headers: { Authorization: `Bearer ${await mintInternalJwt('portfolio-service')}` } }),
+        app.request('/internal/trading/cash', { headers: { Authorization: `Bearer ${await mintInternalJwt('portfolio-service')}` } }),
+        app.request('/internal/trading/cash', { headers: { Authorization: `Bearer ${await mintInternalJwt('signal-service')}` } }),
       ]);
       for (const r of results) expect(r.status).toBe(200);
       const bodies = await Promise.all(results.map((r) => r.json()));
@@ -224,7 +224,7 @@ describe('trading-service routing', () => {
       });
 
       const res = await app.request('/internal/trading/positions', {
-        headers: { 'X-Internal-Token': generateInternalToken('portfolio-service') },
+        headers: { Authorization: `Bearer ${await mintInternalJwt('portfolio-service')}` },
       });
       expect(res.status).toBe(200);
       const body = await res.json();
@@ -248,7 +248,7 @@ describe('trading-service routing', () => {
       const app = buildApp(paperDeps());
       const res = await app.request('/internal/signals/trading/execute', {
         method: 'POST',
-        headers: { 'X-Internal-Token': generateInternalToken('signal-service'), 'Content-Type': 'application/json' },
+        headers: { Authorization: `Bearer ${await mintInternalJwt('signal-service')}`, 'Content-Type': 'application/json' },
         body,
       });
       expect(res.status).toBe(200);
@@ -261,7 +261,7 @@ describe('trading-service routing', () => {
       const app = buildApp(paperDeps());
       const res = await app.request('/internal/signals/trading/execute', {
         method: 'POST',
-        headers: { 'X-Internal-Token': generateInternalToken('portfolio-service'), 'Content-Type': 'application/json' },
+        headers: { Authorization: `Bearer ${await mintInternalJwt('portfolio-service')}`, 'Content-Type': 'application/json' },
         body,
       });
       expect(res.status).toBe(403);

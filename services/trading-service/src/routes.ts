@@ -1,7 +1,9 @@
 import { Hono } from "hono";
+import { zValidator } from "@hono/zod-validator";
+import { z } from "zod";
 import type { Db } from "mongodb";
 import type { RedisClientType } from "redis";
-import { requireAuth, requireRole, requireInternalAny } from "@trader/shared-auth/middleware";
+import { requireAuth, requireRole, requireInternal, requireCaller } from '@trader/shared-auth/middleware';
 import { money, BASE_CURRENCY } from "@trader/shared-types";
 
 import { Trading212Client } from "./infrastructure/t212.ts";
@@ -31,11 +33,7 @@ export function buildApp(deps: AppDeps): Hono {
 
     app.get("/health", (c) => c.json({ status: "ok", trading_mode: modeName(tradingMode) }));
 
-    const requirePortfolio = requireInternalAny("portfolio-service");
-    const requireSignal    = requireInternalAny("signal-service");
-    const requirePortfolioOrSignal = requireInternalAny("portfolio-service", "signal-service");
-
-    app.get("/internal/trading/positions", requirePortfolio, async (c) => {
+    app.get("/internal/trading/positions", requireInternal, requireCaller("portfolio-service"), async (c) => {
         if (deps.accountCache) {
             const snap = await deps.accountCache.get();
             return c.json({ positions: snap.positions });
@@ -44,7 +42,7 @@ export function buildApp(deps: AppDeps): Hono {
         return c.json({ positions });
     });
 
-    app.get("/internal/trading/cash", requirePortfolioOrSignal, async (c) => {
+    app.get("/internal/trading/cash", requireInternal, requireCaller("portfolio-service", "signal-service"), async (c) => {
         if (deps.accountCache) {
             const snap = await deps.accountCache.get();
             return c.json({ free: snap.free, total: snap.total });
@@ -53,7 +51,7 @@ export function buildApp(deps: AppDeps): Hono {
         return c.json(cash);
     });
 
-    app.post("/internal/signals/trading/execute", requireSignal, async (c) => {
+    app.post("/internal/signals/trading/execute", requireInternal, requireCaller("signal-service"), async (c) => {
         return c.json({
             skipped: true,
             reason:  "deprecated — signals are now routed through the order-dispatcher queue. Approve via signal-service to enqueue.",
@@ -93,27 +91,25 @@ export function buildApp(deps: AppDeps): Hono {
         return c.json({ trading_mode: modeName(tradingMode), live_gate_approved: approved });
     });
 
-    admin.post("/api/admin/trading/execute", async (c) => {
-        const body = await c.req.json<{
-            signalId: string;
-            ticker: string;
-            action: "BUY" | "SELL";
-            targetWeight: number;
-            confidence: number;
-            totalNAV?:     { amount: number; currency: "GBP" | "USD" };
-            currentPrice?: { amount: number; currency: "GBP" | "USD" };
-            currentQuantity?: number;
-        }>();
-
-        if (body.totalNAV !== undefined &&
-            (typeof body.totalNAV.amount !== "number" || !body.totalNAV.currency)) {
-            return c.json({ message: "totalNAV must be { amount, currency }" }, 400);
-        }
-        if (body.currentPrice !== undefined &&
-            (typeof body.currentPrice.amount !== "number" || !body.currentPrice.currency)) {
-            return c.json({ message: "currentPrice must be { amount, currency }" }, 400);
-        }
-
+    // Boundary validation via zod. Replaces the hand-rolled checks that previously caught
+    // the malformed totalNAV / currentPrice shapes — those now fail at the validator middleware
+    // with a 400 + zod issue list, before any handler code runs.
+    const MoneyJson = z.object({
+        amount: z.number(),
+        currency: z.enum(["GBP", "USD"]),
+    });
+    const ExecuteBody = z.object({
+        signalId: z.string().min(1),
+        ticker: z.string().min(1),
+        action: z.enum(["BUY", "SELL"]),
+        targetWeight: z.number().min(0).max(1),
+        confidence: z.number().min(0).max(1),
+        totalNAV: MoneyJson.optional(),
+        currentPrice: MoneyJson.optional(),
+        currentQuantity: z.number().int().nonnegative().optional(),
+    });
+    admin.post("/api/admin/trading/execute", zValidator("json", ExecuteBody), async (c) => {
+        const body = c.req.valid("json");
         const db    = await deps.getDb();
         const redis = await deps.getRedis();
 
@@ -122,7 +118,17 @@ export function buildApp(deps: AppDeps): Hono {
         const liveApproved = async (): Promise<boolean> => !!(await redis.get(LIVE_GATE_KEY));
 
         const useCase = new PlaceOrderUseCase(orderRepo, executor, liveApproved, getSignalOrderType);
-        const order   = await useCase.execute(body);
+        // Optional fields are stripped if undefined to satisfy exactOptionalPropertyTypes.
+        const order   = await useCase.execute({
+            signalId:     body.signalId,
+            ticker:       body.ticker,
+            action:       body.action,
+            targetWeight: body.targetWeight,
+            confidence:   body.confidence,
+            ...(body.totalNAV        ? { totalNAV: body.totalNAV } : {}),
+            ...(body.currentPrice    ? { currentPrice: body.currentPrice } : {}),
+            ...(body.currentQuantity !== undefined ? { currentQuantity: body.currentQuantity } : {}),
+        });
 
         if (!order) {
             return c.json({ message: "Order skipped — check TRADING_MODE, live gate, currency match" }, 200);

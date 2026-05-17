@@ -1,6 +1,6 @@
 import type { Collection, Db } from 'mongodb';
 import type { RedisClientType } from 'redis';
-import { generateInternalToken, mintInternalJwt } from '@trader/shared-auth';
+import { mintInternalJwt } from '@trader/shared-auth';
 import { sumPositionsGBP, type FxConverter, type PositionDoc } from '@trader/shared-portfolio';
 import { CircuitBreakerRedis } from '../../infrastructure/CircuitBreakerRedis.ts';
 import { RISK_LIMITS } from './LongOnlyOptimiser.ts';
@@ -224,8 +224,7 @@ export class RiskEngine {
     let cashGBP = 0;
     try {
       const res = await fetch(`${TRADING_SERVICE_URL}/internal/trading/cash`, {
-        headers: { 'X-Internal-Token': generateInternalToken('signal-service'),
-          'Authorization':     `Bearer ${await mintInternalJwt('signal-service')}` },
+        headers: { Authorization: `Bearer ${await mintInternalJwt('signal-service')}` },
       });
       if (res.ok) {
         // Wire format post-FX-fix: { free: { amount, currency }, total: { amount, currency } }.

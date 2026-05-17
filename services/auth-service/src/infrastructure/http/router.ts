@@ -1,5 +1,5 @@
 import { Hono } from 'hono';
-import { requireInternalAny } from '@trader/shared-auth/middleware';
+import { requireInternal, requireCaller } from '@trader/shared-auth/middleware';
 import { verifyRefreshToken, signAccessToken } from '@trader/shared-auth/jwt';
 import type { LoginUseCase } from '../../application/use-cases/LoginUseCase.ts';
 import type { RegisterUseCase } from '../../application/use-cases/RegisterUseCase.ts';
@@ -57,7 +57,7 @@ export function createPublicRouter(login: LoginUseCase, register: RegisterUseCas
 
 export function createInternalRouter() {
   const internal = new Hono();
-  internal.use('*', requireInternalAny('api-gateway'));
+  internal.use('*', requireInternal, requireCaller('api-gateway'));
 
   internal.get('/api/admin/users', async (c) => {
     const db = await getMongoDb();
