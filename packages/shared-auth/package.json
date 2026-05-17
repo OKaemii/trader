@@ -20,6 +20,7 @@
   "scripts": {
     "typecheck": "tsc -b --noEmit",
     "test": "bun test",
-    "build": "tsc -b"
+    "build": "tsc -b",
+    "lint": "eslint src"
   }
 }

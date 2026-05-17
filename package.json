@@ -6,14 +6,20 @@
     "node": ">=22"
   },
   "scripts": {
-    "dev":       "pnpm -r run dev",
-    "build":     "pnpm -r run build",
+    "dev": "pnpm -r run dev",
+    "build": "pnpm -r run build",
     "typecheck": "pnpm -r run typecheck",
-    "lint":      "pnpm -r run lint",
-    "test":      "pnpm -r run test"
+    "lint": "pnpm -r run lint",
+    "test": "pnpm -r run test"
   },
   "devDependencies": {
+    "@eslint/js": "^9",
     "@types/node": "^22.7.5",
-    "typescript": "^5.5.4"
+    "eslint": "^9",
+    "eslint-config-prettier": "^9",
+    "eslint-plugin-import": "^2",
+    "prettier": "^3",
+    "typescript": "^5.5.4",
+    "typescript-eslint": "^8"
   }
 }
