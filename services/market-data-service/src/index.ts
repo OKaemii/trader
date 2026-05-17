@@ -11,6 +11,12 @@ import { createAdminRouter, createInternalBarsRouter } from './admin-routes.ts';
 import { YahooProvider } from './providers/yahoo-provider.ts';
 import { FxClient, YahooFxProvider } from '@trader/shared-fx';
 import { aggregateBars } from '@trader/shared-bars';
+import {
+  HolidayCache, NyseIcalProvider, UkGovBankHolidayProvider, StaticFallbackProvider, STATIC_FALLBACK,
+  nyseCalendar, lseCalendar, marketStateOf, shouldPollMarket, partitionByMarket,
+  soonestNextOpen, expectedLatestBarMs,
+  type Market, type MarketState, type ExchangeCalendar,
+} from '@trader/shared-calendar';
 import { backfillTickers, tickersMissingHistory, healMissingHistory } from './backfill.ts';
 import { msUntilNextTick } from './poll-scheduling.ts';
 
@@ -159,6 +165,29 @@ const provider = new YahooProvider(async (amount, currency) => {
   return fx.toGBP({ amount, currency });
 });
 
+// Calendar wiring: one HolidayCache per process, shared by both ExchangeCalendars.
+// Hydrated in bootstrap() before pollLoop starts. The cache walks
+// mem → Mongo → live providers (NYSE iCal, gov.uk JSON) → static fallback;
+// failures degrade loudly rather than substituting wrong data.
+let _holidayCache: HolidayCache | null = null;
+let _nyseCal: ExchangeCalendar | null = null;
+let _lseCal:  ExchangeCalendar | null = null;
+async function getHolidayCache(): Promise<HolidayCache> {
+  if (_holidayCache) return _holidayCache;
+  const db = await getMongoDb();
+  _holidayCache = new HolidayCache(
+    db,
+    { US: new NyseIcalProvider(), LSE: new UkGovBankHolidayProvider() },
+    STATIC_FALLBACK,
+  );
+  return _holidayCache;
+}
+function calendarFor(market: Market): ExchangeCalendar {
+  if (market === 'US')  return _nyseCal ?? (() => { throw new Error('calendar not yet bootstrapped'); })();
+  if (market === 'LSE') return _lseCal  ?? (() => { throw new Error('calendar not yet bootstrapped'); })();
+  throw new Error(`calendarFor: unsupported market ${market}`);
+}
+
 async function pollLoop(): Promise<void> {
   const redis = await getRedisClient();
   await ensureConsumerGroup(redis, REDIS_STREAMS.MARKET_RAW, 'market-data-service');
@@ -182,86 +211,103 @@ async function pollLoop(): Promise<void> {
       lastUniverseRefresh = Date.now();
     }
 
-    try {
-      // Self-heal pass FIRST: one Mongo aggregation finds tickers whose latest 5m
-      // bar predates fetchRecent's 24h window. fetchRecent can only cover the last
-      // 24h, so anything older needs a targeted backfill. Steady-state cost when no
-      // ticker is gapped: a single aggregation, no Yahoo calls.
+    // Session gate. Partition the universe by exchange and decide, per-market,
+    // whether to fetch this cycle. Markets in REGULAR/PRE/POST poll; CLOSED skips.
+    // When all relevant markets skip, the cycle is a no-op (log + sleep), saving
+    // ~30% of weekly Yahoo calls on weekends + ~10h/weekday of asymmetric closures.
+    const groups = partitionByMarket(activeTickers);
+    type Decision = { market: Market; tickers: string[]; state: MarketState };
+    const decisions: Decision[] = [];
+    for (const m of ['US', 'LSE'] as Market[]) {
+      if (groups[m].length === 0) continue;
+      decisions.push({ market: m, tickers: groups[m], state: await marketStateOf(calendarFor(m), Date.now()) });
+    }
+    const activeDecisions = decisions.filter((d) => d.state === 'REGULAR' || d.state === 'POST' || d.state === 'PRE');
+
+    if (activeDecisions.length === 0) {
+      const summary = decisions.map((d) => `${d.market}=${d.state}`).join(', ');
+      let nextOpenIso = 'unknown';
       try {
-        const db = await getMongoDb();
-        const redis2 = await getRedisClient();
-        const heal = await healMissingHistory(db, redis2, provider, activeTickers);
-        if (heal.healed > 0) {
-          console.warn(`[market-data] heal: ${heal.healed} ticker(s), ${heal.barsAdded} bars filled, ${heal.unrecoverable} unrecoverable`);
+        const next = await soonestNextOpen(decisions.map((d) => calendarFor(d.market)), Date.now());
+        nextOpenIso = new Date(next).toISOString();
+      } catch { /* calendar exhaustion — surfaced separately on /health */ }
+      console.log(`[market-data] session gate skip — ${summary || 'no recognised markets'}; next open ${nextOpenIso}`);
+      pollStats.gateSkipsTotal++;
+      pollStats.lastGateSkipTs = Date.now();
+      const sleepMs = msUntilNextTick(pollIntervalMs, POLL_ANCHOR_OFFSET_MS);
+      console.log(`[market-data] next poll in ${(sleepMs / 1000).toFixed(0)}s at ${new Date(Date.now() + sleepMs).toISOString()}`);
+      await Bun.sleep(sleepMs);
+      continue;
+    }
+
+    // For each open partition, run the existing pipeline scoped to that market's
+    // tickers. The heal pass is session-aware: `expectedLatestMs = most-recent
+    // session close` suppresses Monday-morning false-positives for tickers whose
+    // latest bar IS Friday's close (nothing actually missing — market was just shut).
+    for (const decision of activeDecisions) {
+      try {
+        const cal = calendarFor(decision.market);
+        const expectedLatestMs = (await expectedLatestBarMs(cal, Date.now())) ?? undefined;
+
+        try {
+          const db = await getMongoDb();
+          const redis2 = await getRedisClient();
+          const heal = await healMissingHistory(db, redis2, provider, decision.tickers, { expectedLatestMs });
+          if (heal.healed > 0) {
+            console.warn(`[market-data] heal (${decision.market}): ${heal.healed} ticker(s), ${heal.barsAdded} bars filled, ${heal.unrecoverable} unrecoverable`);
+          }
+        } catch (err) {
+          console.warn(`[market-data] heal pass failed for ${decision.market} (non-fatal):`, err);
         }
-      } catch (err) {
-        console.warn('[market-data] heal pass failed (non-fatal):', err);
-      }
 
-      // Pull a window of 5m bars per ticker — one Yahoo /chart request per ticker
-      // returns ~78 5m bars (a full trading day) at hourly cadence. Storage is always
-      // 5m; what gets published to market:raw is downsampled to the active BAR_FREQUENCY
-      // so strategy-engine's rolling-window math sees bars at the granularity it expects.
-      const rawBars = await provider.fetchRecent(activeTickers, 24);
+        const rawBars = await provider.fetchRecent(decision.tickers, 24);
+        const { valid, invalid } = validator.validate(rawBars);
 
-      // Validation runs on the full Yahoo response — bar-shape checks (positive prices,
-      // OHLC sanity) are unrelated to age. Stale filter runs LATER, only against the
-      // publish-to-stream path, so wider Yahoo responses (Yahoo sometimes returns more
-      // than the requested window) still get persisted via the idempotent upsert.
-      const { valid, invalid } = validator.validate(rawBars);
+        if (invalid.length > 0) {
+          const db = await getMongoDb();
+          await db.collection(COLLECTIONS.BAD_TICKS).insertMany(
+            invalid.map(({ bar, reason }) => ({ ...bar, reason, loggedAt: new Date() })),
+          );
+          console.warn(`[market-data] ${invalid.length} bad ticks rejected (${decision.market})`);
+        }
 
-      if (invalid.length > 0) {
-        const db = await getMongoDb();
-        await db.collection(COLLECTIONS.BAD_TICKS).insertMany(
-          invalid.map(({ bar, reason }) => ({ ...bar, reason, loggedAt: new Date() })),
+        // Gap detection scoped to the partition — a US-only window shouldn't trip
+        // the gap alarm on LSE tickers we deliberately didn't fetch.
+        const representedTickers = new Set(valid.map((b) => b.ticker));
+        const gapReport = gapDetector.check(
+          decision.tickers,
+          decision.tickers.filter((t) => representedTickers.has(t)).map((t) => ({ ticker: t } as OHLCVBar)),
         );
-        console.warn(`[market-data] ${invalid.length} bad ticks rejected`);
-      }
-
-      // Gap detection: count *distinct tickers represented*, not raw bar count. With
-      // fetchRecent returning ~78 bars per ticker, a raw-count check would always pass
-      // even if half the universe failed to resolve.
-      const representedTickers = new Set(valid.map((b) => b.ticker));
-      const gapReport = gapDetector.check(
-        activeTickers,
-        activeTickers.filter((t) => representedTickers.has(t)).map((t) => ({ ticker: t } as OHLCVBar)),
-      );
-      if (gapReport.gapFraction > GAP_THRESHOLD) {
-        const db = await getMongoDb();
-        await db.collection(COLLECTIONS.BAD_TICKS).insertOne({
-          type: 'universe_gap',
-          missingTickers: gapReport.missingTickers,
-          gapFraction: gapReport.gapFraction,
-          timestamp: Date.now(),
-          loggedAt: new Date(),
-        });
-        console.warn(`[market-data] ${(gapReport.gapFraction * 100).toFixed(0)}% of universe missing — skipping strategy cycle`);
-        await Bun.sleep(msUntilNextTick(pollIntervalMs, POLL_ANCHOR_OFFSET_MS));
-        continue;
-      }
-
-      if (valid.length > 0) {
-        // Persist EVERY valid bar — upsert dedups overlap, and a fresh deploy benefits
-        // from caching wider Yahoo responses (e.g. the 60-day default range) cheaply.
-        await persistBars(valid, '5m');
-
-        // Downsample per ticker to BAR_FREQUENCY, then publish ONLY the latest bucket
-        // per ticker to market:raw. See latestPerTicker for the rationale.
-        const targetInterval: BarInterval = cfg.barFrequency === 'intraday' ? '15m' : 'daily';
-        const downsampled = latestPerTicker(valid, targetInterval);
-
-        await xAdd(redis, REDIS_STREAMS.MARKET_RAW, downsampled);
-        for (const bar of downsampled) {
-          await redis.setEx(`market:latest:${bar.ticker}`, 120, JSON.stringify(bar));
+        if (gapReport.gapFraction > GAP_THRESHOLD) {
+          const db = await getMongoDb();
+          await db.collection(COLLECTIONS.BAD_TICKS).insertOne({
+            type: 'universe_gap',
+            market: decision.market,
+            missingTickers: gapReport.missingTickers,
+            gapFraction: gapReport.gapFraction,
+            timestamp: Date.now(),
+            loggedAt: new Date(),
+          });
+          console.warn(`[market-data] ${(gapReport.gapFraction * 100).toFixed(0)}% of ${decision.market} missing — skipping publish`);
+          continue;
         }
 
-        pollStats.lastPollTs   = Date.now();
-        pollStats.lastBarCount = downsampled.length;
-        pollStats.totalCycles++;
-        console.log(`[market-data] persisted ${valid.length} 5m bars, published ${downsampled.length} ${targetInterval} bars (cycle ${pollStats.totalCycles})`);
+        if (valid.length > 0) {
+          await persistBars(valid, '5m');
+          const targetInterval: BarInterval = cfg.barFrequency === 'intraday' ? '15m' : 'daily';
+          const downsampled = latestPerTicker(valid, targetInterval);
+          await xAdd(redis, REDIS_STREAMS.MARKET_RAW, downsampled);
+          for (const bar of downsampled) {
+            await redis.setEx(`market:latest:${bar.ticker}`, 120, JSON.stringify(bar));
+          }
+          pollStats.lastPollTs   = Date.now();
+          pollStats.lastBarCount = downsampled.length;
+          pollStats.totalCycles++;
+          console.log(`[market-data] ${decision.market}: ${valid.length} 5m bars, ${downsampled.length} ${targetInterval} bars (cycle ${pollStats.totalCycles})`);
+        }
+      } catch (e) {
+        console.error(`[market-data] poll error (${decision.market}):`, e);
       }
-    } catch (e) {
-      console.error('[market-data] poll error:', e);
     }
 
     // Wall-clock alignment: sleep until the next aligned tick rather than for a
@@ -273,28 +319,67 @@ async function pollLoop(): Promise<void> {
   }
 }
 
-// Poll stats updated each cycle for /health visibility
-const pollStats = { lastPollTs: null as number | null, lastBarCount: 0, totalCycles: 0 };
+// Poll stats updated each cycle for /health visibility.
+// gateSkipsTotal counts full-cycle skips where all relevant markets are closed; it's
+// what powers the portal's "Yahoo calls saved" tile against totalCycles.
+const pollStats = {
+  lastPollTs:      null as number | null,
+  lastBarCount:    0,
+  totalCycles:     0,
+  gateSkipsTotal:  0,
+  lastGateSkipTs:  null as number | null,
+};
 
 app.get('/health', async (c) => {
   const cfg = await getLiveConfig().catch(() => ({ barFrequency: 'daily', pollIntervalMs: INITIAL_POLL_MS }));
-  // Compute the wall-clock-aligned next-poll timestamp so the portal can show a
-  // countdown without having to know about POLL_ANCHOR_OFFSET_MS. Same helper the
-  // pollLoop uses, so the answer reflects what'll actually fire.
   const nextPollTs = Date.now() + msUntilNextTick(cfg.pollIntervalMs, POLL_ANCHOR_OFFSET_MS);
+
+  // Session-aware surface. Best-effort: if the calendars aren't yet bootstrapped
+  // (very early in the lifecycle) we return what we have rather than 500.
+  const session_states: Partial<Record<Market, MarketState>> = {};
+  let next_session_open_ts: number | null = null;
+  let session_gate_skipping = false;
+  let holiday_source_health: any[] = [];
+  try {
+    const universeMarkets = ['US', 'LSE'] as Market[];
+    const states = await Promise.all(universeMarkets.map(async (m) => [m, await marketStateOf(calendarFor(m), Date.now())] as const));
+    let anyPollable = false;
+    for (const [m, s] of states) {
+      session_states[m] = s;
+      if (s === 'REGULAR' || s === 'PRE' || s === 'POST') anyPollable = true;
+    }
+    session_gate_skipping = !anyPollable;
+    if (session_gate_skipping) {
+      try {
+        next_session_open_ts = await soonestNextOpen([calendarFor('US'), calendarFor('LSE')], Date.now());
+      } catch { /* calendar exhaustion — surfaced via holiday_source_health below */ }
+    }
+    const cache = await getHolidayCache();
+    holiday_source_health = await cache.getSourceHealth();
+  } catch { /* calendars not bootstrapped yet — return blank session fields */ }
+
   return c.json({
-    status:         'ok',
-    bar_frequency:  cfg.barFrequency,
-    poll_interval_ms: cfg.pollIntervalMs,
-    universe_size:  universeManager.activeTickers.length,
-    last_poll_ts:   pollStats.lastPollTs,
-    last_bar_count: pollStats.lastBarCount,
-    total_cycles:   pollStats.totalCycles,
-    next_poll_ts:   nextPollTs,
+    status:                'ok',
+    bar_frequency:         cfg.barFrequency,
+    poll_interval_ms:      cfg.pollIntervalMs,
+    universe_size:         universeManager.activeTickers.length,
+    last_poll_ts:          pollStats.lastPollTs,
+    last_bar_count:        pollStats.lastBarCount,
+    total_cycles:          pollStats.totalCycles,
+    next_poll_ts:          nextPollTs,
+    session_states,
+    session_gate_skipping,
+    next_session_open_ts,
+    gate_skips_total:      pollStats.gateSkipsTotal,
+    last_gate_skip_ts:     pollStats.lastGateSkipTs,
+    holiday_source_health,
   });
 });
 
-app.route('/', createAdminRouter(universeManager, provider));
+app.route('/', createAdminRouter(universeManager, provider, {
+  holidayCache: () => _holidayCache ?? (() => { throw new Error('holiday cache not bootstrapped'); })(),
+  calendarFor,
+}));
 app.route('/', createInternalBarsRouter());
 
 app.get('/latest/:ticker', async (c) => {
@@ -316,6 +401,24 @@ app.get('/latest/:ticker', async (c) => {
 // admin backfill endpoint after the fact.
 async function bootstrap(): Promise<void> {
   await ensureBarIndexes();
+
+  // Holiday cache + per-exchange calendars. Hydrate eagerly so pollLoop's first
+  // gate decision doesn't pay a cold-cache provider hit. Background refresh
+  // keeps the Mongo cache fresh weekly thereafter.
+  const cache = await getHolidayCache();
+  _nyseCal = nyseCalendar(cache);
+  _lseCal  = lseCalendar(cache);
+  try {
+    const year = new Date().getUTCFullYear();
+    await Promise.all([
+      cache.getTable('US',  year),
+      cache.getTable('LSE', year),
+    ]);
+    console.log('[market-data] holiday calendars hydrated');
+  } catch (err) {
+    console.warn('[market-data] holiday hydration failed (will retry on first poll):', err);
+  }
+  cache.startBackgroundRefresh();
 
   let universe: string[] = [];
   try {

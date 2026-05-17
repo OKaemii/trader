@@ -11,6 +11,8 @@ import type { MarketDataProvider } from './providers/market-data-provider.ts';
 import { aggregateBars, getBars, invalidateBars, type RangeKey } from '@trader/shared-bars';
 import { backfillTickers, CACHE_INVALIDATED_TOPIC } from './backfill.ts';
 import { REDIS_STREAMS, POLL_INTERVAL_OPTIONS, type BarInterval, type OHLCVBar, type PollIntervalKey } from '@trader/shared-types';
+import type { HolidayCache, ExchangeCalendar, Market } from '@trader/shared-calendar';
+import { scheduleBetween, marketStateOf } from '@trader/shared-calendar';
 
 interface UniverseOverridesDoc {
   _id: 'singleton';
@@ -52,9 +54,15 @@ const MAX_POLL_MS = 24 * 60 * 60_000;
 const VALID_INTERVALS: BarInterval[] = ['5m', '15m', '1h', 'daily'];
 const VALID_RANGES: RangeKey[]     = ['30d', '60d', '90d'];
 
+export interface CalendarDeps {
+  holidayCache: () => HolidayCache;
+  calendarFor:  (m: Market) => ExchangeCalendar;
+}
+
 export function createAdminRouter(
   universeManager: UniverseManager,
   provider: MarketDataProvider,
+  calendarDeps?: CalendarDeps,
 ): Hono {
   const r = new Hono();
   // Path-scoped, NOT `r.use('*', mw)`. A wildcard `use('*', mw)` on a subapp mounted
@@ -354,6 +362,46 @@ export function createAdminRouter(
     const base = await getBars(redis as any, db, ticker, '5m', range);
     const out  = aggregateBars(base, interval);
     return c.json({ ticker, interval, range, bars: out });
+  });
+
+  // ── Session calendar endpoints ───────────────────────────────────────────
+  // Powers the portal /market-data/calendar page and the source-health panel.
+  // calendarDeps is optional only because legacy tests construct the router without
+  // calendars; production wiring always passes them. Endpoints 503 when absent.
+
+  r.get('/api/admin/market-data/calendar', async (c) => {
+    if (!calendarDeps) return c.json({ error: 'calendar not configured' }, 503);
+    const days = Math.min(60, Math.max(1, parseInt(c.req.query('days') ?? '30', 10)));
+    const now = Date.now();
+    const toMs = now + days * 86_400_000;
+    const [us, lse] = await Promise.all([
+      scheduleBetween(calendarDeps.calendarFor('US'),  now, toMs),
+      scheduleBetween(calendarDeps.calendarFor('LSE'), now, toMs),
+    ]);
+    const [usState, lseState] = await Promise.all([
+      marketStateOf(calendarDeps.calendarFor('US'),  now),
+      marketStateOf(calendarDeps.calendarFor('LSE'), now),
+    ]);
+    return c.json({
+      generatedAt: now,
+      days,
+      current: { US: usState, LSE: lseState },
+      schedule: { US: us, LSE: lse },
+    });
+  });
+
+  r.get('/api/admin/market-data/holiday-sources', async (c) => {
+    if (!calendarDeps) return c.json({ error: 'calendar not configured' }, 503);
+    const health = await calendarDeps.holidayCache().getSourceHealth();
+    return c.json({ generatedAt: Date.now(), sources: health });
+  });
+
+  r.post('/api/admin/market-data/holiday-refresh', async (c) => {
+    if (!calendarDeps) return c.json({ error: 'calendar not configured' }, 503);
+    await calendarDeps.holidayCache().refreshAll();
+    const health = await calendarDeps.holidayCache().getSourceHealth();
+    console.log('[market-data] holiday tables refreshed via admin endpoint');
+    return c.json({ ok: true, sources: health });
   });
 
   return r;

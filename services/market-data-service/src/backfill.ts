@@ -9,9 +9,12 @@
 //   2. Admin endpoint POST /api/admin/market-data/backfill — explicit operator call
 //      with custom ticker/window args.
 //
-// Both paths converge on backfillTickers below: same upsert semantics, same cache
-// invalidation, same pubsub. Bootstrap differs only in *when* it decides to run
-// (see needsBackfill) and in its default window.
+// **Both paths are gate-bypass relative to the session-aware poll gate.** The
+// session calendar (@trader/shared-calendar) skips Yahoo calls when no relevant
+// market is open. Backfills do the opposite: an operator running a backfill at
+// 03:00 Sunday explicitly wants those calls (e.g. recovering from a multi-day
+// outage that happened during a closed window). The calendar is not consulted by
+// the functions here — call sites have already decided to hit the upstream.
 
 import type { Collection, Db } from 'mongodb';
 import type { RedisClientType } from 'redis';
@@ -168,12 +171,27 @@ export async function healMissingHistory(
   redis: RedisClientType,
   provider: MarketDataProvider,
   tickers: string[],
-  opts: { staleThresholdMs?: number } = {},
+  opts: { staleThresholdMs?: number; expectedLatestMs?: number } = {},
 ): Promise<{ healed: number; barsAdded: number; unrecoverable: number }> {
   if (tickers.length === 0) return { healed: 0, barsAdded: 0, unrecoverable: 0 };
   const stale = opts.staleThresholdMs ?? 24 * 60 * 60_000;
   const now   = Date.now();
   const collection = db.collection(COLLECTIONS.OHLCV_BARS);
+
+  // Session-aware gap detection. When the caller passes `expectedLatestMs` (the most
+  // recent session close for the relevant market, from @trader/shared-calendar's
+  // expectedLatestBarMs), a ticker is gapped iff its latest bar is older than that —
+  // i.e. genuine missing data, not "we paused polling during a closed window". This
+  // suppresses ~150 false-positive heals on Monday mornings when every US ticker's
+  // latest bar is Friday's close (>64h old by Monday morning) but nothing is actually
+  // missing. Without an `expectedLatestMs`, falls back to the flat 24h threshold.
+  const isGapped = (latestMs: number): boolean => {
+    if (typeof opts.expectedLatestMs === 'number') {
+      // 60s grace covers Yahoo late-prints vs the exact close ms.
+      return latestMs < opts.expectedLatestMs - 60_000;
+    }
+    return now - latestMs > stale;
+  };
 
   // Single aggregation: latest-bar-timestamp per ticker for the 5m series. Tickers
   // not present in the result have no history at all (handled by bootstrap, not
@@ -186,7 +204,7 @@ export async function healMissingHistory(
   const gapped: Array<{ ticker: string; latestMs: number }> = [];
   for (const row of agg) {
     const latestMs = row.latest instanceof Date ? row.latest.getTime() : Number(row.latest);
-    if (now - latestMs > stale) gapped.push({ ticker: row._id, latestMs });
+    if (isGapped(latestMs)) gapped.push({ ticker: row._id, latestMs });
   }
   if (gapped.length === 0) return { healed: 0, barsAdded: 0, unrecoverable: 0 };
 
