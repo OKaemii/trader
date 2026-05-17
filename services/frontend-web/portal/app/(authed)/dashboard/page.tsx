@@ -4,6 +4,7 @@ import { CashCard } from '@/components/CashCard'
 import { HoldingsPanel } from '@/components/HoldingsPanel'
 import { AutoApproveToggle } from '@/components/AutoApproveToggle'
 import { DangerZone } from '@/components/DangerZone'
+import { MarketStateBadge, type MarketState } from '@/components/MarketStateBadge'
 
 interface HealthRow {
   name: string
@@ -21,6 +22,22 @@ async function fetchHealth(): Promise<HealthRow[] | null> {
   }
 }
 
+// Subset of market-data /health used by the top-bar session badges.
+interface MarketDataHealth {
+  session_states?: Partial<Record<'US' | 'LSE', MarketState>>
+  next_session_open_ts?: number | null
+}
+
+async function fetchMarketDataHealth(): Promise<MarketDataHealth | null> {
+  try {
+    const r = await authedFetch('/api/admin/market-data/health')
+    if (!r.ok) return null
+    return (await r.json()) as MarketDataHealth
+  } catch {
+    return null
+  }
+}
+
 const cards = [
   { href: '/signals', title: 'Signals', desc: 'Latest strategy signals, regime, factor exposure.' },
   { href: '/research', title: 'Research', desc: 'Run backtests, view validation reports, factor decomposition.' },
@@ -29,12 +46,26 @@ const cards = [
 ]
 
 export default async function DashboardPage() {
-  const health = await fetchHealth()
+  const [health, mdHealth] = await Promise.all([fetchHealth(), fetchMarketDataHealth()])
+  const nextOpen = mdHealth?.next_session_open_ts
+    ? new Date(mdHealth.next_session_open_ts).toUTCString()
+    : null
   return (
     <div className="space-y-6 p-6">
-      <div>
-        <h1 className="text-2xl font-bold text-white">Dashboard</h1>
-        <p className="mt-1 text-sm text-gray-400">Account state, holdings, and system overview.</p>
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-bold text-white">Dashboard</h1>
+          <p className="mt-1 text-sm text-gray-400">Account state, holdings, and system overview.</p>
+        </div>
+        {mdHealth?.session_states && (
+          <div className="flex items-center gap-2">
+            {(['US', 'LSE'] as const).map((m) => {
+              const state = mdHealth.session_states?.[m]
+              if (!state) return null
+              return <MarketStateBadge key={m} market={m} state={state} nextOpen={nextOpen} />
+            })}
+          </div>
+        )}
       </div>
 
       <section className="grid grid-cols-1 gap-4 lg:grid-cols-4">

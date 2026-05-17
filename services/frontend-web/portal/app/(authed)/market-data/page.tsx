@@ -1,5 +1,6 @@
 import { getMarketDataConfig, getMarketDataProviderInfo } from '@/app/actions/admin'
 import { MarketDataEditor } from './MarketDataEditor'
+import { SessionSavingsTile } from '@/components/SessionSavingsTile'
 
 export default async function MarketDataPage() {
   const [cfg, prov] = await Promise.all([
@@ -27,5 +28,12 @@ export default async function MarketDataPage() {
   // endpoint yet.
   const providerInfo = prov.ok ? prov.data : null
 
-  return <MarketDataEditor initial={cfg.data} providerInfo={providerInfo} />
+  return (
+    <div className="space-y-6">
+      <MarketDataEditor initial={cfg.data} providerInfo={providerInfo} />
+      <div className="px-6">
+        <SessionSavingsTile />
+      </div>
+    </div>
+  )
 }
