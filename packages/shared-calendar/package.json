@@ -1,0 +1,14 @@
+{
+  "name": "@trader/shared-calendar",
+  "version": "0.0.1",
+  "private": true,
+  "main": "./src/index.ts",
+  "dependencies": {
+    "@trader/shared-mongo": "*",
+    "@trader/shared-types": "*",
+    "mongodb": "^6.5.0"
+  },
+  "scripts": {
+    "test": "bun test"
+  }
+}
