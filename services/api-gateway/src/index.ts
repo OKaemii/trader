@@ -26,11 +26,26 @@ async function proxy(upstream: string, c: any): Promise<Response> {
   const path = c.req.path;
   const qs = c.req.url.includes('?') ? '?' + c.req.url.split('?')[1] : '';
   const url = `${upstream}${path}${qs}`;
-  return fetch(url, {
+  const hasBody = !['GET', 'HEAD'].includes(c.req.method);
+  // Node's fetch (undici) rejects streamed request bodies without `duplex: 'half'`. Bun was
+  // looser. Read the body into a Buffer up front so the body is plain bytes and undici won't
+  // complain about half-duplex streaming.
+  const body = hasBody ? await c.req.raw.arrayBuffer() : undefined;
+  const upstreamRes = await fetch(url, {
     method: c.req.method,
     headers: withInternalHeaders(new Headers(c.req.raw.headers)),
-    body: ['GET', 'HEAD'].includes(c.req.method) ? undefined : c.req.raw.body,
+    body,
   });
+  // Hono's downstream cors middleware mutates `c.res.headers` via Context.header(). Returning
+  // a raw fetch Response here gives Hono an immutable-headered response that cors then crashes
+  // on with "TypeError: immutable". Instead, hand the body bytes back through `c.body(...)`
+  // which constructs a fresh Hono response with mutable headers, then copy across status +
+  // content-type so the consumer sees the same wire payload.
+  const responseBody = await upstreamRes.arrayBuffer();
+  const contentType = upstreamRes.headers.get('content-type');
+  if (contentType) c.header('content-type', contentType);
+  c.status(upstreamRes.status as 200);
+  return c.body(responseBody);
 }
 
 // ── PUBLIC routes (no auth) ──────────────────────────────────────────────────
