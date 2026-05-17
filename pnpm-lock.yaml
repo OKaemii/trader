@@ -45,6 +45,15 @@ importers:
         specifier: ^6.5.0
         version: 6.21.0
 
+  packages/contracts:
+    dependencies:
+      '@trader/shared-types':
+        specifier: workspace:*
+        version: link:../shared-types
+      zod:
+        specifier: ^3.23.0
+        version: 3.25.76
+
   packages/core:
     dependencies:
       '@hono/node-server':
