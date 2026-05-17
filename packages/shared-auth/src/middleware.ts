@@ -1,6 +1,7 @@
 import type { Context, Next } from 'hono';
-import { verifyAccessToken, type UserRole } from './jwt.ts';
+import { verifyAccessToken, verifyTokenForAudience, type TokenClaims, type UserRole } from './jwt.ts';
 import { validateInternalToken } from './internal-token.ts';
+import type { Audience } from './audiences.ts';
 
 // Extract the bearer token from either `Authorization: Bearer …` (server-to-server,
 // portal authedFetch) or the `at` cookie (browser XHR from client components).
@@ -56,3 +57,60 @@ export function requireInternalToken(...callerServices: string[]) {
     return c.json({ error: 'Forbidden' }, 403);
   };
 }
+
+// ── Audience-based JWT middleware (blueprint §11) ────────────────────────────
+// One verification primitive. `aud` is the authorization gate; `sub` carries the caller
+// identity (user id for end-users, service name for peers). Issued by auth-service at login
+// and by `mintInternalJwt` for service-to-service calls. Replaces the HMAC path as callers
+// and callees flip over.
+
+export const requireAudience = (audience: Audience | readonly Audience[]) =>
+  async (c: Context, next: Next): Promise<Response | void> => {
+    const token = extractBearer(c);
+    if (!token) return c.json({ error: 'Unauthorized' }, 401);
+    const list = Array.isArray(audience) ? audience : [audience as Audience];
+    for (const aud of list) {
+      try {
+        const claims = await verifyTokenForAudience(token, aud);
+        c.set('auth', claims);
+        return next();
+      } catch { /* try next */ }
+    }
+    return c.json({ error: 'Unauthorized' }, 401);
+  };
+
+// Admins can use user-scope endpoints; non-admins cannot reach admin scope.
+export const requireUser     = requireAudience(['user', 'admin']);
+export const requireAdmin    = requireAudience('admin');
+export const requireInternal = requireAudience('internal');
+
+/**
+ * Transition shim. Accept either the new audience Bearer JWT (aud='internal') OR the legacy
+ * HMAC X-Internal-Token from any of `callerServices`. Used during Phase 4 migration so
+ * callers and callees can flip independently; deleted in the final commit of Phase 4.
+ */
+export function requireInternalAny(...callerServices: string[]) {
+  return async (c: Context, next: Next): Promise<Response | void> => {
+    const bearer = extractBearer(c);
+    if (bearer) {
+      try {
+        const claims = await verifyTokenForAudience(bearer, 'internal');
+        c.set('auth', claims);
+        return next();
+      } catch { /* fall through to HMAC */ }
+    }
+    const hmac = c.req.header('X-Internal-Token');
+    if (hmac) {
+      for (const caller of callerServices) {
+        try {
+          validateInternalToken(hmac, caller);
+          c.set('hmacCaller', caller);
+          return next();
+        } catch { /* try next */ }
+      }
+    }
+    return c.json({ error: 'Forbidden' }, 403);
+  };
+}
+
+export type { TokenClaims };

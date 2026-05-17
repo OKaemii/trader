@@ -5,7 +5,7 @@
   "type": "module",
   "main": "./dist/index.js",
   "scripts": {
-    "typecheck": "tsc -b --noEmit",
+    "typecheck": "tsc -b",
     "build": "tsc -b",
     "lint": "eslint src",
     "test": "vitest run"

@@ -9,7 +9,7 @@
   },
   "scripts": {
     "build": "tsc -b",
-    "typecheck": "tsc -b --noEmit",
+    "typecheck": "tsc -b",
     "lint": "eslint src",
     "test": "vitest run"
   },

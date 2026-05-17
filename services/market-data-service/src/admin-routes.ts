@@ -2,7 +2,7 @@
 // the api-gateway is the only authorized caller and enforces user-level admin auth.
 
 import { Hono } from 'hono';
-import { requireInternalToken } from '@trader/shared-auth/middleware';
+import { requireInternalAny } from '@trader/shared-auth/middleware';
 import { getMongoDb, COLLECTIONS } from '@trader/shared-mongo';
 import { getRedisClient, xAdd } from '@trader/shared-redis';
 import { getLiveConfig, invalidateLiveConfig, _envDefaultsForTest } from './live-config.ts';
@@ -71,7 +71,7 @@ export function createAdminRouter(
   // routes, which then 403 because they expect caller='strategy-engine' not 'api-gateway'.
   // Same regression that bit trading-service routing; see services/trading-service
   // routing.test.ts for the fixture that pins it.
-  r.use('/api/admin/*', requireInternalToken('api-gateway'));
+  r.use('/api/admin/*', requireInternalAny('api-gateway'));
 
   // ── Universe overrides ────────────────────────────────────────────────────
   r.get('/api/admin/universe/overrides', async (c) => {
@@ -419,7 +419,7 @@ export function createAdminRouter(
 // N round-trips. Single-ticker GET stays for ad-hoc tooling.
 export function createInternalBarsRouter(): Hono {
   const r = new Hono();
-  const requireStrategy = requireInternalToken('strategy-engine');
+  const requireStrategy = requireInternalAny('strategy-engine');
 
   r.get('/internal/bars/:ticker', requireStrategy, async (c) => {
     const ticker   = c.req.param('ticker')!;

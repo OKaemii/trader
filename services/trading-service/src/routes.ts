@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import type { Db } from "mongodb";
 import type { RedisClientType } from "redis";
-import { requireAuth, requireRole, requireInternalToken } from "@trader/shared-auth/middleware";
+import { requireAuth, requireRole, requireInternalAny } from "@trader/shared-auth/middleware";
 import { money, BASE_CURRENCY } from "@trader/shared-types";
 
 import { Trading212Client } from "./infrastructure/t212.ts";
@@ -31,9 +31,9 @@ export function buildApp(deps: AppDeps): Hono {
 
     app.get("/health", (c) => c.json({ status: "ok", trading_mode: modeName(tradingMode) }));
 
-    const requirePortfolio = requireInternalToken("portfolio-service");
-    const requireSignal    = requireInternalToken("signal-service");
-    const requirePortfolioOrSignal = requireInternalToken("portfolio-service", "signal-service");
+    const requirePortfolio = requireInternalAny("portfolio-service");
+    const requireSignal    = requireInternalAny("signal-service");
+    const requirePortfolioOrSignal = requireInternalAny("portfolio-service", "signal-service");
 
     app.get("/internal/trading/positions", requirePortfolio, async (c) => {
         if (deps.accountCache) {

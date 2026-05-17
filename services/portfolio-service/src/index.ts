@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
-import { requireAuth, generateInternalToken } from '@trader/shared-auth';
+import { requireAuth, generateInternalToken, mintInternalJwt } from '@trader/shared-auth';
 import { getMongoDb } from '@trader/shared-mongo';
 import { COLLECTIONS } from '@trader/shared-mongo';
 import { getRedisClient } from '@trader/shared-redis';
@@ -26,7 +26,8 @@ async function getFxClient(): Promise<FxClient> {
 let tradingServiceUnreachableLogged = false;
 async function syncPositions(): Promise<void> {
   try {
-    const headers = { 'X-Internal-Token': generateInternalToken('portfolio-service') };
+    const headers = { 'X-Internal-Token': generateInternalToken('portfolio-service'),
+          'Authorization':     `Bearer ${await mintInternalJwt('portfolio-service')}` };
     const [posRes, cashRes] = await Promise.all([
       fetch('http://trading-service:3005/internal/trading/positions', { headers }),
       fetch('http://trading-service:3005/internal/trading/cash', { headers }),
