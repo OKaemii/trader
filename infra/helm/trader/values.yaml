@@ -3,6 +3,14 @@ global:
   imageRegistry: ""
   imagePullPolicy: IfNotPresent
   env:
+    # ---- Observability ----
+    # OTLP collector endpoint for distributed tracing. Empty = tracing disabled (no-op);
+    # set to e.g. "http://otel-collector.observability:4318/v1/traces" once a Tempo/Jaeger
+    # collector is stood up. Logger emits traceId/spanId on every line when active.
+    otelCollectorUrl: ""
+    # Pino log level for every TS service.
+    logLevel: info
+
     # Single source of truth for all service-tunable env vars. Lives under `global` so subchart
     # deployment templates can read `.Values.global.env.*` directly. Bump these and redeploy —
     # no code change required for any of the toggles documented in CLAUDE.md.
