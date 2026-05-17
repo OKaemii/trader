@@ -9,6 +9,7 @@
     "include": ["src/**/*"],
     "exclude": ["**/__tests__/**", "**/*.test.ts", "tests/**", "dist"],
     "references": [
+        { "path": "../../packages/core" },
         { "path": "../../packages/shared-auth" },
         { "path": "../../packages/shared-bars" },
         { "path": "../../packages/shared-calendar" },

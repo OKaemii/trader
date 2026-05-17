@@ -54,6 +54,7 @@ ENV NODE_ENV=production
 ENV SERVICE=${SERVICE}
 EXPOSE 3000
 
-# Each service's package.json `start` script runs `node dist/index.js` (Phase 3 will rename
-# entry to dist/main.js). Until then, fall back to the existing src/index.ts compiled output.
-CMD ["sh", "-c", "node services/${SERVICE}/dist/index.js"]
+# Phase 3 entry: every service ships a dist/main.js that loads env (fail-fast) then
+# bootstraps. Fall back to dist/index.js if a service hasn't been migrated yet — both
+# are equivalent for trading-service (index.ts triggers main.ts).
+CMD ["sh", "-c", "[ -f services/${SERVICE}/dist/main.js ] && exec node services/${SERVICE}/dist/main.js || exec node services/${SERVICE}/dist/index.js"]

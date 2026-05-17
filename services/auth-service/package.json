@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "bun run --watch src/index.ts",
-    "start": "bun run src/index.ts",
+    "dev": "tsx watch src/main.ts",
+    "start": "node dist/main.js",
     "typecheck": "tsc -b --noEmit",
     "test": "vitest run",
     "build": "tsc -b",
@@ -13,11 +13,13 @@
   },
   "dependencies": {
     "@hono/node-server": "^1.19.14",
+    "@trader/core": "workspace:*",
     "@trader/shared-auth": "workspace:*",
     "@trader/shared-mongo": "workspace:*",
     "@trader/shared-redis": "workspace:*",
     "bcryptjs": "^2.4.3",
-    "hono": "^4.3.0"
+    "hono": "^4.3.0",
+    "zod": "^3.23.0"
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6"
