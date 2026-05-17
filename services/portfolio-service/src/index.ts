@@ -5,6 +5,8 @@ import { COLLECTIONS } from '@trader/shared-mongo';
 import { getRedisClient } from '@trader/shared-redis';
 import { type Money, type Currency, BASE_CURRENCY } from '@trader/shared-types';
 import { FxClient, YahooFxProvider } from '@trader/shared-fx';
+import { sumPositionsGBP, type PositionDoc } from '@trader/shared-portfolio';
+import { buildPositionUpdate } from './sync.ts';
 
 const app = new Hono();
 
@@ -57,48 +59,60 @@ async function syncPositions(): Promise<void> {
 
     const fx = await getFxClient();
 
-    // First pass: compute each position's GBP value via FX. Done in one pass so we can
-    // sum positionsGBP for the weight denominator before the second pass writes weights.
-    const sized = await Promise.all(positions.map(async (p) => {
+    // First pass: extract native-currency price and value. No FX yet — positions are
+    // stored canonically as Money in the instrument's listing currency. GBP NAV is
+    // derived on read by RiskEngine via sumPositionsGBP.
+    const sized = positions.map((p) => {
       const q = typeof p.quantity === 'number' ? p.quantity : 0;
       const ccy: Currency = (p.currentPrice?.currency
         ?? p.averagePrice?.currency
         ?? BASE_CURRENCY) as Currency;
       const priceNative = p.currentPrice?.amount ?? 0;
       const valueNative = q * priceNative;
-      let valueGBP = valueNative;
-      if (ccy !== BASE_CURRENCY && valueNative > 0) {
-        try {
-          valueGBP = await fx.toGBP({ amount: valueNative, currency: ccy });
-        } catch (err) {
-          console.warn(`[portfolio] FX conversion failed for ${p.ticker} (${ccy}); falling back to native value:`, err);
-        }
-      }
-      return { p, q, ccy, priceNative, valueNative, valueGBP };
-    }));
+      return { p, q, ccy, priceNative, valueNative };
+    });
 
-    const positionsGBP = sized.reduce((acc, s) => acc + s.valueGBP, 0);
-    // Fallback NAV: cash endpoint unavailable → weight against holdings-only value so
-    // SELLs can still fire on the largest positions. Surface in logs once.
+    // Compute positionsGBP once for the weight denominator. If FX is unavailable
+    // (live Yahoo failed AND lastGood is stale past 24h), skip the entire sync rather
+    // than persist weights derived from a stale or fabricated value — the next 5min
+    // tick retries. The 100x bug class came from silently substituting native scalars
+    // into GBP-named columns; this helper either succeeds or throws, never lies.
+    const positionsForSum: PositionDoc[] = sized.map((s) => ({
+      ticker:   s.p.ticker,
+      quantity: s.q,
+      currency: s.ccy,
+      currentValue: { amount: s.valueNative, currency: s.ccy },
+    }));
+    let positionsGBP = 0;
+    try {
+      positionsGBP = await sumPositionsGBP(positionsForSum, fx);
+    } catch (err) {
+      console.warn('[portfolio] FX unavailable — skipping sync to avoid stale weights:', err);
+      return;
+    }
+    // Fallback NAV basis: cash endpoint unavailable → weight against holdings-only
+    // value so SELLs can still fire on the largest positions.
     const navBasisGBP = cashGBP && cashGBP > 0 ? cashGBP : positionsGBP;
 
     const db = await getMongoDb();
-    for (const { p, q, ccy, priceNative, valueNative, valueGBP } of sized) {
+    for (const { p, q, ccy, priceNative, valueNative } of sized) {
+      // Per-row GBP for the weight calculation. FX rate is Redis-cached for 1h, so
+      // this is N in-memory multiplies + 0–1 Redis GETs total for the batch.
+      const valueGBP = navBasisGBP > 0 && valueNative > 0
+        ? await fx.toGBP({ amount: valueNative, currency: ccy })
+        : 0;
       const weight = navBasisGBP > 0 ? valueGBP / navBasisGBP : 0;
-      // Persist BOTH native (instrument currency) and GBP. RiskEngine sums currentValueGBP;
-      // the portal can show either. weight is dimensionless.
+      const update = buildPositionUpdate({
+        ticker:      p.ticker,
+        quantity:    q,
+        currency:    ccy,
+        priceNative,
+        valueNative,
+        weight,
+      });
       await db.collection(COLLECTIONS.POSITIONS).updateOne(
         { ticker: p.ticker },
-        { $set: {
-          ticker: p.ticker,
-          quantity: q,
-          currency: ccy,
-          currentPrice: priceNative,
-          currentValue: valueNative,        // instrument currency
-          currentValueGBP: valueGBP,        // BASE_CURRENCY
-          weight,
-          updatedAt: new Date(),
-        }},
+        update,
         { upsert: true },
       );
     }
@@ -143,14 +157,22 @@ authed.get('/api/portfolio', async (c) => {
 
 authed.get('/api/portfolio/pnl', async (c) => {
   const db = await getMongoDb();
-  const positions = await db.collection(COLLECTIONS.POSITIONS).find({}).toArray();
-  // P&L sums in GBP (the only common currency across mixed-market positions). Falls
-  // back to currentValue for legacy rows pre-FX-fix that don't have currentValueGBP yet.
-  const totalValueGBP = positions.reduce((a: number, p: any) =>
-    a + (typeof p.currentValueGBP === 'number' ? p.currentValueGBP : (p.currentValue ?? 0)),
-  0);
-  const totalCostGBP  = positions.reduce((a: number, p: any) =>
-    a + (typeof p.costBasisGBP === 'number' ? p.costBasisGBP : (p.costBasis ?? 0)),
+  const positions = await db.collection(COLLECTIONS.POSITIONS).find({}).toArray() as unknown as PositionDoc[];
+  const fx = await getFxClient();
+  // Total value in GBP via the single read-side helper that owns the FX call.
+  // Throws if FX is unavailable past the 24h stale window — better to surface a 502
+  // than to compute P&L against a fabricated GBP figure.
+  let totalValueGBP: number;
+  try {
+    totalValueGBP = await sumPositionsGBP(positions, fx);
+  } catch (err) {
+    return c.json({ error: 'fx unavailable for P&L computation' }, 502);
+  }
+  // costBasisGBP is the GBP at entry — set at trade close time, not FX-converted on
+  // read. A legacy row without it contributes 0 to cost rather than mixing in a
+  // native-currency scalar.
+  const totalCostGBP = positions.reduce((a: number, p: any) =>
+    a + (typeof p.costBasisGBP === 'number' ? p.costBasisGBP : 0),
   0);
   return c.json({
     totalValueGBP,
