@@ -6,7 +6,7 @@ import {
 
 export const internalBarsContract = defineContract({
     method: "POST",
-    path: "/internal/bars",
+    path: "/internal/api/market-data/bars",
     callerScope: ["strategy-engine"] as const,
     requestSchema: InternalBarsRequestSchema,
     responseSchema: InternalBarsResponseSchema,

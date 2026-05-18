@@ -53,11 +53,16 @@ export async function verifyRefreshToken(token: string): Promise<{ sub: string }
 }
 
 /**
- * Audience-scoped verify. Pass the audience the route requires; jose throws if the token's
- * `aud` claim doesn't match. Returns the typed claims so the caller can read `sub` for
- * per-peer access decisions.
+ * Audience-scoped verify. Pass the audience the route requires (single or list); jose
+ * accepts the token if its `aud` claim matches any of the requested audiences. Returns
+ * the typed claims so the caller can read `sub` for per-peer access decisions.
  */
-export async function verifyTokenForAudience(token: string, audience: Audience): Promise<TokenClaims> {
-  const { payload } = await jwtVerify(token, secret(), { audience });
+export async function verifyTokenForAudience(
+  token: string,
+  audience: Audience | readonly Audience[],
+): Promise<TokenClaims> {
+  const { payload } = await jwtVerify(token, secret(), {
+    audience: audience as string | string[],
+  });
   return payload as unknown as TokenClaims;
 }

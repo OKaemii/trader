@@ -14,6 +14,7 @@ async function main(): Promise<void> {
     const app = await createServer<PortfolioDeps>({
         service: "portfolio-service",
         deps,
+        pathPrefixes: ["/api/portfolio"],
         registerRoutes: (app, d) => {
             app.route("/", createPublicRouter(d));
         },

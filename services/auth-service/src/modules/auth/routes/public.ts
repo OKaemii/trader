@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
 import { Auth as AuthContracts } from '@trader/contracts';
-import { requireInternal, requireCaller } from '@trader/shared-auth/middleware';
+import { parseAdminHeaders } from '@trader/shared-auth/middleware';
 import { verifyRefreshToken, signAccessToken } from '@trader/shared-auth/jwt';
 import type { LoginUseCase } from '../application/LoginUseCase.ts';
 import type { RegisterUseCase } from '../application/RegisterUseCase.ts';
@@ -11,6 +11,7 @@ import { getMongoDb, COLLECTIONS } from '@trader/shared-mongo';
 export function createPublicRouter(login: LoginUseCase, register: RegisterUseCase, users: IUserRepository): Hono {
     const app = new Hono();
 
+    // /api/auth/* — public, no auth header required. These ARE the auth endpoints.
     app.post(
         '/api/auth/register',
         zValidator('json', AuthContracts.RegisterRequestSchema),
@@ -61,17 +62,9 @@ export function createPublicRouter(login: LoginUseCase, register: RegisterUseCas
         },
     );
 
-    return app;
-}
-
-export function createInternalRouter(): Hono {
-    const internal = new Hono();
-    // Gateway is the user-auth perimeter; downstream services see only internal JWTs.
-    // requireInternal verifies aud='internal'; requireCaller pins sub='api-gateway' so
-    // a stray internal JWT from another peer can't reach admin reads.
-    internal.use('*', requireInternal, requireCaller('api-gateway'));
-
-    internal.get('/api/admin/users', async (c) => {
+    // /admin/api/auth/* — admin-only.
+    app.use('/admin/api/auth/*', parseAdminHeaders);
+    app.get('/admin/api/auth/users', async (c) => {
         const db = await getMongoDb();
         const users = await db.collection(COLLECTIONS.USERS).find({}, {
             projection: { passwordHash: 0 },
@@ -79,5 +72,5 @@ export function createInternalRouter(): Hono {
         return c.json({ users });
     });
 
-    return internal;
+    return app;
 }

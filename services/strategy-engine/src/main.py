@@ -73,9 +73,13 @@ _engine_state: dict = {
 }
 
 
+def _health():
+    return {"status": "ok", "active_strategy": ACTIVE_STRATEGY, "bar_frequency": BAR_FREQUENCY, "rolling_window_bars": ROLLING_WINDOW_BARS}
+
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "active_strategy": ACTIVE_STRATEGY, "bar_frequency": BAR_FREQUENCY, "rolling_window_bars": ROLLING_WINDOW_BARS}
+    return _health()
 
 
 @app.get("/healthz")
@@ -83,12 +87,18 @@ def healthz():
     return {"status": "ok"}
 
 
-@app.get("/strategies")
+@app.get("/admin/api/strategy/health")
+def strategy_health_aliased():
+    # Prefix-aliased health for the portal fan-out (nginx-ingress routes by prefix only).
+    return _health()
+
+
+@app.get("/admin/api/strategy/list")
 def list_strategies():
     return {"available": list(STRATEGY_REGISTRY.keys()), "active": ACTIVE_STRATEGY}
 
 
-@app.get("/status")
+@app.get("/admin/api/strategy/status")
 def status():
     s = _engine_state
     ready   = len(s["ready_tickers"])
@@ -172,6 +182,10 @@ async def process_loop() -> None:
         re.attach_store(r)
         await re.load_from_store()
 
+    print(f"[strategy-engine] process_loop ready — strategy={ACTIVE_STRATEGY} bar_freq={BAR_FREQUENCY} "
+          f"rolling_window={ROLLING_WINDOW_BARS} history_range={history_range} history_interval={history_interval} "
+          f"consumer={CONSUMER_NAME} group={CONSUMER_GROUP}", flush=True)
+    idle_polls = 0
     while True:
         # Block up to 5 seconds for new messages; recover from PEL on restart
         messages = await r.xreadgroup(
@@ -181,6 +195,13 @@ async def process_loop() -> None:
             count=10,
             block=5000,
         )
+        if not messages:
+            idle_polls += 1
+            # Log every ~minute so k9s shows the consumer is alive even when market-data is silent.
+            if idle_polls % 12 == 0:
+                print(f"[strategy-engine] idle — no market:raw entries in last ~60s (consumer={CONSUMER_NAME})", flush=True)
+            continue
+        idle_polls = 0
         for _stream_name, entries in (messages or []):
             for entry_id, fields in entries:
                 try:
@@ -191,6 +212,11 @@ async def process_loop() -> None:
                     import time as _time
                     _engine_state["cycles"] += 1
                     _engine_state["last_cycle_ts"] = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
+                    _sample = ",".join(sorted(set(b.ticker for b in bars))[:8])
+                    print(f"[strategy-engine] cycle {_engine_state['cycles']} entry "
+                          f"id={entry_id.decode() if isinstance(entry_id, bytes) else entry_id} "
+                          f"bars={len(bars)} unique_tickers={len(set(b.ticker for b in bars))} "
+                          f"sample=[{_sample}]", flush=True)
 
                     # Batch-fetch rolling-window history for every ticker arriving this
                     # cycle. ONE HTTP round-trip per cycle, regardless of universe size.

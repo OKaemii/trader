@@ -5,7 +5,7 @@ import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
 import type { Logger } from '@trader/core';
 import { MarketData as MarketDataContracts } from '@trader/contracts';
-import { requireInternal, requireCaller } from '@trader/shared-auth/middleware';
+import { parseAdminHeaders, parseInternalHeaders } from '@trader/shared-auth/middleware';
 import { getMongoDb, COLLECTIONS } from '@trader/shared-mongo';
 import { getRedisClient, xAdd } from '@trader/shared-redis';
 import { getLiveConfig, invalidateLiveConfig, _envDefaultsForTest } from '../../shared/live-config.ts';
@@ -72,17 +72,13 @@ export function createAdminRouter(
   const r = new Hono();
   // Path-scoped, NOT `r.use('*', mw)`. A wildcard `use('*', mw)` on a subapp mounted
   // via `app.route('/', subapp)` bleeds the middleware onto every route registered
-  // afterward on the PARENT app — including createInternalBarsRouter's /internal/bars
-  // routes, which then 403 because they expect caller='strategy-engine' not 'api-gateway'.
-  // Same regression that bit trading-service routing; see services/trading-service
-  // routing.test.ts for the fixture that pins it.
-  // Gateway is the user-auth perimeter; admin routes are internal-only and gated by
-  // service identity (sub='api-gateway'). createInternalBarsRouter below pins the peer
-  // bars route to caller='strategy-engine'.
-  r.use('/api/admin/*', requireInternal, requireCaller('api-gateway'));
+  // afterward on the PARENT app — including createInternalBarsRouter's /internal/api/*
+  // routes, which then fail their own parser. Same regression that bit trading-service
+  // routing; see services/trading-service/__tests__/routing.test.ts for the fixture.
+  r.use('/admin/api/market-data/*', parseAdminHeaders);
 
   // ── Universe overrides ────────────────────────────────────────────────────
-  r.get('/api/admin/universe/overrides', async (c) => {
+  r.get('/admin/api/market-data/universe/overrides', async (c) => {
     const db = await getMongoDb();
     const doc = await db.collection<UniverseOverridesDoc>(COLLECTIONS.PORTAL_UNIVERSE_OVERRIDES)
       .findOne({ _id: 'singleton' });
@@ -124,7 +120,7 @@ export function createAdminRouter(
   });
 
   r.put(
-    '/api/admin/universe/overrides',
+    '/admin/api/market-data/universe/overrides',
     zValidator('json', MarketDataContracts.UniverseOverridesRequestSchema),
     async (c) => {
       const body = c.req.valid('json');
@@ -144,13 +140,13 @@ export function createAdminRouter(
     },
   );
 
-  r.post('/api/admin/universe/refresh', async (c) => {
+  r.post('/admin/api/market-data/universe/refresh', async (c) => {
     const tickers = await universeManager.refresh();
     return c.json({ ok: true, universeSize: tickers.length, activeUniverse: tickers });
   });
 
   // ── Market-data config overrides ──────────────────────────────────────────
-  r.get('/api/admin/market-data/config', async (c) => {
+  r.get('/admin/api/market-data/config', async (c) => {
     const db = await getMongoDb();
     const doc = await db.collection<MarketConfigDoc>(COLLECTIONS.PORTAL_MARKET_CONFIG)
       .findOne({ _id: 'singleton' });
@@ -185,7 +181,7 @@ export function createAdminRouter(
   });
 
   r.put(
-    '/api/admin/market-data/config',
+    '/admin/api/market-data/config',
     zValidator('json', MarketDataContracts.MarketConfigRequestSchema),
     async (c) => {
       const body = c.req.valid('json');
@@ -241,7 +237,7 @@ export function createAdminRouter(
   // cache-invalidated message per ticker so subscribers (signal-service, portal) drop
   // their derived state. Returns per-ticker upsert counts.
   r.post(
-    '/api/admin/market-data/backfill',
+    '/admin/api/market-data/backfill',
     zValidator('json', MarketDataContracts.BackfillRequestSchema, (result, c) => {
       if (!result.success) return c.json({ error: 'invalid body', issues: result.error.issues }, 400);
     }),
@@ -275,7 +271,7 @@ export function createAdminRouter(
   // insertMany loop persisted before the upsert switch. Also drops shared-bars Redis
   // cache entries for matching (ticker, interval) pairs.
   r.post(
-    '/api/admin/market-data/clear-cache',
+    '/admin/api/market-data/clear-cache',
     zValidator('json', MarketDataContracts.ClearCacheRequestSchema),
     async (c) => {
       const body = c.req.valid('json');
@@ -308,7 +304,7 @@ export function createAdminRouter(
   // Returns the active provider's identity + lookback cap + the poll-interval keys
   // it's willing to serve. The portal calls this once on mount to populate the
   // poll-cadence dropdown and to show which provider is active.
-  r.get('/api/admin/market-data/provider-info', (c) => {
+  r.get('/admin/api/market-data/provider-info', (c) => {
     return c.json({
       name:          provider.name,
       maxLookbackMs: provider.maxLookbackMs,
@@ -326,7 +322,7 @@ export function createAdminRouter(
   // Returns { ticker: count } for every ticker in ohlcv_bars with at least one 5m bar.
   // Used by the portal to badge unresolvable tickers in the history picker so an
   // operator can see at a glance which entries are empty before clicking through.
-  r.get('/api/admin/market-data/coverage', async (c) => {
+  r.get('/admin/api/market-data/coverage', async (c) => {
     const db = await getMongoDb();
     const agg = await db
       .collection(COLLECTIONS.OHLCV_BARS)
@@ -345,7 +341,7 @@ export function createAdminRouter(
   // Returns the cached 5m series for the ticker, downsampled to the requested interval
   // and trimmed to the requested range. Cache miss reads Mongo via shared-bars.getBars
   // and populates the cache.
-  r.get('/api/admin/market-data/bars/:ticker', async (c) => {
+  r.get('/admin/api/market-data/bars/:ticker', async (c) => {
     const ticker   = c.req.param('ticker');
     const interval = (c.req.query('interval') ?? 'daily') as BarInterval;
     const range    = (c.req.query('range')    ?? '30d')   as RangeKey;
@@ -370,7 +366,7 @@ export function createAdminRouter(
   // calendarDeps is optional only because legacy tests construct the router without
   // calendars; production wiring always passes them. Endpoints 503 when absent.
 
-  r.get('/api/admin/market-data/calendar', async (c) => {
+  r.get('/admin/api/market-data/calendar', async (c) => {
     if (!calendarDeps) return c.json({ error: 'calendar not configured' }, 503);
     const days = Math.min(60, Math.max(1, parseInt(c.req.query('days') ?? '30', 10)));
     const now = Date.now();
@@ -391,13 +387,13 @@ export function createAdminRouter(
     });
   });
 
-  r.get('/api/admin/market-data/holiday-sources', async (c) => {
+  r.get('/admin/api/market-data/holiday-sources', async (c) => {
     if (!calendarDeps) return c.json({ error: 'calendar not configured' }, 503);
     const health = await calendarDeps.holidayCache().getSourceHealth();
     return c.json({ generatedAt: Date.now(), sources: health });
   });
 
-  r.post('/api/admin/market-data/holiday-refresh', async (c) => {
+  r.post('/admin/api/market-data/holiday-refresh', async (c) => {
     if (!calendarDeps) return c.json({ error: 'calendar not configured' }, 503);
     await calendarDeps.holidayCache().refreshAll();
     const health = await calendarDeps.holidayCache().getSourceHealth();
@@ -420,9 +416,9 @@ export function createAdminRouter(
 // N round-trips. Single-ticker GET stays for ad-hoc tooling.
 export function createInternalBarsRouter(): Hono {
   const r = new Hono();
-  const requireStrategy = requireCaller('strategy-engine');
+  
 
-  r.get('/internal/bars/:ticker', requireInternal, requireStrategy, async (c) => {
+  r.get('/internal/api/market-data/bars/:ticker', parseInternalHeaders('strategy-engine'), async (c) => {
     const ticker   = c.req.param('ticker')!;
     const interval = (c.req.query('interval') ?? 'daily') as BarInterval;
     const range    = (c.req.query('range')    ?? '30d')   as RangeKey;
@@ -440,9 +436,8 @@ export function createInternalBarsRouter(): Hono {
   });
 
   r.post(
-    '/internal/bars',
-    requireInternal,
-    requireStrategy,
+    '/internal/api/market-data/bars',
+    parseInternalHeaders('strategy-engine'),
     zValidator('json', MarketDataContracts.InternalBarsRequestSchema, (result, c) => {
       if (!result.success) return c.json({ error: 'invalid body', issues: result.error.issues }, 400);
     }),

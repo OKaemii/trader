@@ -69,21 +69,21 @@ function buildApp() {
 const strategyToken = async () => `Bearer ${await mintInternalJwt('strategy-engine')}`;
 const gatewayToken = async () => `Bearer ${await mintInternalJwt('api-gateway')}`;
 
-describe('GET /internal/bars/:ticker', () => {
+describe('GET /internal/api/market-data/bars/:ticker', () => {
   it('rejects no-token requests with 401', async () => {
-    const res = await buildApp().request('/internal/bars/AAPL_US_EQ?interval=daily&range=30d');
+    const res = await buildApp().request('/internal/api/market-data/bars/AAPL_US_EQ?interval=daily&range=30d');
     expect(res.status).toBe(401);
   });
 
   it('rejects the api-gateway caller — strategy-engine only', async () => {
-    const res = await buildApp().request('/internal/bars/AAPL_US_EQ?interval=daily&range=30d', {
+    const res = await buildApp().request('/internal/api/market-data/bars/AAPL_US_EQ?interval=daily&range=30d', {
       headers: { Authorization: await gatewayToken() },
     });
     expect(res.status).toBe(403);
   });
 
   it('returns bars downsampled to the requested interval (3×5m → 1 daily)', async () => {
-    const res = await buildApp().request('/internal/bars/AAPL_US_EQ?interval=daily&range=30d', {
+    const res = await buildApp().request('/internal/api/market-data/bars/AAPL_US_EQ?interval=daily&range=30d', {
       headers: { Authorization: await strategyToken() },
     });
     expect(res.status).toBe(200);
@@ -102,14 +102,14 @@ describe('GET /internal/bars/:ticker', () => {
   });
 
   it('400 on invalid interval', async () => {
-    const res = await buildApp().request('/internal/bars/AAPL_US_EQ?interval=bogus&range=30d', {
+    const res = await buildApp().request('/internal/api/market-data/bars/AAPL_US_EQ?interval=bogus&range=30d', {
       headers: { Authorization: await strategyToken() },
     });
     expect(res.status).toBe(400);
   });
 
   it('400 on invalid range', async () => {
-    const res = await buildApp().request('/internal/bars/AAPL_US_EQ?interval=daily&range=bogus', {
+    const res = await buildApp().request('/internal/api/market-data/bars/AAPL_US_EQ?interval=daily&range=bogus', {
       headers: { Authorization: await strategyToken() },
     });
     expect(res.status).toBe(400);
@@ -118,7 +118,7 @@ describe('GET /internal/bars/:ticker', () => {
 
 describe('POST /internal/bars (batch)', () => {
   it('rejects no-token requests with 401', async () => {
-    const res = await buildApp().request('/internal/bars', {
+    const res = await buildApp().request('/internal/api/market-data/bars', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ tickers: ['AAPL_US_EQ'] }),
@@ -127,7 +127,7 @@ describe('POST /internal/bars (batch)', () => {
   });
 
   it('returns a {ticker: bars[]} map for multiple tickers', async () => {
-    const res = await buildApp().request('/internal/bars', {
+    const res = await buildApp().request('/internal/api/market-data/bars', {
       method: 'POST',
       headers: { Authorization: await strategyToken(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ tickers: ['AAPL_US_EQ', 'MSFT_US_EQ'], interval: 'daily', range: '30d' }),
@@ -142,7 +142,7 @@ describe('POST /internal/bars (batch)', () => {
   });
 
   it('returns empty map for empty tickers[] without erroring', async () => {
-    const res = await buildApp().request('/internal/bars', {
+    const res = await buildApp().request('/internal/api/market-data/bars', {
       method: 'POST',
       headers: { Authorization: await strategyToken(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ tickers: [] }),
@@ -153,7 +153,7 @@ describe('POST /internal/bars (batch)', () => {
   });
 
   it('defaults to interval=daily, range=30d when omitted', async () => {
-    const res = await buildApp().request('/internal/bars', {
+    const res = await buildApp().request('/internal/api/market-data/bars', {
       method: 'POST',
       headers: { Authorization: await strategyToken(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ tickers: ['AAPL_US_EQ'] }),
@@ -183,7 +183,7 @@ describe('admin + internal-bars on the same app (mounting regression)', () => {
     app.route('/', createAdminRouter(stubUM, new YahooProvider(), noopLog));
     app.route('/', createInternalBarsRouter());
 
-    const res = await app.request('/internal/bars', {
+    const res = await app.request('/internal/api/market-data/bars', {
       method: 'POST',
       headers: { Authorization: await strategyToken(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ tickers: [] }),

@@ -32,9 +32,21 @@ export class GenerateSignalsUseCase {
   ) {}
 
   async execute(features: StrategyOutput): Promise<TradeSignal[]> {
+    const universeSize = features.ticker_universe.length;
+    this.logger.info(
+      {
+        strategy_id: features.strategy_id,
+        ts: features.timestamp,
+        universeSize,
+        regime_confidence: features.regime_confidence,
+        minActionableConfidence: this.config.minActionableConfidence,
+        volTarget: this.config.volTarget,
+      },
+      'GenerateSignals.execute: start',
+    );
     const { allowed, reason } = await this.riskEngine.canTrade();
     if (!allowed) {
-      this.logger.warn({ reason }, 'circuit open');
+      this.logger.warn({ reason }, 'GenerateSignals.execute: circuit open — emitting 0 signals');
       return [];
     }
 
@@ -143,6 +155,23 @@ export class GenerateSignalsUseCase {
         } catch { return null; }
       })
       .filter((s): s is TradeSignal => s !== null && s.isActionable(this.config.minActionableConfidence));
+
+    const actionCounts = signals.reduce<Record<string, number>>((acc, s) => {
+      acc[s.action] = (acc[s.action] ?? 0) + 1;
+      return acc;
+    }, {});
+    this.logger.info(
+      {
+        emitted: signals.length,
+        actionCounts,
+        decayFactor,
+        decayMultiplier,
+        divisorPos,
+        divisorNeg,
+        sample: signals.slice(0, 5).map((s) => ({ ticker: s.ticker, action: s.action, confidence: s.confidence, targetWeight: s.targetWeight })),
+      },
+      `GenerateSignals.execute: emitted ${signals.length} actionable signal(s) of ${universeSize} candidates`,
+    );
 
     await Promise.all(signals.map((s) => this.signalRepo.save(s)));
     // Notification policy (b): emails fire only on lifecycle='executed', not on emission.

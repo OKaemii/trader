@@ -1,0 +1,19 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: market-data-service
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    kubernetes.io/ingress.class: nginx
+spec:
+  rules:
+    - host: trader.local
+      http:
+        paths:
+          - path: /admin/api/market-data
+            pathType: Prefix
+            backend:
+              service:
+                name: market-data-service
+                port:
+                  number: 3002

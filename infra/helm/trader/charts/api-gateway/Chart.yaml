@@ -1,5 +1,0 @@
-apiVersion: v2
-name: api-gateway
-description: API Gateway — single external entry point
-type: application
-version: 0.1.0

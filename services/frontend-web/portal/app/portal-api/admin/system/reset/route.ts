@@ -3,7 +3,7 @@ import { authedFetch } from '@/app/lib/auth-fetch'
 
 export async function POST(req: NextRequest) {
   const body = await req.text()
-  const upstream = await authedFetch('/api/admin/system/reset', {
+  const upstream = await authedFetch('/admin/api/signals/system-reset', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body,

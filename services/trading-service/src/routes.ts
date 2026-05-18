@@ -5,7 +5,7 @@ import type { SignalServiceClient } from "@trader/contracts";
 import { Trading as TradingContracts } from "@trader/contracts";
 import type { Db } from "mongodb";
 import type { RedisClientType } from "redis";
-import { requireInternal, requireCaller } from '@trader/shared-auth/middleware';
+import { parseAdminHeaders, parseInternalHeaders } from "@trader/shared-auth/middleware";
 import { money, BASE_CURRENCY } from "@trader/shared-types";
 
 import { Trading212Client } from "./modules/t212/infrastructure/Trading212Client.ts";
@@ -35,48 +35,61 @@ export function buildApp(deps: AppDeps): Hono {
     const app = new Hono();
     const { tradingMode } = deps;
 
-    app.get("/health", (c) => c.json({ status: "ok", trading_mode: modeName(tradingMode) }));
+    const healthOk = (c: import("hono").Context) => c.json({ status: "ok", trading_mode: modeName(tradingMode) });
+    app.get("/health",                  healthOk);
+    app.get("/admin/api/trading/health", healthOk);
 
-    app.get("/internal/trading/positions", requireInternal, requireCaller("portfolio-service"), async (c) => {
-        if (deps.accountCache) {
-            const snap = await deps.accountCache.get();
-            return c.json({ positions: snap.positions });
-        }
-        const positions = await deps.client().getPositions();
-        return c.json({ positions });
-    });
+    // ── /internal/api/trading/* (peer-to-peer) ─────────────────────────────────
+    // Each route pins its allowed callers; we keep parsers per-route (not a wildcard
+    // `use('/internal/api/trading/*', mw)`) so different callers can hit different routes
+    // without one parser short-circuiting another.
+    app.get("/internal/api/trading/positions",
+        parseInternalHeaders("portfolio-service"),
+        async (c) => {
+            if (deps.accountCache) {
+                const snap = await deps.accountCache.get();
+                return c.json({ positions: snap.positions });
+            }
+            const positions = await deps.client().getPositions();
+            return c.json({ positions });
+        },
+    );
 
-    app.get("/internal/trading/cash", requireInternal, requireCaller("portfolio-service", "signal-service"), async (c) => {
-        if (deps.accountCache) {
-            const snap = await deps.accountCache.get();
-            return c.json({ free: snap.free, total: snap.total });
-        }
-        const cash = await deps.client().getCash();
-        return c.json(cash);
-    });
+    app.get("/internal/api/trading/cash",
+        parseInternalHeaders("portfolio-service", "signal-service"),
+        async (c) => {
+            if (deps.accountCache) {
+                const snap = await deps.accountCache.get();
+                return c.json({ free: snap.free, total: snap.total });
+            }
+            const cash = await deps.client().getCash();
+            return c.json(cash);
+        },
+    );
 
-    app.post("/internal/signals/trading/execute", requireInternal, requireCaller("signal-service"), async (c) => {
-        return c.json({
+    // Deprecated stub: the legacy synchronous execute path is replaced by the order-dispatcher
+    // queue. Kept so any old in-cluster caller gets a clear deprecation message rather than 404.
+    app.post("/internal/api/trading/execute",
+        parseInternalHeaders("signal-service"),
+        async (c) => c.json({
             skipped: true,
             reason:  "deprecated — signals are now routed through the order-dispatcher queue. Approve via signal-service to enqueue.",
-        }, 200);
-    });
+        }, 200),
+    );
 
-    // Gateway is the user-auth perimeter. All `/api/admin/*` traffic here arrives only
-    // via the gateway proxy, which mints a fresh internal JWT (sub='api-gateway') per
-    // request. The /internal/* routes above pin different requireCaller subjects for
-    // their peer services.
-    app.use("/api/admin/*", requireInternal, requireCaller("api-gateway"));
-    const admin = app;
+    // ── /admin/api/trading/* (portal) ──────────────────────────────────────────
+    // Path-scoped wildcard for admin auth; admin routes never overlap /internal/api/* on
+    // this Hono instance, so this is safe (each prefix only matches its own subtree).
+    app.use("/admin/api/trading/*", parseAdminHeaders);
 
-    admin.post("/api/admin/trading/toggle", (c) => {
+    app.post("/admin/api/trading/toggle", (c) => {
         return c.json({
             mode: modeName(tradingMode),
             message: "Change TRADING_MODE env var and redeploy to switch modes",
         });
     });
 
-    admin.post("/api/admin/trading/approve-live", async (c) => {
+    app.post("/admin/api/trading/approve-live", async (c) => {
         if (tradingMode !== TradingMode.Live) {
             return c.json({ error: "TRADING_MODE is not set to Live — change in Helm values and redeploy first" }, 400);
         }
@@ -86,14 +99,14 @@ export function buildApp(deps: AppDeps): Hono {
         return c.json({ approved: true, message: "Live trading gate opened. Real T212 orders will be placed on next signal." });
     });
 
-    admin.post("/api/admin/trading/revoke-live", async (c) => {
+    app.post("/admin/api/trading/revoke-live", async (c) => {
         const redis = await deps.getRedis();
         await redis.del(LIVE_GATE_KEY);
         deps.logger?.warn("Live trading approval REVOKED by admin");
         return c.json({ approved: false, message: "Live trading gate closed." });
     });
 
-    admin.get("/api/admin/trading/status", async (c) => {
+    app.get("/admin/api/trading/status", async (c) => {
         const redis = await deps.getRedis();
         const approved = !!(await redis.get(LIVE_GATE_KEY));
         return c.json({ trading_mode: modeName(tradingMode), live_gate_approved: approved });
@@ -101,8 +114,8 @@ export function buildApp(deps: AppDeps): Hono {
 
     // Admin manual order placement. Schema comes from @trader/contracts so the producer
     // (this route) and any consumer (admin tooling, ad-hoc scripts) share one source of truth.
-    admin.post(
-        "/api/admin/trading/execute",
+    app.post(
+        "/admin/api/trading/execute",
         zValidator("json", TradingContracts.ExecuteOrderRequestSchema),
         async (c) => {
             const body = c.req.valid("json");
@@ -145,14 +158,14 @@ export function buildApp(deps: AppDeps): Hono {
         },
     );
 
-    admin.get("/api/admin/trading/orders", async (c) => {
+    app.get("/admin/api/trading/orders", async (c) => {
         const db        = await deps.getDb();
         const orderRepo = new MongoOrderRepository(db);
         const orders    = await orderRepo.findRecent(50);
         return c.json({ orders });
     });
 
-    admin.get("/api/admin/trading/cash", async (c) => {
+    app.get("/admin/api/trading/cash", async (c) => {
         if (tradingMode === TradingMode.Paper) {
             return c.json({
                 free:  money(0, BASE_CURRENCY),
@@ -168,7 +181,7 @@ export function buildApp(deps: AppDeps): Hono {
         }
     });
 
-    admin.get("/api/admin/trading/positions", async (c) => {
+    app.get("/admin/api/trading/positions", async (c) => {
         if (tradingMode === TradingMode.Paper) {
             return c.json({ positions: [], mode: modeName(tradingMode) });
         }

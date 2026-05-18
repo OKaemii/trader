@@ -14,14 +14,14 @@ const PORTFOLIO_OR_SIGNAL = ["portfolio-service", "signal-service"] as const;
 
 export const getCashContract = defineContract({
     method: "GET",
-    path: "/internal/trading/cash",
+    path: "/internal/api/trading/cash",
     callerScope: PORTFOLIO_OR_SIGNAL,
     responseSchema: CashResponseSchema,
 });
 
 export const getPositionsContract = defineContract({
     method: "GET",
-    path: "/internal/trading/positions",
+    path: "/internal/api/trading/positions",
     callerScope: PORTFOLIO,
     responseSchema: PositionsResponseSchema,
 });
@@ -34,7 +34,7 @@ export const ExecuteOrderResponseSchema = z.union([
 ]);
 export const executeOrderContract = defineContract({
     method: "POST",
-    path: "/api/admin/trading/execute",
+    path: "/admin/api/trading/execute",
     callerScope: [] as const,                       // user-fronted admin route, not peer-to-peer
     requestSchema: ExecuteOrderRequestSchema,
     responseSchema: ExecuteOrderResponseSchema,

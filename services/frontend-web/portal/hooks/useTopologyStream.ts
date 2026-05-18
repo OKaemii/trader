@@ -22,7 +22,7 @@ export function useTopologyStream() {
       if (cancelled) return;
 
       const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-      ws = new WebSocket(`${protocol}://${window.location.host}/ws/topology?token=${encodeURIComponent(token)}`);
+      ws = new WebSocket(`${protocol}://${window.location.host}/ws/api/signals/topology?token=${encodeURIComponent(token)}`);
       ws.onmessage = (evt) => {
         try { setFeatures(JSON.parse(evt.data)); } catch {}
       };

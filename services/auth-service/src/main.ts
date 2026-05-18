@@ -2,7 +2,7 @@ import { createServer, createLogger, listen, registerGracefulShutdown } from "@t
 
 import { loadAuthEnv } from "./env.ts";
 import { wireDependencies, type AuthDeps } from "./wiring.ts";
-import { createPublicRouter, createInternalRouter } from "./modules/auth/routes/public.ts";
+import { createPublicRouter } from "./modules/auth/routes/public.ts";
 
 async function main(): Promise<void> {
     const env    = loadAuthEnv();
@@ -12,9 +12,9 @@ async function main(): Promise<void> {
     const app = await createServer<AuthDeps>({
         service: "auth-service",
         deps,
+        pathPrefixes: ["/api/auth", "/admin/api/auth"],
         registerRoutes: (app, d) => {
             app.route("/", createPublicRouter(d.login, d.register, d.users));
-            app.route("/", createInternalRouter());
         },
         readiness: async () => true,
     });

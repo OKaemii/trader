@@ -48,7 +48,7 @@ export interface MarketDataConfig {
 export async function getUniverseOverrides(): Promise<
   { ok: true; data: UniverseOverrides } | { ok: false; status: number }
 > {
-  const r = await authedFetch('/api/admin/universe/overrides')
+  const r = await authedFetch('/admin/api/market-data/universe/overrides')
   if (!r.ok) return { ok: false, status: r.status }
   return { ok: true, data: (await r.json()) as UniverseOverrides }
 }
@@ -57,7 +57,7 @@ export async function saveUniverseOverrides(
   adds: string[],
   removes: string[],
 ): Promise<{ ok: boolean; status: number }> {
-  const r = await authedFetch('/api/admin/universe/overrides', {
+  const r = await authedFetch('/admin/api/market-data/universe/overrides', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ adds, removes }),
@@ -69,7 +69,7 @@ export async function saveUniverseOverrides(
 export async function refreshUniverse(): Promise<
   { ok: true; universeSize: number } | { ok: false; status: number }
 > {
-  const r = await authedFetch('/api/admin/universe/refresh', { method: 'POST' })
+  const r = await authedFetch('/admin/api/market-data/universe/refresh', { method: 'POST' })
   if (!r.ok) return { ok: false, status: r.status }
   const j = (await r.json()) as { universeSize: number }
   revalidatePath('/universe')
@@ -81,7 +81,7 @@ export async function refreshUniverse(): Promise<
 export async function getMarketDataConfig(): Promise<
   { ok: true; data: MarketDataConfig } | { ok: false; status: number }
 > {
-  const r = await authedFetch('/api/admin/market-data/config')
+  const r = await authedFetch('/admin/api/market-data/config')
   if (!r.ok) return { ok: false, status: r.status }
   return { ok: true, data: (await r.json()) as MarketDataConfig }
 }
@@ -102,7 +102,7 @@ export interface ProviderInfo {
 export async function getMarketDataProviderInfo(): Promise<
   { ok: true; data: ProviderInfo } | { ok: false; status: number }
 > {
-  const r = await authedFetch('/api/admin/market-data/provider-info')
+  const r = await authedFetch('/admin/api/market-data/provider-info')
   if (!r.ok) return { ok: false, status: r.status }
   return { ok: true, data: (await r.json()) as ProviderInfo }
 }
@@ -112,7 +112,7 @@ export async function saveMarketDataConfig(
   pollIntervalMs: number | null,
   signalOrderType: OrderType | null,
 ): Promise<{ ok: boolean; status: number; error?: string }> {
-  const r = await authedFetch('/api/admin/market-data/config', {
+  const r = await authedFetch('/admin/api/market-data/config', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ barFrequency, pollIntervalMs, signalOrderType }),
@@ -144,7 +144,7 @@ export async function backfillMarketData(
 ): Promise<{ ok: true; data: BackfillResult } | { ok: false; status: number; error?: string }> {
   const body: Record<string, unknown> = { days }
   if (tickers && tickers.length > 0) body.tickers = tickers
-  const r = await authedFetch('/api/admin/market-data/backfill', {
+  const r = await authedFetch('/admin/api/market-data/backfill', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -198,7 +198,7 @@ export interface MarketDataHealth {
 export async function getMarketDataHealth(): Promise<
   { ok: true; data: MarketDataHealth } | { ok: false; status: number }
 > {
-  const r = await authedFetch('/api/admin/market-data/health')
+  const r = await authedFetch('/admin/api/market-data/health')
   if (!r.ok) return { ok: false, status: r.status }
   return { ok: true, data: (await r.json()) as MarketDataHealth }
 }
@@ -206,7 +206,7 @@ export async function getMarketDataHealth(): Promise<
 export async function getMarketDataCoverage(): Promise<
   { ok: true; data: Record<string, number> } | { ok: false; status: number }
 > {
-  const r = await authedFetch('/api/admin/market-data/coverage')
+  const r = await authedFetch('/admin/api/market-data/coverage')
   if (!r.ok) return { ok: false, status: r.status }
   const body = (await r.json()) as { coverage: Record<string, number> }
   return { ok: true, data: body.coverage ?? {} }
@@ -217,7 +217,7 @@ export async function getBarHistory(
   interval: BarInterval,
   range: BarRange,
 ): Promise<{ ok: true; data: { ticker: string; interval: BarInterval; range: BarRange; bars: BarPoint[] } } | { ok: false; status: number; error?: string }> {
-  const url = `/api/admin/market-data/bars/${encodeURIComponent(ticker)}?interval=${interval}&range=${range}`
+  const url = `/admin/api/market-data/bars/${encodeURIComponent(ticker)}?interval=${interval}&range=${range}`
   const r = await authedFetch(url)
   if (!r.ok) {
     const j = await r.json().catch(() => ({})) as { error?: string }
@@ -234,7 +234,7 @@ export async function clearMarketDataCache(
   const body: Record<string, unknown> = { dryRun }
   if (interval)        body.interval        = interval
   if (beforeTimestamp) body.beforeTimestamp = beforeTimestamp
-  const r = await authedFetch('/api/admin/market-data/clear-cache', {
+  const r = await authedFetch('/admin/api/market-data/clear-cache', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),

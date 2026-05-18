@@ -55,7 +55,7 @@ class BacktestResult(BaseModel):
     completed_at: str
 
 
-@app.post('/api/admin/backtest/run', response_model=BacktestResult)
+@app.post('/admin/api/backtest/run', response_model=BacktestResult)
 async def run_backtest(req: BacktestRequest):
     _require_internal(req.internal_token)
 
@@ -139,7 +139,7 @@ async def run_backtest(req: BacktestRequest):
     )
 
 
-@app.get('/api/admin/backtest/results')
+@app.get('/admin/api/backtest/results')
 async def get_results(strategy_id: str = '', limit: int = 10):
     query = {'strategy_id': strategy_id} if strategy_id else {}
     results = await _db['backtest_results'].find(query).sort('run_at', -1).limit(limit).to_list(length=limit)
@@ -150,6 +150,16 @@ async def get_results(strategy_id: str = '', limit: int = 10):
     return {'results': results}
 
 
+def _health():
+    return {'status': 'ok', 'service': 'backtest-engine', 'retraining_policy': RETRAINING_POLICY}
+
+
 @app.get('/health')
 async def health():
-    return {'status': 'ok', 'service': 'backtest-engine', 'retraining_policy': RETRAINING_POLICY}
+    return _health()
+
+
+@app.get('/admin/api/backtest/health')
+async def backtest_health_aliased():
+    # Prefix-aliased health for the portal fan-out (nginx-ingress routes by prefix only).
+    return _health()

@@ -14,6 +14,7 @@ async function main(): Promise<void> {
     const app = await createServer<NotificationDeps>({
         service: "notification-service",
         deps,
+        pathPrefixes: ["/api/notifications"],
         registerRoutes: (app, d) => {
             app.route("/", createPublicRouter(d));
         },

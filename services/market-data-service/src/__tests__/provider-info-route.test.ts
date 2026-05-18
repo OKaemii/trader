@@ -1,4 +1,4 @@
-// Route-level test for /api/admin/market-data/provider-info. The portal calls this
+// Route-level test for /admin/api/market-data/provider-info. The portal calls this
 // once on mount to populate the poll-cadence dropdown — so the contract pinned here
 // is what the FE depends on:
 //   { name, maxLookbackMs, allowedPollIntervals: [{key,ms,label,tier}, ...] }
@@ -62,7 +62,7 @@ vi.mock('@trader/shared-redis', () => ({
 }));
 
 const { Hono } = await import('hono');
-const { mintInternalJwt } = await import('@trader/shared-auth');
+const { signAccessToken } = await import('@trader/shared-auth');
 const { createAdminRouter } = await import('../modules/admin/routes.ts');
 const { YahooProvider } = await import('../modules/bars/infrastructure/providers/yahoo-provider.ts');
 
@@ -76,20 +76,21 @@ function buildApp() {
   return app;
 }
 
-// Admin routes are gated as internal-from-gateway: the gateway is the only edge that
-// handles user JWTs; downstream services see only internal JWTs minted with sub='api-gateway'.
-const gatewayToken = async () => `Bearer ${await mintInternalJwt('api-gateway')}`;
+// Admin routes are gated by parseAdminHeaders: each service is its own auth perimeter
+// and verifies the user JWT directly. The portal hits these routes through nginx-ingress
+// (path-prefix routing, no auth at the edge).
+const gatewayToken = async () => `Bearer ${await signAccessToken({ sub: 'admin-user', role: 'admin' })}`;
 
-describe('GET /api/admin/market-data/provider-info', () => {
+describe('GET /admin/api/market-data/provider-info', () => {
   it('requires the api-gateway internal token (401 without)', async () => {
     const app = buildApp();
-    const res = await app.request('/api/admin/market-data/provider-info');
+    const res = await app.request('/admin/api/market-data/provider-info');
     expect(res.status).toBe(401);
   });
 
   it('returns provider name, max lookback, and the allowed poll intervals', async () => {
     const app = buildApp();
-    const res = await app.request('/api/admin/market-data/provider-info', {
+    const res = await app.request('/admin/api/market-data/provider-info', {
       headers: { Authorization: await gatewayToken() },
     });
     expect(res.status).toBe(200);
@@ -108,11 +109,11 @@ describe('GET /api/admin/market-data/provider-info', () => {
   });
 });
 
-describe('PUT /api/admin/market-data/config (allowlist enforcement)', () => {
+describe('PUT /admin/api/market-data/config (allowlist enforcement)', () => {
   it('accepts pollIntervalMs values in the provider allowlist and persists them', async () => {
     const before = updateOneCalls;
     const app = buildApp();
-    const res = await app.request('/api/admin/market-data/config', {
+    const res = await app.request('/admin/api/market-data/config', {
       method: 'PUT',
       headers: { Authorization: await gatewayToken(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ pollIntervalMs: 60 * 60_000 }),  // 1h, in Yahoo's list
@@ -126,7 +127,7 @@ describe('PUT /api/admin/market-data/config (allowlist enforcement)', () => {
   it('rejects pollIntervalMs values outside the provider allowlist with 400 BEFORE writing to Mongo', async () => {
     const before = updateOneCalls;
     const app = buildApp();
-    const res = await app.request('/api/admin/market-data/config', {
+    const res = await app.request('/admin/api/market-data/config', {
       method: 'PUT',
       headers: { Authorization: await gatewayToken(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ pollIntervalMs: 7000 }),  // 7s — not in any provider's list
@@ -140,12 +141,12 @@ describe('PUT /api/admin/market-data/config (allowlist enforcement)', () => {
   });
 });
 
-describe('PUT /api/admin/market-data/config (signalOrderType hot-swap)', () => {
+describe('PUT /admin/api/market-data/config (signalOrderType hot-swap)', () => {
   it('persists signalOrderType=Market (1) and publishes the config-invalidated pubsub', async () => {
     publishCalls.length = 0;
     const before = updateOneCalls;
     const app = buildApp();
-    const res = await app.request('/api/admin/market-data/config', {
+    const res = await app.request('/admin/api/market-data/config', {
       method: 'PUT',
       headers: { Authorization: await gatewayToken(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ signalOrderType: 1 }),  // OrderType.Market
@@ -168,7 +169,7 @@ describe('PUT /api/admin/market-data/config (signalOrderType hot-swap)', () => {
     publishCalls.length = 0;
     const before = updateOneCalls;
     const app = buildApp();
-    const res = await app.request('/api/admin/market-data/config', {
+    const res = await app.request('/admin/api/market-data/config', {
       method: 'PUT',
       headers: { Authorization: await gatewayToken(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ signalOrderType: 99 }),
@@ -181,7 +182,7 @@ describe('PUT /api/admin/market-data/config (signalOrderType hot-swap)', () => {
   it('accepts a save that explicitly clears signalOrderType (null = no override)', async () => {
     publishCalls.length = 0;
     const app = buildApp();
-    const res = await app.request('/api/admin/market-data/config', {
+    const res = await app.request('/admin/api/market-data/config', {
       method: 'PUT',
       headers: { Authorization: await gatewayToken(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ signalOrderType: null }),

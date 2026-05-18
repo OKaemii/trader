@@ -196,22 +196,31 @@ async function pollLoop(): Promise<void> {
   await ensureConsumerGroup(redis, REDIS_STREAMS.MARKET_RAW, 'market-data-service');
 
   // Build initial universe from T212 instruments + instrument_registry
+  log.info('[market-data] poll-loop: refreshing universe at startup');
   let activeTickers = await universeManager.refresh();
   if (activeTickers.length === 0) {
     // Fallback to env var seed list if registry is empty
     activeTickers = (env.TICKER_UNIVERSE ?? 'AAPL_US_EQ,MSFT_US_EQ,GOOGL_US_EQ,AMZN_US_EQ,NVDA_US_EQ,TSLA_US_EQ,FB_US_EQ,NFLX_US_EQ,AMD_US_EQ,INTC_US_EQ').split(',');
     log.warn(`[market-data] universe empty — using TICKER_UNIVERSE env: ${activeTickers.join(',')}`);
+  } else {
+    log.info(`[market-data] active universe: ${activeTickers.length} tickers`);
   }
   let lastUniverseRefresh = Date.now();
+  let cycleCounter = 0;
 
   while (true) {
+    cycleCounter++;
+    const cycleStartMs = Date.now();
     const cfg = await getLiveConfig();
     const pollIntervalMs = cfg.pollIntervalMs;
+    log.info(`[market-data] ── cycle ${cycleCounter} start @ ${new Date(cycleStartMs).toISOString()} | bar_frequency=${cfg.barFrequency} poll_interval=${(pollIntervalMs / 1000).toFixed(0)}s | universe=${activeTickers.length}`);
 
     // Monthly universe refresh
     if (Date.now() - lastUniverseRefresh > UNIVERSE_REFRESH_MS) {
+      log.info('[market-data] universe refresh due');
       activeTickers = await universeManager.refresh();
       lastUniverseRefresh = Date.now();
+      log.info(`[market-data] universe refreshed: ${activeTickers.length} tickers`);
     }
 
     // Session gate. Partition the universe by exchange and decide, per-market,
@@ -219,11 +228,17 @@ async function pollLoop(): Promise<void> {
     // When all relevant markets skip, the cycle is a no-op (log + sleep), saving
     // ~30% of weekly Yahoo calls on weekends + ~10h/weekday of asymmetric closures.
     const groups = partitionByMarket(activeTickers);
+    log.info(`[market-data] partition: US=${groups.US.length} LSE=${groups.LSE.length} OTHER=${groups.OTHER.length}`);
+    if (groups.OTHER.length > 0) {
+      log.warn(`[market-data] ${groups.OTHER.length} ticker(s) in OTHER bucket — not pollable. Sample: ${groups.OTHER.slice(0, 10).join(',')}`);
+    }
     type Decision = { market: Market; tickers: string[]; state: MarketState };
     const decisions: Decision[] = [];
     for (const m of ['US', 'LSE'] as Market[]) {
       if (groups[m].length === 0) continue;
-      decisions.push({ market: m, tickers: groups[m], state: await marketStateOf(calendarFor(m), Date.now()) });
+      const state = await marketStateOf(calendarFor(m), Date.now());
+      decisions.push({ market: m, tickers: groups[m], state });
+      log.info(`[market-data] ${m} session=${state} (tickers=${groups[m].length})`);
     }
     const activeDecisions = decisions.filter((d) => d.state === 'REGULAR' || d.state === 'POST' || d.state === 'PRE');
 
@@ -234,11 +249,11 @@ async function pollLoop(): Promise<void> {
         const next = await soonestNextOpen(decisions.map((d) => calendarFor(d.market)), Date.now());
         nextOpenIso = new Date(next).toISOString();
       } catch { /* calendar exhaustion — surfaced separately on /health */ }
-      log.info(`[market-data] session gate skip — ${summary || 'no recognised markets'}; next open ${nextOpenIso}`);
+      log.info(`[market-data] session gate SKIP — ${summary || 'no recognised markets (everything in OTHER bucket)'}; next open ${nextOpenIso}`);
       pollStats.gateSkipsTotal++;
       pollStats.lastGateSkipTs = Date.now();
       const sleepMs = msUntilNextTick(pollIntervalMs, POLL_ANCHOR_OFFSET_MS);
-      log.info(`[market-data] next poll in ${(sleepMs / 1000).toFixed(0)}s at ${new Date(Date.now() + sleepMs).toISOString()}`);
+      log.info(`[market-data] cycle ${cycleCounter} end (skip) — next poll in ${(sleepMs / 1000).toFixed(0)}s at ${new Date(Date.now() + sleepMs).toISOString()}`);
       await sleep(sleepMs);
       continue;
     }
@@ -255,23 +270,26 @@ async function pollLoop(): Promise<void> {
         try {
           const db = await getMongoDb();
           const redis2 = await getRedisClient();
+          const healStart = Date.now();
           const heal = await healMissingHistory(db, redis2, provider, decision.tickers, expectedLatestMs !== undefined ? { expectedLatestMs } : {});
-          if (heal.healed > 0) {
-            log.warn(`[market-data] heal (${decision.market}): ${heal.healed} ticker(s), ${heal.barsAdded} bars filled, ${heal.unrecoverable} unrecoverable`);
-          }
+          log.info(`[market-data] heal (${decision.market}) checked ${decision.tickers.length} tickers in ${Date.now() - healStart}ms — healed=${heal.healed} barsAdded=${heal.barsAdded} unrecoverable=${heal.unrecoverable}`);
         } catch (err) {
           log.warn(`[market-data] heal pass failed for ${decision.market} (non-fatal):`, err);
         }
 
+        const fetchStart = Date.now();
+        log.info(`[market-data] ${decision.market} fetchRecent: requesting 24h window for ${decision.tickers.length} tickers`);
         const rawBars = await provider.fetchRecent(decision.tickers, 24);
+        const fetchMs = Date.now() - fetchStart;
         const { valid, invalid } = validator.validate(rawBars);
+        log.info(`[market-data] ${decision.market} fetched ${rawBars.length} raw bars in ${fetchMs}ms — valid=${valid.length} invalid=${invalid.length}`);
 
         if (invalid.length > 0) {
           const db = await getMongoDb();
           await db.collection(COLLECTIONS.BAD_TICKS).insertMany(
             invalid.map(({ bar, reason }) => ({ ...bar, reason, loggedAt: new Date() })),
           );
-          log.warn(`[market-data] ${invalid.length} bad ticks rejected (${decision.market})`);
+          log.warn(`[market-data] ${invalid.length} bad ticks rejected (${decision.market}) — sample reasons: ${invalid.slice(0, 3).map((i) => i.reason).join(' | ')}`);
         }
 
         // Gap detection scoped to the partition — a US-only window shouldn't trip
@@ -281,6 +299,7 @@ async function pollLoop(): Promise<void> {
           decision.tickers,
           decision.tickers.filter((t) => representedTickers.has(t)).map((t) => ({ ticker: t } as OHLCVBar)),
         );
+        log.info(`[market-data] ${decision.market} gap-check: ${representedTickers.size}/${decision.tickers.length} tickers represented (gap=${(gapReport.gapFraction * 100).toFixed(1)}% threshold=${(GAP_THRESHOLD * 100).toFixed(0)}%)`);
         if (gapReport.gapFraction > GAP_THRESHOLD) {
           const db = await getMongoDb();
           await db.collection(COLLECTIONS.BAD_TICKS).insertOne({
@@ -291,11 +310,12 @@ async function pollLoop(): Promise<void> {
             timestamp: Date.now(),
             loggedAt: new Date(),
           });
-          log.warn(`[market-data] ${(gapReport.gapFraction * 100).toFixed(0)}% of ${decision.market} missing — skipping publish`);
+          log.warn(`[market-data] ${(gapReport.gapFraction * 100).toFixed(0)}% of ${decision.market} missing — SKIPPING publish. Missing sample: ${gapReport.missingTickers.slice(0, 10).join(',')}`);
           continue;
         }
 
         if (valid.length > 0) {
+          const persistStart = Date.now();
           await persistBars(valid, '5m');
           const targetInterval: BarInterval = cfg.barFrequency === 'intraday' ? '15m' : 'daily';
           const downsampled = latestPerTicker(valid, targetInterval);
@@ -306,7 +326,9 @@ async function pollLoop(): Promise<void> {
           pollStats.lastPollTs   = Date.now();
           pollStats.lastBarCount = downsampled.length;
           pollStats.totalCycles++;
-          log.info(`[market-data] ${decision.market}: ${valid.length} 5m bars, ${downsampled.length} ${targetInterval} bars (cycle ${pollStats.totalCycles})`);
+          log.info(`[market-data] ${decision.market} persisted ${valid.length} 5m bars + xAdd ${downsampled.length} ${targetInterval} bars to market:raw in ${Date.now() - persistStart}ms (totalCycles=${pollStats.totalCycles})`);
+        } else {
+          log.warn(`[market-data] ${decision.market}: no valid bars to persist this cycle`);
         }
       } catch (e) {
         log.error(`[market-data] poll error (${decision.market}):`, e);
@@ -317,7 +339,7 @@ async function pollLoop(): Promise<void> {
     // fixed pollIntervalMs. Eliminates drift across pod restarts — polls always land
     // on the same wall-clock minutes regardless of when the pod started.
     const sleepMs = msUntilNextTick(pollIntervalMs, POLL_ANCHOR_OFFSET_MS);
-    log.info(`[market-data] next poll in ${(sleepMs / 1000).toFixed(0)}s at ${new Date(Date.now() + sleepMs).toISOString()}`);
+    log.info(`[market-data] ── cycle ${cycleCounter} end in ${Date.now() - cycleStartMs}ms — next poll in ${(sleepMs / 1000).toFixed(0)}s at ${new Date(Date.now() + sleepMs).toISOString()}`);
     await sleep(sleepMs);
   }
 }
@@ -333,7 +355,7 @@ const pollStats = {
   lastGateSkipTs:  null as number | null,
 };
 
-app.get('/health', async (c) => {
+const healthHandler = async (c: import('hono').Context) => {
   const cfg = await getLiveConfig().catch(() => ({ barFrequency: 'daily', pollIntervalMs: INITIAL_POLL_MS }));
   const nextPollTs = Date.now() + msUntilNextTick(cfg.pollIntervalMs, POLL_ANCHOR_OFFSET_MS);
 
@@ -377,16 +399,20 @@ app.get('/health', async (c) => {
     last_gate_skip_ts:     pollStats.lastGateSkipTs,
     holiday_source_health,
   });
-});
+};
+app.get('/health', healthHandler);
+app.get('/admin/api/market-data/health', healthHandler);
 
 // Lightweight console-backed logger shim; market-data-service still runs from index.ts
 // at module scope. Pino-backed logger is wired in src/main.ts and threaded down when the
 // service is migrated to the modules/ shape.
 const adminLogger = {
-  info:  (..._args: unknown[]) => { /* swallowed; market-data is verbose in dev */ },
-  warn:  (...args: unknown[]) => log.warn('[market-data]', ...args),
-  error: (...args: unknown[]) => log.error('[market-data]', ...args),
-  debug: () => {}, trace: () => {}, fatal: (...args: unknown[]) => log.error('[market-data]', ...args),
+  info:  (...args: unknown[]) => log.info('[market-data:admin]', ...args),
+  warn:  (...args: unknown[]) => log.warn('[market-data:admin]', ...args),
+  error: (...args: unknown[]) => log.error('[market-data:admin]', ...args),
+  debug: (...args: unknown[]) => log.debug('[market-data:admin]', ...args),
+  trace: () => {},
+  fatal: (...args: unknown[]) => log.error('[market-data:admin]', ...args),
   child: () => adminLogger, level: 'info',
 } as unknown as Parameters<typeof createAdminRouter>[2];
 

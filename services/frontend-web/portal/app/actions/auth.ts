@@ -2,7 +2,8 @@
 import { redirect } from 'next/navigation'
 import { createSession, deleteSession } from '@/app/lib/session'
 
-const GATEWAY = process.env.GATEWAY_URL ?? 'http://api-gateway:3000'
+const INGRESS_URL  = process.env.INGRESS_URL  ?? 'http://ingress-nginx-controller.ingress-nginx.svc.cluster.local:80'
+const INGRESS_HOST = process.env.INGRESS_HOST ?? 'trader.local'
 
 export async function login(
   _prevState: { error?: string } | undefined,
@@ -15,9 +16,9 @@ export async function login(
 
   let res: Response
   try {
-    res = await fetch(`${GATEWAY}/api/auth/login`, {
+    res = await fetch(`${INGRESS_URL}/api/auth/login`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', Host: INGRESS_HOST },
       body: JSON.stringify({ email, password }),
     })
   } catch {

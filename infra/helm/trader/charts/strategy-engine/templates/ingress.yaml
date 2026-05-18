@@ -1,0 +1,19 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: strategy-engine
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    kubernetes.io/ingress.class: nginx
+spec:
+  rules:
+    - host: trader.local
+      http:
+        paths:
+          - path: /admin/api/strategy
+            pathType: Prefix
+            backend:
+              service:
+                name: strategy-engine
+                port:
+                  number: 8000

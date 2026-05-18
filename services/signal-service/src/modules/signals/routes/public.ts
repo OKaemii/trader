@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
-import { requireInternal, requireCaller } from '@trader/shared-auth/middleware';
+import { parseUserHeaders, parseAdminHeaders } from '@trader/shared-auth/middleware';
 import { Signals as SignalsContracts } from '@trader/contracts';
 import type { ApproveSignalUseCase } from '../../approval/application/ApproveSignal.ts';
 import type { GetSignalProgressUseCase } from '../application/GetSignalProgress.ts';
@@ -18,16 +18,22 @@ interface Deps {
   riskEngine: RiskEngine;
 }
 
+/**
+ * /api/signals/* (user) and /admin/api/signals/* (admin) — the portal-facing routes.
+ * Each service is its own auth perimeter: the path prefix encodes the audience, and the
+ * matching parser is mounted per scope.
+ */
 export function createRouter(deps: Deps): Hono {
   const router = new Hono();
 
-  // Gateway is the user-auth perimeter. All `/api/*` traffic arrives here only via the
-  // gateway proxy, which mints a fresh internal JWT (sub='api-gateway') per request.
-  // Path-scoped guard so this doesn't bleed onto the /internal/* peer routes mounted
-  // by createInternalRouter (which pin a different requireCaller).
-  router.use('/api/*', requireInternal, requireCaller('api-gateway'));
+  // Path-scoped (NOT a wildcard) so the parsers don't bleed onto /internal/api/* mounted
+  // later on the same Hono app. See the comment in createInternalRouter for the regression
+  // this avoids.
+  router.use('/api/signals/*',       parseUserHeaders);
+  router.use('/admin/api/signals/*', parseAdminHeaders);
 
-  router.get('/api/signals', async (c) => {
+  // ── User-scope reads ──────────────────────────────────────────────────────
+  router.get('/api/signals/recent', async (c) => {
     const limit = Math.min(parseInt(c.req.query('limit') ?? '50'), 200);
     const signals = await deps.findRecent.execute(limit);
     return c.json({ signals });
@@ -41,11 +47,16 @@ export function createRouter(deps: Deps): Hono {
     return c.json({ signals });
   });
 
+  // ── Admin: signals lifecycle control ──────────────────────────────────────
+  router.get('/admin/api/signals/history', async (c) => {
+    const limit = Math.min(parseInt(c.req.query('limit') ?? '50'), 200);
+    const signals = await deps.findRecent.execute(limit);
+    return c.json({ signals });
+  });
+
   // Admin approve: flips lifecycle to 'approved' and triggers trading-service auto-execute
-  // (which itself decides whether to place the order based on TRADING_MODE). The gateway
-  // has already verified the caller is an admin user — `/api/admin/*` here is just a
-  // logical namespace; per-route role re-checks would be redundant.
-  router.post('/api/admin/signals/approve/:id', async (c) => {
+  // (which itself decides whether to place the order based on TRADING_MODE).
+  router.post('/admin/api/signals/approve/:id', async (c) => {
     const id = c.req.param('id')!;
     await deps.approveSignal.execute(id);
     return c.json({ approved: id });
@@ -54,11 +65,11 @@ export function createRouter(deps: Deps): Hono {
   // Auto-approve: when enabled, every freshly generated signal is approved on emission.
   // BUYs are pro-rated to fit free cash so the optimiser's ratio + sector cap survive.
   // Fires real T212 orders in demo/live mode — operator opts in deliberately.
-  router.get('/api/admin/signals/auto-approve', async (c) => {
+  router.get('/admin/api/signals/auto-approve', async (c) => {
     return c.json({ enabled: await deps.autoApprovalGate.isEnabled() });
   });
   router.post(
-    '/api/admin/signals/auto-approve',
+    '/admin/api/signals/auto-approve',
     zValidator('json', SignalsContracts.AutoApproveBodySchema, (result, c) => {
       if (!result.success) return c.json({ error: 'enabled (boolean) required' }, 400);
     }),
@@ -72,7 +83,7 @@ export function createRouter(deps: Deps): Hono {
   // Retry a failed signal: failed → queued, attempts reset. The dispatcher picks it up on
   // its next claim. Conditions (drift, cash, TTL) are re-evaluated then — a retry doesn't
   // guarantee execution, only another attempt.
-  router.post('/api/admin/signals/retry/:id', async (c) => {
+  router.post('/admin/api/signals/retry/:id', async (c) => {
     const id = c.req.param('id')!;
     const signal = await deps.signalRepo.findById(id);
     if (!signal) return c.json({ error: 'not found' }, 404);
@@ -85,7 +96,7 @@ export function createRouter(deps: Deps): Hono {
 
   // Cancel a queued / executing signal: transitions to Failed/ManualCancel. The strategy
   // treats it as if it never happened (no entry in the FIFO BUY ledger).
-  router.post('/api/admin/signals/cancel/:id', async (c) => {
+  router.post('/admin/api/signals/cancel/:id', async (c) => {
     const id = c.req.param('id')!;
     const signal = await deps.signalRepo.findById(id);
     if (!signal) return c.json({ error: 'not found' }, 404);
@@ -98,21 +109,14 @@ export function createRouter(deps: Deps): Hono {
     return c.json({ id, lifecycle: SignalLifecycle.Failed, reason: SignalFailureReason.ManualCancel });
   });
 
-  // History — most-recent signals (admin's primary feed view on the portal).
-  router.get('/api/admin/signals/history', async (c) => {
-    const limit = Math.min(parseInt(c.req.query('limit') ?? '50'), 200);
-    const signals = await deps.findRecent.execute(limit);
-    return c.json({ signals });
-  });
-
   // Risk engine status — circuit-breaker state, NAV snapshot, current drawdown.
-  router.get('/api/admin/risk/status', async (c) => {
+  router.get('/admin/api/signals/risk/status', async (c) => {
     const status = await deps.riskEngine.status();
     return c.json(status);
   });
 
   // Reset the circuit breaker manually (after investigating the trip cause).
-  router.post('/api/admin/risk/circuit-breaker/reset', async (c) => {
+  router.post('/admin/api/signals/risk/circuit-breaker/reset', async (c) => {
     await deps.riskEngine.resetCircuitBreaker();
     return c.json({ reset: true, ts: Date.now() });
   });
