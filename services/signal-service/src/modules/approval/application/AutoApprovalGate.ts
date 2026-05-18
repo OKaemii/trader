@@ -21,13 +21,20 @@
 import type { RedisClientType } from 'redis';
 import type { Logger } from '@trader/core';
 import type { TradingServiceClient } from '@trader/contracts';
-import type { TradeSignal } from '../../signals/domain/TradeSignal.ts';
+import { SignalLifecycle, type TradeSignal } from '../../signals/domain/TradeSignal.ts';
 import type { ISignalRepository } from '../../signals/domain/ISignalRepository.ts';
 import type { ApproveSignalUseCase } from './ApproveSignal.ts';
 
 const REDIS_KEY = 'signal:auto_approve';
 
 export class AutoApprovalGate {
+  // Sweep state. The sweeper picks up signals stuck at lifecycle=Pending — for example
+  // when a transient Mongo failover left the per-signal approve() in the original batch
+  // throwing NotWritablePrimary. Without this, those signals stay Pending forever because
+  // process() only ever sees the freshly-emitted batch (fire-and-forget from GenerateSignals).
+  private sweepTimer: ReturnType<typeof setInterval> | undefined;
+  private sweepInProgress = false;
+
   constructor(
     private readonly redis: Pick<RedisClientType, 'get' | 'set' | 'del'>,
     private readonly signalRepo: ISignalRepository,
@@ -47,11 +54,19 @@ export class AutoApprovalGate {
 
   /** Process a freshly generated batch. Caller awaits if it cares about completion. */
   async process(signals: TradeSignal[]): Promise<{ approved: number; scaled: number; skipped: number }> {
-    if (!(await this.isEnabled())) return { approved: 0, scaled: 0, skipped: 0 };
-    if (signals.length === 0)      return { approved: 0, scaled: 0, skipped: 0 };
+    if (!(await this.isEnabled())) {
+      this.logger.info({ signals: signals.length }, 'auto-approval gate: disabled — skipping');
+      return { approved: 0, scaled: 0, skipped: 0 };
+    }
+    if (signals.length === 0) {
+      this.logger.info('auto-approval gate: enabled but no signals to process');
+      return { approved: 0, scaled: 0, skipped: 0 };
+    }
 
     const sells = signals.filter((s) => s.action === 'SELL');
     const buys  = signals.filter((s) => s.action === 'BUY');
+    this.logger.info({ sells: sells.length, buys: buys.length },
+      'auto-approval gate: processing batch');
 
     let approved = 0;
     let scaled   = 0;
@@ -115,6 +130,55 @@ export class AutoApprovalGate {
       }
     }
 
+    this.logger.info({ approved, scaled, skipped, totalIn: signals.length },
+      'auto-approval gate: batch done');
     return { approved, scaled, skipped };
+  }
+
+  /**
+   * Periodic sweep for stuck Pending signals. Reuses `process()` against any rows
+   * still at lifecycle=Pending. Idempotent: signals already past Pending (Approved /
+   * Queued / Executed / Failed) are excluded by the filter, so a re-sweep cannot
+   * double-process them. approve() + markQueued() are unconditional $set updates,
+   * so even a race between a fresh-batch process() and a concurrent sweeper is safe.
+   *
+   * Returns a stop fn used by graceful-shutdown wiring.
+   */
+  startSweeper(intervalMs: number, pendingLimit = 100): () => void {
+    if (this.sweepTimer) {
+      this.logger.warn('auto-approval gate: sweeper already running');
+      return () => this.stopSweeper();
+    }
+    this.logger.info({ intervalMs, pendingLimit }, 'auto-approval gate: starting sweeper');
+    const tick = async (): Promise<void> => {
+      if (this.sweepInProgress) {
+        // Previous tick still draining a large batch — let it finish instead of
+        // racing against itself.
+        return;
+      }
+      if (!(await this.isEnabled())) return;
+      this.sweepInProgress = true;
+      try {
+        const pending = await this.signalRepo.findByLifecycle([SignalLifecycle.Pending], pendingLimit);
+        if (pending.length === 0) return;
+        this.logger.info({ pending: pending.length }, 'auto-approval gate: sweep picked up stuck Pending signals');
+        await this.process(pending);
+      } catch (err) {
+        this.logger.warn({ err }, 'auto-approval gate: sweep failed');
+      } finally {
+        this.sweepInProgress = false;
+      }
+    };
+    void tick();
+    this.sweepTimer = setInterval(() => { void tick(); }, intervalMs);
+    return () => this.stopSweeper();
+  }
+
+  private stopSweeper(): void {
+    if (this.sweepTimer) {
+      clearInterval(this.sweepTimer);
+      this.sweepTimer = undefined;
+      this.logger.info('auto-approval gate: sweeper stopped');
+    }
   }
 }
