@@ -1,3 +1,4 @@
+import type { Logger } from '@trader/core';
 import type { Money } from '@trader/shared-types';
 import type { Trading212Client, T212Position } from './t212.ts';
 
@@ -30,6 +31,7 @@ export interface AccountCacheOpts {
   ttlMs?: number;
   staleFallbackMs?: number;
   now?: () => number;
+  logger?: Logger;
 }
 
 export class AccountCache {
@@ -38,6 +40,7 @@ export class AccountCache {
   private readonly ttlMs: number;
   private readonly staleFallbackMs: number;
   private readonly now: () => number;
+  private readonly logger: Logger | null;
 
   constructor(
     private readonly client: Pick<Trading212Client, 'getCash' | 'getPositions'>,
@@ -46,6 +49,7 @@ export class AccountCache {
     this.ttlMs           = opts.ttlMs           ?? 30_000;
     this.staleFallbackMs = opts.staleFallbackMs ?? 5 * 60_000;
     this.now             = opts.now             ?? (() => Date.now());
+    this.logger          = opts.logger          ?? null;
   }
 
   async get(): Promise<AccountSnapshot> {
@@ -63,7 +67,7 @@ export class AccountCache {
         // error and let the dispatcher proceed. Without this, a single T212 429 takes the
         // whole queue offline until cache TTL clears.
         if (this.snapshot && this.now() - this.snapshot.fetchedAt < this.staleFallbackMs) {
-          console.warn('[account-cache] live fetch failed, serving stale snapshot:', err);
+          if (this.logger) this.logger.warn({ err }, 'account-cache: live fetch failed, serving stale snapshot');
           return this.snapshot;
         }
         throw err;

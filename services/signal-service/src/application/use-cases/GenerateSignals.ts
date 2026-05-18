@@ -4,6 +4,7 @@ import type { ISignalPublisher } from '../../domain/interfaces/ISignalPublisher.
 import type { IPortfolioState } from '../../domain/interfaces/IPortfolioState.ts';
 import type { IPriceLookup } from '../../domain/interfaces/IPriceLookup.ts';
 import type { StrategyOutput } from '@trader/shared-types';
+import type { Logger } from '@trader/core';
 import { buildStructuredRationale } from '../services/RationaleBuilder.ts';
 import { PortfolioConstructor } from '../services/PortfolioConstructor.ts';
 import type { RiskEngine } from '../services/RiskEngine.ts';
@@ -11,7 +12,10 @@ import type { StrategyDecayMonitor } from '../services/StrategyDecayMonitor.ts';
 import type { AutoApprovalGate } from '../services/AutoApprovalGate.ts';
 import { randomUUID } from 'node:crypto';
 
-const MIN_ACTIONABLE_CONFIDENCE = parseFloat(process.env.MIN_ACTIONABLE_CONFIDENCE ?? '0.3');
+export interface GenerateSignalsConfig {
+  minActionableConfidence: number;
+  volTarget: number;
+}
 
 export class GenerateSignalsUseCase {
   constructor(
@@ -19,6 +23,8 @@ export class GenerateSignalsUseCase {
     private readonly publisher: ISignalPublisher,
     private readonly portfolioState: IPortfolioState,
     private readonly riskEngine: RiskEngine,
+    private readonly logger: Logger,
+    private readonly config: GenerateSignalsConfig,
     private readonly portfolioConstructor: PortfolioConstructor = new PortfolioConstructor(),
     private readonly decayMonitor?: StrategyDecayMonitor,
     private readonly priceLookup?: IPriceLookup,
@@ -28,7 +34,7 @@ export class GenerateSignalsUseCase {
   async execute(features: StrategyOutput): Promise<TradeSignal[]> {
     const { allowed, reason } = await this.riskEngine.canTrade();
     if (!allowed) {
-      console.warn(`[GenerateSignals] circuit open — ${reason}`);
+      this.logger.warn({ reason }, 'circuit open');
       return [];
     }
 
@@ -37,12 +43,12 @@ export class GenerateSignalsUseCase {
     if (this.decayMonitor) {
       const health = await this.decayMonitor.run();
       if (health === 'suspended') {
-        console.warn('[GenerateSignals] strategy suspended by decay monitor — no new signals');
+        this.logger.warn('strategy suspended by decay monitor — no new signals');
         return [];
       }
       if (health === 'degraded') {
         decayMultiplier = 0.25;
-        console.warn('[GenerateSignals] strategy degraded — reducing position size to 25%');
+        this.logger.warn('strategy degraded — reducing position size to 25%');
       }
     }
 
@@ -55,14 +61,14 @@ export class GenerateSignalsUseCase {
           tickers: features.ticker_universe,
           sectors: features.ticker_universe.map((t) => features.sectors[t] ?? 'Unknown'),
           currentWeights: features.ticker_universe.map((t) => currentWeights[t] ?? 0),
-          targetVol: parseFloat(process.env.VOL_TARGET ?? '0.10'),
+          targetVol: this.config.volTarget,
           covariance: features.covariance_matrix,
         },
         features.factor_attributions ?? {},
       );
 
     if (stabilityWarnings.length > 0) {
-      for (const w of stabilityWarnings) console.warn(`[PortfolioConstructor] ${w}`);
+      for (const w of stabilityWarnings) this.logger.warn({ warning: w }, 'portfolio-constructor stability');
     }
 
     const weights = this.riskEngine.applyRegimeScaling(
@@ -136,7 +142,7 @@ export class GenerateSignalsUseCase {
           });
         } catch { return null; }
       })
-      .filter((s): s is TradeSignal => s !== null && s.isActionable(MIN_ACTIONABLE_CONFIDENCE));
+      .filter((s): s is TradeSignal => s !== null && s.isActionable(this.config.minActionableConfidence));
 
     await Promise.all(signals.map((s) => this.signalRepo.save(s)));
     // Notification policy (b): emails fire only on lifecycle='executed', not on emission.
@@ -148,8 +154,8 @@ export class GenerateSignalsUseCase {
     // gate logs its own outcome and a slow trading-service round-trip shouldn't block
     // the next strategy cycle. See AutoApprovalGate for the cash pro-rate logic.
     if (this.autoApprovalGate) {
-      this.autoApprovalGate.process(signals).catch((e) => {
-        console.warn('[GenerateSignals] auto-approval gate failed:', e);
+      this.autoApprovalGate.process(signals).catch((err: unknown) => {
+        this.logger.warn({ err }, 'auto-approval gate failed');
       });
     }
     return signals;

@@ -21,6 +21,7 @@ import {
 } from '@trader/shared-calendar';
 import { backfillTickers, tickersMissingHistory, healMissingHistory } from './backfill.ts';
 import { msUntilNextTick } from './poll-scheduling.ts';
+import { log } from './logger.ts';
 
 // Wall-clock anchor for the poll grid. 24h ticks land at this UTC offset (~1h after
 // US close = 22:00 UTC); shorter intervals land at the same phase. Override via env
@@ -134,18 +135,18 @@ async function ensureBarIndexes(): Promise<void> {
     const info = await db.listCollections({ name: COLLECTIONS.OHLCV_BARS }).toArray();
     const coll = info[0];
     if (coll && (coll.type === 'timeseries' || (coll as any).options?.timeseries)) {
-      console.error('[market-data] FATAL: ohlcv_bars is a time-series collection — unique indexes + updateOne upserts are unsupported. Run: db.ohlcv_bars.drop(); db.createCollection("ohlcv_bars"); then redeploy.');
+      log.error('[market-data] FATAL: ohlcv_bars is a time-series collection — unique indexes + updateOne upserts are unsupported. Run: db.ohlcv_bars.drop(); db.createCollection("ohlcv_bars"); then redeploy.');
       process.exit(1);
     }
   } catch (err) {
-    console.warn('[market-data] could not check collection type:', err);
+    log.warn('[market-data] could not check collection type:', err);
   }
 
   await db.collection(COLLECTIONS.OHLCV_BARS).createIndex(
     { ticker: 1, timestamp: 1, interval: 1 },
     { unique: true, name: 'ticker_timestamp_interval_unique' },
   ).catch((err) => {
-    console.warn('[market-data] unique index ensure failed (likely existing duplicates):', err instanceof Error ? err.message : err);
+    log.warn('[market-data] unique index ensure failed (likely existing duplicates):', err instanceof Error ? err.message : err);
   });
 }
 
@@ -200,7 +201,7 @@ async function pollLoop(): Promise<void> {
   if (activeTickers.length === 0) {
     // Fallback to env var seed list if registry is empty
     activeTickers = (process.env.TICKER_UNIVERSE ?? 'AAPL_US_EQ,MSFT_US_EQ,GOOGL_US_EQ,AMZN_US_EQ,NVDA_US_EQ,TSLA_US_EQ,FB_US_EQ,NFLX_US_EQ,AMD_US_EQ,INTC_US_EQ').split(',');
-    console.warn(`[market-data] universe empty — using TICKER_UNIVERSE env: ${activeTickers.join(',')}`);
+    log.warn(`[market-data] universe empty — using TICKER_UNIVERSE env: ${activeTickers.join(',')}`);
   }
   let lastUniverseRefresh = Date.now();
 
@@ -234,11 +235,11 @@ async function pollLoop(): Promise<void> {
         const next = await soonestNextOpen(decisions.map((d) => calendarFor(d.market)), Date.now());
         nextOpenIso = new Date(next).toISOString();
       } catch { /* calendar exhaustion — surfaced separately on /health */ }
-      console.log(`[market-data] session gate skip — ${summary || 'no recognised markets'}; next open ${nextOpenIso}`);
+      log.info(`[market-data] session gate skip — ${summary || 'no recognised markets'}; next open ${nextOpenIso}`);
       pollStats.gateSkipsTotal++;
       pollStats.lastGateSkipTs = Date.now();
       const sleepMs = msUntilNextTick(pollIntervalMs, POLL_ANCHOR_OFFSET_MS);
-      console.log(`[market-data] next poll in ${(sleepMs / 1000).toFixed(0)}s at ${new Date(Date.now() + sleepMs).toISOString()}`);
+      log.info(`[market-data] next poll in ${(sleepMs / 1000).toFixed(0)}s at ${new Date(Date.now() + sleepMs).toISOString()}`);
       await sleep(sleepMs);
       continue;
     }
@@ -257,10 +258,10 @@ async function pollLoop(): Promise<void> {
           const redis2 = await getRedisClient();
           const heal = await healMissingHistory(db, redis2, provider, decision.tickers, expectedLatestMs !== undefined ? { expectedLatestMs } : {});
           if (heal.healed > 0) {
-            console.warn(`[market-data] heal (${decision.market}): ${heal.healed} ticker(s), ${heal.barsAdded} bars filled, ${heal.unrecoverable} unrecoverable`);
+            log.warn(`[market-data] heal (${decision.market}): ${heal.healed} ticker(s), ${heal.barsAdded} bars filled, ${heal.unrecoverable} unrecoverable`);
           }
         } catch (err) {
-          console.warn(`[market-data] heal pass failed for ${decision.market} (non-fatal):`, err);
+          log.warn(`[market-data] heal pass failed for ${decision.market} (non-fatal):`, err);
         }
 
         const rawBars = await provider.fetchRecent(decision.tickers, 24);
@@ -271,7 +272,7 @@ async function pollLoop(): Promise<void> {
           await db.collection(COLLECTIONS.BAD_TICKS).insertMany(
             invalid.map(({ bar, reason }) => ({ ...bar, reason, loggedAt: new Date() })),
           );
-          console.warn(`[market-data] ${invalid.length} bad ticks rejected (${decision.market})`);
+          log.warn(`[market-data] ${invalid.length} bad ticks rejected (${decision.market})`);
         }
 
         // Gap detection scoped to the partition — a US-only window shouldn't trip
@@ -291,7 +292,7 @@ async function pollLoop(): Promise<void> {
             timestamp: Date.now(),
             loggedAt: new Date(),
           });
-          console.warn(`[market-data] ${(gapReport.gapFraction * 100).toFixed(0)}% of ${decision.market} missing — skipping publish`);
+          log.warn(`[market-data] ${(gapReport.gapFraction * 100).toFixed(0)}% of ${decision.market} missing — skipping publish`);
           continue;
         }
 
@@ -306,10 +307,10 @@ async function pollLoop(): Promise<void> {
           pollStats.lastPollTs   = Date.now();
           pollStats.lastBarCount = downsampled.length;
           pollStats.totalCycles++;
-          console.log(`[market-data] ${decision.market}: ${valid.length} 5m bars, ${downsampled.length} ${targetInterval} bars (cycle ${pollStats.totalCycles})`);
+          log.info(`[market-data] ${decision.market}: ${valid.length} 5m bars, ${downsampled.length} ${targetInterval} bars (cycle ${pollStats.totalCycles})`);
         }
       } catch (e) {
-        console.error(`[market-data] poll error (${decision.market}):`, e);
+        log.error(`[market-data] poll error (${decision.market}):`, e);
       }
     }
 
@@ -317,7 +318,7 @@ async function pollLoop(): Promise<void> {
     // fixed pollIntervalMs. Eliminates drift across pod restarts — polls always land
     // on the same wall-clock minutes regardless of when the pod started.
     const sleepMs = msUntilNextTick(pollIntervalMs, POLL_ANCHOR_OFFSET_MS);
-    console.log(`[market-data] next poll in ${(sleepMs / 1000).toFixed(0)}s at ${new Date(Date.now() + sleepMs).toISOString()}`);
+    log.info(`[market-data] next poll in ${(sleepMs / 1000).toFixed(0)}s at ${new Date(Date.now() + sleepMs).toISOString()}`);
     await sleep(sleepMs);
   }
 }
@@ -384,9 +385,9 @@ app.get('/health', async (c) => {
 // service is migrated to the modules/ shape.
 const adminLogger = {
   info:  (..._args: unknown[]) => { /* swallowed; market-data is verbose in dev */ },
-  warn:  (...args: unknown[]) => console.warn('[market-data]', ...args),
-  error: (...args: unknown[]) => console.error('[market-data]', ...args),
-  debug: () => {}, trace: () => {}, fatal: (...args: unknown[]) => console.error('[market-data]', ...args),
+  warn:  (...args: unknown[]) => log.warn('[market-data]', ...args),
+  error: (...args: unknown[]) => log.error('[market-data]', ...args),
+  debug: () => {}, trace: () => {}, fatal: (...args: unknown[]) => log.error('[market-data]', ...args),
   child: () => adminLogger, level: 'info',
 } as unknown as Parameters<typeof createAdminRouter>[2];
 
@@ -428,9 +429,9 @@ async function bootstrap(): Promise<void> {
       cache.getTable('US',  year),
       cache.getTable('LSE', year),
     ]);
-    console.log('[market-data] holiday calendars hydrated');
+    log.info('[market-data] holiday calendars hydrated');
   } catch (err) {
-    console.warn('[market-data] holiday hydration failed (will retry on first poll):', err);
+    log.warn('[market-data] holiday hydration failed (will retry on first poll):', err);
   }
   cache.startBackgroundRefresh();
 
@@ -438,7 +439,7 @@ async function bootstrap(): Promise<void> {
   try {
     universe = await universeManager.refresh();
   } catch (err) {
-    console.warn('[market-data] universe refresh failed during bootstrap, skipping backfill:', err);
+    log.warn('[market-data] universe refresh failed during bootstrap, skipping backfill:', err);
   }
   if (universe.length === 0) {
     universe = (process.env.TICKER_UNIVERSE ?? '').split(',').filter(Boolean);
@@ -449,23 +450,23 @@ async function bootstrap(): Promise<void> {
       const db = await getMongoDb();
       const missing = await tickersMissingHistory(db, universe);
       if (missing.length > 0) {
-        console.log(`[market-data] bootstrap: ${missing.length}/${universe.length} tickers have no 5m history — backfilling`);
+        log.info(`[market-data] bootstrap: ${missing.length}/${universe.length} tickers have no 5m history — backfilling`);
         const redis = await getRedisClient();
         const results = await backfillTickers(db, redis, provider, missing);
         const ok    = results.filter((r) => !r.error).length;
         const total = results.reduce((acc, r) => acc + r.upserted, 0);
         const fail  = results.filter((r) => r.error).length;
-        console.log(`[market-data] bootstrap backfill complete: ${ok}/${results.length} tickers OK, ${total} bars upserted, ${fail} failures`);
+        log.info(`[market-data] bootstrap backfill complete: ${ok}/${results.length} tickers OK, ${total} bars upserted, ${fail} failures`);
       } else {
-        console.log(`[market-data] bootstrap: all ${universe.length} tickers have history — skipping backfill`);
+        log.info(`[market-data] bootstrap: all ${universe.length} tickers have history — skipping backfill`);
       }
     } catch (err) {
-      console.warn('[market-data] bootstrap backfill failed:', err);
+      log.warn('[market-data] bootstrap backfill failed:', err);
     }
   }
 
   pollLoop().catch((err) => {
-    console.error('[fatal]', err);
+    log.error('[fatal]', err);
     process.exit(1);
   });
 }
@@ -476,5 +477,5 @@ bootstrap();
 
 const port = Number(process.env.PORT ?? 3002);
 serve({ fetch: app.fetch, port }, (info) => {
-  console.log(`[market-data-service] listening on :${info.port}`);
+  log.info(`[market-data-service] listening on :${info.port}`);
 });

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { GenerateSignalsUseCase } from '../application/use-cases/GenerateSignals.ts';
+import { GenerateSignalsUseCase, type GenerateSignalsConfig } from '../application/use-cases/GenerateSignals.ts';
 import { TradeSignal } from '../domain/entities/TradeSignal.ts';
 import type { ISignalRepository } from '../domain/interfaces/ISignalRepository.ts';
 import type { ISignalPublisher } from '../domain/interfaces/ISignalPublisher.ts';
@@ -7,6 +7,17 @@ import type { IPortfolioState } from '../domain/interfaces/IPortfolioState.ts';
 import type { IPriceLookup } from '../domain/interfaces/IPriceLookup.ts';
 import type { RiskEngine } from '../application/services/RiskEngine.ts';
 import { SignalLifecycle, type StrategyOutput } from '@trader/shared-types';
+import type { Logger } from '@trader/core';
+
+const stubLogger: Logger = {
+  info: () => {}, warn: () => {}, error: () => {}, debug: () => {},
+  trace: () => {}, fatal: () => {}, child: () => stubLogger, level: 'info',
+} as unknown as Logger;
+
+const stubConfig: GenerateSignalsConfig = {
+  minActionableConfidence: 0.30,
+  volTarget: 0.10,
+};
 
 // ── Mocks ─────────────────────────────────────────────────────────────────────
 
@@ -93,7 +104,7 @@ describe('GenerateSignalsUseCase', () => {
     repo = new MockSignalRepository();
     publisher = new MockPublisher();
     portfolioState = new MockPortfolioState();
-    useCase = new GenerateSignalsUseCase(repo, publisher, portfolioState, makeMockRiskEngine());
+    useCase = new GenerateSignalsUseCase(repo, publisher, portfolioState, makeMockRiskEngine(), stubLogger, stubConfig);
   });
 
   it('emits BUY signals when portfolio is empty and scores are positive', async () => {
@@ -133,9 +144,7 @@ describe('GenerateSignalsUseCase', () => {
   });
 
   it('returns empty array when circuit breaker is open', async () => {
-    const blockedUseCase = new GenerateSignalsUseCase(
-      repo, publisher, portfolioState, makeMockRiskEngine(false),
-    );
+    const blockedUseCase = new GenerateSignalsUseCase(repo, publisher, portfolioState, makeMockRiskEngine(false), stubLogger, stubConfig);
     const signals = await blockedUseCase.execute(baseFeatures());
     expect(signals).toHaveLength(0);
     expect(repo.saved).toHaveLength(0);
@@ -148,7 +157,7 @@ describe('GenerateSignalsUseCase', () => {
     const heavyAAPL = new MockPortfolioState({ AAPL: 0.9, MSFT: 0.05, GOOG: 0.05 });
     const features = baseFeatures();
     features.composite_scores = { AAPL: -0.3, MSFT: 0.9, GOOG: 0.1 };
-    const sellUseCase = new GenerateSignalsUseCase(repo, publisher, heavyAAPL, makeMockRiskEngine());
+    const sellUseCase = new GenerateSignalsUseCase(repo, publisher, heavyAAPL, makeMockRiskEngine(), stubLogger, stubConfig);
     const signals = await sellUseCase.execute(features);
     const hasSell = signals.some((s) => s.action === 'SELL');
     expect(hasSell).toBe(true);
@@ -220,10 +229,7 @@ describe('GenerateSignalsUseCase', () => {
 
   it('stamps entryPrice from the price lookup when available', async () => {
     const prices = new MockPriceLookup({ AAPL: 200, MSFT: 400, GOOG: 150 });
-    const withPrices = new GenerateSignalsUseCase(
-      repo, publisher, portfolioState, makeMockRiskEngine(),
-      undefined, undefined, prices,
-    );
+    const withPrices = new GenerateSignalsUseCase(repo, publisher, portfolioState, makeMockRiskEngine(), stubLogger, stubConfig, undefined, undefined, prices);
     const signals = await withPrices.execute(baseFeatures());
     expect(signals.length).toBeGreaterThan(0);
     for (const s of signals) {
@@ -239,10 +245,7 @@ describe('GenerateSignalsUseCase', () => {
 
   it('leaves entryPrice undefined when no price is available', async () => {
     const prices = new MockPriceLookup({}); // empty
-    const noPrices = new GenerateSignalsUseCase(
-      repo, publisher, portfolioState, makeMockRiskEngine(),
-      undefined, undefined, prices,
-    );
+    const noPrices = new GenerateSignalsUseCase(repo, publisher, portfolioState, makeMockRiskEngine(), stubLogger, stubConfig, undefined, undefined, prices);
     const signals = await noPrices.execute(baseFeatures());
     for (const s of signals) expect(s.entryPrice).toBeUndefined();
   });

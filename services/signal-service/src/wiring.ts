@@ -40,18 +40,24 @@ export async function wireDependencies(env: SignalEnv, logger: Logger) {
     const riskEngine  = new RiskEngine(db, redis, fx, tradingClient, logger);
     await riskEngine.init();
 
-    const decayMonitor    = new StrategyDecayMonitor(db, redis);
-    const portfolioState  = new MongoPortfolioState(db.collection("positions"), fx);
+    const decayMonitor    = new StrategyDecayMonitor(db, redis, logger);
+    const portfolioState  = new MongoPortfolioState(db.collection("positions"), fx, logger);
     const priceLookup     = new MongoPriceLookup(db);
     const approveSignal   = new ApproveSignalUseCase(signalRepo);
     const autoApprovalGate = new AutoApprovalGate(redis, signalRepo, approveSignal, tradingClient, logger);
     const publisher       = new RedisSignalPublisher(redis);
     const generateSignals = new GenerateSignalsUseCase(
-        signalRepo, publisher, portfolioState, riskEngine, undefined, decayMonitor, priceLookup, autoApprovalGate,
+        signalRepo, publisher, portfolioState, riskEngine,
+        logger,
+        { minActionableConfidence: env.MIN_ACTIONABLE_CONFIDENCE, volTarget: env.VOL_TARGET },
+        undefined, decayMonitor, priceLookup, autoApprovalGate,
     );
     const findRecent      = { execute: (limit: number) => signalRepo.findRecent(limit) };
     const getProgress     = new GetSignalProgressUseCase(signalRepo, portfolioState, priceLookup);
-    const subscriber      = new RedisStrategySubscriber(redis);
+    const subscriber      = new RedisStrategySubscriber(redis, {
+        consumerName: `signal-service-${env.POD_NAME}`,
+        logger,
+    });
 
     return {
         logger, env, redis, db, fx, tradingClient,

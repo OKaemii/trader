@@ -4,8 +4,12 @@
 // instead of waiting on the TTL. This is what lets the operator flip Limit ⇄ Market
 // from the portal without restarting trading-service.
 
+import type { Logger } from '@trader/core';
 import { getMongoDb, COLLECTIONS } from '@trader/shared-mongo';
 import { OrderType } from '../domain/entities/Order.ts';
+
+let _logger: Logger | null = null;
+export function setLiveConfigLogger(logger: Logger): void { _logger = logger; }
 
 interface MarketConfigDoc {
   _id: 'singleton';
@@ -35,7 +39,7 @@ export async function getSignalOrderType(): Promise<OrderType> {
     doc = await db.collection<MarketConfigDoc>(COLLECTIONS.PORTAL_MARKET_CONFIG)
       .findOne({ _id: 'singleton' }, { projection: { signalOrderType: 1 } });
   } catch (err) {
-    console.warn('[trading-service:live-config] mongo read failed, using env default:', err);
+    if (_logger) _logger.warn({ err }, 'live-config: mongo read failed, using env default');
   }
   const stored = doc?.signalOrderType;
   const value: OrderType =

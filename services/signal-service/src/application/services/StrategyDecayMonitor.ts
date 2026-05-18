@@ -1,5 +1,6 @@
 import type { Collection, Db } from 'mongodb';
 import type { RedisClientType } from 'redis';
+import type { Logger } from '@trader/core';
 import { COLLECTIONS } from '@trader/shared-mongo';
 import { SignalLifecycle } from '@trader/shared-types';
 
@@ -26,7 +27,7 @@ export class StrategyDecayMonitor {
   private readonly redis: RedisClientType;
   private readonly signals: Collection;
 
-  constructor(db: Db, redis: RedisClientType) {
+  constructor(db: Db, redis: RedisClientType, private readonly logger?: Logger) {
     this.healthLog = db.collection(COLLECTIONS.STRATEGY_HEALTH_LOG);
     this.signals   = db.collection(COLLECTIONS.SIGNALS);
     this.redis     = redis;
@@ -130,7 +131,7 @@ export class StrategyDecayMonitor {
     });
 
     if (health === 'degraded' || health === 'suspended') {
-      console.warn(`[StrategyDecayMonitor] strategy ${health} — metrics:`, metrics);
+      this.logger?.warn({ health, metrics }, 'strategy decay');
     }
   }
 }

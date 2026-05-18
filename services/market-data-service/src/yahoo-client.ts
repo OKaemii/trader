@@ -1,5 +1,6 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import type { OHLCVBar, BarInterval, Currency } from '@trader/shared-types';
+import { log } from './logger.ts';
 
 interface YahooQuote {
   open: (number | null)[];
@@ -479,7 +480,7 @@ export async function fetchYahooPrices(
       } else {
         failures++;
 
-        console.warn(
+        log.warn(
           '[yahoo] price fetch failed',
           {
             t212Ticker,
@@ -506,13 +507,13 @@ export async function fetchYahooPrices(
    * Only fail hard if core coverage collapses.
    */
   if (coverage < 0.35) {
-    console.error(
+    log.error(
       `[market-data] critical coverage failure (${Math.round(
         coverage * 100
       )}%)`
     );
   } else {
-    console.info(
+    log.info(
       `[market-data] coverage ${Math.round(
         coverage * 100
       )}% (${bars.length}/${t212Tickers.length})`

@@ -78,14 +78,14 @@ export function buildApp(deps: AppDeps): Hono {
         }
         const redis = await deps.getRedis();
         await redis.set(LIVE_GATE_KEY, "1");
-        console.warn("[TradingService] LIVE TRADING APPROVED by admin — real orders will now be placed");
+        deps.logger?.warn("LIVE TRADING APPROVED by admin — real orders will now be placed");
         return c.json({ approved: true, message: "Live trading gate opened. Real T212 orders will be placed on next signal." });
     });
 
     admin.post("/api/admin/trading/revoke-live", async (c) => {
         const redis = await deps.getRedis();
         await redis.del(LIVE_GATE_KEY);
-        console.warn("[TradingService] Live trading approval REVOKED by admin");
+        deps.logger?.warn("Live trading approval REVOKED by admin");
         return c.json({ approved: false, message: "Live trading gate closed." });
     });
 

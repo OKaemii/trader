@@ -16,6 +16,7 @@
 
 import type { OHLCVBar, BarInterval, Currency, PollIntervalKey } from '@trader/shared-types';
 import type { MarketDataProvider } from './market-data-provider.ts';
+import { log } from '../logger.ts';
 import {
   fetchYahooPrices,
   fetchYahooLiquidity,
@@ -87,7 +88,7 @@ export class YahooProvider implements MarketDataProvider {
       );
       for (const r of results) {
         if (r.status === 'fulfilled') out.push(...r.value);
-        else console.warn('[yahoo] fetchRecent batch entry failed:', r.reason);
+        else log.warn('[yahoo] fetchRecent batch entry failed:', r.reason);
       }
       if (i + YAHOO_BATCH_SIZE < tickers.length) {
         await new Promise((res) => setTimeout(res, YAHOO_BATCH_DELAY_MS));
@@ -115,7 +116,7 @@ export class YahooProvider implements MarketDataProvider {
 
     const symbol = toYahooSymbol(ticker);
     if (isBlacklisted(symbol)) {
-      console.warn(`[yahoo] history skipped — ${symbol} is blacklisted`);
+      log.warn(`[yahoo] history skipped — ${symbol} is blacklisted`);
       return [];
     }
 
@@ -129,7 +130,7 @@ export class YahooProvider implements MarketDataProvider {
     const TRUNCATION_LOG_THRESHOLD_MS = 60_000;
     let effectiveStart = startTs;
     if (startTs < earliest - TRUNCATION_LOG_THRESHOLD_MS) {
-      console.warn(`[yahoo] history truncated for ${symbol}: requested ${new Date(startTs).toISOString()} but 5m cap is ${FIVE_MIN_LOOKBACK_DAYS}d (=${new Date(earliest).toISOString()})`);
+      log.warn(`[yahoo] history truncated for ${symbol}: requested ${new Date(startTs).toISOString()} but 5m cap is ${FIVE_MIN_LOOKBACK_DAYS}d (=${new Date(earliest).toISOString()})`);
       effectiveStart = earliest;
     } else if (startTs < earliest) {
       // Within the noise band (caller's Date.now() vs ours): silently clamp.
@@ -150,7 +151,7 @@ export class YahooProvider implements MarketDataProvider {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       data = (await res.json()) as YahooResponse;
     } catch (err) {
-      console.warn(`[yahoo] history fetch failed for ${symbol}:`, err instanceof Error ? err.message : err);
+      log.warn(`[yahoo] history fetch failed for ${symbol}:`, err instanceof Error ? err.message : err);
       return [];
     }
 

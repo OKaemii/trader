@@ -1,11 +1,13 @@
 import type { IPortfolioState } from '../domain/interfaces/IPortfolioState.ts';
 import type { Collection } from 'mongodb';
+import type { Logger } from '@trader/core';
 import { sumPositionsGBP, type FxConverter, type PositionDoc } from '@trader/shared-portfolio';
 
 export class MongoPortfolioState implements IPortfolioState {
   constructor(
     private readonly collection: Collection,
     private readonly fx: FxConverter,
+    private readonly logger?: Logger,
   ) {}
 
   async currentWeights(): Promise<Record<string, number>> {
@@ -27,7 +29,7 @@ export class MongoPortfolioState implements IPortfolioState {
     let nav = 0;
     try { nav = await sumPositionsGBP(positions, this.fx); }
     catch (err) {
-      console.warn('[MongoPortfolioState] FX unavailable for drawdown, returning 0:', err);
+      this.logger?.warn({ err }, 'FX unavailable for drawdown, returning 0');
       return 0;
     }
     // HWM is recorded as a GBP scalar per-position (renamed from the pre-FX `hwmValue`
