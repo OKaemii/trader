@@ -85,8 +85,13 @@ async function main(): Promise<void> {
 
     app.onError(errorHandler(logger));
 
-    void deps.subscriber.subscribe(async (features) => { await deps.generateSignals.execute(features); });
+    for (const sub of deps.subscribers) {
+        void sub.subscribe(async (features) => { await deps.generateSignals.execute(features); });
+    }
     await deps.bus.subscribe("market", async () => { await deps.cache.invalidatePattern("*"); });
+
+    // Self-heal stuck Pending signals. See AutoApprovalGate.startSweeper for the rationale.
+    const stopSweeper = deps.autoApprovalGate.startSweeper(env.AUTO_APPROVE_SWEEP_INTERVAL_MS);
 
     const server = serve({ fetch: app.fetch, port: env.PORT }, (info) => {
         logger.info({ port: info.port }, "signal-service listening");
@@ -95,6 +100,7 @@ async function main(): Promise<void> {
 
     registerGracefulShutdown(logger, {
         onSignal: async () => {
+            stopSweeper();
             await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
             await deps.redis.quit();
         },

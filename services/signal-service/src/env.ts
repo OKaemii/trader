@@ -20,6 +20,22 @@ const EnvSchema = z.object({
     // Per-pod consumer name on Redis-stream subscriber.
     POD_NAME: z.string().default("local"),
 
+    // Comma-separated list of strategy-output streams to multiplex. Each entry spawns
+    // its own subscriber with consumer group `signal-service:{stream}`. Defaults to the
+    // legacy single stream so a chart without WP2's per-worker outputs keeps working.
+    // WP2 helm sets this to e.g. "signals:strategy,signals:strategy:5m:factor_rank_v1,signals:strategy:daily:factor_rank_v1"
+    // — keep the legacy entry during cutover so in-flight signals on the old stream are
+    // drained, then drop it once strategy-engine has fully migrated.
+    STRATEGY_INPUT_STREAMS: z.string().default("signals:strategy"),
+
+    // AutoApprovalGate sweeper interval. The gate's per-cycle process() is fire-and-forget
+    // and per-signal exceptions are caught + dropped (e.g. Mongo NotWritablePrimary during a
+    // primary failover), so without the sweeper any signal that hit such an error stays at
+    // lifecycle=Pending forever. 60s gives a stuck signal at most one minute to recover —
+    // shorter than the polling cadence on the portal page, so the operator never sees a
+    // permanently-stuck row when auto-approve is on.
+    AUTO_APPROVE_SWEEP_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
+
     OTLP_ENDPOINT: z.string().url().optional(),
 });
 

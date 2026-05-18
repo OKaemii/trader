@@ -1,7 +1,5 @@
-import json
 import numpy as np
 from dataclasses import dataclass
-from typing import Optional, Protocol
 
 
 @dataclass
@@ -39,78 +37,69 @@ class RegimeEngine:
 
     Position sizing in the signal service scales by: regime_confidence.
 
-    State (returns history + previous correlation matrix) can be persisted to a Redis-like
-    store via `attach_store()` so warm-up survives pod restarts. Without a store, the engine
-    spends ~21 daily cycles (or ~21 intraday bars) in the warm-up sentinel after every boot.
+    Warm-up: the engine needs ≥ WINDOW_VOL cross-sectional return vectors before it
+    produces a non-sentinel confidence. The strategy-engine host runs a historical
+    prewarm pass at boot (see main.py historical_prewarm()) that feeds 2× HISTORY_MIN
+    vectors from Mongo before the first live cycle — so steady state is reached on
+    cycle 1, not cycle 22. No Redis persistence needed: every boot recomputes
+    deterministically from the bar history.
     """
 
     WINDOW_TREND = 63   # trading days for trend estimation
     WINDOW_VOL   = 21   # trading days for realised vol
     HISTORY_MIN  = 63   # minimum history required
-    STATE_KEY    = "regime:state"
 
     def __init__(self) -> None:
-        self._returns_history: list[np.ndarray] = []  # list of cross-sectional return vectors
+        # Two parallel histories — both required because the regime metrics have
+        # different invariance properties under universe change:
+        #
+        # _mean_history  : scalar per cycle (cross-sectional mean of returns). Universe-
+        #                  invariant — a 7-ticker mean is comparable to a 10-ticker mean
+        #                  as long as both are equal-weighted. Used for trend + vol stats.
+        #
+        # _corr_window   : full cross-sectional vectors over the last WINDOW_VOL cycles.
+        #                  Required for the correlation matrix. Reset on any universe size
+        #                  change — comparing a 7×7 corr to an 8×8 corr is mathematically
+        #                  undefined, so we drop the window rather than crash.
+        #
+        # Pre-prewarm, storing the full vector worked because consecutive cycles usually
+        # shared the same universe. With historical prewarm replaying 126 days of bars,
+        # the universe legitimately changes across the window (different tickers ready on
+        # different dates) and `np.array(_returns_history)` becomes inhomogeneous → ValueError.
+        # Splitting the storage is the principled fix, not a workaround.
+        self._mean_history: list[float] = []
+        self._corr_window: list[np.ndarray] = []
         self._prev_corr: np.ndarray | None = None
-        self._store: Optional["AsyncStore"] = None
-
-    def attach_store(self, store: "AsyncStore") -> None:
-        """Attach an async key-value store (typically a redis client) for state persistence."""
-        self._store = store
-
-    async def load_from_store(self) -> None:
-        """Best-effort restore from the attached store. Safe to call before any update()."""
-        if self._store is None:
-            return
-        raw = await self._store.get(self.STATE_KEY)
-        if not raw:
-            return
-        try:
-            blob = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
-            self._returns_history = [np.asarray(row, dtype=float) for row in blob.get("returns_history", [])]
-            prev = blob.get("prev_corr")
-            self._prev_corr = np.asarray(prev, dtype=float) if prev is not None else None
-            print(f"[RegimeEngine] restored {len(self._returns_history)} cycles of warm-up state")
-        except (ValueError, KeyError, TypeError) as exc:
-            print(f"[RegimeEngine] state restore failed (ignoring): {exc}")
-
-    async def _persist(self) -> None:
-        if self._store is None:
-            return
-        # Only persist after warm-up to keep the payload bounded; pre-warmup state would be
-        # rebuilt in 21 cycles either way.
-        if len(self._returns_history) < self.WINDOW_VOL:
-            return
-        try:
-            blob = {
-                "returns_history": [r.tolist() for r in self._returns_history],
-                "prev_corr": self._prev_corr.tolist() if self._prev_corr is not None else None,
-            }
-            await self._store.set(self.STATE_KEY, json.dumps(blob))
-        except Exception as exc:  # noqa: BLE001 — logging only; persistence is best-effort
-            print(f"[RegimeEngine] state persist failed (ignoring): {exc}")
-
-    async def update_async(self, cross_sectional_returns: np.ndarray) -> RegimeState:
-        """Async variant of update() that also persists state to the attached store."""
-        state = self.update(cross_sectional_returns)
-        await self._persist()
-        return state
 
     def update(self, cross_sectional_returns: np.ndarray) -> RegimeState:
         """
         cross_sectional_returns: shape (n_assets,) for the current period.
         Returns RegimeState with confidence score and component metrics.
         """
-        self._returns_history.append(cross_sectional_returns)
-        if len(self._returns_history) > self.HISTORY_MIN * 2:
-            self._returns_history.pop(0)
-
-        if len(self._returns_history) < self.WINDOW_VOL:
+        n_assets = len(cross_sectional_returns)
+        if n_assets == 0:
             return RegimeState(confidence=0.5, trend_score=0.0, volatility_z=0.0,
                                dispersion=0.0, correlation_stability=0.0)
 
-        history = np.array(self._returns_history)     # (T, n_assets)
-        market_returns = history.mean(axis=1)          # equal-weight index return
+        # Universe-invariant: scalar mean return per cycle.
+        self._mean_history.append(float(cross_sectional_returns.mean()))
+        if len(self._mean_history) > self.HISTORY_MIN * 2:
+            self._mean_history.pop(0)
+
+        # Correlation window: requires consistent n_assets across the window. Reset on
+        # any change rather than retain stale corr from a different universe.
+        if self._corr_window and len(self._corr_window[0]) != n_assets:
+            self._corr_window.clear()
+            self._prev_corr = None
+        self._corr_window.append(cross_sectional_returns.copy())
+        if len(self._corr_window) > self.WINDOW_VOL:
+            self._corr_window.pop(0)
+
+        if len(self._mean_history) < self.WINDOW_VOL:
+            return RegimeState(confidence=0.5, trend_score=0.0, volatility_z=0.0,
+                               dispersion=0.0, correlation_stability=0.0)
+
+        market_returns = np.asarray(self._mean_history, dtype=float)
 
         # Trend: rolling 63-day cumulative index return
         trend_window = min(self.WINDOW_TREND, len(market_returns))
@@ -121,16 +110,20 @@ class RegimeEngine:
         vol_history = float(market_returns.std()) if len(market_returns) > 30 else vol_recent
         vol_z = (vol_recent - vol_history) / (vol_history + 1e-8)
 
-        # Dispersion: cross-sectional std of returns today
+        # Dispersion: cross-sectional std of returns today (scalar from the current cycle —
+        # no history needed, so universe-invariant by construction).
         dispersion = float(cross_sectional_returns.std())
 
-        # Correlation stability: Frobenius distance of current vs previous corr matrix
-        recent_mat = history[-self.WINDOW_VOL:].T     # (n_assets, window)
-        corr = np.corrcoef(recent_mat)
+        # Correlation stability: only when the corr window is full AND the universe has
+        # been stable across it. After a reset (n_assets change), stability is 0 until the
+        # window refills — that's the right answer ("undefined, no signal").
         stability = 0.0
-        if self._prev_corr is not None and self._prev_corr.shape == corr.shape:
-            stability = float(np.linalg.norm(corr - self._prev_corr, 'fro'))
-        self._prev_corr = corr.copy()
+        if len(self._corr_window) == self.WINDOW_VOL and n_assets >= 2:
+            recent_mat = np.array(self._corr_window).T   # (n_assets, WINDOW_VOL)
+            corr = np.corrcoef(recent_mat)
+            if self._prev_corr is not None and self._prev_corr.shape == corr.shape:
+                stability = float(np.linalg.norm(corr - self._prev_corr, 'fro'))
+            self._prev_corr = corr.copy()
 
         # Soft confidence: logistic centred on (vol_z=0, stability=0) → 1.0 in calm markets,
         # decaying toward 0 as vol excess and correlation instability grow. Previous formula
@@ -148,9 +141,3 @@ class RegimeEngine:
             dispersion=dispersion,
             correlation_stability=stability,
         )
-
-
-class AsyncStore(Protocol):
-    """Minimal interface for the optional persistence store (matches redis.asyncio)."""
-    async def get(self, key: str) -> object: ...
-    async def set(self, key: str, value: str) -> object: ...

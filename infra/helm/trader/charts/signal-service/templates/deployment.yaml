@@ -39,8 +39,6 @@ spec:
               value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb-headless:27017/trader?authSource=trader&directConnection=true"
             - name: TRADING_MODE
               value: {{ .Values.global.env.tradingMode | default "Paper" | quote }}
-            - name: BAR_FREQUENCY
-              value: {{ .Values.global.env.barFrequency | default "daily" | quote }}
             - name: SIGNAL_ORDER_TYPE
               value: {{ .Values.global.env.signalOrderType | default "Limit" | quote }}
             - name: ACTIVE_STRATEGY
@@ -49,6 +47,16 @@ spec:
               value: {{ .Values.global.env.volTarget | default "0.10" | quote }}
             - name: MIN_ACTIONABLE_CONFIDENCE
               value: {{ .Values.global.env.minActionableConfidence | default "0.30" | quote }}
+            # WP2.3: comma-separated stream list. Keeps the legacy `signals:strategy`
+            # attached during cutover so any in-flight messages drain, then layers on
+            # one per-worker stream `signals:strategy:{mode}:{strategyId}` derived from
+            # global.strategies. Falls back to legacy-only when strategies isn't set.
+            - name: STRATEGY_INPUT_STREAMS
+{{- $streams := list "signals:strategy" -}}
+{{- range (.Values.global.strategies | default (list)) }}
+  {{- $streams = append $streams (printf "signals:strategy:%s:%s" .mode .strategyId) -}}
+{{- end }}
+              value: {{ join "," $streams | quote }}
           livenessProbe:
             httpGet:
               path: /health

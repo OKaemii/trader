@@ -1,8 +1,10 @@
 """
 Tests for MarketDataClient. Mocks the HTTP layer via respx — no network, no
 market-data-service required. Pins:
-  - HMAC token shape matches packages/shared-auth/src/internal-token.ts (so the
-    server-side validateInternalToken accepts it)
+  - HS256 JWT shape matches packages/shared-auth/src/internal-jwt.ts (so the
+    server-side parseInternalHeaders accepts it)
+  - Auth header is `Authorization: Bearer <jwt>` (not the old X-Internal-Token)
+  - URLs target the post-refactor /internal/api/market-data/bars/* paths
   - Per-cycle cache: same (ticker, interval, range) within one cycle = no second HTTP call
   - start_cycle() clears the cache across cycles
   - Batch endpoint coalesces multiple tickers into one round-trip
@@ -11,18 +13,19 @@ market-data-service required. Pins:
 """
 from __future__ import annotations
 
-import hmac
+import base64
 import hashlib
+import hmac
 import json
 
 import httpx
 import pytest
 import respx
 
-from src.infrastructure.market_data_client import MarketDataClient
+from src.infrastructure.market_data_client import MarketDataClient, mint_internal_jwt
 
 
-SECRET = "test-internal-secret"
+SECRET = "test-jwt-secret"
 BASE_URL = "http://market-data-service:3002"
 
 
@@ -33,33 +36,54 @@ def _bar(ts: int, close: float) -> dict:
     }
 
 
-def _verify_token(token: str, caller: str = "strategy-engine") -> bool:
-    """Mirror of validateInternalToken — used in assertions."""
+def _verify_jwt(token: str, secret: str = SECRET, caller: str = "strategy-engine") -> bool:
+    """Mirror of parseInternalHeaders — verifies HS256 signature + caller claim."""
     try:
-        ts_str, mac = token.split(".")
-        expected = hmac.new(SECRET.encode(), f"{caller}:{ts_str}".encode(), hashlib.sha256).hexdigest()
-        return hmac.compare_digest(mac, expected)
+        header_b64, payload_b64, sig_b64 = token.split(".")
+        signing_input = f"{header_b64}.{payload_b64}".encode()
+        expected = hmac.new(secret.encode(), signing_input, hashlib.sha256).digest()
+        # base64url decode (re-pad first)
+        def _decode(s: str) -> bytes:
+            pad = 4 - (len(s) % 4)
+            return base64.urlsafe_b64decode(s + ("=" * pad if pad < 4 else ""))
+        if not hmac.compare_digest(_decode(sig_b64), expected):
+            return False
+        payload = json.loads(_decode(payload_b64))
+        return payload.get("sub") == caller and payload.get("aud") == "internal"
     except Exception:
         return False
 
 
+def _bearer(request: httpx.Request) -> str:
+    header = request.headers.get("Authorization", "")
+    return header[len("Bearer "):] if header.startswith("Bearer ") else ""
+
+
 @pytest.mark.asyncio
-async def test_fetch_bars_signs_token_correctly():
-    """Token must validate against the shared HMAC scheme so the server accepts it."""
+async def test_fetch_bars_signs_jwt_correctly():
+    """Token must validate against the shared HS256 JWT scheme so the server accepts it."""
     client = MarketDataClient(base_url=BASE_URL, secret=SECRET)
     client.start_cycle("c1")
 
-    captured_token: list[str] = []
+    captured: list[str] = []
     async def handler(request: httpx.Request) -> httpx.Response:
-        captured_token.append(request.headers.get("X-Internal-Token", ""))
+        captured.append(_bearer(request))
         return httpx.Response(200, json={"ticker": "AAPL_US_EQ", "interval": "daily", "range": "30d", "bars": []})
 
     with respx.mock() as mock:
-        mock.get(f"{BASE_URL}/internal/bars/AAPL_US_EQ?interval=daily&range=30d").mock(side_effect=handler)
+        mock.get(f"{BASE_URL}/internal/api/market-data/bars/AAPL_US_EQ?interval=daily&range=30d").mock(side_effect=handler)
         await client.fetch_bars("AAPL_US_EQ")
 
-    assert len(captured_token) == 1
-    assert _verify_token(captured_token[0]), f"server-side HMAC check failed for token: {captured_token[0]}"
+    assert len(captured) == 1
+    assert _verify_jwt(captured[0]), f"server-side JWT check failed for token: {captured[0]}"
+
+
+@pytest.mark.asyncio
+async def test_mint_internal_jwt_shape():
+    """Standalone mint helper produces parseable HS256 JWTs with the expected claims."""
+    token = mint_internal_jwt("strategy-engine", SECRET)
+    assert token.count(".") == 2
+    assert _verify_jwt(token)
 
 
 @pytest.mark.asyncio
@@ -67,7 +91,7 @@ async def test_fetch_bars_returns_parsed_bars():
     client = MarketDataClient(base_url=BASE_URL, secret=SECRET)
     client.start_cycle("c1")
     with respx.mock() as mock:
-        mock.get(f"{BASE_URL}/internal/bars/AAPL_US_EQ?interval=daily&range=30d").mock(
+        mock.get(f"{BASE_URL}/internal/api/market-data/bars/AAPL_US_EQ?interval=daily&range=30d").mock(
             return_value=httpx.Response(200, json={
                 "ticker": "AAPL_US_EQ", "interval": "daily", "range": "30d",
                 "bars": [_bar(1000, 100), _bar(2000, 101), _bar(3000, 102)],
@@ -85,7 +109,7 @@ async def test_per_cycle_cache_hits_dont_hit_http():
     client = MarketDataClient(base_url=BASE_URL, secret=SECRET)
     client.start_cycle("c1")
     with respx.mock() as mock:
-        route = mock.get(f"{BASE_URL}/internal/bars/AAPL_US_EQ?interval=daily&range=30d").mock(
+        route = mock.get(f"{BASE_URL}/internal/api/market-data/bars/AAPL_US_EQ?interval=daily&range=30d").mock(
             return_value=httpx.Response(200, json={"ticker": "AAPL_US_EQ", "interval": "daily", "range": "30d", "bars": [_bar(1, 1.0)]}),
         )
         await client.fetch_bars("AAPL_US_EQ")
@@ -99,7 +123,7 @@ async def test_start_cycle_clears_cache_across_cycles():
     client = MarketDataClient(base_url=BASE_URL, secret=SECRET)
     client.start_cycle("c1")
     with respx.mock() as mock:
-        route = mock.get(f"{BASE_URL}/internal/bars/AAPL_US_EQ?interval=daily&range=30d").mock(
+        route = mock.get(f"{BASE_URL}/internal/api/market-data/bars/AAPL_US_EQ?interval=daily&range=30d").mock(
             return_value=httpx.Response(200, json={"ticker": "AAPL_US_EQ", "interval": "daily", "range": "30d", "bars": [_bar(1, 1.0)]}),
         )
         await client.fetch_bars("AAPL_US_EQ")
@@ -113,7 +137,7 @@ async def test_batch_fetch_returns_map_keyed_by_ticker():
     client = MarketDataClient(base_url=BASE_URL, secret=SECRET)
     client.start_cycle("c1")
     with respx.mock() as mock:
-        mock.post(f"{BASE_URL}/internal/bars").mock(
+        mock.post(f"{BASE_URL}/internal/api/market-data/bars").mock(
             return_value=httpx.Response(200, json={
                 "interval": "daily", "range": "30d",
                 "bars": {
@@ -135,7 +159,7 @@ async def test_batch_fetch_skips_already_cached_tickers():
     client.start_cycle("c1")
     with respx.mock() as mock:
         # First call: prime the cache for AAPL only
-        first = mock.post(f"{BASE_URL}/internal/bars").mock(
+        first = mock.post(f"{BASE_URL}/internal/api/market-data/bars").mock(
             return_value=httpx.Response(200, json={"interval": "daily", "range": "30d", "bars": {"AAPL_US_EQ": [_bar(1, 100.0)]}}),
         )
         await client.fetch_bars_batch(["AAPL_US_EQ"])
@@ -164,7 +188,7 @@ async def test_batch_fetch_returns_no_entry_for_missing_tickers():
     client = MarketDataClient(base_url=BASE_URL, secret=SECRET)
     client.start_cycle("c1")
     with respx.mock() as mock:
-        mock.post(f"{BASE_URL}/internal/bars").mock(
+        mock.post(f"{BASE_URL}/internal/api/market-data/bars").mock(
             return_value=httpx.Response(200, json={"interval": "daily", "range": "30d", "bars": {"AAPL_US_EQ": [_bar(1, 100.0)]}}),
         )
         result = await client.fetch_bars_batch(["AAPL_US_EQ", "UNKNOWN_TICKER"])
@@ -180,7 +204,7 @@ async def test_batch_fetch_empty_tickers_returns_empty_dict_no_http():
     # assert_all_called=False so we can declare the route purely to count calls without
     # respx flagging the never-called route as a test failure.
     with respx.mock(assert_all_called=False) as mock:
-        route = mock.post(f"{BASE_URL}/internal/bars")
+        route = mock.post(f"{BASE_URL}/internal/api/market-data/bars")
         result = await client.fetch_bars_batch([])
     assert result == {}
     assert route.call_count == 0

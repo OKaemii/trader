@@ -1,0 +1,80 @@
+{{/*
+WP3: KEDA ScaledObject — emitted only for workers with `scaleToZero: true`. KEDA scales
+the Deployment from 0 → 1 when the consumer group has pending (unacked) entries, and
+back to 0 after the cooldown when the PEL drains. The daily worker is the prototype use
+case: idle from session close → next session close (~24h), then bursts to process one
+day's bars and exits.
+
+Why pendingEntriesCount and not streamLength:
+- streamLength counts every entry ever xAdded; with no trim policy, it grows forever and
+  KEDA would never scale down.
+- pendingEntriesCount tracks the consumer group's unacknowledged-entries-list (PEL),
+  which drops to 0 the moment the worker acks. Correct scale-up + scale-down signal.
+
+Why a bootstrap Job (job-keda-bootstrap.yaml):
+- pendingEntriesCount needs the consumer group to exist before KEDA can query it. When
+  the worker is scaled to 0 on a fresh deploy, no pod has started, so the group hasn't
+  been created. The bootstrap Job runs once on helm install/upgrade and XGROUP CREATEs
+  the group at the stream tail ("$") with MKSTREAM so the stream exists too.
+
+KEDA polls every `pollingInterval` (30s). Cold start for the python image + prewarm is
+~30-60s, so end-to-end latency from "daily bar lands on stream" → "first signal emitted"
+is ~60-90s. Acceptable for daily strategies; not suitable for tighter cadences.
+*/}}
+{{- $strategies := (.Values.global).strategies | default (.Values.strategies | default (list)) -}}
+{{/*
+Validation: scale-to-zero is incompatible with tight-cadence workers. KEDA polls every
+30s and python prewarm takes ~30-60s — total cold start ≈60-90s. A 5m worker that scaled
+to 0 between bars (15min apart in intraday mode) would spend more time cold-starting than
+processing. Fail fast at template render so a misconfigured upgrade can't deploy.
+*/}}
+{{- $forbiddenCadences := list "5m" "15m" "1m" "intraday" -}}
+{{- range $strategies }}
+{{- if and .scaleToZero (or (has .mode $forbiddenCadences) (eq (.barFrequency | default "") "intraday")) }}
+{{- fail (printf "strategy-engine: scaleToZero=true is forbidden on worker mode=%q barFrequency=%q (cold start ~60-90s exceeds the bar cadence). Use mode in {daily, weekly, 1h, 24h} or remove scaleToZero." .mode (.barFrequency | default "")) }}
+{{- end }}
+{{- end }}
+{{- range $idx, $s := $strategies }}
+{{- if $s.scaleToZero }}
+{{- $tag := printf "%s-%s" $s.mode $s.strategyId -}}
+{{- $name := printf "strategy-engine-%s" ($tag | replace "_" "-") }}
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: {{ printf "%s-redis-auth" $name }}
+  namespace: {{ $.Release.Namespace }}
+spec:
+  secretTargetRef:
+    - parameter: password
+      name: trader-secrets
+      key: REDIS_PASSWORD
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    app: strategy-engine
+    worker: {{ $tag | quote }}
+spec:
+  scaleTargetRef:
+    name: {{ $name }}
+  pollingInterval: 30
+  cooldownPeriod:  {{ $s.cooldownSeconds | default 300 }}
+  minReplicaCount: 0
+  maxReplicaCount: {{ $s.maxReplicas | default 1 }}
+  triggers:
+    - type: redis-streams
+      metadata:
+        address:               "redis-master.{{ $.Release.Namespace }}.svc.cluster.local:6379"
+        stream:                {{ printf "market:raw:%s" $s.mode | quote }}
+        consumerGroup:         {{ $name | quote }}
+        pendingEntriesCount:   "1"
+        activationLagCount:    "1"
+        enableTLS:             "false"
+      authenticationRef:
+        name: {{ printf "%s-redis-auth" $name }}
+{{- end }}
+{{- end }}
