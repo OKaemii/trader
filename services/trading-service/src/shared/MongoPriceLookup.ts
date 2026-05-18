@@ -16,11 +16,11 @@ export class MongoPriceLookup {
     return close && close > 0 ? close : null;
   }
 
-  // Money-tagged variant. Reads the bar's `currency` field; falls back to GBP for
-  // legacy pre-FX rows. Safe because pence is normalised at the market-data boundary
-  // so the only untagged bars in storage are GBP-listed equities. Used by the order
-  // dispatcher to construct typed inputs for PlaceOrderUseCase — the type system then
-  // refuses to compile any call site that forgets to FX-align NAV with price.
+  // Money-tagged variant. Reads the bar's `currency` field; when missing, infers from
+  // the T212 ticker suffix (`_US_EQ` → USD, anything else → GBP — LSE l_EQ tickers are
+  // GBP after the yahoo-client pence normalisation). Without this fallback, untagged US
+  // bars (pre-currency-persistence-fix) would be mis-tagged GBP and dispatcher would
+  // size orders by an FX factor → rounded down to 0 shares for almost every US signal.
   async lastCloseMoney(ticker: string): Promise<Money | null> {
     const doc = await this.db.collection(COLLECTIONS.OHLCV_BARS)
       .find({ ticker })
@@ -30,7 +30,12 @@ export class MongoPriceLookup {
     if (!doc) return null;
     const close = typeof doc.close === 'number' ? doc.close : null;
     if (!close || close <= 0) return null;
-    const ccy: Currency = (doc.currency === 'USD' || doc.currency === 'GBP') ? doc.currency : 'GBP';
+    let ccy: Currency;
+    if (doc.currency === 'USD' || doc.currency === 'GBP') {
+      ccy = doc.currency;
+    } else {
+      ccy = /_US_EQ$/.test(ticker) ? 'USD' : 'GBP';
+    }
     return { amount: close, currency: ccy };
   }
 }

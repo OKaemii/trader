@@ -3,6 +3,7 @@ import type { SignalServiceClient, OpenBuy } from '@trader/contracts';
 import { type Order, OrderSide, OrderStatus } from '../../orders/domain/Order.ts';
 import type { IOrderRepository } from '../../orders/domain/IOrderRepository.ts';
 import type { Trading212Client, T212HistoryItem } from '../../t212/infrastructure/Trading212Client.ts';
+import { scaleT212Quote, type PriceLookupForScaler } from '../../../shared/T212PriceScaler.ts';
 
 const MAX_HISTORY_PAGES = 5;    // 5 × 50 = 250 most-recent terminal orders — well beyond a 30s tick window
 const HISTORY_PAGE_SIZE = 50;
@@ -27,17 +28,24 @@ const HISTORY_PAGE_SIZE = 50;
 //      become a requirement.
 export class FillsPoller {
     private timer?: ReturnType<typeof setInterval> | undefined;
+    private tickCounter = 0;
+    private idleTicks = 0;
 
     constructor(
-        private readonly orderRepo:  IOrderRepository,
-        private readonly t212:       Trading212Client,
-        private readonly signal:     SignalServiceClient,
-        private readonly intervalMs: number,
-        private readonly logger:     Logger,
+        private readonly orderRepo:   IOrderRepository,
+        private readonly t212:        Trading212Client,
+        private readonly signal:      SignalServiceClient,
+        private readonly intervalMs:  number,
+        private readonly logger:      Logger,
+        // Optional but required in production: cross-checks T212 fill prices against the
+        // stored bar close to detect pence-quoted LSE listings. Without it, fills for
+        // tickers like SUPRl_EQ / SGLNl_EQ are written 100x inflated to Mongo.
+        private readonly priceLookup: PriceLookupForScaler | null = null,
     ) {}
 
     start(): void {
         if (this.timer) return;
+        this.logger.info({ intervalMs: this.intervalMs }, 'fills-poller: starting');
         this.tick().catch((err) => this.logger.warn({ err }, 'initial tick failed'));
         this.timer = setInterval(() => {
             this.tick().catch((err) => this.logger.warn({ err }, 'tick failed'));
@@ -48,26 +56,49 @@ export class FillsPoller {
         if (this.timer) {
             clearInterval(this.timer);
             this.timer = undefined;
+            this.logger.info('fills-poller: stopped');
         }
     }
 
     private async tick(): Promise<void> {
+        this.tickCounter++;
         const open = await this.orderRepo.findOpen();
-        if (open.length === 0) return;
+        if (open.length === 0) {
+            this.idleTicks++;
+            // Log every ~minute equivalent so k9s shows we're alive even with no open orders.
+            const logEvery = Math.max(1, Math.floor(60_000 / this.intervalMs));
+            if (this.idleTicks % logEvery === 0) {
+                this.logger.info({ tick: this.tickCounter, idleTicks: this.idleTicks },
+                    'fills-poller: idle (no submitted orders)');
+            }
+            return;
+        }
+        this.idleTicks = 0;
+        this.logger.info({ tick: this.tickCounter, open: open.length }, 'fills-poller: tick start');
 
         const active    = await this.t212.listActiveOrders();
         const activeIds = new Set(active.map((o) => o.id));
 
         const terminated = open.filter((o) => o.t212OrderId && !activeIds.has(o.t212OrderId));
-        if (terminated.length === 0) return;
+        if (terminated.length === 0) {
+            this.logger.info({ tick: this.tickCounter, activeAtBroker: active.length },
+                'fills-poller: all open orders still active at broker — no terminations to resolve');
+            return;
+        }
+        this.logger.info({ tick: this.tickCounter, terminated: terminated.length, activeAtBroker: active.length },
+            'fills-poller: terminations detected — fetching history');
 
         const lookupIds = new Set(terminated.map((o) => String(o.t212OrderId)));
         const history   = await this.collectHistoryFor(lookupIds);
+        this.logger.info({ tick: this.tickCounter, wanted: lookupIds.size, resolved: history.size },
+            'fills-poller: history fetched');
 
         for (const order of terminated) {
             const item = history.get(String(order.t212OrderId));
             if (!item) {
                 // Not in history yet; T212 typically populates within a tick or two. Skip and retry.
+                this.logger.info({ tick: this.tickCounter, t212OrderId: order.t212OrderId, ticker: order.ticker },
+                    'fills-poller: order not in history yet — retrying next tick');
                 continue;
             }
             await this.applyHistoryItem(order, item);
@@ -102,7 +133,10 @@ export class FillsPoller {
 
         if (status === 'FILLED' && item.fill) {
             const filledAt = Date.parse(item.fill.filledAt);
-            const fillPrice = item.fill.price;
+            const rawFillPrice = item.fill.price;
+            const fillPrice = this.priceLookup
+                ? await scaleT212Quote(order.ticker, rawFillPrice, this.priceLookup, this.logger)
+                : rawFillPrice;
             const filledQuantity = item.fill.quantity;
             await this.orderRepo.save({ ...order, status: OrderStatus.Filled, filledAt, fillPrice, filledQuantity });
 
