@@ -22,7 +22,13 @@ const ACCESS_TTL  = '15m';
 const REFRESH_TTL = '7d';
 
 export async function signAccessToken(payload: Omit<AppJWTPayload, 'iat' | 'exp'>): Promise<string> {
-  return new SignJWT(payload as Record<string, unknown>)
+  // aud is what the audience-JWT middleware (requireUser / requireAdmin) gates on.
+  // Admins get aud='admin' so requireAdmin accepts them; non-admins get aud='user'
+  // so requireUser accepts them (requireUser also accepts 'admin'). Without this, every
+  // /api/* route protected by requireUser returns 401 because jose rejects tokens that
+  // don't carry the audience the route demands.
+  const aud: Audience = payload.role === 'admin' ? 'admin' : 'user';
+  return new SignJWT({ ...(payload as Record<string, unknown>), aud })
     .setProtectedHeader({ alg: 'HS256' })
     .setIssuedAt()
     .setExpirationTime(ACCESS_TTL)
