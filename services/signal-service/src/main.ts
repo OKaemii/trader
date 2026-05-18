@@ -31,6 +31,7 @@ async function main(): Promise<void> {
                 riskEngine: d.riskEngine,
                 signalRepo: d.signalRepo,
                 publisher: d.publisher,
+                logger: d.logger,
             }));
 
             // Prometheus metrics — preserved verbatim from the legacy index.ts.

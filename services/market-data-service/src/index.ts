@@ -379,7 +379,18 @@ app.get('/health', async (c) => {
   });
 });
 
-app.route('/', createAdminRouter(universeManager, provider, {
+// Lightweight console-backed logger shim; market-data-service still runs from index.ts
+// at module scope. Pino-backed logger is wired in src/main.ts and threaded down when the
+// service is migrated to the modules/ shape.
+const adminLogger = {
+  info:  (..._args: unknown[]) => { /* swallowed; market-data is verbose in dev */ },
+  warn:  (...args: unknown[]) => console.warn('[market-data]', ...args),
+  error: (...args: unknown[]) => console.error('[market-data]', ...args),
+  debug: () => {}, trace: () => {}, fatal: (...args: unknown[]) => console.error('[market-data]', ...args),
+  child: () => adminLogger, level: 'info',
+} as unknown as Parameters<typeof createAdminRouter>[2];
+
+app.route('/', createAdminRouter(universeManager, provider, adminLogger, {
   holidayCache: () => _holidayCache ?? (() => { throw new Error('holiday cache not bootstrapped'); })(),
   calendarFor,
 }));

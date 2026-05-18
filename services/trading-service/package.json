@@ -12,6 +12,7 @@
     "lint": "eslint src"
   },
   "dependencies": {
+    "@trader/contracts": "workspace:*",
     "@hono/node-server": "^1.19.14",
     "@hono/zod-validator": "^0.8.0",
     "@trader/core": "workspace:*",

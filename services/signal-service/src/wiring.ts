@@ -1,4 +1,6 @@
 import type { Logger } from "@trader/core";
+import { TradingServiceClient } from "@trader/contracts";
+import { mintInternalJwt } from "@trader/shared-auth";
 import { getMongoDb } from "@trader/shared-mongo";
 import { getRedisClient } from "@trader/shared-redis";
 import { FxClient, YahooFxProvider } from "@trader/shared-fx";
@@ -24,18 +26,25 @@ export async function wireDependencies(env: SignalEnv, logger: Logger) {
     // Single FxClient shared by RiskEngine NAV math + MongoPortfolioState drawdown reads.
     const fx = new FxClient(redis as never, new YahooFxProvider());
 
+    // Typed peer-service client for trading-service /internal/* — owns auth + JSON parsing.
+    const tradingClient = new TradingServiceClient({
+        baseUrl: env.TRADING_SERVICE_URL,
+        callerService: "signal-service",
+        mintToken: mintInternalJwt,
+    });
+
     const { manager, cache, bus, collection } = createSignalDataLayer(db, redis);
     await bus.subscribe("signals", (key) => cache.invalidate(key));
 
     const signalRepo  = new MongoSignalRepository(manager, cache, bus, collection);
-    const riskEngine  = new RiskEngine(db, redis, fx);
+    const riskEngine  = new RiskEngine(db, redis, fx, tradingClient, logger);
     await riskEngine.init();
 
     const decayMonitor    = new StrategyDecayMonitor(db, redis);
     const portfolioState  = new MongoPortfolioState(db.collection("positions"), fx);
     const priceLookup     = new MongoPriceLookup(db);
     const approveSignal   = new ApproveSignalUseCase(signalRepo);
-    const autoApprovalGate = new AutoApprovalGate(redis, signalRepo, approveSignal);
+    const autoApprovalGate = new AutoApprovalGate(redis, signalRepo, approveSignal, tradingClient, logger);
     const publisher       = new RedisSignalPublisher(redis);
     const generateSignals = new GenerateSignalsUseCase(
         signalRepo, publisher, portfolioState, riskEngine, undefined, decayMonitor, priceLookup, autoApprovalGate,
@@ -45,7 +54,7 @@ export async function wireDependencies(env: SignalEnv, logger: Logger) {
     const subscriber      = new RedisStrategySubscriber(redis);
 
     return {
-        logger, env, redis, db, fx,
+        logger, env, redis, db, fx, tradingClient,
         signalRepo, riskEngine, decayMonitor, portfolioState, priceLookup,
         approveSignal, autoApprovalGate, publisher, generateSignals,
         findRecent, getProgress, subscriber, cache, bus,

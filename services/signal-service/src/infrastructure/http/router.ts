@@ -1,5 +1,7 @@
 import { Hono } from 'hono';
+import { zValidator } from '@hono/zod-validator';
 import { requireAuth, requireRole } from '@trader/shared-auth/middleware';
+import { Signals as SignalsContracts } from '@trader/contracts';
 import type { ApproveSignalUseCase } from '../../application/use-cases/ApproveSignal.ts';
 import type { GetSignalProgressUseCase } from '../../application/use-cases/GetSignalProgress.ts';
 import type { AutoApprovalGate } from '../../application/services/AutoApprovalGate.ts';
@@ -51,12 +53,18 @@ export function createRouter(deps: Deps): Hono {
   router.get('/api/admin/signals/auto-approve', requireRole('admin'), async (c) => {
     return c.json({ enabled: await deps.autoApprovalGate.isEnabled() });
   });
-  router.post('/api/admin/signals/auto-approve', requireRole('admin'), async (c) => {
-    const body = await c.req.json<{ enabled?: boolean }>().catch(() => ({} as { enabled?: boolean }));
-    if (typeof body.enabled !== 'boolean') return c.json({ error: 'enabled (boolean) required' }, 400);
-    await deps.autoApprovalGate.setEnabled(body.enabled);
-    return c.json({ enabled: body.enabled });
-  });
+  router.post(
+    '/api/admin/signals/auto-approve',
+    requireRole('admin'),
+    zValidator('json', SignalsContracts.AutoApproveBodySchema, (result, c) => {
+      if (!result.success) return c.json({ error: 'enabled (boolean) required' }, 400);
+    }),
+    async (c) => {
+      const { enabled } = c.req.valid('json');
+      await deps.autoApprovalGate.setEnabled(enabled);
+      return c.json({ enabled });
+    },
+  );
 
   // Retry a failed signal: failed → queued, attempts reset. The dispatcher picks it up on
   // its next claim. Conditions (drift, cash, TTL) are re-evaluated then — a retry doesn't

@@ -2,6 +2,9 @@
 // the api-gateway is the only authorized caller and enforces user-level admin auth.
 
 import { Hono } from 'hono';
+import { zValidator } from '@hono/zod-validator';
+import type { Logger } from '@trader/core';
+import { MarketData as MarketDataContracts } from '@trader/contracts';
 import { requireInternal, requireCaller } from '@trader/shared-auth/middleware';
 import { getMongoDb, COLLECTIONS } from '@trader/shared-mongo';
 import { getRedisClient, xAdd } from '@trader/shared-redis';
@@ -62,6 +65,7 @@ export interface CalendarDeps {
 export function createAdminRouter(
   universeManager: UniverseManager,
   provider: MarketDataProvider,
+  logger: Logger,
   calendarDeps?: CalendarDeps,
 ): Hono {
   const r = new Hono();
@@ -115,22 +119,26 @@ export function createAdminRouter(
     });
   });
 
-  r.put('/api/admin/universe/overrides', async (c) => {
-    const body = await c.req.json<{ adds?: string[]; removes?: string[]; userId?: string }>();
-    // Preserve case so T212 suffixes (e.g. `l_EQ` for London) survive. Earlier code upper-cased
-    // every entry, which silently broke any non-_US_EQ ticker passing through portal overrides.
-    const norm = (arr: string[] | undefined) =>
-      (arr ?? []).map((t) => t.trim()).filter(Boolean);
-    const adds = norm(body.adds);
-    const removes = norm(body.removes);
-    const db = await getMongoDb();
-    await db.collection(COLLECTIONS.PORTAL_UNIVERSE_OVERRIDES).updateOne(
-      { _id: 'singleton' as any },
-      { $set: { adds, removes, updatedBy: body.userId ?? 'unknown', updatedAt: new Date() } },
-      { upsert: true },
-    );
-    return c.json({ ok: true, adds, removes });
-  });
+  r.put(
+    '/api/admin/universe/overrides',
+    zValidator('json', MarketDataContracts.UniverseOverridesRequestSchema),
+    async (c) => {
+      const body = c.req.valid('json');
+      // Preserve case so T212 suffixes (e.g. `l_EQ` for London) survive. Earlier code upper-cased
+      // every entry, which silently broke any non-_US_EQ ticker passing through portal overrides.
+      const norm = (arr: string[] | undefined): string[] =>
+        (arr ?? []).map((t) => t.trim()).filter(Boolean);
+      const adds = norm(body.adds);
+      const removes = norm(body.removes);
+      const db = await getMongoDb();
+      await db.collection(COLLECTIONS.PORTAL_UNIVERSE_OVERRIDES).updateOne(
+        { _id: 'singleton' as any },
+        { $set: { adds, removes, updatedBy: body.userId ?? 'unknown', updatedAt: new Date() } },
+        { upsert: true },
+      );
+      return c.json({ ok: true, adds, removes });
+    },
+  );
 
   r.post('/api/admin/universe/refresh', async (c) => {
     const tickers = await universeManager.refresh();
@@ -171,63 +179,53 @@ export function createAdminRouter(
     });
   });
 
-  r.put('/api/admin/market-data/config', async (c) => {
-    const body = await c.req.json<{
-      barFrequency?: 'daily' | 'intraday' | null;
-      pollIntervalMs?: number | null;
-      signalOrderType?: 0 | 1 | null;
-      userId?: string;
-    }>();
-    if (body.barFrequency != null && !['daily', 'intraday'].includes(body.barFrequency)) {
-      return c.json({ error: 'invalid barFrequency' }, 400);
-    }
-    if (body.signalOrderType != null && !ORDER_TYPE_VALUES.includes(body.signalOrderType)) {
-      return c.json({ error: `invalid signalOrderType (expected ${ORDER_TYPE_LIMIT}=Limit or ${ORDER_TYPE_MARKET}=Market)` }, 400);
-    }
-    if (body.pollIntervalMs != null) {
-      if (body.pollIntervalMs < MIN_POLL_MS || body.pollIntervalMs > MAX_POLL_MS) {
-        return c.json({ error: `pollIntervalMs out of range (${MIN_POLL_MS}..${MAX_POLL_MS})` }, 400);
+  r.put(
+    '/api/admin/market-data/config',
+    zValidator('json', MarketDataContracts.MarketConfigRequestSchema),
+    async (c) => {
+      const body = c.req.valid('json');
+      if (body.pollIntervalMs != null) {
+        if (body.pollIntervalMs < MIN_POLL_MS || body.pollIntervalMs > MAX_POLL_MS) {
+          return c.json({ error: `pollIntervalMs out of range (${MIN_POLL_MS}..${MAX_POLL_MS})` }, 400);
+        }
+        // Defence-in-depth: zod accepts any positive int; reject anything outside the active
+        // provider's allowedPollIntervals.
+        const allowedMs = provider.allowedPollIntervals.map((k) => POLL_INTERVAL_OPTIONS[k].ms);
+        if (!allowedMs.includes(body.pollIntervalMs)) {
+          return c.json({
+            error: `pollIntervalMs not allowed by provider ${provider.name}`,
+            allowed: allowedMs,
+          }, 400);
+        }
       }
-      // Defence-in-depth: even if the portal renders the dropdown correctly, a stale
-      // tab or direct API hit could submit any value. Reject anything not in the
-      // active provider's allowedPollIntervals.
-      const allowedMs = provider.allowedPollIntervals.map((k) => POLL_INTERVAL_OPTIONS[k].ms);
-      if (!allowedMs.includes(body.pollIntervalMs)) {
-        return c.json({
-          error: `pollIntervalMs not allowed by provider ${provider.name}`,
-          allowed: allowedMs,
-        }, 400);
+      const db = await getMongoDb();
+      await db.collection(COLLECTIONS.PORTAL_MARKET_CONFIG).updateOne(
+        { _id: 'singleton' as any },
+        { $set: {
+          barFrequency: body.barFrequency ?? null,
+          pollIntervalMs: body.pollIntervalMs ?? null,
+          signalOrderType: body.signalOrderType ?? null,
+          updatedBy: body.userId ?? 'unknown',
+          updatedAt: new Date(),
+        }},
+        { upsert: true },
+      );
+      invalidateLiveConfig();
+      // Best-effort: tell trading-service + strategy-engine to drop their caches now.
+      try {
+        const redis = await getRedisClient();
+        await redis.publish(CONFIG_INVALIDATED_TOPIC, JSON.stringify({
+          barFrequency:    body.barFrequency    ?? null,
+          signalOrderType: body.signalOrderType ?? null,
+          pollIntervalMs:  body.pollIntervalMs  ?? null,
+          ts: Date.now(),
+        }));
+      } catch (err) {
+        logger.warn({ err }, 'config-invalidated publish failed');
       }
-    }
-    const db = await getMongoDb();
-    await db.collection(COLLECTIONS.PORTAL_MARKET_CONFIG).updateOne(
-      { _id: 'singleton' as any },
-      { $set: {
-        barFrequency: body.barFrequency ?? null,
-        pollIntervalMs: body.pollIntervalMs ?? null,
-        signalOrderType: body.signalOrderType ?? null,
-        updatedBy: body.userId ?? 'unknown',
-        updatedAt: new Date(),
-      }},
-      { upsert: true },
-    );
-    invalidateLiveConfig();
-    // Best-effort: tell trading-service + strategy-engine to drop their caches now
-    // rather than wait up to 15s for TTL. Failing to publish doesn't block the save —
-    // subscribers will pick up the change on their next cache refresh either way.
-    try {
-      const redis = await getRedisClient();
-      await redis.publish(CONFIG_INVALIDATED_TOPIC, JSON.stringify({
-        barFrequency:   body.barFrequency   ?? null,
-        signalOrderType:  body.signalOrderType  ?? null,
-        pollIntervalMs: body.pollIntervalMs ?? null,
-        ts: Date.now(),
-      }));
-    } catch (err) {
-      console.warn('[admin] config-invalidated publish failed:', err);
-    }
-    return c.json({ ok: true });
-  });
+      return c.json({ ok: true });
+    },
+  );
 
   // ── Backfill 5m history ────────────────────────────────────────────────────
   // POST /api/admin/market-data/backfill
@@ -237,25 +235,31 @@ export function createAdminRouter(
   // Persists 5m bars (upsert), invalidates the shared-bars cache, and publishes a
   // cache-invalidated message per ticker so subscribers (signal-service, portal) drop
   // their derived state. Returns per-ticker upsert counts.
-  r.post('/api/admin/market-data/backfill', async (c) => {
-    const body = await c.req.json<{ tickers?: string[]; days?: number }>().catch(() => ({} as { tickers?: string[]; days?: number }));
-    const tickers = body.tickers && body.tickers.length > 0
-      ? body.tickers
-      : universeManager.activeTickers;
-    if (tickers.length === 0) return c.json({ error: 'no tickers (universe empty and no body.tickers)' }, 400);
-    const days = body.days && body.days > 0 && body.days <= 60 ? body.days : 60;
-    const db = await getMongoDb();
-    const redis = await getRedisClient();
-    const results = await backfillTickers(db, redis, provider, tickers, {
-      windowMs: days * 24 * 60 * 60_000,
-    });
-    return c.json({
-      tickers: results.length,
-      bars:    results.reduce((acc, r) => acc + r.upserted, 0),
-      failures: results.filter((r) => r.error).length,
-      results,
-    });
-  });
+  r.post(
+    '/api/admin/market-data/backfill',
+    zValidator('json', MarketDataContracts.BackfillRequestSchema, (result, c) => {
+      if (!result.success) return c.json({ error: 'invalid body', issues: result.error.issues }, 400);
+    }),
+    async (c) => {
+      const body = c.req.valid('json');
+      const tickers = body.tickers && body.tickers.length > 0
+        ? body.tickers
+        : universeManager.activeTickers;
+      if (tickers.length === 0) return c.json({ error: 'no tickers (universe empty and no body.tickers)' }, 400);
+      const days = body.days ?? 60;
+      const db = await getMongoDb();
+      const redis = await getRedisClient();
+      const results = await backfillTickers(db, redis, provider, tickers, {
+        windowMs: days * 24 * 60 * 60_000,
+      });
+      return c.json({
+        tickers: results.length,
+        bars:    results.reduce((acc, r) => acc + r.upserted, 0),
+        failures: results.filter((r) => r.error).length,
+        results,
+      });
+    },
+  );
 
   // ── Clear cached bars ──────────────────────────────────────────────────────
   // POST /api/admin/market-data/clear-cache
@@ -265,42 +269,34 @@ export function createAdminRouter(
   // Use this to clean up the existing duplicate intraday-snapshot rows that the buggy
   // insertMany loop persisted before the upsert switch. Also drops shared-bars Redis
   // cache entries for matching (ticker, interval) pairs.
-  r.post('/api/admin/market-data/clear-cache', async (c) => {
-    const body = await c.req.json<{
-      interval?: BarInterval;
-      beforeTimestamp?: number;
-      dryRun?: boolean;
-    }>().catch(() => ({} as { interval?: BarInterval; beforeTimestamp?: number; dryRun?: boolean }));
-    const dryRun = body.dryRun !== false;
-    if (body.interval && !VALID_INTERVALS.includes(body.interval)) {
-      return c.json({ error: `invalid interval (one of ${VALID_INTERVALS.join(',')})` }, 400);
-    }
+  r.post(
+    '/api/admin/market-data/clear-cache',
+    zValidator('json', MarketDataContracts.ClearCacheRequestSchema),
+    async (c) => {
+      const body = c.req.valid('json');
+      const dryRun = body.dryRun !== false;
 
-    const filter: Record<string, unknown> = {};
-    if (body.interval)        filter.interval  = body.interval;
-    if (body.beforeTimestamp) filter.timestamp = { $lt: new Date(body.beforeTimestamp) };
+      const filter: Record<string, unknown> = {};
+      if (body.interval)        filter.interval  = body.interval;
+      if (body.beforeTimestamp) filter.timestamp = { $lt: new Date(body.beforeTimestamp) };
 
-    const db = await getMongoDb();
-    const collection = db.collection(COLLECTIONS.OHLCV_BARS);
-    const matchCount = await collection.countDocuments(filter);
-    if (dryRun) {
-      return c.json({ dryRun: true, wouldDelete: matchCount, filter });
-    }
+      const db = await getMongoDb();
+      const collection = db.collection(COLLECTIONS.OHLCV_BARS);
+      const matchCount = await collection.countDocuments(filter);
+      if (dryRun) {
+        return c.json({ dryRun: true, wouldDelete: matchCount, filter });
+      }
 
-    const res = await collection.deleteMany(filter);
-
-    // Best-effort cache invalidation. We don't know which (ticker, interval) pairs the
-    // delete touched without an extra aggregation; the simplest correct behaviour is
-    // to publish a wildcard cache-invalidated message and let subscribers refresh on
-    // next read. shared-bars consumers re-read from Mongo on cache miss.
-    const redis = await getRedisClient();
-    try {
-      await redis.publish(CACHE_INVALIDATED_TOPIC, JSON.stringify({ scope: 'bulk', filter, deleted: res.deletedCount, ts: Date.now() }));
-    } catch (err) {
-      console.warn('[admin] clear-cache publish failed:', err);
-    }
-    return c.json({ deleted: res.deletedCount, filter });
-  });
+      const res = await collection.deleteMany(filter);
+      const redis = await getRedisClient();
+      try {
+        await redis.publish(CACHE_INVALIDATED_TOPIC, JSON.stringify({ scope: 'bulk', filter, deleted: res.deletedCount, ts: Date.now() }));
+      } catch (err) {
+        logger.warn({ err }, 'clear-cache publish failed');
+      }
+      return c.json({ deleted: res.deletedCount, filter });
+    },
+  );
 
   // ── Provider info ──────────────────────────────────────────────────────────
   // GET /api/admin/market-data/provider-info
@@ -400,7 +396,7 @@ export function createAdminRouter(
     if (!calendarDeps) return c.json({ error: 'calendar not configured' }, 503);
     await calendarDeps.holidayCache().refreshAll();
     const health = await calendarDeps.holidayCache().getSourceHealth();
-    console.log('[market-data] holiday tables refreshed via admin endpoint');
+    logger.info('holiday tables refreshed via admin endpoint');
     return c.json({ ok: true, sources: health });
   });
 
@@ -438,35 +434,31 @@ export function createInternalBarsRouter(): Hono {
     return c.json({ ticker, interval, range, bars: out });
   });
 
-  r.post('/internal/bars', requireInternal, requireStrategy, async (c) => {
-    const body = await c.req.json<{
-      tickers:  string[];
-      interval?: BarInterval;
-      range?:    RangeKey;
-    }>().catch(() => ({ tickers: [] } as any));
-    const tickers  = Array.isArray(body.tickers) ? body.tickers : [];
-    const interval = (body.interval ?? 'daily') as BarInterval;
-    const range    = (body.range    ?? '30d')   as RangeKey;
-    if (!VALID_INTERVALS.includes(interval)) {
-      return c.json({ error: `invalid interval (one of ${VALID_INTERVALS.join(',')})` }, 400);
-    }
-    if (!VALID_RANGES.includes(range)) {
-      return c.json({ error: `invalid range (one of ${VALID_RANGES.join(',')})` }, 400);
-    }
-    if (tickers.length === 0) return c.json({ bars: {} });
+  r.post(
+    '/internal/bars',
+    requireInternal,
+    requireStrategy,
+    zValidator('json', MarketDataContracts.InternalBarsRequestSchema, (result, c) => {
+      if (!result.success) return c.json({ error: 'invalid body', issues: result.error.issues }, 400);
+    }),
+    async (c) => {
+      const body = c.req.valid('json');
+      const interval = body.interval ?? 'daily';
+      const range    = body.range    ?? '30d';
 
-    const db    = await getMongoDb();
-    const redis = await getRedisClient();
-    const out: Record<string, OHLCVBar[]> = {};
-    // Per-ticker fetch is cheap because getBars hits Redis on the second-onwards
-    // call within a TTL window. We could parallelise with Promise.all if the cache
-    // miss path proves slow in production; for now serial is simpler and predictable.
-    for (const ticker of tickers) {
-      const base = await getBars(redis as any, db, ticker, '5m', range);
-      out[ticker] = aggregateBars(base, interval);
-    }
-    return c.json({ interval, range, bars: out });
-  });
+      const db    = await getMongoDb();
+      const redis = await getRedisClient();
+      const out: Record<string, OHLCVBar[]> = {};
+      // Per-ticker fetch is cheap because getBars hits Redis on the second-onwards
+      // call within a TTL window. We could parallelise with Promise.all if the cache
+      // miss path proves slow in production; for now serial is simpler and predictable.
+      for (const ticker of body.tickers) {
+        const base = await getBars(redis as any, db, ticker, '5m', range);
+        out[ticker] = aggregateBars(base, interval);
+      }
+      return c.json({ interval, range, bars: out });
+    },
+  );
 
   return r;
 }

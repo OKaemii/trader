@@ -47,7 +47,9 @@ export const OHLCVBarSchema = z.object({
 export type OHLCVBar = z.infer<typeof OHLCVBarSchema>;
 
 export const InternalBarsRequestSchema = z.object({
-    tickers: z.array(z.string().min(1)).min(1),
+    // Empty arrays are valid — caller signalling "no work to do" returns {bars: {}}.
+    // Per-element non-empty is still enforced.
+    tickers: z.array(z.string().min(1)),
     interval: BarIntervalSchema.optional(),
     range: RangeKeySchema.optional(),
 });

@@ -12,13 +12,61 @@
 //
 // INTERNAL_SECRET pinned before importing FillsPoller so generateInternalToken matches.
 
-process.env.INTERNAL_SECRET = 'test-internal-secret';
+process.env.JWT_SECRET = 'test-jwt-secret-min-16-chars';
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { FillsPoller } from '../application/services/FillsPoller.ts';
 import { type Order, OrderSide, OrderType, OrderStatus } from '../domain/entities/Order.ts';
 import type { IOrderRepository } from '../domain/interfaces/IOrderRepository.ts';
 import type { Trading212Client, T212HistoryItem } from '../infrastructure/t212.ts';
+import type { Logger } from '@trader/core';
+import type { SignalServiceClient, OpenBuysResponse } from '@trader/contracts';
+
+// Stub logger that satisfies the @trader/core Logger interface.
+const noopLogger: Logger = {
+  info: () => {}, warn: () => {}, error: () => {}, debug: () => {},
+  trace: () => {}, fatal: () => {}, child: () => noopLogger, level: 'info',
+} as unknown as Logger;
+
+// Captures every SignalServiceClient call so tests can assert the wire contract without
+// going through fetch. Stubs that don't override a method default to an empty/noop response.
+interface CapturedCalls {
+  executed: Array<{ id: string; at?: number; quantity?: number }>;
+  closed:   Array<{ id: string; exitPrice: number; at?: number }>;
+  decrement: Array<{ id: string; by: number }>;
+  openBuysByTicker: string[];
+}
+function makeSignalStub(opts: { openBuys?: Record<string, OpenBuysResponse['signals']> } = {}): { client: SignalServiceClient; calls: CapturedCalls } {
+  const calls: CapturedCalls = { executed: [], closed: [], decrement: [], openBuysByTicker: [] };
+  const client: SignalServiceClient = {
+    markExecuted: async (id, at, quantity) => {
+      const entry: { id: string; at?: number; quantity?: number } = { id };
+      if (at !== undefined) entry.at = at;
+      if (quantity !== undefined) entry.quantity = quantity;
+      calls.executed.push(entry);
+      return { id, executedAt: at ?? 0, executedQuantity: quantity };
+    },
+    markClosed: async (id, exitPrice, at) => {
+      const entry: { id: string; exitPrice: number; at?: number } = { id, exitPrice };
+      if (at !== undefined) entry.at = at;
+      calls.closed.push(entry);
+      return { id, closedAt: at ?? 0, exitPrice };
+    },
+    decrementQuantity: async (id, by) => {
+      calls.decrement.push({ id, by });
+      return { id, decrementedBy: by };
+    },
+    openBuys: async (ticker) => {
+      calls.openBuysByTicker.push(ticker);
+      return { signals: opts.openBuys?.[ticker] ?? [] };
+    },
+    claimQueue:    async () => ({ signal: null }),
+    requeue:       async (id) => ({ id, lifecycle: 0 }),
+    failQueue:     async () => { /* noop */ },
+    sweepQueue:    async () => ({ reverted: 0 }),
+  } as unknown as SignalServiceClient;
+  return { client, calls };
+}
 
 function makeOrder(o: Partial<Order> = {}): Order {
   return {
@@ -113,12 +161,12 @@ function installFetchMock(handlers: Record<string, MockedFetchResponse | ((url: 
 describe('FillsPoller.tick', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
-    globalThis.fetch = vi.fn(async () => new Response('{}', { status: 200 })) as unknown as typeof fetch;
   });
 
   it('does nothing when no orders are open', async () => {
     const repo = new StubRepo([]);
-    const poller = new FillsPoller(repo, makeT212({}), 60_000);
+    const { client } = makeSignalStub();
+    const poller = new FillsPoller(repo, makeT212({}), client, 60_000, noopLogger);
     await (poller as unknown as { tick: () => Promise<void> }).tick();
     expect(repo.saved).toHaveLength(0);
   });
@@ -126,7 +174,8 @@ describe('FillsPoller.tick', () => {
   it('leaves orders untouched while they are still in active list', async () => {
     const repo = new StubRepo([makeOrder({ t212OrderId: '111' })]);
     const t212 = makeT212({ active: [{ id: '111' }] });
-    const poller = new FillsPoller(repo, t212, 60_000);
+    const { client } = makeSignalStub();
+    const poller = new FillsPoller(repo, t212, client, 60_000, noopLogger);
     await (poller as unknown as { tick: () => Promise<void> }).tick();
     expect(repo.saved).toHaveLength(0);
   });
@@ -137,8 +186,8 @@ describe('FillsPoller.tick', () => {
       active:  [],
       history: [filledItem({ id: 222, side: 'BUY', price: 250.25, qty: 5, filledAt: '2026-05-13T22:19:18.000Z' })],
     });
-    const calls = installFetchMock({});
-    const poller = new FillsPoller(repo, t212, 60_000);
+    const { client, calls } = makeSignalStub();
+    const poller = new FillsPoller(repo, t212, client, 60_000, noopLogger);
     await (poller as unknown as { tick: () => Promise<void> }).tick();
 
     expect(repo.saved).toHaveLength(1);
@@ -148,11 +197,9 @@ describe('FillsPoller.tick', () => {
     expect(saved.filledQuantity).toBe(5);
     expect(saved.filledAt).toBe(Date.parse('2026-05-13T22:19:18.000Z'));
 
-    // BUY fill notifies /executed with the real fill quantity, NOT /closed.
-    const execCall = calls.find((c) => c.url.includes('/internal/trading/signals/buy-sig/executed'));
-    expect(execCall).toBeDefined();
-    expect(JSON.parse((execCall!.init as RequestInit).body as string)).toMatchObject({ quantity: 5 });
-    expect(calls.find((c) => c.url.includes('/closed'))).toBeUndefined();
+    // BUY fill notifies executed with the real fill quantity, never close.
+    expect(calls.executed).toContainEqual(expect.objectContaining({ id: 'buy-sig', quantity: 5 }));
+    expect(calls.closed).toHaveLength(0);
   });
 
   it('marks a SELL filled, closes the SELL signal, and walks open BUYs FIFO to close them', async () => {
@@ -163,42 +210,25 @@ describe('FillsPoller.tick', () => {
     });
     // SELL of 5 shares; two BUYs with 2 + 4 shares oldest-first. Expect first BUY fully
     // closed (2), second BUY partially decremented by 3 (4 → 1).
-    const calls = installFetchMock({
-      '/internal/trading/signals/open-buys/AAPL_US_EQ': {
-        body: { signals: [
+    const { client, calls } = makeSignalStub({
+      openBuys: {
+        'AAPL_US_EQ': [
           { id: 'buy-1', executedQuantity: 2, executedAt: 1000 },
           { id: 'buy-2', executedQuantity: 4, executedAt: 2000 },
-        ] },
+        ],
       },
     });
-
-    const poller = new FillsPoller(repo, t212, 60_000);
+    const poller = new FillsPoller(repo, t212, client, 60_000, noopLogger);
     await (poller as unknown as { tick: () => Promise<void> }).tick();
 
-    // Order updated to filled
     expect(repo.saved[0].status).toBe(OrderStatus.Filled);
     expect(repo.saved[0].fillPrice).toBe(305.0);
-
-    // SELL signal itself closed
-    const sellClosedCall = calls.find((c) => c.url.endsWith('/internal/trading/signals/sell-sig/closed'));
-    expect(sellClosedCall).toBeDefined();
-    expect(JSON.parse((sellClosedCall!.init as RequestInit).body as string)).toMatchObject({ exitPrice: 305.0 });
-
-    // open-buys lookup made
-    expect(calls.some((c) => c.url.includes('/open-buys/AAPL_US_EQ'))).toBe(true);
-
-    // First BUY (qty=2) fully consumed → /closed
-    const buy1Closed = calls.find((c) => c.url.endsWith('/internal/trading/signals/buy-1/closed'));
-    expect(buy1Closed).toBeDefined();
-    expect(JSON.parse((buy1Closed!.init as RequestInit).body as string).exitPrice).toBe(305.0);
-
-    // Second BUY (qty=4, only 3 remain to consume) → /decrement-quantity by 3
-    const buy2Dec = calls.find((c) => c.url.endsWith('/internal/trading/signals/buy-2/decrement-quantity'));
-    expect(buy2Dec).toBeDefined();
-    expect(JSON.parse((buy2Dec!.init as RequestInit).body as string).by).toBe(3);
-
-    // Second BUY should NOT be closed (still has 1 share left)
-    expect(calls.find((c) => c.url.endsWith('/internal/trading/signals/buy-2/closed'))).toBeUndefined();
+    expect(calls.closed).toContainEqual(expect.objectContaining({ id: 'sell-sig', exitPrice: 305.0 }));
+    expect(calls.openBuysByTicker).toContain('AAPL_US_EQ');
+    expect(calls.closed).toContainEqual(expect.objectContaining({ id: 'buy-1', exitPrice: 305.0 }));
+    expect(calls.decrement).toContainEqual({ id: 'buy-2', by: 3 });
+    // buy-2 should NOT be closed (1 share remaining)
+    expect(calls.closed.find((c) => c.id === 'buy-2')).toBeUndefined();
   });
 
   it('on SELL with exact match closes all matching BUYs (no decrement)', async () => {
@@ -207,20 +237,20 @@ describe('FillsPoller.tick', () => {
       active:  [],
       history: [filledItem({ id: 334, side: 'SELL', price: 200, qty: 6, ticker: 'TSLA_US_EQ' })],
     });
-    const calls = installFetchMock({
-      '/internal/trading/signals/open-buys/TSLA_US_EQ': {
-        body: { signals: [
+    const { client, calls } = makeSignalStub({
+      openBuys: {
+        'TSLA_US_EQ': [
           { id: 'b1', executedQuantity: 3, executedAt: 1 },
           { id: 'b2', executedQuantity: 3, executedAt: 2 },
-        ] },
+        ],
       },
     });
-    const poller = new FillsPoller(repo, t212, 60_000);
+    const poller = new FillsPoller(repo, t212, client, 60_000, noopLogger);
     await (poller as unknown as { tick: () => Promise<void> }).tick();
 
-    expect(calls.find((c) => c.url.endsWith('/b1/closed'))).toBeDefined();
-    expect(calls.find((c) => c.url.endsWith('/b2/closed'))).toBeDefined();
-    expect(calls.find((c) => c.url.includes('/decrement-quantity'))).toBeUndefined();
+    expect(calls.closed.find((c) => c.id === 'b1')).toBeDefined();
+    expect(calls.closed.find((c) => c.id === 'b2')).toBeDefined();
+    expect(calls.decrement).toHaveLength(0);
   });
 
   it('on SELL with no open BUYs warns but does not error', async () => {
@@ -229,16 +259,15 @@ describe('FillsPoller.tick', () => {
       active:  [],
       history: [filledItem({ id: 335, side: 'SELL', price: 100, qty: 1, ticker: 'NVDA_US_EQ' })],
     });
-    const calls = installFetchMock({
-      '/internal/trading/signals/open-buys/NVDA_US_EQ': { body: { signals: [] } },
-    });
-    const poller = new FillsPoller(repo, t212, 60_000);
+    const { client, calls } = makeSignalStub({ openBuys: { 'NVDA_US_EQ': [] } });
+    const poller = new FillsPoller(repo, t212, client, 60_000, noopLogger);
     await (poller as unknown as { tick: () => Promise<void> }).tick();
 
     // SELL signal still gets closed even when no entry BUYs remain.
-    expect(calls.find((c) => c.url.endsWith('/sell-sig-3/closed'))).toBeDefined();
-    // No close/decrement calls for any BUY signal id.
-    expect(calls.filter((c) => /\/(closed|decrement-quantity)$/.test(c.url) && !c.url.endsWith('/sell-sig-3/closed'))).toHaveLength(0);
+    expect(calls.closed).toContainEqual(expect.objectContaining({ id: 'sell-sig-3' }));
+    // No additional BUY close/decrement calls.
+    expect(calls.closed.filter((c) => c.id !== 'sell-sig-3')).toHaveLength(0);
+    expect(calls.decrement).toHaveLength(0);
   });
 
   it('marks a cancelled order without notifying signal-service', async () => {
@@ -247,13 +276,15 @@ describe('FillsPoller.tick', () => {
       active:  [],
       history: [terminalItem(444, 'CANCELLED')],
     });
-    const calls = installFetchMock({});
-    const poller = new FillsPoller(repo, t212, 60_000);
+    const { client, calls } = makeSignalStub();
+    const poller = new FillsPoller(repo, t212, client, 60_000, noopLogger);
     await (poller as unknown as { tick: () => Promise<void> }).tick();
 
     expect(repo.saved[0].status).toBe(OrderStatus.Cancelled);
     expect(repo.saved[0].filledQuantity).toBe(0);
-    expect(calls).toHaveLength(0);
+    expect(calls.executed).toHaveLength(0);
+    expect(calls.closed).toHaveLength(0);
+    expect(calls.decrement).toHaveLength(0);
   });
 
   it('handles REJECTED and EXPIRED the same way as CANCELLED', async () => {
@@ -265,7 +296,8 @@ describe('FillsPoller.tick', () => {
       active:  [],
       history: [terminalItem(555, 'REJECTED'), terminalItem(666, 'EXPIRED')],
     });
-    const poller = new FillsPoller(repo, t212, 60_000);
+    const { client } = makeSignalStub();
+    const poller = new FillsPoller(repo, t212, client, 60_000, noopLogger);
     await (poller as unknown as { tick: () => Promise<void> }).tick();
     expect(repo.saved.map((o) => o.status)).toEqual([OrderStatus.Cancelled, OrderStatus.Cancelled]);
   });
@@ -273,7 +305,8 @@ describe('FillsPoller.tick', () => {
   it('leaves an order submitted when it is missing from both active and history (race)', async () => {
     const repo = new StubRepo([makeOrder({ t212OrderId: '777' })]);
     const t212 = makeT212({ active: [], history: [] });
-    const poller = new FillsPoller(repo, t212, 60_000);
+    const { client } = makeSignalStub();
+    const poller = new FillsPoller(repo, t212, client, 60_000, noopLogger);
     await (poller as unknown as { tick: () => Promise<void> }).tick();
     expect(repo.saved).toHaveLength(0);
   });
@@ -290,7 +323,8 @@ describe('FillsPoller.tick', () => {
         { items: [filledItem({ id: 200, price: 200 })], nextPagePath: null },
       ],
     });
-    const poller = new FillsPoller(repo, t212, 60_000);
+    const { client } = makeSignalStub();
+    const poller = new FillsPoller(repo, t212, client, 60_000, noopLogger);
     await (poller as unknown as { tick: () => Promise<void> }).tick();
     expect(repo.saved.find((o) => o.t212OrderId === '100')?.fillPrice).toBe(100);
     expect(repo.saved.find((o) => o.t212OrderId === '200')?.fillPrice).toBe(200);

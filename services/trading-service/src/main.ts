@@ -18,6 +18,8 @@ async function main(): Promise<void> {
         getRedis: () => getRedisClient() as unknown as Promise<Pick<RedisClientType, "get" | "set" | "del">>,
         getDb:    () => getMongoDb(),
         client:   () => deps.sharedClient,
+        signal:   deps.signal,
+        logger,
         accountCache: deps.sharedAccountCache,
     };
     const app = buildApp(appDeps);
