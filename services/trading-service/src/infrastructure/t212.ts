@@ -1,13 +1,7 @@
 import { type Currency, type Money, money } from '@trader/shared-types';
 
-// Helm passes TRADING_MODE as the enum member name ('Live'/'Demo'/'Paper'). We compare
-// against the string here rather than importing TradingMode to keep this file dependency-
-// free — it's the lowest-level infrastructure module.
-function t212Base(): string {
-  return process.env.TRADING_MODE === 'Live'
-    ? 'https://live.trading212.com/api/v0'
-    : 'https://demo.trading212.com/api/v0';
-}
+const LIVE_BASE_URL = 'https://live.trading212.com/api/v0';
+const DEMO_BASE_URL = 'https://demo.trading212.com/api/v0';
 
 // T212 quotes positions in the instrument's listing currency. We derive that from the
 // T212 ticker suffix because T212's portfolio response doesn't include currency on each
@@ -33,22 +27,31 @@ export interface T212Cash {
   total: Money;
 }
 
-export class Trading212Client {
-  private headers: Record<string, string>;
+export interface Trading212ClientOptions {
+  apiKey: string;
+  apiKeyId: string;
+  /** Pass `true` for live.trading212.com, `false` for demo.trading212.com. */
+  live: boolean;
+}
 
-  constructor(apiKey: string, apiKeyId: string) {
-    const auth = 'Basic ' + Buffer.from(`${apiKeyId}:${apiKey}`).toString('base64');
+export class Trading212Client {
+  private readonly headers: Record<string, string>;
+  private readonly baseUrl: string;
+
+  constructor(opts: Trading212ClientOptions) {
+    const auth = 'Basic ' + Buffer.from(`${opts.apiKeyId}:${opts.apiKey}`).toString('base64');
     this.headers = { Authorization: auth, 'Content-Type': 'application/json' };
+    this.baseUrl = opts.live ? LIVE_BASE_URL : DEMO_BASE_URL;
   }
 
   async getPortfolio(): Promise<unknown> {
-    const res = await fetch(`${t212Base()}/portfolio`, { headers: this.headers });
+    const res = await fetch(`${this.baseUrl}/portfolio`, { headers: this.headers });
     if (!res.ok) throw new Error(`T212 portfolio: ${res.status}`);
     return res.json();
   }
 
   async getCash(): Promise<T212Cash> {
-    const res = await fetch(`${t212Base()}/equity/account/cash`, { headers: this.headers });
+    const res = await fetch(`${this.baseUrl}/equity/account/cash`, { headers: this.headers });
     if (!res.ok) throw new Error(`T212 cash: ${res.status}`);
     const raw = await res.json() as { free?: number; total?: number };
     const free  = Number(raw.free  ?? 0);
@@ -57,7 +60,7 @@ export class Trading212Client {
   }
 
   async getPositions(): Promise<T212Position[]> {
-    const res = await fetch(`${t212Base()}/equity/portfolio`, { headers: this.headers });
+    const res = await fetch(`${this.baseUrl}/equity/portfolio`, { headers: this.headers });
     if (!res.ok) throw new Error(`T212 positions: ${res.status}`);
     const raw = await res.json() as Array<Record<string, unknown>>;
     return (raw ?? []).map((p) => {
@@ -79,7 +82,7 @@ export class Trading212Client {
   async placeMarketOrder(ticker: string, quantity: number): Promise<{ orderId: string }> {
     // T212 rejects market orders with `timeValidity` set ("Invalid payload"); only limit orders carry it.
     const body = JSON.stringify({ ticker, quantity });
-    const res  = await fetch(`${t212Base()}/equity/orders/market`, {
+    const res  = await fetch(`${this.baseUrl}/equity/orders/market`, {
       method: 'POST', headers: this.headers, body,
     });
     if (!res.ok) throw new Error(`T212 market order: ${res.status} ${await res.text()}`);
@@ -89,7 +92,7 @@ export class Trading212Client {
 
   async placeLimitOrder(ticker: string, quantity: number, limitPrice: number): Promise<{ orderId: string }> {
     const body = JSON.stringify({ ticker, quantity, limitPrice, timeValidity: 'DAY' });
-    const res  = await fetch(`${t212Base()}/equity/orders/limit`, {
+    const res  = await fetch(`${this.baseUrl}/equity/orders/limit`, {
       method: 'POST', headers: this.headers, body,
     });
     if (!res.ok) throw new Error(`T212 limit order: ${res.status} ${await res.text()}`);
@@ -100,7 +103,7 @@ export class Trading212Client {
   // Active orders — anything still working. A submitted order that drops off this list has
   // either filled or terminated. Returns raw objects; callers extract just the orderId.
   async listActiveOrders(): Promise<Array<{ id: string }>> {
-    const res = await fetch(`${t212Base()}/equity/orders`, { headers: this.headers });
+    const res = await fetch(`${this.baseUrl}/equity/orders`, { headers: this.headers });
     if (!res.ok) throw new Error(`T212 list orders: ${res.status}`);
     const data = await res.json() as Array<any>;
     return (data ?? []).map((o) => ({ id: String(o.id ?? o.orderId ?? '') }));
@@ -114,7 +117,7 @@ export class Trading212Client {
     nextPagePath: string | null;
   }> {
     const path = opts?.cursor ?? `/api/v0/equity/history/orders?limit=${opts?.limit ?? 50}`;
-    const base = t212Base().replace('/api/v0', '');
+    const base = this.baseUrl.replace('/api/v0', '');
     const res  = await fetch(`${base}${path}`, { headers: this.headers });
     if (!res.ok) throw new Error(`T212 history orders: ${res.status}`);
     const data = await res.json() as { items?: T212HistoryItem[]; nextPagePath?: string | null };

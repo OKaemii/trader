@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { createLogger } from "@trader/core";
 
 // Mock shared-mongo BEFORE importing the module under test so the dynamic mongo
 // lookup inside live-config is captured.
@@ -13,11 +14,16 @@ vi.mock('@trader/shared-mongo', () => ({
 
 const liveConfig = await import('../infrastructure/live-config.ts');
 const { OrderType } = await import('../domain/entities/Order.ts');
+const testLogger = createLogger({ service: "trading-service-test", level: "error" });
+
+function setEnvDefault(raw: string | undefined): void {
+  liveConfig.configureLiveConfig({ logger: testLogger, envDefault: liveConfig.parseSignalOrderType(raw) });
+}
 
 describe('trading-service live-config', () => {
   beforeEach(() => {
     liveConfig.invalidateSignalOrderType();
-    delete process.env.SIGNAL_ORDER_TYPE;
+    setEnvDefault(undefined);   // baseline = Limit
   });
   afterEach(() => {
     findOneImpl = async () => null;
@@ -31,7 +37,7 @@ describe('trading-service live-config', () => {
 
   it('honours env override when no doc is present', async () => {
     findOneImpl = async () => null;
-    process.env.SIGNAL_ORDER_TYPE = 'Market';
+    setEnvDefault('Market');
     liveConfig.invalidateSignalOrderType();
     const mode = await liveConfig.getSignalOrderType();
     expect(mode).toBe(OrderType.Market);
@@ -39,7 +45,7 @@ describe('trading-service live-config', () => {
 
   it('is case-insensitive on the env (defends against legacy lowercase Helm/Terraform values)', async () => {
     findOneImpl = async () => null;
-    process.env.SIGNAL_ORDER_TYPE = 'market';   // legacy lowercase
+    setEnvDefault('market');   // legacy lowercase
     liveConfig.invalidateSignalOrderType();
     const mode = await liveConfig.getSignalOrderType();
     expect(mode).toBe(OrderType.Market);
@@ -47,7 +53,7 @@ describe('trading-service live-config', () => {
 
   it('accepts the integer form of the env (in case ops parameterises by value)', async () => {
     findOneImpl = async () => null;
-    process.env.SIGNAL_ORDER_TYPE = String(OrderType.Market);
+    setEnvDefault(String(OrderType.Market));
     liveConfig.invalidateSignalOrderType();
     const mode = await liveConfig.getSignalOrderType();
     expect(mode).toBe(OrderType.Market);
@@ -55,7 +61,7 @@ describe('trading-service live-config', () => {
 
   it('prefers the Mongo override over env', async () => {
     findOneImpl = async () => ({ _id: 'singleton', signalOrderType: OrderType.Market });
-    process.env.SIGNAL_ORDER_TYPE = 'Limit';
+    setEnvDefault('Limit');
     liveConfig.invalidateSignalOrderType();
     const mode = await liveConfig.getSignalOrderType();
     expect(mode).toBe(OrderType.Market);
@@ -96,7 +102,7 @@ describe('trading-service live-config', () => {
 
   it('returns env default when mongo read throws', async () => {
     findOneImpl = async () => { throw new Error('mongo down'); };
-    process.env.SIGNAL_ORDER_TYPE = 'Market';
+    setEnvDefault('Market');
     liveConfig.invalidateSignalOrderType();
     const mode = await liveConfig.getSignalOrderType();
     expect(mode).toBe(OrderType.Market);

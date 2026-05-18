@@ -9,6 +9,7 @@ import { requireInternal, requireCaller } from '@trader/shared-auth/middleware';
 import { getMongoDb, COLLECTIONS } from '@trader/shared-mongo';
 import { getRedisClient, xAdd } from '@trader/shared-redis';
 import { getLiveConfig, invalidateLiveConfig, _envDefaultsForTest } from './live-config.ts';
+import { getRuntimeEnv } from './runtime-env.ts';
 import type { UniverseManager } from './universe-manager.ts';
 import type { MarketDataProvider } from './providers/market-data-provider.ts';
 import { aggregateBars, getBars, invalidateBars, type RangeKey } from '@trader/shared-bars';
@@ -156,8 +157,9 @@ export function createAdminRouter(
     // bar/poll columns. Override is whatever the doc says (null = no override). Env is
     // parsed both ways — accept the enum-member name ('Limit' / 'Market') for human
     // readability in Helm AND the integer value for parameterised setups.
+    const rawSignalOrderType = getRuntimeEnv().SIGNAL_ORDER_TYPE;
     const envSignalOrderType: 0 | 1 =
-      process.env.SIGNAL_ORDER_TYPE === 'Market' || process.env.SIGNAL_ORDER_TYPE === String(ORDER_TYPE_MARKET)
+      rawSignalOrderType === 'Market' || rawSignalOrderType === String(ORDER_TYPE_MARKET)
         ? ORDER_TYPE_MARKET
         : ORDER_TYPE_LIMIT;
     return c.json({

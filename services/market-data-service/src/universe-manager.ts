@@ -17,14 +17,25 @@ export type FxToGBP = (amount: number, currency: Currency) => Promise<number>;
 // path are off by an FX factor.
 const IDENTITY_FX: FxToGBP = async (amount) => amount;
 
-const MAX_UNIVERSE_SIZE   = parseInt(process.env.UNIVERSE_MAX_SIZE   ?? '150');
-const INCLUDE_US          = (process.env.UNIVERSE_INCLUDE_US  ?? '').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
-const INCLUDE_LSE         = (process.env.UNIVERSE_INCLUDE_LSE ?? '').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
-const MIN_PRICE_GBP       = parseFloat(process.env.UNIVERSE_MIN_PRICE ?? '1.0');
-// Section 29b: ADV ≥ £2M (20-day trailing). Applied only when T212 provides real volume data.
-// Current T212 integration sets volume=0 — filter is a no-op until a real feed is wired.
-// Spread (≤ 30bps) cannot be filtered here: T212 API does not expose bid-ask spread.
-const MIN_ADV_GBP         = parseFloat(process.env.UNIVERSE_MIN_ADV ?? String(2_000_000));
+export interface UniverseConfig {
+  maxSize:    number;
+  includeUs:  string[];
+  includeLse: string[];
+  minPriceGbp: number;
+  // Section 29b: ADV ≥ £2M (20-day trailing). Applied only when T212 provides real volume data.
+  // Current T212 integration sets volume=0 — filter is a no-op until a real feed is wired.
+  // Spread (≤ 30bps) cannot be filtered here: T212 API does not expose bid-ask spread.
+  minAdvGbp: number;
+}
+
+const DEFAULT_CONFIG: UniverseConfig = {
+  maxSize:    150,
+  includeUs:  [],
+  includeLse: [],
+  minPriceGbp: 1.0,
+  minAdvGbp: 2_000_000,
+};
+
 const ADV_LOOKBACK_DAYS   = 20;
 const MAX_SECTOR_FRACTION = 0.35;  // Section 29c: no more than 35% from one GICS sector
 
@@ -89,14 +100,18 @@ export function applyUniverseOverrides(
  * (same shortName), keeping the higher-ranked candidate. This guards against future
  * dual-listing additions (e.g. SHEL appearing in both lists).
  *
- * Returns at most MAX_UNIVERSE_SIZE entries, ranked by 5-day average dollar volume
+ * Returns at most this.config.maxSize entries, ranked by 5-day average dollar volume
  * descending, with the sector cap applied (currently a no-op since T212 returns
  * sector='Unknown' for every instrument).
  */
 async function selectCurated(
   rawInstruments: Awaited<ReturnType<typeof fetchT212Instruments>>,
   fxToGBP: FxToGBP,
+  config: UniverseConfig,
 ): Promise<InstrumentMeta[]> {
+  const includeUs  = config.includeUs;
+  const includeLse = config.includeLse;
+  const maxSize    = config.maxSize;
   // Build a shortName-indexed lookup, choosing the best T212 ticker per (symbol, market).
   // T212 lists multiple cross-listings per symbol (e.g. VFEM has VFEMl_EQ, VFEMs_EQ, VFEMa_EQ);
   // we score per-market and keep the top scorer.
@@ -122,7 +137,7 @@ async function selectCurated(
   let unresolvedUS = 0;
   let unresolvedLSE = 0;
 
-  for (const sym of INCLUDE_US) {
+  for (const sym of includeUs) {
     const m = byMarket.US[sym];
     if (!m) { unresolvedUS++; continue; }
     if (seenShortNames.has(sym)) continue;
@@ -135,7 +150,7 @@ async function selectCurated(
       market:       'US',
     });
   }
-  for (const sym of INCLUDE_LSE) {
+  for (const sym of includeLse) {
     const m = byMarket.LSE[sym];
     if (!m) { unresolvedLSE++; continue; }
     if (seenShortNames.has(sym)) {
@@ -155,7 +170,7 @@ async function selectCurated(
   if (unresolvedUS || unresolvedLSE) {
     log.warn(`[universe] include-list unresolved: US=${unresolvedUS} LSE=${unresolvedLSE} (T212 has no matching instrument)`);
   }
-  log.info(`[universe] curated candidates: ${candidates.length} (US: ${INCLUDE_US.length - unresolvedUS}, LSE: ${INCLUDE_LSE.length - unresolvedLSE})`);
+  log.info(`[universe] curated candidates: ${candidates.length} (US: ${includeUs.length - unresolvedUS}, LSE: ${includeLse.length - unresolvedLSE})`);
 
   // Yahoo liquidity rank. ADV values are normalised to GBP (the base currency) so a
   // USD-denominated $1M ADV and a GBP-denominated £1M ADV are no longer treated as
@@ -166,12 +181,12 @@ async function selectCurated(
 
   // Sector cap (currently inert until sector enrichment lands, but kept symmetric with
   // the legacy path so an upgrade to real GICS sectors works without touching this code).
-  const sectorCap = Math.floor(MAX_UNIVERSE_SIZE * MAX_SECTOR_FRACTION);
+  const sectorCap = Math.floor(maxSize * MAX_SECTOR_FRACTION);
   const sectorCount: Record<string, number> = {};
   const selected: InstrumentMeta[] = [];
 
   for (const inst of candidates) {
-    if (selected.length >= MAX_UNIVERSE_SIZE) break;
+    if (selected.length >= maxSize) break;
     const sector = inst.sector;
     if (sector !== 'Unknown' && (sectorCount[sector] ?? 0) >= sectorCap) continue;
     selected.push(inst);
@@ -183,12 +198,15 @@ async function selectCurated(
 export class UniverseManager {
   private _activeUniverse: string[] = [];
   private _sectorMap: Record<string, string> = {};
+  private readonly config: UniverseConfig;
 
   // Optional FX converter for liquidity ranking. Default (identity) keeps tests and
   // any caller that doesn't supply FX working — at the cost of incorrect cross-currency
   // ranking. Production wiring (services/market-data-service/src/index.ts) always
   // injects the live Yahoo-backed FxClient.
-  constructor(private readonly fxToGBP: FxToGBP = IDENTITY_FX) {}
+  constructor(private readonly fxToGBP: FxToGBP = IDENTITY_FX, config: Partial<UniverseConfig> = {}) {
+    this.config = { ...DEFAULT_CONFIG, ...config };
+  }
 
   /** Call once at startup, then monthly. */
   async refresh(): Promise<string[]> {
@@ -219,15 +237,15 @@ export class UniverseManager {
 
     let selected: InstrumentMeta[];
 
-    if (INCLUDE_US.length > 0 || INCLUDE_LSE.length > 0) {
+    if (this.config.includeUs.length > 0 || this.config.includeLse.length > 0) {
       // ── 2/3/4 (curated): resolve include lists → ADV rank → top N ────────────
       // Each include-list symbol is matched against T212's `shortName` (the bare symbol,
       // e.g. "AAPL", "SHEL") and the best T212 ticker is picked per the market preference:
       // US list prefers `_US_EQ`, LSE list prefers GBP/GBX `l_EQ`. Unresolved symbols are
       // dropped — the log line reports how many. Liquidity comes from a one-shot Yahoo call
       // per candidate; ranking ensures stable selection across refreshes when the candidate
-      // pool exceeds MAX_UNIVERSE_SIZE.
-      selected = await selectCurated(rawInstruments, this.fxToGBP);
+      // pool exceeds this.config.maxSize.
+      selected = await selectCurated(rawInstruments, this.fxToGBP, this.config);
     } else {
       // ── 2. Fetch OHLCV stats for Section 29b eligibility filters ─────────────
       const allTickers = instruments.map((i) => i.ticker);
@@ -260,12 +278,12 @@ export class UniverseManager {
         if (!stats) return true;  // No OHLCV history yet (bootstrapping) — allow through
 
         // Price filter (Section 29b: ≥ £1)
-        if (stats.latestClose > 0 && stats.latestClose < MIN_PRICE_GBP) return false;
+        if (stats.latestClose > 0 && stats.latestClose < this.config.minPriceGbp) return false;
 
         // ADV filter (Section 29b: ≥ £2M). No-op when volume=0 (T212 limitation).
         if (stats.avgVolume > 0) {
           const adv = stats.avgVolume * stats.latestClose;
-          if (adv < MIN_ADV_GBP) return false;
+          if (adv < this.config.minAdvGbp) return false;
         }
 
         return true;
@@ -274,12 +292,12 @@ export class UniverseManager {
       // ── 4. Sector-balance cap (Section 29c) ──────────────────────────────────
       // 'Unknown' is exempt: T212 instruments API provides no sector data, so all instruments
       // fall into 'Unknown' until enriched. Capping Unknown would silently truncate the universe.
-      const sectorCap = Math.floor(MAX_UNIVERSE_SIZE * MAX_SECTOR_FRACTION);
+      const sectorCap = Math.floor(this.config.maxSize * MAX_SECTOR_FRACTION);
       const sectorCount: Record<string, number> = {};
       selected = [];
 
       for (const inst of eligible) {
-        if (selected.length >= MAX_UNIVERSE_SIZE) break;
+        if (selected.length >= this.config.maxSize) break;
         const sector = inst.sector;
         if (sector !== 'Unknown' && (sectorCount[sector] ?? 0) >= sectorCap) continue;
         selected.push(inst);
