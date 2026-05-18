@@ -65,8 +65,18 @@ class MemCollection {
   async findOneAndUpdate(filter: any, update: any, opts: any) {
     const list = Array.from(this.rows.values()).filter((r) => this.matches(r, filter));
     if (opts?.sort) {
-      const [k, dir] = Object.entries(opts.sort)[0] as [string, number];
-      list.sort((a, b) => (a[k] > b[k] ? 1 : a[k] < b[k] ? -1 : 0) * dir);
+      // Multi-key sort to mirror Mongo: walk keys in declaration order, first
+      // differing key decides. Real Mongo does the same; the previous single-key
+      // version silently ignored secondary sort fields (caught the action+timestamp
+      // sort introduced for SELL-before-BUY claim ordering).
+      const keys = Object.entries(opts.sort) as Array<[string, number]>;
+      list.sort((a, b) => {
+        for (const [k, dir] of keys) {
+          if (a[k] > b[k]) return  1 * dir;
+          if (a[k] < b[k]) return -1 * dir;
+        }
+        return 0;
+      });
     }
     const target = list[0];
     if (!target) return null;
@@ -131,6 +141,20 @@ describe('MongoSignalRepository queue methods', () => {
     expect(got?.id).toBe('b');
     expect(manager.rows.get('b').lifecycle).toBe(SignalLifecycle.Executing);
     expect(manager.rows.get('b').attempts).toBe(1);
+  });
+
+  it('claimNextQueued prefers SELL over BUY (frees cash before committing)', async () => {
+    const { repo, manager } = wire();
+    // Insert: older BUY, newer SELL. SELL should win despite later timestamp.
+    await manager.insert(makeSignal('buy-old',  100, SignalLifecycle.Queued));
+    await manager.insert(new TradeSignal({
+      id: 'sell-new', timestamp: 200, ticker: 'MSFT_US_EQ', strategy_id: 'test',
+      action: 'SELL', confidence: 0.5, targetWeight: 0, rationale: '{}',
+      lifecycle: SignalLifecycle.Queued,
+    }));
+    const got = await repo.claimNextQueued();
+    expect(got?.id).toBe('sell-new');
+    expect(got?.action).toBe('SELL');
   });
 
   it('markFailed records reason + detail', async () => {
