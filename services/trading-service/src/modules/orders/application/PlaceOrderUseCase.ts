@@ -61,6 +61,15 @@ export class PlaceOrderUseCase {
     }
 
     async execute(input: PlaceOrderInput): Promise<Order | null> {
+        this.logger.info({
+            signalId: input.signalId, ticker: input.ticker, action: input.action,
+            targetWeight: input.targetWeight, confidence: input.confidence,
+            currentQuantity: input.currentQuantity,
+            navAmt: input.totalNAV?.amount, navCcy: input.totalNAV?.currency,
+            priceAmt: input.currentPrice?.amount, priceCcy: input.currentPrice?.currency,
+            mode: TradingMode[this.tradingMode],
+        }, 'PlaceOrderUseCase: start');
+
         // Mode semantics:
         //   Paper → no broker call; notifications only.
         //   Demo  → real orders to demo.trading212 with demo API keys; no live-gate required.
@@ -94,6 +103,10 @@ export class PlaceOrderUseCase {
         const orderType = this.router.selectOrderType(OrderReason.Signal, signalOrderType);
 
         const quantity = this._computeQuantity(input);
+        this.logger.info({
+            signalId: input.signalId, ticker: input.ticker,
+            quantity, orderType: OrderType[orderType], side: OrderSide[side],
+        }, 'PlaceOrderUseCase: sized');
         if (quantity <= 0) {
             this.logger.info({ ticker: input.ticker }, 'computed quantity=0 — skipping');
             return null;
@@ -114,7 +127,9 @@ export class PlaceOrderUseCase {
         };
 
         await this.orderRepo.save(order);
+        this.logger.info({ orderId: order.id, ticker: order.ticker }, 'PlaceOrderUseCase: order saved (Pending) — calling broker');
 
+        const brokerStart = Date.now();
         try {
             const result = await this.executor.execute({
                 ticker:     order.ticker,
@@ -128,10 +143,17 @@ export class PlaceOrderUseCase {
             order.t212OrderId  = result.t212OrderId;
             order.executedAt   = Date.now();
             if (result.message) order.errorMessage = result.message;
+            this.logger.info({
+                orderId: order.id, ticker: order.ticker,
+                t212OrderId: result.t212OrderId,
+                status: OrderStatus[result.status],
+                brokerMs: Date.now() - brokerStart,
+                message: result.message,
+            }, 'PlaceOrderUseCase: broker responded');
         } catch (err) {
             order.status       = OrderStatus.Failed;
             order.errorMessage = String(err);
-            this.logger.error({ err, ticker: order.ticker }, 'T212 execution error');
+            this.logger.error({ err, ticker: order.ticker, brokerMs: Date.now() - brokerStart }, 'T212 execution error');
         }
 
         await this.orderRepo.save(order);
@@ -147,11 +169,14 @@ export class PlaceOrderUseCase {
     }
 
     private async notifySignalExecuted(signalId: string, at: number): Promise<void> {
+        const t0 = Date.now();
         try {
             await this.signal.markExecuted(signalId, at);
+            const ms = Date.now() - t0;
+            if (ms > 1000) this.logger.warn({ signalId, ms }, 'notifySignalExecuted slow (>1s)');
         } catch (err) {
             // Lifecycle update is best-effort — order state in trading-service is authoritative.
-            this.logger.warn({ err, signalId }, 'signal lifecycle update failed');
+            this.logger.warn({ err, signalId, ms: Date.now() - t0 }, 'signal lifecycle update failed');
         }
     }
 
@@ -176,8 +201,16 @@ export class PlaceOrderUseCase {
         const currentValue = currentQuantity * currentPrice.amount;
         const delta        = (targetValue - currentValue) / currentPrice.amount;
 
-        if (action === 'BUY'  && delta > 0) return Math.floor(delta);
-        if (action === 'SELL' && delta < 0) return Math.floor(Math.abs(delta));
+        // Fractional shares. T212 supports them natively (demo + most US/UK tickers);
+        // the previous `Math.floor` destroyed up to 70% of the optimiser's intended
+        // risk allocation on small accounts — e.g. a £50 target on a $100 ticker is
+        // 0.5 shares, not 0. 4 dp ≈ 1/10000th of a share, well within T212's precision.
+        // Floor at 0.0001 to skip infinitesimal orders T212 would reject anyway.
+        const round4 = (x: number): number => Math.round(x * 10000) / 10000;
+        const minQty = 0.0001;
+
+        if (action === 'BUY'  && delta >=  minQty) return round4(delta);
+        if (action === 'SELL' && delta <= -minQty) return round4(Math.abs(delta));
         return 0;
     }
 }

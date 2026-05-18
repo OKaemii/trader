@@ -11,7 +11,7 @@ import { MongoPriceLookup } from '../../../shared/MongoPriceLookup.ts';
 import { T212OrderExecutor } from '../../t212/infrastructure/T212OrderExecutor.ts';
 import { PlaceOrderUseCase } from '../application/PlaceOrderUseCase.ts';
 import { getSignalOrderType } from './live-config.ts';
-import { TradingMode, OrderStatus, OrderType } from '../domain/Order.ts';
+import { TradingMode, OrderStatus, OrderType, OrderSide } from '../domain/Order.ts';
 
 // OrderDispatcher — the durable-queue worker. Replaces the synchronous "approve →
 // trading-service POST /internal/signals/trading/execute → T212" path that previously
@@ -94,47 +94,82 @@ export class OrderDispatcher {
 
     async start(): Promise<void> {
         this.deps.logger.info({
-            mode: this.deps.tradingMode,
+            mode: TradingMode[this.deps.tradingMode],
             minIntervalMs: this.minIntervalMs,
+            idleSleepMs:   this.idleSleepMs,
             maxAttempts:   this.maxAttempts,
             queueTtlMs:    this.queueTtlMs,
             drift:         this.drift,
-        }, 'order-dispatcher starting');
+        }, 'order-dispatcher: starting loop');
+        let idleTicks = 0;
+        let cycleCounter = 0;
         while (!this.stopped) {
             try {
                 const signal = await this.claim();
                 if (!signal) {
+                    idleTicks++;
+                    if (idleTicks % 12 === 0) {
+                        this.deps.logger.info({ idleTicks, idleSleepMs: this.idleSleepMs },
+                            'order-dispatcher: idle (queue empty)');
+                    }
                     await this.sleep(this.idleSleepMs);
                     continue;
                 }
+                idleTicks = 0;
+                cycleCounter++;
+                this.deps.logger.info({
+                    cycle: cycleCounter,
+                    signalId: signal.id,
+                    ticker:   signal.ticker,
+                    action:   signal.action,
+                    targetWeight: signal.targetWeight,
+                    confidence:   signal.confidence,
+                    entryPrice:   signal.entryPrice,
+                    attempts:     signal.attempts,
+                    ageMs:        this.now() - signal.timestamp,
+                }, 'order-dispatcher: claimed signal');
+                const procStart = Date.now();
                 await this.processOne(signal);
+                this.deps.logger.info({
+                    cycle: cycleCounter, signalId: signal.id, durationMs: Date.now() - procStart,
+                }, 'order-dispatcher: processed signal');
             } catch (err) {
                 this.deps.logger.error({ err }, 'dispatcher loop error');
                 await this.sleep(this.idleSleepMs);
             }
             await this.sleep(this.minIntervalMs);
         }
+        this.deps.logger.info('order-dispatcher: loop stopped');
     }
 
     // Returns nothing; all outcomes are written to signal-service via callbacks.
     private async processOne(signal: ClaimedSignal): Promise<void> {
         if (signal.action === 'HOLD') {
+            this.deps.logger.warn({ signalId: signal.id, ticker: signal.ticker },
+                'dispatcher: rejecting HOLD action (cannot be placed)');
             await this.markFailed(signal.id, SignalFailureReason.BrokerRejected, 'HOLD action cannot be placed');
             return;
         }
 
         if (signal.attempts > this.maxAttempts) {
+            this.deps.logger.warn({ signalId: signal.id, attempts: signal.attempts, cap: this.maxAttempts },
+                'dispatcher: retries exhausted');
             await this.markFailed(signal.id, SignalFailureReason.RetriesExhausted, `exceeded ${this.maxAttempts} attempts`);
             return;
         }
 
-        if (this.now() - signal.timestamp > this.queueTtlMs) {
+        const ageMs = this.now() - signal.timestamp;
+        if (ageMs > this.queueTtlMs) {
+            this.deps.logger.warn({ signalId: signal.id, ageMs, ttl: this.queueTtlMs },
+                'dispatcher: queue expired');
             await this.markFailed(signal.id, SignalFailureReason.QueueExpired,
-                `age=${this.now() - signal.timestamp}ms > ttl=${this.queueTtlMs}ms`);
+                `age=${ageMs}ms > ttl=${this.queueTtlMs}ms`);
             return;
         }
 
         if (this.deps.tradingMode === TradingMode.Paper) {
+            this.deps.logger.info({ signalId: signal.id, ticker: signal.ticker },
+                'dispatcher: TRADING_MODE=Paper — marking executed (no broker call)');
             await this.notifyExecuted(signal.id, this.now());
             return;
         }
@@ -148,9 +183,28 @@ export class OrderDispatcher {
             return;
         }
 
+        this.deps.logger.info({
+            signalId: signal.id,
+            ticker:   signal.ticker,
+            cashFree: snapshot.free?.amount,
+            cashTotal: snapshot.total?.amount,
+            cashCcy:  snapshot.total?.currency,
+            positions: snapshot.positions.length,
+        }, 'dispatcher: account snapshot ok');
+
         const db = await this.deps.getDb();
         const priceLookup = new MongoPriceLookup(db);
         const currentPrice = await priceLookup.lastCloseMoney(signal.ticker);
+
+        if (!currentPrice) {
+            this.deps.logger.warn({ signalId: signal.id, ticker: signal.ticker },
+                'dispatcher: no current price in Mongo — sizing will return 0 and signal will fail CashInsufficient');
+        } else {
+            this.deps.logger.info({
+                signalId: signal.id, ticker: signal.ticker,
+                currentPrice: currentPrice.amount, currency: currentPrice.currency,
+            }, 'dispatcher: current price loaded');
+        }
 
         // Drift gate: scalar comparison in the instrument's currency. Both currentPrice.amount
         // and signal.entryPrice are recorded at emission in the instrument currency, so the
@@ -158,6 +212,11 @@ export class OrderDispatcher {
         if (signal.entryPrice && currentPrice && signal.entryPrice > 0) {
             const movement = Math.abs(currentPrice.amount - signal.entryPrice) / signal.entryPrice;
             if (movement > this.drift) {
+                this.deps.logger.warn({
+                    signalId: signal.id, ticker: signal.ticker,
+                    entry: signal.entryPrice, current: currentPrice.amount,
+                    movement, tolerance: this.drift,
+                }, 'dispatcher: price drift exceeds tolerance — failing signal');
                 await this.markFailed(
                     signal.id,
                     SignalFailureReason.MarketDrift,
@@ -165,13 +224,47 @@ export class OrderDispatcher {
                 );
                 return;
             }
+            this.deps.logger.info({
+                signalId: signal.id, movement, tolerance: this.drift,
+            }, 'dispatcher: drift within tolerance');
         }
 
         const currentQuantity = snapshot.positions.find((p) => p.ticker === signal.ticker)?.quantity ?? 0;
 
         const redis = await this.deps.getRedis();
         const orderRepo = new MongoOrderRepository(db);
+
+        // In-flight awareness: T212 fills are async. Without this, two BUY signals for the
+        // same ticker fired back-to-back both see currentQuantity=0 and both place the full
+        // delta, doubling the position. Net the submitted-but-unfilled orders into an
+        // effective position before sizing. BUYs add, SELLs subtract.
+        const inflightT0 = Date.now();
+        const inflight = await orderRepo.findInflightByTicker(signal.ticker);
+        const inflightMs = Date.now() - inflightT0;
+        if (inflightMs > 500) {
+            this.deps.logger.warn({ signalId: signal.id, ticker: signal.ticker, inflightMs },
+                'dispatcher: findInflightByTicker slow (>500ms)');
+        }
+        const inflightDelta = inflight.reduce(
+            (acc, o) => acc + (o.side === OrderSide.Buy ? o.quantity : -o.quantity),
+            0,
+        );
+        const effectiveQuantity = currentQuantity + inflightDelta;
+        if (inflightDelta !== 0) {
+            this.deps.logger.info({
+                signalId: signal.id, ticker: signal.ticker,
+                currentQuantity, inflightDelta, effectiveQuantity,
+                inflightCount: inflight.length,
+            }, 'dispatcher: inflight orders detected — sizing against effective position');
+        }
+
+        const existingT0 = Date.now();
         const existing  = await orderRepo.findBySignalId(signal.id);
+        const existingMs = Date.now() - existingT0;
+        if (existingMs > 500) {
+            this.deps.logger.warn({ signalId: signal.id, ticker: signal.ticker, existingMs },
+                'dispatcher: findBySignalId slow (>500ms)');
+        }
         if (existing) {
             this.deps.logger.info({ signalId: signal.id, orderId: existing.id },
                 'order already exists for signal — marking executed (post-crash sweep)');
@@ -197,6 +290,12 @@ export class OrderDispatcher {
             ? await this.deps.fxFromGBP(navGBP, instrumentCcy)
             : navGBP;
         const totalNAV: Money = { amount: navInstrAmt, currency: instrumentCcy };
+        this.deps.logger.info({
+            signalId: signal.id, ticker: signal.ticker,
+            navGBP, navInstr: navInstrAmt, instrumentCcy,
+            currentQuantity, inflightDelta, effectiveQuantity,
+            targetWeight: signal.targetWeight,
+        }, 'dispatcher: sized inputs — handing off to PlaceOrderUseCase');
 
         try {
             const order = await useCase.execute({
@@ -207,21 +306,35 @@ export class OrderDispatcher {
                 confidence:      signal.confidence,
                 totalNAV,
                 ...(currentPrice ? { currentPrice } : {}),
-                currentQuantity,
+                currentQuantity: effectiveQuantity,
             });
 
             if (!order) {
-                await this.markFailed(signal.id, SignalFailureReason.CashInsufficient,
-                    'PlaceOrderUseCase returned null (zero qty or gate closed)');
+                // ZeroQuantity is the honest tag: the math returned qty < minQty (0.0001
+                // shares), or — for Live mode — the live-trading gate was closed. Cash
+                // wasn't the bottleneck; the position size just rounded to nothing.
+                // CashInsufficient is reserved for actual cash failures (e.g. when we
+                // size correctly but the broker reports insufficient buying power).
+                this.deps.logger.warn({ signalId: signal.id, ticker: signal.ticker },
+                    'dispatcher: PlaceOrderUseCase returned null — failing as ZeroQuantity');
+                await this.markFailed(signal.id, SignalFailureReason.ZeroQuantity,
+                    'PlaceOrderUseCase returned null (qty < minQty or live gate closed)');
                 return;
             }
 
             if (order.status === OrderStatus.Failed) {
+                this.deps.logger.warn({ signalId: signal.id, ticker: signal.ticker, error: order.errorMessage },
+                    'dispatcher: order placement failed at broker');
                 await this.transientFailureOrRequeue(signal, SignalFailureReason.BrokerRejected,
                     order.errorMessage ?? 'unknown broker error');
                 return;
             }
 
+            this.deps.logger.info({
+                signalId: signal.id, ticker: signal.ticker,
+                orderId: order.id, t212OrderId: order.t212OrderId,
+                status: OrderStatus[order.status], qty: order.quantity, limitPrice: order.limitPrice,
+            }, 'dispatcher: order placed');
             this.deps.accountCache.invalidate();
         } catch (err) {
             this.deps.logger.warn({ err, signalId: signal.id }, 'place-order threw');
@@ -260,18 +373,24 @@ export class OrderDispatcher {
     }
 
     private async markFailed(id: string, reason: FailureReason, detail: string): Promise<void> {
+        const t0 = Date.now();
         try {
             await this.deps.signal.failQueue(id, reason, detail);
+            const ms = Date.now() - t0;
+            if (ms > 1000) this.deps.logger.warn({ signalId: id, reason, ms }, 'mark-failed slow (>1s)');
         } catch (err) {
-            this.deps.logger.warn({ err, signalId: id, reason, detail }, 'mark-failed failed');
+            this.deps.logger.warn({ err, signalId: id, reason, detail, ms: Date.now() - t0 }, 'mark-failed failed');
         }
     }
 
     private async notifyExecuted(id: string, at: number): Promise<void> {
+        const t0 = Date.now();
         try {
             await this.deps.signal.markExecuted(id, at);
+            const ms = Date.now() - t0;
+            if (ms > 1000) this.deps.logger.warn({ signalId: id, ms }, 'notify-executed slow (>1s)');
         } catch (err) {
-            this.deps.logger.warn({ err, signalId: id }, 'notify-executed failed');
+            this.deps.logger.warn({ err, signalId: id, ms: Date.now() - t0 }, 'notify-executed failed');
         }
     }
 

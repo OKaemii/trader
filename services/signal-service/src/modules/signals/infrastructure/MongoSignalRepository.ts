@@ -93,6 +93,12 @@ export class MongoSignalRepository implements ISignalRepository {
     // Atomic FIFO claim. findOneAndUpdate with sort makes this safe under multi-pod
     // dispatcher (only one pod wins the row). attempts increments here, not on requeue,
     // so retry exhaustion is counted correctly even if a worker dies mid-call.
+    //
+    // Sort order — `action: -1` makes SELL (lexicographic 'S') claim before BUY ('B'):
+    // SELLs free cash from exits before BUYs commit new capital. Within an action, the
+    // tie-break is timestamp ascending (oldest first) — standard FIFO. Without this,
+    // a rebalance cycle with mixed BUY/SELL would interleave randomly, locking cash in
+    // new buys before the optimiser's exits had a chance to free it.
     const now = new Date();
     const res = await this.collection.findOneAndUpdate(
       { lifecycle: SignalLifecycle.Queued },
@@ -100,7 +106,7 @@ export class MongoSignalRepository implements ISignalRepository {
         $set: { lifecycle: SignalLifecycle.Executing, lastAttemptAt: now },
         $inc: { attempts: 1 },
       },
-      { sort: { timestamp: 1 }, returnDocument: 'after' },
+      { sort: { action: -1, timestamp: 1 }, returnDocument: 'after' },
     );
     const doc = (res as any)?.value ?? res;
     if (!doc) return null;

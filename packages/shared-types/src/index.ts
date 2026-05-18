@@ -144,11 +144,12 @@ export enum SignalLifecycle {
 
 // Why a signal landed in `Failed`. Surfaced in the portal next to the row.
 export enum SignalFailureReason {
-  CashInsufficient,      // computed quantity rounded to zero against current cash
+  CashInsufficient,      // free cash too low to fund computed quantity at current price
   MarketDrift,           // mid-price moved past PRICE_DRIFT_TOLERANCE since emission
   QueueExpired,          // aged past QUEUE_TTL_MS before successful send
   BrokerRejected,        // T212 returned a non-retryable 4xx
   RetriesExhausted,      // hit ORDER_MAX_ATTEMPTS on transient errors (429 / network)
+  ZeroQuantity,          // computed quantity below the sub-share minimum (e.g. target value < 1 share even fractional). Distinct from CashInsufficient: the cash IS there, the position is just too small to express in shares.
   ManualCancel,          // admin clicked Cancel in the portal
 }
 
@@ -201,10 +202,26 @@ export interface SignalRationale {
 
 // Redis stream keys (use xAdd/xReadGroup — NOT publish/subscribe)
 export const REDIS_STREAMS = {
-  MARKET_RAW:       'market:raw',        // market-data-service → strategy-engine
-  STRATEGY_OUTPUT:  'signals:strategy',  // strategy-engine → signal-service
-  TRADE_SIGNALS:    'signals:trade',     // signal-service → notification-service
+  // Legacy single-cadence stream. Kept while WP2 (per-(mode, strategy) strategy-engine
+  // workers) lands. Producer dual-writes during the cutover so existing consumers stay
+  // alive. Remove once every consumer has migrated to the mode-tagged streams below.
+  MARKET_RAW:        'market:raw',           // market-data-service → strategy-engine
+  // Mode-tagged streams. 5m fires every poll cycle; daily fires once per (market, UTC
+  // date) at session close. Strategy-engine workers attach to the stream that matches
+  // their declared BAR_FREQUENCY.
+  MARKET_RAW_5M:     'market:raw:5m',
+  MARKET_RAW_DAILY:  'market:raw:daily',
+  STRATEGY_OUTPUT:   'signals:strategy',     // strategy-engine → signal-service (shared, legacy)
+  TRADE_SIGNALS:     'signals:trade',        // signal-service → notification-service
 } as const;
+
+// Per-worker strategy output stream — `signals:strategy:{mode}:{strategyId}`. Each
+// strategy-engine worker writes here; signal-service multiplexes consumer groups across
+// the active set. Producers should resolve the topic via `strategyOutputStream(mode, id)`
+// so the formatting stays one-sourced.
+export function strategyOutputStream(mode: 'intraday' | 'daily' | '5m', strategyId: string): string {
+  return `signals:strategy:${mode}:${strategyId}`;
+}
 
 // Redis pub/sub channels — ephemeral dashboard events only (not the trading pipeline)
 export const REDIS_PUBSUB = {

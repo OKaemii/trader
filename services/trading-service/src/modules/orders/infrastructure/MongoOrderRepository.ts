@@ -37,6 +37,14 @@ export class MongoOrderRepository implements IOrderRepository {
     return docs.map((d) => this._fromDoc(d));
   }
 
+  async findInflightByTicker(ticker: string): Promise<Order[]> {
+    const docs = await this.col.find({
+      ticker,
+      status: OrderStatus.Submitted,
+    }).toArray();
+    return docs.map((d) => this._fromDoc(d));
+  }
+
   private _fromDoc(doc: any): Order {
     const { _id, ...rest } = doc;
     return { id: _id, ...rest } as Order;
