@@ -39,7 +39,7 @@ global:
     priceDriftTolerance:  "0.01"          # 1% absolute price drift → market_drift (terminal)
     activeStrategy: factor_rank_v1      # factor_rank_v1 | sector_momentum_v1 | topology_v1
     volTarget: "0.10"                   # portfolio vol target (signal-service)
-    minActionableConfidence: "0.30"     # min confidence to emit a TradeSignal (signal-service)
+    minActionableConfidence: "0.50"     # min confidence to emit a BUY TradeSignal. Raised from 0.30 to cut low-conviction noise and concentrate on stronger picks. SELLs that reduce/exit a held position bypass this floor — exits are portfolio-driven, not conviction-driven.
     # Raised from 0.20: demo T212 universe contains ETPs/small-caps with no Yahoo Finance equivalent.
     # Lower back to 0.20 once a real-data universe (standard tickers only) is in use.
     gapThreshold: "0.60"
