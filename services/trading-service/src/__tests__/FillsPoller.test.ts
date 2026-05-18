@@ -15,10 +15,10 @@
 process.env.JWT_SECRET = 'test-jwt-secret-min-16-chars';
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { FillsPoller } from '../application/services/FillsPoller.ts';
-import { type Order, OrderSide, OrderType, OrderStatus } from '../domain/entities/Order.ts';
-import type { IOrderRepository } from '../domain/interfaces/IOrderRepository.ts';
-import type { Trading212Client, T212HistoryItem } from '../infrastructure/t212.ts';
+import { FillsPoller } from '../modules/fills/application/FillsPoller.ts';
+import { type Order, OrderSide, OrderType, OrderStatus } from '../modules/orders/domain/Order.ts';
+import type { IOrderRepository } from '../modules/orders/domain/IOrderRepository.ts';
+import type { Trading212Client, T212HistoryItem } from '../modules/t212/infrastructure/Trading212Client.ts';
 import type { Logger } from '@trader/core';
 import type { SignalServiceClient, OpenBuysResponse } from '@trader/contracts';
 

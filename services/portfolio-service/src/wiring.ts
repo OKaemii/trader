@@ -8,8 +8,8 @@ import { getRedisClient } from "@trader/shared-redis";
 import { FxClient, YahooFxProvider } from "@trader/shared-fx";
 
 import type { PortfolioEnv } from "./env.ts";
-import { PositionSyncService } from "./application/PositionSyncService.ts";
-import { PortfolioReadService } from "./application/PortfolioReadService.ts";
+import { PositionSyncService } from "./modules/positions/application/PositionSyncService.ts";
+import { PortfolioReadService } from "./modules/positions/application/PortfolioReadService.ts";
 
 export interface PortfolioDeps {
     readonly logger: Logger;

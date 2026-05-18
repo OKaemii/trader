@@ -5,7 +5,7 @@
 // drop the dispatcher to its knees if a recent snapshot exists.
 
 import { describe, it, expect } from "vitest";
-import { AccountCache } from '../infrastructure/account-cache.ts';
+import { AccountCache } from '../modules/orders/infrastructure/AccountCache.ts';
 
 class FakeClient {
   cashCalls = 0;

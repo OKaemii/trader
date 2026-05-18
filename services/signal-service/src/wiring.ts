@@ -6,18 +6,18 @@ import { getRedisClient } from "@trader/shared-redis";
 import { FxClient, YahooFxProvider } from "@trader/shared-fx";
 
 import type { SignalEnv } from "./env.ts";
-import { createSignalDataLayer } from "./infrastructure/data.ts";
-import { MongoSignalRepository } from "./infrastructure/repositories/MongoSignalRepository.ts";
-import { RedisSignalPublisher } from "./infrastructure/messaging/RedisSignalPublisher.ts";
-import { RedisStrategySubscriber } from "./infrastructure/messaging/RedisStrategySubscriber.ts";
-import { MongoPortfolioState } from "./infrastructure/MongoPortfolioState.ts";
-import { MongoPriceLookup } from "./infrastructure/MongoPriceLookup.ts";
-import { GenerateSignalsUseCase } from "./application/use-cases/GenerateSignals.ts";
-import { ApproveSignalUseCase } from "./application/use-cases/ApproveSignal.ts";
-import { GetSignalProgressUseCase } from "./application/use-cases/GetSignalProgress.ts";
-import { RiskEngine } from "./application/services/RiskEngine.ts";
-import { StrategyDecayMonitor } from "./application/services/StrategyDecayMonitor.ts";
-import { AutoApprovalGate } from "./application/services/AutoApprovalGate.ts";
+import { createSignalDataLayer } from "./shared/data.ts";
+import { MongoPriceLookup } from "./shared/MongoPriceLookup.ts";
+import { MongoSignalRepository } from "./modules/signals/infrastructure/MongoSignalRepository.ts";
+import { RedisSignalPublisher } from "./modules/signals/infrastructure/RedisSignalPublisher.ts";
+import { RedisStrategySubscriber } from "./modules/signals/infrastructure/RedisStrategySubscriber.ts";
+import { GenerateSignalsUseCase } from "./modules/signals/application/GenerateSignals.ts";
+import { GetSignalProgressUseCase } from "./modules/signals/application/GetSignalProgress.ts";
+import { MongoPortfolioState } from "./modules/risk/infrastructure/MongoPortfolioState.ts";
+import { RiskEngine } from "./modules/risk/application/RiskEngine.ts";
+import { ApproveSignalUseCase } from "./modules/approval/application/ApproveSignal.ts";
+import { AutoApprovalGate } from "./modules/approval/application/AutoApprovalGate.ts";
+import { StrategyDecayMonitor } from "./modules/approval/application/StrategyDecayMonitor.ts";
 
 export async function wireDependencies(env: SignalEnv, logger: Logger) {
     const redis = await getRedisClient();

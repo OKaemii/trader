@@ -2,7 +2,7 @@ import { createServer, createLogger, listen, registerGracefulShutdown } from "@t
 
 import { loadPortfolioEnv } from "./env.ts";
 import { wireDependencies, type PortfolioDeps } from "./wiring.ts";
-import { createPublicRouter } from "./routes/public.ts";
+import { createPublicRouter } from "./modules/positions/routes/public.ts";
 
 const SYNC_INTERVAL_MS = 5 * 60 * 1000;
 

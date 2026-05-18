@@ -17,10 +17,10 @@ process.env.JWT_SECRET = 'test-jwt-secret-min-16-chars';
 
 import { describe, it, expect, beforeAll } from "vitest";
 import { buildApp, type AppDeps } from '../index.ts';
-import { AccountCache } from '../infrastructure/account-cache.ts';
+import { AccountCache } from '../modules/orders/infrastructure/AccountCache.ts';
 import { signAccessToken } from '@trader/shared-auth/jwt';
 import { mintInternalJwt } from '@trader/shared-auth/internal-jwt';
-import { TradingMode } from '../domain/entities/Order.ts';
+import { TradingMode } from '../modules/orders/domain/Order.ts';
 
 // Minimal in-memory Redis stub — only the three methods the routes actually call.
 function makeRedis() {

@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { LoginUseCase } from '../application/use-cases/LoginUseCase.ts';
-import { User } from '../domain/entities/User.ts';
-import type { IUserRepository } from '../domain/interfaces/IUserRepository.ts';
-import type { IRefreshTokenStore } from '../domain/interfaces/IRefreshTokenStore.ts';
+import { LoginUseCase } from '../modules/auth/application/LoginUseCase.ts';
+import { User } from '../modules/auth/domain/User.ts';
+import type { IUserRepository } from '../modules/auth/domain/IUserRepository.ts';
+import type { IRefreshTokenStore } from '../modules/auth/domain/IRefreshTokenStore.ts';
 import { verifyAccessToken } from '@trader/shared-auth/jwt';
 import bcrypt from 'bcryptjs';
 

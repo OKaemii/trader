@@ -5,10 +5,10 @@ import { createNodeWebSocket } from "@hono/node-ws";
 import { createLogger, registerGracefulShutdown } from "@trader/core";
 
 import { loadGatewayEnv } from "./env.ts";
-import { createPublicRouter } from "./routes/public.ts";
-import { createAuthedRouter } from "./routes/authed.ts";
-import { createAdminRouter } from "./routes/admin.ts";
-import { registerWebSockets } from "./routes/websocket.ts";
+import { createPublicRouter } from "./modules/gateway/routes/public.ts";
+import { createAuthedRouter } from "./modules/gateway/routes/authed.ts";
+import { createAdminRouter } from "./modules/gateway/routes/admin.ts";
+import { registerWebSockets } from "./modules/gateway/routes/websocket.ts";
 
 async function main(): Promise<void> {
     const env    = loadGatewayEnv();

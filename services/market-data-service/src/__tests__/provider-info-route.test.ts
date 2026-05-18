@@ -63,8 +63,8 @@ vi.mock('@trader/shared-redis', () => ({
 
 const { Hono } = await import('hono');
 const { mintInternalJwt } = await import('@trader/shared-auth');
-const { createAdminRouter } = await import('../admin-routes.ts');
-const { YahooProvider } = await import('../providers/yahoo-provider.ts');
+const { createAdminRouter } = await import('../modules/admin/routes.ts');
+const { YahooProvider } = await import('../modules/bars/infrastructure/providers/yahoo-provider.ts');
 
 function buildApp() {
   const app = new Hono();

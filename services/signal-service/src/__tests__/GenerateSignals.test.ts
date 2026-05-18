@@ -1,11 +1,11 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { GenerateSignalsUseCase, type GenerateSignalsConfig } from '../application/use-cases/GenerateSignals.ts';
-import { TradeSignal } from '../domain/entities/TradeSignal.ts';
-import type { ISignalRepository } from '../domain/interfaces/ISignalRepository.ts';
-import type { ISignalPublisher } from '../domain/interfaces/ISignalPublisher.ts';
-import type { IPortfolioState } from '../domain/interfaces/IPortfolioState.ts';
-import type { IPriceLookup } from '../domain/interfaces/IPriceLookup.ts';
-import type { RiskEngine } from '../application/services/RiskEngine.ts';
+import { GenerateSignalsUseCase, type GenerateSignalsConfig } from '../modules/signals/application/GenerateSignals.ts';
+import { TradeSignal } from '../modules/signals/domain/TradeSignal.ts';
+import type { ISignalRepository } from '../modules/signals/domain/ISignalRepository.ts';
+import type { ISignalPublisher } from '../modules/signals/domain/ISignalPublisher.ts';
+import type { IPortfolioState } from '../modules/risk/application/IPortfolioState.ts';
+import type { IPriceLookup } from '../modules/signals/domain/IPriceLookup.ts';
+import type { RiskEngine } from '../modules/risk/application/RiskEngine.ts';
 import { SignalLifecycle, type StrategyOutput } from '@trader/shared-types';
 import type { Logger } from '@trader/core';
 

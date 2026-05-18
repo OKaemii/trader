@@ -3,8 +3,8 @@ import { startTracer, traceMixin } from "@trader/telemetry";
 
 import { loadSignalEnv } from "./env.ts";
 import { wireDependencies, type SignalDeps } from "./wiring.ts";
-import { createRouter } from "./infrastructure/http/router.ts";
-import { createInternalRouter } from "./infrastructure/http/internal-router.ts";
+import { createRouter } from "./modules/signals/routes/public.ts";
+import { createInternalRouter } from "./modules/signals/routes/internal.ts";
 
 async function main(): Promise<void> {
     const env    = loadSignalEnv();

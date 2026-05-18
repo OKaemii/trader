@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { BarValidator } from '../bar-validator.ts';
-import { GapDetector } from '../gap-detector.ts';
-import { StaleDetector } from '../stale-detector.ts';
+import { BarValidator } from '../modules/bars/infrastructure/bar-validator.ts';
+import { GapDetector } from '../modules/bars/infrastructure/gap-detector.ts';
+import { StaleDetector } from '../modules/bars/infrastructure/stale-detector.ts';
 import type { OHLCVBar } from '@trader/shared-types';
 
 function makeBar(overrides: Partial<OHLCVBar> = {}): OHLCVBar {

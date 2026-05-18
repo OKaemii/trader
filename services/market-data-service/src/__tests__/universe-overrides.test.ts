@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { applyUniverseOverrides, type InstrumentMeta } from '../universe-manager.ts';
+import { applyUniverseOverrides, type InstrumentMeta } from '../modules/universe/application/UniverseManager.ts';
 
 function inst(ticker: string, sector = 'Tech'): InstrumentMeta {
   return { ticker, name: ticker, sector, t212Tradable: true };

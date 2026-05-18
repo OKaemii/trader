@@ -2,7 +2,7 @@ import { createServer, createLogger, listen, registerGracefulShutdown } from "@t
 
 import { loadAuthEnv } from "./env.ts";
 import { wireDependencies, type AuthDeps } from "./wiring.ts";
-import { createPublicRouter, createInternalRouter } from "./infrastructure/http/router.ts";
+import { createPublicRouter, createInternalRouter } from "./modules/auth/routes/public.ts";
 
 async function main(): Promise<void> {
     const env    = loadAuthEnv();
