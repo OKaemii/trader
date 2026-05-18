@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
 import { Auth as AuthContracts } from '@trader/contracts';
-import { requireInternal, requireCaller } from '@trader/shared-auth/middleware';
+import { requireAuth, requireRole } from '@trader/shared-auth/middleware';
 import { verifyRefreshToken, signAccessToken } from '@trader/shared-auth/jwt';
 import type { LoginUseCase } from '../application/LoginUseCase.ts';
 import type { RegisterUseCase } from '../application/RegisterUseCase.ts';
@@ -66,7 +66,11 @@ export function createPublicRouter(login: LoginUseCase, register: RegisterUseCas
 
 export function createInternalRouter(): Hono {
     const internal = new Hono();
-    internal.use('*', requireInternal, requireCaller('api-gateway'));
+    // The gateway proxies the end-user's JWT (aud='admin' for admins). Authentication
+    // happens once at the gateway with requireAuth+requireRole('admin'); we re-validate
+    // here to prevent a direct in-cluster bypass. Peer services that need admin-equivalent
+    // access call /internal/* endpoints (none today on auth-service) with internal JWT.
+    internal.use('*', requireAuth, requireRole('admin'));
 
     internal.get('/api/admin/users', async (c) => {
         const db = await getMongoDb();

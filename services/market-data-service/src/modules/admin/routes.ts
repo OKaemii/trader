@@ -5,7 +5,7 @@ import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
 import type { Logger } from '@trader/core';
 import { MarketData as MarketDataContracts } from '@trader/contracts';
-import { requireInternal, requireCaller } from '@trader/shared-auth/middleware';
+import { requireInternal, requireCaller, requireAuth, requireRole } from '@trader/shared-auth/middleware';
 import { getMongoDb, COLLECTIONS } from '@trader/shared-mongo';
 import { getRedisClient, xAdd } from '@trader/shared-redis';
 import { getLiveConfig, invalidateLiveConfig, _envDefaultsForTest } from '../../shared/live-config.ts';
@@ -76,7 +76,10 @@ export function createAdminRouter(
   // routes, which then 403 because they expect caller='strategy-engine' not 'api-gateway'.
   // Same regression that bit trading-service routing; see services/trading-service
   // routing.test.ts for the fixture that pins it.
-  r.use('/api/admin/*', requireInternal, requireCaller('api-gateway'));
+  // The gateway proxies the end-user's JWT (aud='admin' for admins). Admin routes are
+  // user-initiated requests, not peer-to-peer service calls. createInternalBarsRouter
+  // below keeps requireInternal+requireCaller('strategy-engine') for the peer bars route.
+  r.use('/api/admin/*', requireAuth, requireRole('admin'));
 
   // ── Universe overrides ────────────────────────────────────────────────────
   r.get('/api/admin/universe/overrides', async (c) => {

@@ -62,7 +62,7 @@ vi.mock('@trader/shared-redis', () => ({
 }));
 
 const { Hono } = await import('hono');
-const { mintInternalJwt } = await import('@trader/shared-auth');
+const { signAccessToken } = await import('@trader/shared-auth');
 const { createAdminRouter } = await import('../modules/admin/routes.ts');
 const { YahooProvider } = await import('../modules/bars/infrastructure/providers/yahoo-provider.ts');
 
@@ -76,10 +76,13 @@ function buildApp() {
   return app;
 }
 
-const gatewayToken = async () => `Bearer ${await mintInternalJwt('api-gateway')}`;
+// Admin routes are user-initiated via the gateway; they accept the end-user's JWT
+// (aud='admin' for admins). The gateway forwards this token unchanged — see
+// services/api-gateway/src/modules/gateway/infrastructure/proxy.ts.
+const gatewayToken = async () => `Bearer ${await signAccessToken({ sub: 'admin-user', role: 'admin' })}`;
 
 describe('GET /api/admin/market-data/provider-info', () => {
-  it('requires the api-gateway internal token (401 without)', async () => {
+  it('requires an admin user JWT (401 without)', async () => {
     const app = buildApp();
     const res = await app.request('/api/admin/market-data/provider-info');
     expect(res.status).toBe(401);
