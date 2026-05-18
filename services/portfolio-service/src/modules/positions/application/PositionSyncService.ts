@@ -18,16 +18,28 @@ export interface PositionSyncDeps {
 // canonically in the listing currency; GBP NAV is derived on read by sumPositionsGBP.
 export class PositionSyncService {
     private tradingUnreachableLogged = false;
+    private cycleCounter = 0;
 
     constructor(private readonly deps: PositionSyncDeps) {}
 
     async run(): Promise<void> {
+        this.cycleCounter++;
+        const cycle = this.cycleCounter;
+        const cycleStart = Date.now();
+        this.deps.logger.info({ cycle }, "position-sync: cycle start");
         try {
             const [posRes, cashRes] = await Promise.all([
                 this.deps.trading.getPositions(),
                 this.deps.trading.getCash().catch(() => null),
             ]);
             this.tradingUnreachableLogged = false;
+            this.deps.logger.info({
+                cycle,
+                positions: posRes.positions.length,
+                cashFree: cashRes?.free?.amount,
+                cashTotal: cashRes?.total?.amount,
+                cashCcy:  cashRes?.total?.currency ?? cashRes?.free?.currency,
+            }, "position-sync: fetched from trading-service");
 
             const cashGBP = (cashRes?.total.currency ?? cashRes?.free.currency) === "GBP"
                 ? (cashRes?.total.amount ?? cashRes?.free.amount ?? undefined)
@@ -55,10 +67,14 @@ export class PositionSyncService {
             try {
                 positionsGBP = await sumPositionsGBP(positionsForSum, this.deps.fx);
             } catch (err) {
-                this.deps.logger.warn({ err }, "FX unavailable — skipping sync to avoid stale weights");
+                this.deps.logger.warn({ cycle, err }, "FX unavailable — skipping sync to avoid stale weights");
                 return;
             }
             const navBasisGBP = cashGBP && cashGBP > 0 ? cashGBP : positionsGBP;
+            this.deps.logger.info({
+                cycle, positionsGBP, navBasisGBP,
+                navBasisSource: cashGBP && cashGBP > 0 ? "cashGBP" : "positionsGBP",
+            }, "position-sync: NAV computed");
 
             for (const { p, q, ccy, priceNative, valueNative } of sized) {
                 const valueGBP = navBasisGBP > 0 && valueNative > 0
@@ -85,7 +101,14 @@ export class PositionSyncService {
             const heldTickers = posRes.positions
                 .map((p) => p.ticker)
                 .filter((t): t is string => typeof t === "string");
-            await this.deps.db.collection(COLLECTIONS.POSITIONS).deleteMany({ ticker: { $nin: heldTickers } });
+            const deleteRes = await this.deps.db.collection(COLLECTIONS.POSITIONS).deleteMany({ ticker: { $nin: heldTickers } });
+            this.deps.logger.info({
+                cycle,
+                upserted: sized.length,
+                deleted:  deleteRes.deletedCount,
+                durationMs: Date.now() - cycleStart,
+                heldSample: heldTickers.slice(0, 10),
+            }, "position-sync: cycle done");
         } catch (err) {
             const cause = (err as { cause?: { code?: string } })?.cause;
             const code = cause?.code ?? (err as { code?: string })?.code;
@@ -106,8 +129,12 @@ export class PositionSyncService {
 
     /** Schedules `run()` every `intervalMs`, invokes once immediately. Returns a stop fn. */
     start(intervalMs: number): () => void {
+        this.deps.logger.info({ intervalMs }, "position-sync: starting (will run immediately, then every intervalMs)");
         const timer = setInterval(() => { void this.run(); }, intervalMs);
         void this.run();
-        return () => clearInterval(timer);
+        return () => {
+            clearInterval(timer);
+            this.deps.logger.info("position-sync: stopped");
+        };
     }
 }
