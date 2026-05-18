@@ -37,11 +37,34 @@ export function registerTopologyWebSocket(
         return {
             async onOpen(_, ws) {
                 const redis = await getRedisClient();
+                // Warm-replay: ship the cached snapshot as the FIRST frame so a fresh
+                // client doesn't sit in skeleton state waiting up to 15 min for the next
+                // strategy cycle to publish. Strategy-engine writes this key on every
+                // cycle (main.py `_redis.set("strategy:latest_output", payload)`).
+                try {
+                    const snapshot = await redis.get("strategy:latest_output");
+                    if (snapshot) ws.send(snapshot);
+                } catch {
+                    // Best-effort. If the cache read fails, the pubsub will still deliver
+                    // the next cycle; better to let the client connect than to drop them.
+                }
                 cleanup = await subscribe(redis, "strategy:dashboard", (p) => ws.send(JSON.stringify(p)));
             },
             onClose() { cleanup?.(); },
         };
     }));
+
+    // REST snapshot of the same payload the WebSocket warm-replays on connect. Used by
+    // the portal's SSR layer to render topology-driven widgets (factor exposures, regime,
+    // Betti curves) with real data on the first byte — no client-mount skeleton flicker.
+    // Kept under /admin because the underlying data is the strategy's internal state.
+    app.get("/admin/api/signals/topology/snapshot", parseAdminHeaders, async (c) => {
+        const redis = await getRedisClient();
+        const snapshot = await redis.get("strategy:latest_output");
+        if (!snapshot) return c.json({ data: null });
+        try { return c.json({ data: JSON.parse(snapshot) }); }
+        catch { return c.json({ data: null }); }
+    });
 }
 
 /**
