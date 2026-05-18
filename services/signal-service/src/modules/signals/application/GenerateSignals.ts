@@ -120,8 +120,26 @@ export class GenerateSignalsUseCase {
       ? await this.priceLookup.lastCloseMany(features.ticker_universe)
       : {};
 
+    // In-flight guard: skip tickers that already have a signal in Approved / Queued /
+    // Executing. Without this, the strategy reads stale currentWeights (positions sync
+    // every 5min) and re-emits a BUY for a ticker whose prior BUY is still draining the
+    // dispatcher queue. By the time the dispatcher claims the new signal the position has
+    // filled to (or past) target, qty rounds to zero, and the signal fails with what looks
+    // like ZeroQuantity — but the real cause is the strategy never seeing its own pending
+    // intent. Filter is bounded at 500 — well above the typical in-flight depth.
+    const inflightSignals = await this.signalRepo.findByLifecycle(
+      [SignalLifecycle.Approved, SignalLifecycle.Queued, SignalLifecycle.Executing],
+      500,
+    );
+    const inflightTickers = new Set(inflightSignals.map((s) => s.ticker));
+    if (inflightTickers.size > 0) {
+      this.logger.info({ count: inflightTickers.size, sample: Array.from(inflightTickers).slice(0, 10) },
+        'GenerateSignals.execute: in-flight signals — those tickers will be skipped this cycle');
+    }
+
     const signals = features.ticker_universe
       .map((ticker: string, i: number): TradeSignal | null => {
+        if (inflightTickers.has(ticker)) return null;
         const w = weights[i] ?? 0;
         const currentW = currentWeights[ticker] ?? 0;
         if (w < 0.01 && currentW < 0.01) return null;
@@ -140,6 +158,31 @@ export class GenerateSignalsUseCase {
           const entry = lastCloses[ticker];
           const score = features.composite_scores[ticker] ?? 0;
           const divisor = score >= 0 ? divisorPos : divisorNeg;
+          // Per-signal AnalysisContext — minimal subset of the cycle's StrategyOutput
+          // needed by downstream notification enrichment (sector, score, regime). We
+          // deliberately drop the full covariance_matrix and ticker_universe to keep
+          // the wire/Mongo payload small; the AnalysisEmailSender only reads:
+          //   - sectors[this.ticker]
+          //   - composite_scores[this.ticker]
+          //   - regime_confidence
+          //   - position_size_multiplier
+          //   - strategy_id
+          // Without this attachment, the email enricher saw `undefined` for every
+          // field and the LLM hallucinated alarming "Unknown sector / 0.000 score /
+          // unknown regime" context (visible to the operator as concerning analysis).
+          const analysisContext = {
+            timestamp:                features.timestamp,
+            strategy_id:              features.strategy_id,
+            ticker_universe:          [],
+            composite_scores:         { [ticker]: score },
+            factor_attributions:      {},
+            sectors:                  { [ticker]: features.sectors[ticker] ?? 'Unknown' },
+            covariance_matrix:        [],
+            regime_confidence:        features.regime_confidence,
+            ...(features.position_size_multiplier !== undefined
+              ? { position_size_multiplier: features.position_size_multiplier }
+              : {}),
+          };
           return new TradeSignal({
             id: randomUUID(),
             timestamp: features.timestamp,
@@ -151,10 +194,22 @@ export class GenerateSignalsUseCase {
             rationale: JSON.stringify(rationale),
             ...(entry && entry > 0 ? { entryPrice: entry } : {}),
             lifecycle: SignalLifecycle.Pending,
+            features_snapshot: analysisContext,
           });
         } catch { return null; }
       })
-      .filter((s): s is TradeSignal => s !== null && s.isActionable(this.config.minActionableConfidence));
+      // SELLs are exits — portfolio decisions, not conviction decisions. When the
+      // optimiser drops a held ticker out of its top picks, w < currentW and a SELL
+      // is emitted: that's the strategy saying "free this capital for better picks".
+      // Gating SELLs on confidence (which measures direction conviction, not
+      // rebalance need) used to suppress exits for held positions with near-zero
+      // composite_scores, so positions persisted even when the optimiser wanted them
+      // gone. BUYs still need conviction — they commit new capital.
+      .filter((s): s is TradeSignal =>
+        s !== null && (
+          s.action === 'SELL' ||
+          s.isActionable(this.config.minActionableConfidence)
+        ));
 
     const actionCounts = signals.reduce<Record<string, number>>((acc, s) => {
       acc[s.action] = (acc[s.action] ?? 0) + 1;
