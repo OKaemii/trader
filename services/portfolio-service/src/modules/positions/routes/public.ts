@@ -1,11 +1,13 @@
 import { Hono } from "hono";
-import { requireAuth } from "@trader/shared-auth";
+import { requireInternal, requireCaller } from "@trader/shared-auth";
 import type { PortfolioDeps } from "../../../wiring.ts";
 
 export function createPublicRouter(deps: PortfolioDeps): Hono {
     const router = new Hono();
-    router.use("/api/portfolio/*", requireAuth);
-    router.use("/api/portfolio",   requireAuth);
+    // Gateway is the user-auth perimeter; portfolio reads via /api/portfolio reach us
+    // only through the gateway proxy with sub='api-gateway'.
+    router.use("/api/portfolio/*", requireInternal, requireCaller("api-gateway"));
+    router.use("/api/portfolio",   requireInternal, requireCaller("api-gateway"));
 
     router.get("/api/portfolio", async (c) => {
         const positions = await deps.readService.listPositions();

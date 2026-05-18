@@ -22,11 +22,9 @@ const ACCESS_TTL  = '15m';
 const REFRESH_TTL = '7d';
 
 export async function signAccessToken(payload: Omit<AppJWTPayload, 'iat' | 'exp'>): Promise<string> {
-  // aud is what the audience-JWT middleware (requireUser / requireAdmin) gates on.
-  // Admins get aud='admin' so requireAdmin accepts them; non-admins get aud='user'
-  // so requireUser accepts them (requireUser also accepts 'admin'). Without this, every
-  // /api/* route protected by requireUser returns 401 because jose rejects tokens that
-  // don't carry the audience the route demands.
+  // aud mirrors role so the gateway can use audience-aware middleware (requireUser /
+  // requireAdmin) if it wants — but the rest of the cluster never sees this token. The
+  // gateway is the only edge that handles user JWTs; everything downstream is internal.
   const aud: Audience = payload.role === 'admin' ? 'admin' : 'user';
   return new SignJWT({ ...(payload as Record<string, unknown>), aud })
     .setProtectedHeader({ alg: 'HS256' })

@@ -12,18 +12,19 @@ process.env.JWT_SECRET      = 'test-jwt-secret';
 
 import { describe, it, expect, beforeAll } from "vitest";
 import { Hono } from 'hono';
-import { signAccessToken } from '@trader/shared-auth/jwt';
+import { mintInternalJwt } from '@trader/shared-auth';
 import { createRouter } from '../modules/signals/routes/public.ts';
 import type { ISignalRepository } from '../modules/signals/domain/ISignalRepository.ts';
 import { TradeSignal, SignalLifecycle, SignalFailureReason } from '../modules/signals/domain/TradeSignal.ts';
 
-let adminJWT: string;
+let gatewayJWT: string;
 beforeAll(async () => {
-  adminJWT = await signAccessToken({ sub: 'tester', role: 'admin' });
+  // /api/admin/* is gated as internal-from-gateway. End-user JWTs never reach this service.
+  gatewayJWT = await mintInternalJwt('api-gateway');
 });
 
 function adminHeaders() {
-  return { Authorization: `Bearer ${adminJWT}` };
+  return { Authorization: `Bearer ${gatewayJWT}` };
 }
 
 class StubRepo implements ISignalRepository {
@@ -65,6 +66,7 @@ function buildApp(repo: StubRepo) {
     getProgress:   { execute: async () => [] } as any,
     autoApprovalGate: {} as any,
     signalRepo: repo,
+    riskEngine:    { status: async () => ({}), resetCircuitBreaker: async () => {} } as any,
   }));
   return app;
 }
