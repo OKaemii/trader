@@ -1,0 +1,53 @@
+{{/*
+KEDA bootstrap Job — see scaledobject.yaml for the why. Runs once per scale-to-zero
+worker on helm install/upgrade and:
+  1. MKSTREAM-creates the stream if missing (so xAdd from market-data-service can land)
+  2. XGROUP CREATE the consumer group at the stream tail ("$") so KEDA's pendingEntriesCount
+     scaler has something to query before the worker has ever started
+
+BUSYGROUP responses are tolerated (the group already exists from a prior run/upgrade).
+
+Hook ordering: weight=-1 so the Job runs before any other post-install hook the chart
+or its dependencies might define. delete-policy=before-hook-creation,hook-succeeded so a
+failed run leaves the Pod around for log inspection, but successful runs clean up.
+*/}}
+{{- $strategies := (.Values.global).strategies | default (.Values.strategies | default (list)) -}}
+{{- range $idx, $s := $strategies }}
+{{- if $s.scaleToZero }}
+{{- $tag := printf "%s-%s" $s.mode $s.strategyId -}}
+{{- $name := printf "strategy-engine-%s" ($tag | replace "_" "-") }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ printf "%s-keda-bootstrap" $name }}
+  namespace: {{ $.Release.Namespace }}
+  annotations:
+    "helm.sh/hook":              post-install,post-upgrade
+    "helm.sh/hook-weight":       "-1"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  ttlSecondsAfterFinished: 60
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: redis-bootstrap
+          image: redis:7-alpine
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: REDIS_PASSWORD
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              out=$(redis-cli -h redis-master -p 6379 -a "$REDIS_PASSWORD" \
+                XGROUP CREATE "market:raw:{{ $s.mode }}" "{{ $name }}" '$' MKSTREAM 2>&1) || true
+              echo "$out"
+              # Treat BUSYGROUP (group already exists) as success; any other error fails.
+              echo "$out" | grep -E 'OK|BUSYGROUP' >/dev/null
+{{- end }}
+{{- end }}

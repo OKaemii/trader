@@ -45,7 +45,7 @@ export async function wireDependencies(env: SignalEnv, logger: Logger) {
     const priceLookup     = new MongoPriceLookup(db);
     const approveSignal   = new ApproveSignalUseCase(signalRepo);
     const autoApprovalGate = new AutoApprovalGate(redis, signalRepo, approveSignal, tradingClient, logger);
-    const publisher       = new RedisSignalPublisher(redis);
+    const publisher       = new RedisSignalPublisher(redis, logger);
     const generateSignals = new GenerateSignalsUseCase(
         signalRepo, publisher, portfolioState, riskEngine,
         logger,
@@ -54,16 +54,28 @@ export async function wireDependencies(env: SignalEnv, logger: Logger) {
     );
     const findRecent      = { execute: (limit: number) => signalRepo.findRecent(limit) };
     const getProgress     = new GetSignalProgressUseCase(signalRepo, portfolioState, priceLookup);
-    const subscriber      = new RedisStrategySubscriber(redis, {
-        consumerName: `signal-service-${env.POD_NAME}`,
+    // WP2.3: multiplex across one subscriber per strategy-output stream. Each gets its
+    // own consumer group keyed by stream name so multiple signal-service pods can scale
+    // horizontally without re-delivering messages, and a stream that goes idle (e.g. the
+    // daily worker between session closes) doesn't block reads from the others.
+    const streamList = env.STRATEGY_INPUT_STREAMS
+        .split(',').map((s) => s.trim()).filter(Boolean);
+    if (streamList.length === 0) {
+        throw new Error('STRATEGY_INPUT_STREAMS resolved to empty — refusing to start with no subscriber');
+    }
+    const subscribers = streamList.map((stream) => new RedisStrategySubscriber(redis, {
+        stream,
+        consumerGroup: `signal-service:${stream}`,
+        consumerName:  `signal-service-${env.POD_NAME}`,
         logger,
-    });
+    }));
+    logger.info({ streams: streamList }, 'strategy subscribers wired');
 
     return {
         logger, env, redis, db, fx, tradingClient,
         signalRepo, riskEngine, decayMonitor, portfolioState, priceLookup,
         approveSignal, autoApprovalGate, publisher, generateSignals,
-        findRecent, getProgress, subscriber, cache, bus,
+        findRecent, getProgress, subscribers, cache, bus,
     } as const;
 }
 

@@ -1,3 +1,5 @@
+{{- $strategies := (.Values.global).strategies | default (.Values.strategies | default (list)) -}}
+{{- if eq (len $strategies) 0 -}}
 apiVersion: v1
 kind: Service
 metadata:
@@ -11,3 +13,56 @@ spec:
     - port: 8000
       targetPort: 8000
       protocol: TCP
+{{- else -}}
+{{/* Per-worker Service. Each worker also has a stable name the ingress can pin to,
+     and the matching selector (worker label) avoids any cross-routing. */}}
+{{- range $idx, $s := $strategies }}
+{{- $tag := printf "%s-%s" $s.mode $s.strategyId -}}
+{{- $name := printf "strategy-engine-%s" ($tag | replace "_" "-") }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    app: strategy-engine
+    worker: {{ $tag | quote }}
+spec:
+  type: ClusterIP
+  selector:
+    app: strategy-engine
+    worker: {{ $tag | quote }}
+  ports:
+    - port: 8000
+      targetPort: 8000
+      protocol: TCP
+{{- end }}
+{{/* Aggregate alias Service. Points at the worker named in .Values.primaryStrategy
+     (defaulting to the first entry) so existing portal calls to "strategy-engine"
+     keep working without an ingress rewrite. The ingress still maps the admin path
+     to this name; per-worker access goes through the named services above. */}}
+{{- $primary := (.Values.global).primaryStrategy | default (.Values.primaryStrategy | default (printf "%s-%s" (index $strategies 0).mode (index $strategies 0).strategyId)) -}}
+{{- $primaryName := printf "strategy-engine-%s" ($primary | replace "_" "-") }}
+{{- /* explicit blank line so the --- below begins a new YAML document */}}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: strategy-engine
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: strategy-engine
+    role: alias
+    primary: {{ $primary | quote }}
+spec:
+  type: ClusterIP
+  selector:
+    app: strategy-engine
+    worker: {{ $primary | quote }}
+  ports:
+    - port: 8000
+      targetPort: 8000
+      protocol: TCP
+{{- end -}}

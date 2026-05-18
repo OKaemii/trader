@@ -1,5 +1,4 @@
 import os
-import sys
 import json
 import asyncio
 import dataclasses
@@ -12,7 +11,6 @@ from .application.sector_momentum_strategy import SectorMomentumStrategy
 from .application.factor_rank_strategy import FactorRankStrategy
 from .domain.dataclasses import OHLCVBar
 from .infrastructure.market_data_client import MarketDataClient
-from .infrastructure.live_config import get_live_config, invalidate as invalidate_live_config
 
 STRATEGY_REGISTRY = {
     'topology_v1':        TopologyStrategy,
@@ -54,8 +52,31 @@ _bars_processed = Counter(
     ['strategy_id'],
 )
 
-CONSUMER_GROUP = "strategy-engine"
-CONSUMER_NAME  = f"strategy-engine-{os.getenv('POD_NAME', 'local')}"
+# WP2: stream wiring is now per-worker. Defaults preserve single-deployment behaviour
+# (legacy `market:raw` + shared `signals:strategy`) so a chart that doesn't set the new
+# env vars keeps working through the cutover. WP2 helm sets these to literal stream names
+# like `market:raw:5m` and `signals:strategy:5m:factor_rank_v1`.
+INPUT_STREAM   = os.getenv("INPUT_STREAM",   "market:raw")
+OUTPUT_STREAM  = os.getenv("OUTPUT_STREAM",  "signals:strategy")
+CONSUMER_GROUP = os.getenv("CONSUMER_GROUP", "strategy-engine")
+CONSUMER_NAME  = f"{CONSUMER_GROUP}-{os.getenv('POD_NAME', 'local')}"
+
+# ── Engine singletons ──────────────────────────────────────────────────────
+# Lifted to module scope so the admin /replay endpoint can call into the same
+# strategy instance + history cache that the live runLoop uses. Both code paths
+# share an asyncio.Lock to serialise strategy.update() calls — RegimeEngine and
+# FeatureStabilityAnalyser carry cross-cycle state that mustn't race.
+#
+# All three are populated by startup() before either runLoop or replay can run;
+# the None sentinels exist purely for type-checker clarity.
+_strategy = None          # type: ignore[var-annotated]
+_bars_client = None       # type: ignore[var-annotated]
+_redis = None             # type: ignore[var-annotated]
+_history_interval: str = "daily"
+_history_range:    str = "30d"
+_needed:           int = 20
+_prewarmed:        bool = False
+_cycle_lock = asyncio.Lock()
 
 # Shared state exposed by /status — written by process_loop, read by HTTP handlers.
 # `ticker_bars`/`ready_tickers` used to be derived from arrivals counting; now they
@@ -146,131 +167,290 @@ def bars_from_json(data: list) -> list[OHLCVBar]:
     ]
 
 
-async def process_loop() -> None:
-    r = await aioredis.from_url(REDIS_URL)
-    await ensure_consumer_group(r, "market:raw", CONSUMER_GROUP)
+def _pick_prewarm_range(calendar_days: int) -> str:
+    """Smallest RangeKey that covers `calendar_days`. Matches shared-bars enum."""
+    if calendar_days <= 30:  return "30d"
+    if calendar_days <= 60:  return "60d"
+    if calendar_days <= 90:  return "90d"
+    return "180d"
+
+
+async def historical_prewarm(
+    strategy,
+    bars_client: MarketDataClient,
+    history_interval: str,
+    active_tickers: list[str],
+) -> None:
+    """
+    Replay `strategy.prewarm_cycles` historical bars-as-of-each-date through
+    strategy.update() so cross-cycle state (RegimeEngine returns history,
+    FeatureStabilityAnalyser buffers) reaches steady state BEFORE the first
+    live cycle.
+
+    Mongo-deterministic: every boot recomputes the same state from the same bar
+    history. No Redis persistence required. Mode-swap-safe: replays whichever
+    interval the booted mode requested.
+
+    No-op when strategy.prewarm_cycles == 0 (strategies without cross-cycle state).
+    """
+    needed = getattr(strategy, "prewarm_cycles", 0)
+    if needed <= 0:
+        print(f"[strategy-engine] prewarm: skipped (strategy.prewarm_cycles=0)", flush=True)
+        return
+    if not active_tickers:
+        print(f"[strategy-engine] prewarm: skipped (empty universe)", flush=True)
+        return
+
+    # Pick a range that covers `needed` cycles worth of history with a margin.
+    # Daily: ~1.4 calendar days per trading day, plus a week for holidays.
+    # Intraday (15m): 126 cycles = ~32 trading hours; the smallest RangeKey (30d)
+    # over-fetches but the payload is still small.
+    if history_interval == "daily":
+        calendar_days = int(needed * 1.5) + 7
+    else:
+        calendar_days = 30
+    range_key = _pick_prewarm_range(calendar_days)
+
+    import time as _t
+    t0 = _t.time()
+    print(
+        f"[strategy-engine] prewarm: requesting {range_key} of {history_interval} bars "
+        f"for {len(active_tickers)} tickers (target_cycles={needed})",
+        flush=True,
+    )
+    bars_client.start_cycle("prewarm")
+    history_map = await bars_client.fetch_bars_batch(
+        tickers=active_tickers,
+        interval=history_interval,
+        range_key=range_key,
+    )
+    fetch_ms = int((_t.time() - t0) * 1000)
+
+    # Build a per-timestamp bucket: ts -> [bars at that ts across all tickers].
+    by_ts: dict[int, list[OHLCVBar]] = {}
+    for t, bars in history_map.items():
+        for b in bars:
+            by_ts.setdefault(b.timestamp, []).append(b)
+
+    timestamps = sorted(by_ts.keys())
+    # Take only the most recent `needed` timestamps — RegimeEngine self-caps at
+    # HISTORY_MIN * 2 and would pop anything older immediately anyway.
+    replay = timestamps[-needed:]
+    if not replay:
+        print(f"[strategy-engine] prewarm: no historical bars returned — skipping", flush=True)
+        return
+
+    print(
+        f"[strategy-engine] prewarm: fetched {sum(len(v) for v in history_map.values())} bars "
+        f"in {fetch_ms}ms; replaying {len(replay)} cycles",
+        flush=True,
+    )
+
+    t1 = _t.time()
+    skipped = 0
+    for ts in replay:
+        bars_at_ts = by_ts[ts]
+
+        # Strategy lookup: closes oldest-first, up to and including this timestamp.
+        # Replaces the live cycle's market-data-service round-trip with a slice
+        # of the already-fetched history_map. No I/O.
+        def history_at_ts(t: str, _ts=ts, _hist=history_map) -> list[float]:
+            return [b.close for b in _hist.get(t, []) if b.timestamp <= _ts]
+
+        try:
+            strategy.update(bars_at_ts, history_at_ts)
+        except Exception as exc:
+            skipped += 1
+            if skipped <= 3:
+                print(f"[strategy-engine] prewarm ts={ts} skipped: {exc!r}", flush=True)
+
+    replay_ms = int((_t.time() - t1) * 1000)
+    print(
+        f"[strategy-engine] prewarm: replayed {len(replay) - skipped}/{len(replay)} cycles in "
+        f"{replay_ms}ms — strategy now at steady state (skipped={skipped})",
+        flush=True,
+    )
+
+
+async def _init_engine_singletons() -> None:
+    """
+    Called once from startup(). Constructs the strategy + clients + derives mode-
+    dependent config. Idempotent: safe to no-op if called twice.
+    """
+    global _strategy, _bars_client, _redis, _history_interval, _history_range, _needed
+    if _strategy is not None:
+        return
+    _redis = await aioredis.from_url(REDIS_URL)
+    await ensure_consumer_group(_redis, INPUT_STREAM, CONSUMER_GROUP)
 
     strategy_cls = STRATEGY_REGISTRY.get(ACTIVE_STRATEGY)
     if not strategy_cls:
         raise RuntimeError(f"Unknown strategy: {ACTIVE_STRATEGY}")
-    strategy = strategy_cls()
+    _strategy = strategy_cls()
 
-    # Single client across the loop — its per-cycle cache clears on start_cycle.
-    bars_client = MarketDataClient()
+    # Single client across the engine — its per-cycle cache clears on start_cycle.
+    _bars_client = MarketDataClient()
 
-    # Range key the HTTP endpoint accepts. shared-bars currently supports 30d/60d/90d.
-    # 30d is enough for the 20-bar daily window with weekend/holiday margin; topology
-    # needs 30 bars so we ask for 60d there. We pick based on the strategy's declared
-    # rolling_window, falling back to 30d.
-    #
-    # TODO: guard against rolling_window > what 90d at the chosen interval can supply.
-    # Today no strategy declares one that large (factor_rank=20 daily, topology=30 daily,
-    # both fit in 60d). If someone sets BAR_FREQUENCY=intraday with ROLLING_WINDOW_BARS=60
-    # and a 15m interval, 60 bars × 15m = 15h of history — well inside 30d, so still fine.
-    # The hole is only exposed if rolling_window > ~8500 (15m bars in 90d) or > 90 (daily
-    # bars in 90d). Add an explicit assertion + expand shared-bars range keys when that
-    # becomes real.
-    needed = getattr(strategy, "rolling_window", ROLLING_WINDOW_BARS)
-    history_range = "30d" if needed <= 25 else "60d"
-    history_interval = "daily" if BAR_FREQUENCY == "daily" else "15m"
+    _needed = getattr(_strategy, "rolling_window", ROLLING_WINDOW_BARS)
+    _history_interval = "daily" if BAR_FREQUENCY == "daily" else "15m"
+    # Range key the HTTP endpoint accepts. shared-bars currently supports
+    # 30d / 60d / 90d / 180d. 30d covers the 20-bar daily window; 60d covers the
+    # 60-bar 15m intraday window. Prewarm asks for a longer range separately.
+    _history_range = "30d" if _needed <= 25 else "60d"
 
-    # Persist regime state across pod restarts so the engine doesn't spend ~21 cycles
-    # in the warm-up sentinel after every redeploy. Only strategies that expose their
-    # regime engine via `regime_engine_for_persistence` participate.
-    if hasattr(strategy, "regime_engine_for_persistence"):
-        re = strategy.regime_engine_for_persistence()
-        re.attach_store(r)
-        await re.load_from_store()
+    print(f"[strategy-engine] singletons ready — strategy={ACTIVE_STRATEGY} bar_freq={BAR_FREQUENCY} "
+          f"rolling_window={ROLLING_WINDOW_BARS} history_range={_history_range} history_interval={_history_interval} "
+          f"prewarm_cycles={getattr(_strategy, 'prewarm_cycles', 0)} "
+          f"input={INPUT_STREAM} output={OUTPUT_STREAM} consumer={CONSUMER_NAME} group={CONSUMER_GROUP}", flush=True)
 
-    print(f"[strategy-engine] process_loop ready — strategy={ACTIVE_STRATEGY} bar_freq={BAR_FREQUENCY} "
-          f"rolling_window={ROLLING_WINDOW_BARS} history_range={history_range} history_interval={history_interval} "
-          f"consumer={CONSUMER_NAME} group={CONSUMER_GROUP}", flush=True)
+
+async def process_cycle(
+    bars: list[OHLCVBar],
+    *,
+    source: str,
+    entry_id: str | None = None,
+    publish: bool = True,
+) -> dict:
+    """
+    Run one strategy cycle. Used by both the live runLoop (source="stream") and
+    the admin /replay endpoint (source="admin").
+
+    Returns a result dict for the caller — runLoop ignores it, replay returns it
+    as JSON.
+
+    Concurrency: holds _cycle_lock for the full strategy.update() + publish.
+    RegimeEngine and FeatureStabilityAnalyser carry cross-cycle state that must
+    not interleave between two concurrent callers (runLoop + replay).
+
+    `publish=False` runs the strategy and returns the output without xadding
+    signals:strategy. Useful for replay's dry-run mode where the operator wants
+    to see what the engine WOULD produce without driving signal-service.
+    """
+    assert _strategy is not None and _bars_client is not None and _redis is not None, \
+        "engine singletons not initialised — call _init_engine_singletons() first"
+
+    async with _cycle_lock:
+        global _prewarmed
+
+        import time as _t
+        _engine_state["cycles"] += 1
+        _engine_state["last_cycle_ts"] = _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime())
+        cycle_n = _engine_state["cycles"]
+
+        active_tickers = sorted(set(b.ticker for b in bars))
+        sample = ",".join(active_tickers[:8])
+        print(f"[strategy-engine] cycle {cycle_n} entry source={source} "
+              f"id={entry_id} bars={len(bars)} unique_tickers={len(active_tickers)} "
+              f"sample=[{sample}]", flush=True)
+
+        # Lazy prewarm on the FIRST cycle (regardless of source) — populates
+        # RegimeEngine + FeatureStabilityAnalyser state from Mongo so cycle 1
+        # starts at steady state instead of the 0.5 confidence sentinel.
+        if not _prewarmed:
+            await historical_prewarm(_strategy, _bars_client, _history_interval, active_tickers)
+            _prewarmed = True
+
+        cycle_id = f"{cycle_n}:{entry_id or source}"
+        _bars_client.start_cycle(cycle_id)
+        _fetch_start = _t.time()
+        history_map = await _bars_client.fetch_bars_batch(
+            tickers=active_tickers,
+            interval=_history_interval,
+            range_key=_history_range,
+        )
+        _fetch_ms = int((_t.time() - _fetch_start) * 1000)
+
+        def _lookup(t: str, _m=history_map) -> list[float]:
+            return [b.close for b in _m.get(t, [])]
+
+        _engine_state["active_universe"] = active_tickers
+        _engine_state["ready_tickers"]   = [t for t in active_tickers if len(_lookup(t)) >= _needed]
+        _ready = len(_engine_state["ready_tickers"])
+        _total = len(_engine_state["active_universe"])
+        _warming = _total - _ready
+        print(f"[strategy-engine] cycle {cycle_n} history fetched in {_fetch_ms}ms "
+              f"interval={_history_interval} range={_history_range} "
+              f"ready={_ready}/{_total} warming={_warming} (needed={_needed}+ bars per ticker)",
+              flush=True)
+
+        _update_start = _t.time()
+        output = _strategy.update(bars, _lookup)
+        _update_ms = int((_t.time() - _update_start) * 1000)
+
+        _bars_processed.labels(strategy_id=ACTIVE_STRATEGY).inc(len(bars))
+
+        if output is None:
+            reason = "unknown"
+            if _ready < _strategy.min_universe_size:
+                reason = f"ready={_ready} < min_universe_size={_strategy.min_universe_size}"
+            elif _total == 0:
+                reason = "no bars on the stream"
+            else:
+                reason = "strategy returned None (regime gate or all HOLD)"
+            print(f"[strategy-engine] cycle {cycle_n} NO SIGNAL "
+                  f"strategy_update={_update_ms}ms — {reason}", flush=True)
+            return {
+                "cycle": cycle_n, "source": source, "ready": _ready, "total": _total,
+                "warming": _warming, "signal_emitted": False, "reason": reason,
+                "fetch_ms": _fetch_ms, "update_ms": _update_ms,
+            }
+
+        if publish:
+            payload = json.dumps(dataclasses.asdict(output))
+            await _redis.xadd(OUTPUT_STREAM, {"data": payload})
+            await _redis.set("strategy:latest_output", payload)
+            await _redis.set("regime:confidence", str(output.regime_confidence))
+            await _redis.publish("strategy:dashboard", payload)
+            _signals_published.labels(strategy_id=ACTIVE_STRATEGY).inc()
+            _regime_confidence.labels(strategy_id=ACTIVE_STRATEGY).set(output.regime_confidence)
+            _engine_state["signals_emitted"] += 1
+            _engine_state["last_signal"] = _engine_state["last_cycle_ts"]
+        _nonzero = sum(1 for v in (output.composite_scores or {}).values() if v != 0)
+        print(f"[strategy-engine] cycle {cycle_n} SIGNAL "
+              f"{'EMITTED' if publish else 'COMPUTED (dry_run)'} "
+              f"strategy_update={_update_ms}ms ready={_ready}/{_total} "
+              f"regime_confidence={output.regime_confidence:.3f} "
+              f"nonzero_scores={_nonzero}/{len(output.ticker_universe)} "
+              f"position_size_multiplier={getattr(output, 'position_size_multiplier', 1.0):.2f}",
+              flush=True)
+        return {
+            "cycle": cycle_n, "source": source, "ready": _ready, "total": _total,
+            "warming": _warming, "signal_emitted": publish, "dry_run": not publish,
+            "fetch_ms": _fetch_ms, "update_ms": _update_ms,
+            "regime_confidence": output.regime_confidence,
+            "nonzero_scores": _nonzero, "universe_size": len(output.ticker_universe),
+            "output": dataclasses.asdict(output) if not publish else None,   # full payload only in dry-run
+        }
+
+
+async def process_loop() -> None:
+    await _init_engine_singletons()
+    assert _redis is not None
     idle_polls = 0
     while True:
-        # Block up to 5 seconds for new messages; recover from PEL on restart
-        messages = await r.xreadgroup(
+        messages = await _redis.xreadgroup(
             groupname=CONSUMER_GROUP,
             consumername=CONSUMER_NAME,
-            streams={"market:raw": ">"},
+            streams={INPUT_STREAM: ">"},
             count=10,
             block=5000,
         )
         if not messages:
             idle_polls += 1
-            # Log every ~minute so k9s shows the consumer is alive even when market-data is silent.
             if idle_polls % 12 == 0:
-                print(f"[strategy-engine] idle — no market:raw entries in last ~60s (consumer={CONSUMER_NAME})", flush=True)
+                print(f"[strategy-engine] idle — no {INPUT_STREAM} entries in last ~60s (consumer={CONSUMER_NAME})", flush=True)
             continue
         idle_polls = 0
         for _stream_name, entries in (messages or []):
             for entry_id, fields in entries:
+                eid = entry_id.decode() if isinstance(entry_id, bytes) else entry_id
                 try:
                     bars = bars_from_json(json.loads(fields[b"data"]))
-                    _bars_processed.labels(strategy_id=ACTIVE_STRATEGY).inc(len(bars))
-
-                    # Update shared state for /status
-                    import time as _time
-                    _engine_state["cycles"] += 1
-                    _engine_state["last_cycle_ts"] = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
-                    _sample = ",".join(sorted(set(b.ticker for b in bars))[:8])
-                    print(f"[strategy-engine] cycle {_engine_state['cycles']} entry "
-                          f"id={entry_id.decode() if isinstance(entry_id, bytes) else entry_id} "
-                          f"bars={len(bars)} unique_tickers={len(set(b.ticker for b in bars))} "
-                          f"sample=[{_sample}]", flush=True)
-
-                    # Batch-fetch rolling-window history for every ticker arriving this
-                    # cycle. ONE HTTP round-trip per cycle, regardless of universe size.
-                    # market-data-service serves from its read-through Redis cache, so
-                    # the steady-state path is sub-millisecond on the strategy side.
-                    cycle_id = f"{_engine_state['cycles']}:{entry_id.decode() if isinstance(entry_id, bytes) else entry_id}"
-                    bars_client.start_cycle(cycle_id)
-                    active_tickers = sorted(set(b.ticker for b in bars))
-                    history_map = await bars_client.fetch_bars_batch(
-                        tickers=active_tickers,
-                        interval=history_interval,
-                        range_key=history_range,
-                    )
-                    # Strategy lookup: returns closes oldest-first for any ticker. Tickers
-                    # missing from history_map (e.g. brand-new universe additions before
-                    # backfill catches up) get an empty list — strategies treat that as
-                    # "skip" via their min-length check.
-                    def _lookup(t: str, _m=history_map) -> list[float]:
-                        return [b.close for b in _m.get(t, [])]
-
-                    _engine_state["active_universe"] = active_tickers
-                    _engine_state["ready_tickers"]   = [t for t in active_tickers if len(_lookup(t)) >= needed]
-
-                    output = strategy.update(bars, _lookup)
-
-                    # Persist regime state out-of-band so warm-up survives restarts. The
-                    # strategy.update() path is synchronous; this hook fires after each cycle.
-                    if hasattr(strategy, "regime_engine_for_persistence"):
-                        await strategy.regime_engine_for_persistence()._persist()
-
-                    # Log readiness state every cycle until signals start, then only on signals
-                    ready  = len(_engine_state["ready_tickers"])
-                    total  = len(_engine_state["active_universe"])
-                    if output is None:
-                        print(f"[strategy-engine] no signal — cycle {_engine_state['cycles']}: "
-                              f"{ready}/{total} tickers have {needed}+ bars in Mongo (min_universe={strategy.min_universe_size})")
-                    else:
-                        payload = json.dumps(dataclasses.asdict(output))
-                        await r.xadd("signals:strategy", {"data": payload})
-                        await r.set("strategy:latest_output", payload)
-                        await r.set("regime:confidence", str(output.regime_confidence))
-                        await r.publish("strategy:dashboard", payload)
-                        _signals_published.labels(strategy_id=ACTIVE_STRATEGY).inc()
-                        _regime_confidence.labels(strategy_id=ACTIVE_STRATEGY).set(output.regime_confidence)
-                        _engine_state["signals_emitted"] += 1
-                        _engine_state["last_signal"] = _engine_state["last_cycle_ts"]
-                        print(f"[strategy-engine] signal emitted — {ready} tickers, "
-                              f"regime_confidence={output.regime_confidence:.3f}")
-
-                    await r.xack("market:raw", CONSUMER_GROUP, entry_id)
+                    await process_cycle(bars, source=f"stream:{INPUT_STREAM}", entry_id=eid, publish=True)
+                    await _redis.xack(INPUT_STREAM, CONSUMER_GROUP, entry_id)
                 except Exception as exc:
-                    # Log but do not ACK — message stays in PEL for retry/inspection
                     _processing_errors.labels(strategy_id=ACTIVE_STRATEGY).inc()
-                    print(f"[strategy-engine] processing error on {entry_id}: {exc}")
+                    print(f"[strategy-engine] processing error on {entry_id}: {exc!r}", flush=True)
 
 
 def _on_loop_done(task: asyncio.Task) -> None:
@@ -284,56 +464,74 @@ def _on_loop_done(task: asyncio.Task) -> None:
         print(f"[strategy-engine] FATAL: process_loop crashed: {exc!r}", flush=True)
 
 
-async def watch_config_invalidations() -> None:
-    """Subscribe to the portal's `config:invalidated` pubsub and self-restart when
-    bar_frequency changes from the boot-time value.
-
-    Strategy classes capture ROLLING_WINDOW (20 daily / 60 intraday) at module
-    import time, and the running strategy instance owns regime / lookback state we
-    don't want to corrupt with a mid-flight swap. Exiting cleanly here lets k8s
-    restart the pod with the new env, which takes ~10s end-to-end — fast enough
-    that the operator perceives "Save in portal → engine picks up new mode" as a
-    single action without manual `kubectl rollout restart`.
-
-    Failure to subscribe (e.g. Redis briefly unavailable at boot) is logged but
-    non-fatal: the 15s TTL still propagates changes, just slower.
+@app.post("/admin/api/strategy/replay")
+async def replay(body: dict) -> dict:
     """
-    redis_url = os.getenv("REDIS_URL", "redis://redis:6379")
-    boot_bar_frequency = BAR_FREQUENCY
-    try:
-        r = await aioredis.from_url(redis_url)
-        pubsub = r.pubsub()
-        await pubsub.subscribe("config:invalidated")
-        print(f"[strategy-engine] subscribed to config:invalidated (boot bar_frequency={boot_bar_frequency})", flush=True)
-        async for msg in pubsub.listen():
-            if msg is None or msg.get("type") != "message":
-                continue
-            invalidate_live_config()
-            try:
-                cfg = await get_live_config()
-            except Exception as exc:
-                print(f"[strategy-engine] post-invalidation live-config read failed: {exc!r}", flush=True)
-                continue
-            if cfg.bar_frequency != boot_bar_frequency:
-                print(
-                    f"[strategy-engine] bar_frequency flipped {boot_bar_frequency} → {cfg.bar_frequency} via portal; "
-                    f"exiting cleanly so k8s restarts the pod with the new ROLLING_WINDOW.",
-                    flush=True,
-                )
-                # os._exit bypasses asyncio shutdown — that's deliberate: we want a hard,
-                # immediate exit so kubelet restarts us. A graceful shutdown would let
-                # the in-flight cycle finish on the OLD config, which is exactly what
-                # we're trying to avoid.
-                sys.stdout.flush()
-                os._exit(0)
-            else:
-                print(f"[strategy-engine] config invalidation: bar_frequency unchanged ({cfg.bar_frequency})", flush=True)
-    except Exception as exc:
-        print(f"[strategy-engine] config-invalidated watcher crashed: {exc!r} — TTL fallback still active", flush=True)
+    Manually trigger one strategy cycle, bypassing the market:raw stream.
+
+    Useful for:
+      - smoke-testing strategy changes without waiting for the next bar boundary
+      - forcing a re-evaluation after an admin backfill populated Mongo
+      - cluster-debugging: prove the full strategy → signal-service path works
+        with a known universe and a deterministic invocation
+
+    Body:
+      {
+        "universe": ["AAPL_US_EQ", "MSFT_US_EQ", ...],   // required, ≥1 ticker
+        "dry_run":  true | false                          // optional, default true
+      }
+
+    dry_run=true (default):
+      Compute the StrategyOutput and return it in the JSON response. DOES NOT
+      publish to signals:strategy. Use this when you want to inspect what the
+      engine would produce without driving signal-service / trading-service.
+
+    dry_run=false:
+      Full pipeline — publish to signals:strategy as if it came from market-data.
+      signal-service will consume, approve (if auto-approval is on), and the
+      dispatcher will place orders in whichever TRADING_MODE is configured.
+      USE WITH CARE in Demo/Live mode — this WILL place real orders.
+
+    Returns:
+      {
+        cycle, source: "admin:replay", ready, total, warming,
+        signal_emitted: bool, dry_run: bool,
+        fetch_ms, update_ms,
+        regime_confidence?, nonzero_scores?, universe_size?,
+        output?: {...}     // full StrategyOutput only in dry-run
+      }
+    """
+    universe = body.get("universe") or []
+    dry_run  = bool(body.get("dry_run", True))
+    if not isinstance(universe, list) or not all(isinstance(t, str) for t in universe):
+        return {"error": "universe must be a list of ticker strings", "status": 400}
+    if not universe:
+        return {"error": "universe is empty", "status": 400}
+
+    # Synthetic bars — only the ticker matters; the strategy fetches real price
+    # history from Mongo via bars_client. Timestamps and OHLCV values are zero
+    # placeholders. Cross-sectional return comes from history_map[ticker][-1] -
+    # history_map[ticker][-2], not from these bars.
+    import time as _t
+    now_ms = int(_t.time() * 1000)
+    bars = [
+        OHLCVBar(ticker=t, timestamp=now_ms, open=0.0, high=0.0, low=0.0, close=0.0, volume=0.0)
+        for t in universe
+    ]
+
+    result = await process_cycle(bars, source="admin:replay", entry_id=None, publish=not dry_run)
+    return result
 
 
 @app.on_event("startup")
 async def startup() -> None:
+    # Initialise singletons (strategy, bars_client, redis) BEFORE either the runLoop
+    # or the replay endpoint can call into them. process_loop() also calls
+    # _init_engine_singletons() but it's idempotent — first call wins, second no-ops.
+    # Doing it here means a replay request that arrives before process_loop reaches
+    # its init still finds the singletons ready.
+    await _init_engine_singletons()
+
     # Retain a reference on app.state so the task isn't GC'd. Previously this was a
     # bare create_task() with no reference held, which Python is free to collect —
     # observed in prod as "Task was destroyed but it is pending!" at startup.
@@ -341,7 +539,7 @@ async def startup() -> None:
     task.add_done_callback(_on_loop_done)
     app.state.process_loop_task = task
 
-    # Separate task so a pubsub stall (e.g. Redis hiccup) can't deadlock the strategy
-    # loop. Watcher does its own try/except; failure logs and is non-fatal.
-    watcher = asyncio.create_task(watch_config_invalidations(), name="config_watcher")
-    app.state.config_watcher_task = watcher
+    # Note: BAR_FREQUENCY is a deploy-time decision. A portal flip in `portal_market_config`
+    # does NOT hot-swap the engine — operator must `kubectl rollout restart` after updating
+    # the helm value. Worker-per-mode (see roadmap) replaces this with separate pods
+    # parameterized at deploy time.

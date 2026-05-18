@@ -16,7 +16,7 @@ global:
     # no code change required for any of the toggles documented in CLAUDE.md.
     tradingMode: Demo                   # Paper (notify only) | Demo (demo.trading212) | Live (trading212; admin gate required)
     signalOrderType: Limit              # Limit (T212-friendly, weekly) | Market (immediate fill, daily). Risk-exits always Market.
-    barFrequency: daily                 # daily | intraday
+    barFrequency: intraday                 # daily | intraday
     # Default polling cadence for market-data-service live polling. Must be one of the
     # active provider's allowedPollIntervals (Yahoo: 15m / 1h / 24h). The portal renders
     # the dropdown from those values; this default is what new deploys land on before
@@ -61,6 +61,31 @@ global:
     # and fall back to the legacy "first N from T212" selection.
     universeIncludeUS: "AAPL,ABBV,ABT,ACN,ADBE,AIG,AMD,AMGN,AMT,AMZN,AVGO,AXP,BA,BAC,BK,BKNG,BLK,BMY,BRKB,C,CAT,CHTR,CL,CMCSA,COF,COP,COST,CRM,CSCO,CVS,CVX,DE,DHR,DIS,DOW,DUK,EMR,F,FDX,GD,GE,GILD,GM,GOOG,GOOGL,GS,HD,HON,IBM,INTC,INTU,ISRG,JNJ,JPM,KHC,KMI,KO,LIN,LLY,LMT,LOW,MA,MCD,MDLZ,MDT,META,MMM,MO,MRK,MS,MSFT,NEE,NFLX,NKE,NVDA,ORCL,PEP,PFE,PG,PM,PYPL,QCOM,RTX,SBUX,SCHW,SO,SPG,T,TGT,TMO,TMUS,TSLA,TXN,UNH,UNP,UPS,USB,V,VZ,WBA,WFC,WMT,XOM"
     universeIncludeLSE: "AAL,ABF,ADM,AHT,ANTO,AUTO,AV,AZN,BARC,BATS,BDEV,BEZ,BKG,BME,BNZL,BP,BRBY,CCH,CNA,CRDA,CRH,CTEC,DGE,DPLM,DSV,EDV,ENT,EXPN,EZJ,FCIT,FRAS,FRES,GLEN,GSK,HIK,HL,HLN,HSBA,HWDN,IAG,IHG,III,IMB,IMI,INF,ITRK,JD,KGF,LAND,LGEN,LLOY,LMP,LSEG,MNDI,MNG,MRO,NG,NWG,NXT,PHNX,PRU,PSH,PSN,PSON,RIO,RKT,RMV,RR,RTO,SBRY,SDR,SGE,SGRO,SHEL,SMDS,SMIN,SMT,SN,SPX,SSE,STAN,STJ,SVT,TSCO,TW,ULVR,UTG,UU,VOD,WEIR,WPP,WTB"
+
+  # WP2: strategy-engine runs one pod per tuple. The strategy-engine subchart loops over
+  # this list. Lives under `global` so the subchart sees it without explicit import.
+  # - 5m worker consumes market:raw:5m every cycle; tracks intraday regime.
+  # - daily worker consumes market:raw:daily once per (market, UTC-date) at session close.
+  # Each worker writes to its own output stream `signals:strategy:{mode}:{strategyId}`
+  # which signal-service multiplexes onto its consumer loop.
+  # Add/remove entries to scale strategy count; replicas:0 takes a worker offline cleanly.
+  # `primaryStrategy` picks which worker the legacy `strategy-engine` Service alias points
+  # at — keeps the portal and any other in-cluster caller working without ingress rewrites.
+  strategies:
+    - mode:         "5m"
+      barFrequency: "intraday"
+      strategyId:   "factor_rank_v1"
+      replicas:     1
+    - mode:         "daily"
+      barFrequency: "daily"
+      strategyId:   "factor_rank_v1"
+      # WP3: KEDA scale-to-zero. Worker idles at 0 replicas until a daily bar lands on
+      # `market:raw:daily`; KEDA spins it up, processes, scales back down after the
+      # cooldown. `replicas:` is omitted intentionally — KEDA owns the count when this
+      # flag is set. See charts/strategy-engine/templates/scaledobject.yaml.
+      scaleToZero:     true
+      cooldownSeconds: 300
+  primaryStrategy: "5m-factor_rank_v1"
 
 redis:
   host: redis-master

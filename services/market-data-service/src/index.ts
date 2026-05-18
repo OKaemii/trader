@@ -12,7 +12,7 @@ import { getLiveConfig } from './shared/live-config.ts';
 import { createAdminRouter, createInternalBarsRouter } from './modules/admin/routes.ts';
 import { YahooProvider } from './modules/bars/infrastructure/providers/yahoo-provider.ts';
 import { FxClient, YahooFxProvider } from '@trader/shared-fx';
-import { aggregateBars } from '@trader/shared-bars';
+import { aggregateBars, invalidateBarsBulk } from '@trader/shared-bars';
 import {
   HolidayCache, NyseIcalProvider, UkGovBankHolidayProvider, StaticFallbackProvider, STATIC_FALLBACK,
   nyseCalendar, lseCalendar, marketStateOf, shouldPollMarket, partitionByMarket,
@@ -51,10 +51,26 @@ const validator  = new BarValidator();
 const INITIAL_POLL_MS = env.POLL_INTERVAL_MS ?? (env.BAR_FREQUENCY === 'daily' ? 20 * 60 * 1000 : 60 * 1000);
 const gapDetector = new GapDetector(INITIAL_POLL_MS);
 const staleDetector = new StaleDetector(INITIAL_POLL_MS * 3);
-const universeManager = new UniverseManager(async (amount, currency) => {
-  const fx = await getFxClient();
-  return fx.toGBP({ amount, currency });
-});
+// Parse the comma-separated include lists from env. Without this, UniverseManager
+// silently falls through to the legacy "first N from T212" path which admits every
+// instrument T212 carries — Xetra, Lisbon, Madrid, etc. — and the active universe
+// ends up dominated by OTHER-bucket tickers our session-gate ignores.
+const parseSymbolList = (s: string): string[] =>
+  s.split(',').map((t) => t.trim()).filter(Boolean);
+
+const universeManager = new UniverseManager(
+  async (amount, currency) => {
+    const fx = await getFxClient();
+    return fx.toGBP({ amount, currency });
+  },
+  {
+    maxSize:     env.UNIVERSE_MAX_SIZE,
+    includeUs:   parseSymbolList(env.UNIVERSE_INCLUDE_US),
+    includeLse:  parseSymbolList(env.UNIVERSE_INCLUDE_LSE),
+    minPriceGbp: env.UNIVERSE_MIN_PRICE,
+    minAdvGbp:   env.UNIVERSE_MIN_ADV,
+  },
+);
 
 // Each insert is an upsert on (ticker, timestamp, interval) so re-polling the same EOD
 // bar — which used to happen every 20m for the entire day and bloat the collection with
@@ -71,6 +87,12 @@ async function persistBars(bars: OHLCVBar[], interval: BarInterval): Promise<voi
           ticker:          bar.ticker,
           timestamp:       new Date(bar.timestamp),
           interval,
+          // YahooClient.normaliseYahooCurrency stamps every fetched bar with the listing
+          // currency. Without persisting it, downstream price lookups (signal-service
+          // MongoPriceLookup, trading-service dispatcher) have no way to know whether a
+          // US bar is USD-priced — and the lookup's GBP fallback then mis-sizes orders
+          // by an FX factor (e.g. AIG @ $77 sized as if £77 → rounds to 0 shares).
+          ...(bar.currency ? { currency: bar.currency } : {}),
           open:            bar.open,
           high:            bar.high,
           low:             bar.low,
@@ -111,6 +133,86 @@ export function latestPerTicker(bars: OHLCVBar[], targetInterval: BarInterval): 
     if (last) out.push(last);
   }
   return out;
+}
+
+// Daily session-close emit. Fires once per (market, UTC-date) when the market reaches
+// CLOSED, putting one rolled-up daily bar per ticker on market:raw:daily. Gated by a
+// Redis NX-set with 25h TTL so:
+//   • two pollLoop pods (future HA) can't double-emit
+//   • a pod restart after the close doesn't re-fire the same date
+//   • the gate naturally rolls over for the next day after >24h idle
+// We aggregate today's persisted 5m bars (UTC-day fold) — by the time state==CLOSED, the
+// session's final 5m bars have already been persisted by the regular poll path.
+async function maybeEmitDailyAtClose(
+  redis: Awaited<ReturnType<typeof getRedisClient>>,
+  groups: { US: string[]; LSE: string[] },
+  cycleCounter: number,
+): Promise<void> {
+  const utcDate = new Date().toISOString().slice(0, 10);          // YYYY-MM-DD (UTC)
+  const utcMidnightMs = Date.parse(`${utcDate}T00:00:00.000Z`);
+
+  for (const market of ['US', 'LSE'] as Market[]) {
+    const tickers = groups[market];
+    if (tickers.length === 0) continue;
+
+    const state = await marketStateOf(calendarFor(market), Date.now());
+    if (state !== 'CLOSED') continue;
+
+    const gateKey = `market-data:daily-emit:${market}:${utcDate}`;
+    const acquired = await redis.set(gateKey, '1', { NX: true, EX: 25 * 60 * 60 });
+    if (!acquired) continue;       // already emitted this UTC date for this market
+
+    try {
+      const db = await getMongoDb();
+      const docs = await db.collection(COLLECTIONS.OHLCV_BARS)
+        .find({
+          ticker:    { $in: tickers },
+          interval:  '5m',
+          timestamp: { $gte: new Date(utcMidnightMs) },
+        })
+        .toArray();
+      if (docs.length === 0) {
+        log.warn(`[market-data] daily-emit ${market} ${utcDate}: no 5m bars found — skipping`);
+        continue;
+      }
+      // Group by ticker then aggregate-to-daily so aggregateBars sees one ticker's bars
+      // at a time (it folds all rows into a single output bar keyed by the head ticker).
+      const byTicker = new Map<string, OHLCVBar[]>();
+      for (const d of docs) {
+        const bar: OHLCVBar = {
+          ticker:    d.ticker as string,
+          timestamp: (d.timestamp as Date).getTime(),
+          interval:  '5m',
+          open:      d.open as number,
+          high:      d.high as number,
+          low:       d.low as number,
+          close:     d.close as number,
+          volume:    d.volume as number,
+        };
+        let list = byTicker.get(bar.ticker);
+        if (!list) { list = []; byTicker.set(bar.ticker, list); }
+        list.push(bar);
+      }
+      const dailyBars: OHLCVBar[] = [];
+      for (const list of byTicker.values()) {
+        const agg = aggregateBars(list, 'daily');
+        const last = agg[agg.length - 1];
+        if (last) dailyBars.push(last);
+      }
+      if (dailyBars.length === 0) {
+        log.warn(`[market-data] daily-emit ${market} ${utcDate}: aggregation produced 0 bars`);
+        continue;
+      }
+      await persistBars(dailyBars, 'daily');
+      await xAdd(redis, REDIS_STREAMS.MARKET_RAW_DAILY, dailyBars);
+      log.info(`[market-data] daily-emit ${market} ${utcDate} cycle=${cycleCounter}: ${dailyBars.length} bars → market:raw:daily`);
+    } catch (err) {
+      // Release the gate on failure so the next cycle retries. Without this, a transient
+      // Mongo blip would silently skip the daily emit for the entire day.
+      await redis.del(gateKey).catch(() => {});
+      log.error(`[market-data] daily-emit ${market} ${utcDate} failed — gate released for retry:`, err);
+    }
+  }
 }
 
 // Ensure the unique compound index on every boot. Mongo no-ops if it already matches.
@@ -242,6 +344,12 @@ async function pollLoop(): Promise<void> {
     }
     const activeDecisions = decisions.filter((d) => d.state === 'REGULAR' || d.state === 'POST' || d.state === 'PRE');
 
+    // Daily session-close emit. Runs every cycle regardless of the session-gate skip
+    // below — when all markets are closed, that's exactly when this fires (catches up
+    // markets that closed since the last cycle, including after pod restart).
+    await maybeEmitDailyAtClose(redis, { US: groups.US, LSE: groups.LSE }, cycleCounter)
+      .catch((err) => log.error('[market-data] daily-emit pass failed:', err));
+
     if (activeDecisions.length === 0) {
       const summary = decisions.map((d) => `${d.market}=${d.state}`).join(', ');
       let nextOpenIso = 'unknown';
@@ -317,16 +425,33 @@ async function pollLoop(): Promise<void> {
         if (valid.length > 0) {
           const persistStart = Date.now();
           await persistBars(valid, '5m');
+          // Invalidate the shared-bars Redis read-through cache for every ticker we
+          // just wrote. Without this, a consumer (strategy-engine, dispatcher drift
+          // gate, portal) that hit getBars() during a cache-miss BEFORE these bars
+          // existed would have a 1h-TTL empty entry poisoning every read until expiry.
+          // Observed in cluster as `ready=0/N` in strategy-engine despite live
+          // persisted bars landing in Mongo on the same cycle.
+          const writtenTickers = Array.from(new Set(valid.map((b) => b.ticker)));
+          await invalidateBarsBulk(redis as any, writtenTickers.map((t) => ({ ticker: t, interval: '5m' as BarInterval })));
           const targetInterval: BarInterval = cfg.barFrequency === 'intraday' ? '15m' : 'daily';
           const downsampled = latestPerTicker(valid, targetInterval);
           await xAdd(redis, REDIS_STREAMS.MARKET_RAW, downsampled);
+
+          // WP1: mode-tagged dual-write. 5m bars stream every cycle for intraday workers
+          // regardless of cfg.barFrequency (the producer no longer chooses which mode
+          // gets fed — every active strategy-engine worker picks its own stream). Daily
+          // bars are NOT emitted here; they fire once per session close in the loop's
+          // session-transition handler so daily workers don't re-process the same date.
+          const fivemBars = latestPerTicker(valid, '5m');
+          await xAdd(redis, REDIS_STREAMS.MARKET_RAW_5M, fivemBars);
+
           for (const bar of downsampled) {
             await redis.setEx(`market:latest:${bar.ticker}`, 120, JSON.stringify(bar));
           }
           pollStats.lastPollTs   = Date.now();
           pollStats.lastBarCount = downsampled.length;
           pollStats.totalCycles++;
-          log.info(`[market-data] ${decision.market} persisted ${valid.length} 5m bars + xAdd ${downsampled.length} ${targetInterval} bars to market:raw in ${Date.now() - persistStart}ms (totalCycles=${pollStats.totalCycles})`);
+          log.info(`[market-data] ${decision.market} persisted ${valid.length} 5m bars + invalidated ${writtenTickers.length} cache entries + xAdd ${downsampled.length} ${targetInterval}→market:raw + ${fivemBars.length} 5m→market:raw:5m in ${Date.now() - persistStart}ms (totalCycles=${pollStats.totalCycles})`);
         } else {
           log.warn(`[market-data] ${decision.market}: no valid bars to persist this cycle`);
         }

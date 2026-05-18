@@ -1,3 +1,22 @@
+{{/*
+WP2: one Deployment per (mode, strategyId) tuple. Each worker owns its own input
+stream, output stream, and consumer group — so a daily worker and a 5m worker can run
+side-by-side without stepping on each other.
+
+values.yaml.strategies shape:
+  strategies:
+    - mode:         "5m"             # used for input stream key + output stream tag
+      barFrequency: "intraday"       # propagated to BAR_FREQUENCY env (drives rolling window)
+      strategyId:   "factor_rank_v1" # propagated to ACTIVE_STRATEGY env
+      replicas:     1                # 0 = scaled-down (KEDA can drive this in WP3)
+
+If `.Values.strategies` is empty/missing, falls back to a single legacy deployment that
+matches the pre-WP2 chart shape — used during cutover and for backwards compatibility
+with charts that haven't been migrated yet.
+*/}}
+{{- $strategies := (.Values.global).strategies | default (.Values.strategies | default (list)) -}}
+{{- if eq (len $strategies) 0 -}}
+{{/* ── Legacy single-deployment fallback ───────────────────────────────────── */}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -32,15 +51,16 @@ spec:
                 secretKeyRef:
                   name: trader-secrets
                   key: INTERNAL_SECRET
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: JWT_SECRET
             - name: MONGODB_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: trader-secrets
                   key: MONGODB_PASSWORD
-            # Used by infrastructure/live_config.py to read portal_market_config for
-            # the bar-frequency hot-swap (via the config:invalidated pubsub). Without
-            # this, motor falls back to localhost and silently fails — engine keeps
-            # running on env defaults but loses the portal-override path.
             - name: MONGODB_URL
               value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb-headless:27017/trader?authSource=trader&directConnection=true"
             - name: BAR_FREQUENCY
@@ -61,3 +81,100 @@ spec:
               port: 8000
             initialDelaySeconds: 10
             periodSeconds: 10
+{{- else -}}
+{{/* ── Per-worker deployments ─────────────────────────────────────────────── */}}
+{{- range $idx, $s := $strategies }}
+{{- $tag := printf "%s-%s" $s.mode $s.strategyId -}}
+{{- $name := printf "strategy-engine-%s" ($tag | replace "_" "-") }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    app: strategy-engine
+    worker: {{ $tag | quote }}
+spec:
+  {{- if not $s.scaleToZero }}
+  # When scaleToZero is on, KEDA owns the replica count via its HPA — emitting `replicas`
+  # here would cause helm and KEDA to fight on every upgrade. The bootstrap Job ensures
+  # the consumer group exists so KEDA can scale from 0 → 1 immediately on the first
+  # daily emit.
+  replicas: {{ $s.replicas | default 1 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app: strategy-engine
+      worker: {{ $tag | quote }}
+  template:
+    metadata:
+      labels:
+        app: strategy-engine
+        worker: {{ $tag | quote }}
+    spec:
+      containers:
+        - name: strategy-engine
+          image: {{ $.Values.image | default "trader/strategy-engine:latest" }}
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8000
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: REDIS_PASSWORD
+            - name: REDIS_URL
+              value: "redis://:$(REDIS_PASSWORD)@redis-master:6379"
+            - name: INTERNAL_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: INTERNAL_SECRET
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: JWT_SECRET
+            - name: MONGODB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: MONGODB_PASSWORD
+            - name: MONGODB_URL
+              value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb-headless:27017/trader?authSource=trader&directConnection=true"
+            # ── Per-worker stream wiring ─────────────────────────────────────
+            # INPUT_STREAM: market-data publishes here; the worker is the consumer.
+            # OUTPUT_STREAM: signal-service multiplexes consumer groups across the
+            # set defined in values.yaml — see WP2.3 (signal-service main loop).
+            - name: INPUT_STREAM
+              value: {{ printf "market:raw:%s" $s.mode | quote }}
+            - name: OUTPUT_STREAM
+              value: {{ printf "signals:strategy:%s:%s" $s.mode $s.strategyId | quote }}
+            - name: CONSUMER_GROUP
+              value: {{ $name | quote }}
+            - name: BAR_FREQUENCY
+              value: {{ $s.barFrequency | default "daily" | quote }}
+            - name: ACTIVE_STRATEGY
+              value: {{ $s.strategyId | quote }}
+            - name: SIGNAL_ORDER_TYPE
+              value: {{ $.Values.global.env.signalOrderType | default "Limit" | quote }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+{{- end }}
+{{- end -}}

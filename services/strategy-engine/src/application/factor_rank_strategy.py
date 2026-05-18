@@ -47,10 +47,6 @@ class FactorRankStrategy(BaseStrategy):
             'momentum': [], 'reversal': [], 'low_vol': [],
         }
 
-    def regime_engine_for_persistence(self) -> RegimeEngine:
-        """Hook for main.py to attach Redis state persistence to this strategy's regime engine."""
-        return self._regime_engine
-
     @property
     def strategy_id(self) -> str:
         return 'factor_rank_v1'
@@ -58,6 +54,13 @@ class FactorRankStrategy(BaseStrategy):
     @property
     def min_universe_size(self) -> int:
         return 5
+
+    @property
+    def prewarm_cycles(self) -> int:
+        # Match RegimeEngine's own self-imposed retention cap so the regime + feature-
+        # stability state reach steady state by cycle 1. Beyond this the engine pops
+        # the oldest vector, so feeding more is wasted compute.
+        return RegimeEngine.HISTORY_MIN * 2
 
     def update(
         self,

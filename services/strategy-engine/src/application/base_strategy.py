@@ -44,3 +44,18 @@ class BaseStrategy(ABC):
     def rolling_window(self) -> int:
         """How many historical bars the strategy needs per ticker."""
         return 20
+
+    @property
+    def prewarm_cycles(self) -> int:
+        """
+        How many *historical* cycles of update() the engine host should replay at boot
+        to populate any cross-cycle state (regime returns history, feature stability
+        accumulators, etc.) BEFORE subscribing to the live stream.
+
+        Default 0 = no prewarm (strategies without cross-cycle state). Strategies that
+        carry state across cycles should return the depth at which their internal
+        buffers saturate — e.g. RegimeEngine.HISTORY_MIN * 2 = 126 for factor_rank.
+
+        See main.historical_prewarm() for the replay implementation.
+        """
+        return 0

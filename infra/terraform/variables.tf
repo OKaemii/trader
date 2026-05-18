@@ -47,7 +47,15 @@ variable "resend_api_key" {
   default   = ""
 }
 
-variable "notify_email" {
+// DeepSeek API key — powers per-cycle analysis email enrichment (company profiles +
+// sector reasoning) in notification-service. Empty disables the analysis path; the
+// per-signal quick emails keep firing regardless.
+variable "deepseek_api_key" {
+  sensitive = true
+  default   = ""
+}
+
+variable "email_to" {
   default = "panxiaqi@gmail.com"
 }
 

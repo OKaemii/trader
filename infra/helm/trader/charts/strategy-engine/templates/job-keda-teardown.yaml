@@ -1,0 +1,59 @@
+{{/*
+KEDA teardown Job — pre-delete counterpart to job-keda-bootstrap.yaml. Mirrors the same
+per-scaleToZero-worker loop and destroys the consumer group on `helm uninstall` so a
+later re-install doesn't inherit stale PEL state (which would cause KEDA to immediately
+scale up on an already-acked but cosmetically-pending message).
+
+We don't bother kubectl-deleting the ScaledObject explicitly — helm tears it down along
+with everything else, and KEDA's controller drops the managed HPA within seconds of the
+SO disappearing. A stale HPA against a deleted Deployment is a no-op (nothing to scale)
+so the marginal value of a pre-delete kubectl Job (with the RBAC overhead) isn't worth it.
+
+Hook ordering: weight=-1 + pre-delete so the consumer-group cleanup runs before helm
+deletes the Deployment/Service/ScaledObject. We don't need to be later than them; we just
+need to land while Redis is still reachable from the namespace.
+*/}}
+{{- $strategies := (.Values.global).strategies | default (.Values.strategies | default (list)) -}}
+{{- range $idx, $s := $strategies }}
+{{- if $s.scaleToZero }}
+{{- $tag := printf "%s-%s" $s.mode $s.strategyId -}}
+{{- $name := printf "strategy-engine-%s" ($tag | replace "_" "-") }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ printf "%s-keda-teardown" $name }}
+  namespace: {{ $.Release.Namespace }}
+  annotations:
+    "helm.sh/hook":              pre-delete
+    "helm.sh/hook-weight":       "-1"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  ttlSecondsAfterFinished: 60
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: redis-teardown
+          image: redis:7-alpine
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: REDIS_PASSWORD
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              # XGROUP DESTROY returns an integer (1 if destroyed, 0 if not found). Either
+              # outcome is acceptable: idempotent cleanup. Only a real Redis error fails.
+              out=$(redis-cli -h redis-master -p 6379 -a "$REDIS_PASSWORD" \
+                XGROUP DESTROY "market:raw:{{ $s.mode }}" "{{ $name }}" 2>&1) || true
+              echo "$out"
+              echo "$out" | grep -Eq '^(0|1)$' || {
+                echo "unexpected redis-cli response — failing teardown so operator notices"
+                exit 1
+              }
+{{- end }}
+{{- end }}
