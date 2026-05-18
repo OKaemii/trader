@@ -22,6 +22,7 @@ import { COLLECTIONS } from '@trader/shared-mongo';
 import { invalidateBars } from '@trader/shared-bars';
 import type { OHLCVBar, BarInterval } from '@trader/shared-types';
 import type { MarketDataProvider } from './providers/market-data-provider.ts';
+import { log } from './logger.ts';
 
 // Topic for the cross-service cache-invalidation pubsub. Anything maintaining a
 // derived view of bar history (signal-service' price-lookup cache, the portal's
@@ -129,7 +130,7 @@ async function backfillOne(
   try {
     await redis.publish(CACHE_INVALIDATED_TOPIC, JSON.stringify({ ticker, interval, fetched: bars.length, ts: Date.now() }));
   } catch (err) {
-    console.warn(`[backfill] pubsub publish failed for ${ticker}:`, err);
+    log.warn(`[backfill] pubsub publish failed for ${ticker}:`, err);
   }
 
   return { ticker, fetched: bars.length, upserted: reported };
@@ -209,7 +210,7 @@ export async function healMissingHistory(
   }
   if (gapped.length === 0) return { healed: 0, barsAdded: 0, unrecoverable: 0 };
 
-  console.warn(`[heal] ${gapped.length} ticker(s) have >${(stale / 3_600_000).toFixed(1)}h gap — backfilling`);
+  log.warn(`[heal] ${gapped.length} ticker(s) have >${(stale / 3_600_000).toFixed(1)}h gap — backfilling`);
 
   let barsAdded = 0;
   let unrecoverable = 0;
@@ -244,9 +245,9 @@ export async function healMissingHistory(
           loggedAt: new Date(),
         });
       } catch (err) {
-        console.warn('[heal] failed to log unrecoverable_gap:', err);
+        log.warn('[heal] failed to log unrecoverable_gap:', err);
       }
-      console.warn(`[heal] unrecoverable gap for ${ticker}: ${latestMs} → ${startTs} (${((startTs - latestMs) / 86_400_000).toFixed(1)}d) past provider cap`);
+      log.warn(`[heal] unrecoverable gap for ${ticker}: ${latestMs} → ${startTs} (${((startTs - latestMs) / 86_400_000).toFixed(1)}d) past provider cap`);
     }
   }
 

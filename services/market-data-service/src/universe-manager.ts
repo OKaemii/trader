@@ -7,6 +7,7 @@ import { COLLECTIONS } from '@trader/shared-mongo';
 import type { Currency } from '@trader/shared-types';
 import { fetchT212Instruments } from './t212-client.ts';
 import { fetchYahooLiquidity } from './yahoo-client.ts';
+import { log } from './logger.ts';
 
 // FX converter callback; same shape as the one we pass to YahooProvider. Provided by
 // the bootstrap (index.ts) so the manager stays independent of @trader/shared-fx.
@@ -138,7 +139,7 @@ async function selectCurated(
     const m = byMarket.LSE[sym];
     if (!m) { unresolvedLSE++; continue; }
     if (seenShortNames.has(sym)) {
-      console.warn(`[universe] cross-listing dedup: ${sym} already in US pool, skipping LSE ${m.ticker}`);
+      log.warn(`[universe] cross-listing dedup: ${sym} already in US pool, skipping LSE ${m.ticker}`);
       continue;
     }
     seenShortNames.add(sym);
@@ -152,9 +153,9 @@ async function selectCurated(
   }
 
   if (unresolvedUS || unresolvedLSE) {
-    console.warn(`[universe] include-list unresolved: US=${unresolvedUS} LSE=${unresolvedLSE} (T212 has no matching instrument)`);
+    log.warn(`[universe] include-list unresolved: US=${unresolvedUS} LSE=${unresolvedLSE} (T212 has no matching instrument)`);
   }
-  console.log(`[universe] curated candidates: ${candidates.length} (US: ${INCLUDE_US.length - unresolvedUS}, LSE: ${INCLUDE_LSE.length - unresolvedLSE})`);
+  log.info(`[universe] curated candidates: ${candidates.length} (US: ${INCLUDE_US.length - unresolvedUS}, LSE: ${INCLUDE_LSE.length - unresolvedLSE})`);
 
   // Yahoo liquidity rank. ADV values are normalised to GBP (the base currency) so a
   // USD-denominated $1M ADV and a GBP-denominated £1M ADV are no longer treated as
@@ -206,7 +207,7 @@ export class UniverseManager {
         t212Tradable: true,
       }));
     } catch (err) {
-      console.warn('[universe] T212 instrument fetch failed, using existing registry:', err);
+      log.warn('[universe] T212 instrument fetch failed, using existing registry:', err);
       // Fall back to whatever is already in the registry
       const existing = await db.collection(COLLECTIONS.INSTRUMENT_REGISTRY)
         .find({ activeTo: null })
@@ -298,7 +299,7 @@ export class UniverseManager {
     const overrideResult = applyUniverseOverrides(selected, overridesDoc);
     selected = overrideResult.result;
     if (overrideResult.added || overrideResult.removed) {
-      console.log(`[universe] overrides applied: +${overrideResult.added} -${overrideResult.removed}`);
+      log.info(`[universe] overrides applied: +${overrideResult.added} -${overrideResult.removed}`);
     }
 
     const newTickers = new Set(selected.map((i) => i.ticker));
@@ -346,7 +347,7 @@ export class UniverseManager {
           { $set: { activeTo: null, addedReason: 'universe_reactivation', updatedAt: now } },
         );
       }
-      console.log(`[universe] added ${added.length} instruments: ${added.map((i) => i.ticker).join(', ')}`);
+      log.info(`[universe] added ${added.length} instruments: ${added.map((i) => i.ticker).join(', ')}`);
     }
 
     // Refresh ADV + market on every surviving entry so the portal table doesn't show
@@ -371,13 +372,13 @@ export class UniverseManager {
         { ticker: { $in: removed.map((d: any) => d.ticker) }, activeTo: null },
         { $set: { activeTo: now, removedReason: 'universe_refresh', updatedAt: now } },
       );
-      console.log(`[universe] removed ${removed.length} instruments: ${removed.map((d: any) => d.ticker).join(', ')}`);
+      log.info(`[universe] removed ${removed.length} instruments: ${removed.map((d: any) => d.ticker).join(', ')}`);
     }
 
     this._activeUniverse = selected.map((i) => i.ticker);
     this._sectorMap      = Object.fromEntries(selected.map((i) => [i.ticker, i.sector]));
 
-    console.log(`[universe] active universe: ${this._activeUniverse.length} instruments`);
+    log.info(`[universe] active universe: ${this._activeUniverse.length} instruments`);
     return this._activeUniverse;
   }
 

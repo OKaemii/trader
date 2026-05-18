@@ -1,5 +1,6 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import type { OHLCVBar } from '@trader/shared-types';
+import { log } from './logger.ts';
 
 function t212Base(): string {
   return process.env.TRADING_MODE === 'live'
@@ -59,7 +60,7 @@ export async function fetchT212Instruments(): Promise<T212Instrument[]> {
     if (res.ok) return res.json() as Promise<T212Instrument[]>;
     if (res.status === 429) {
       const wait = 30_000 * 2 ** attempt;
-      console.warn(`[t212] instruments rate-limited, retrying in ${wait / 1000}s`);
+      log.warn(`[t212] instruments rate-limited, retrying in ${wait / 1000}s`);
       await sleep(wait);
       continue;
     }

@@ -13,15 +13,16 @@ import { AccountCache } from "./infrastructure/account-cache.ts";
 import { OrderDispatcher } from "./infrastructure/order-dispatcher.ts";
 import { FillsPoller } from "./application/services/FillsPoller.ts";
 import { TradingMode } from "./domain/entities/Order.ts";
-import { invalidateSignalOrderType } from "./infrastructure/live-config.ts";
+import { invalidateSignalOrderType, setLiveConfigLogger } from "./infrastructure/live-config.ts";
 
 export async function wireDependencies(env: TradingEnv, logger: Logger) {
+    setLiveConfigLogger(logger);
     const live   = env.TRADING_MODE === TradingMode.Live;
     const apiKey   = live ? env.T212_API_KEY    ?? "" : env.T212_API_KEY_DEMO    ?? "";
     const apiKeyId = live ? env.T212_API_KEY_ID ?? "" : env.T212_API_KEY_ID_DEMO ?? "";
     const sharedClient = new Trading212Client(apiKey, apiKeyId);
 
-    const sharedAccountCache = new AccountCache(sharedClient, { ttlMs: env.ACCOUNT_CACHE_TTL_MS });
+    const sharedAccountCache = new AccountCache(sharedClient, { ttlMs: env.ACCOUNT_CACHE_TTL_MS, logger });
 
     let fxClient: FxClient | null = null;
     const getFxClient = async (): Promise<FxClient> => {

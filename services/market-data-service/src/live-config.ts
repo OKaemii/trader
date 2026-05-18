@@ -2,6 +2,7 @@
 // caches for 15s, falls back to env defaults. Override > Helm/env > built-in default.
 
 import { getMongoDb, COLLECTIONS } from '@trader/shared-mongo';
+import { log } from './logger.ts';
 
 export interface MarketConfigDoc {
   _id: 'singleton';
@@ -39,7 +40,7 @@ export async function getLiveConfig(): Promise<LiveConfig> {
     doc = await db.collection<MarketConfigDoc>(COLLECTIONS.PORTAL_MARKET_CONFIG)
       .findOne({ _id: 'singleton' });
   } catch (err) {
-    console.warn('[live-config] mongo read failed, using env defaults:', err);
+    log.warn('[live-config] mongo read failed, using env defaults:', err);
   }
   const value: LiveConfig = {
     barFrequency: doc?.barFrequency ?? envBarFrequency(),
