@@ -2,8 +2,12 @@
 import { useEffect, useState } from 'react';
 import type { StrategyOutput } from '@/types/trader';
 
-export function useTopologyStream() {
-  const [features, setFeatures] = useState<StrategyOutput | null>(null);
+// Initial snapshot is SSR-fetched via /admin/api/signals/topology/snapshot and passed
+// down so consumers (FactorExposureChart, RegimeWidget, BettiCurveChart) render real
+// data on first paint. Without this seed, the page sits in skeleton state for up to
+// 15 minutes — until the next strategy cycle publishes via the WebSocket pubsub.
+export function useTopologyStream(initial: StrategyOutput | null = null) {
+  const [features, setFeatures] = useState<StrategyOutput | null>(initial);
 
   useEffect(() => {
     let ws: WebSocket | null = null;
