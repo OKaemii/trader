@@ -85,8 +85,18 @@ export class RiskEngine {
 
     const today = this._today();
     if (this._state.day_date !== today) {
-      const nav = await this._computeNav();
-      this._state.day_open_nav = nav;
+      const { nav, complete } = await this._computeNav();
+      // Only baseline day_open_nav from a COMPLETE reading. An incomplete reading
+      // (cash fetch failed, etc.) would freeze a degraded baseline that biases
+      // every subsequent daily-loss calc downward. Better to defer setting it —
+      // canTrade() will pick up the first complete reading and set the baseline
+      // lazily on the same-day path.
+      if (complete) {
+        this._state.day_open_nav = nav;
+      } else {
+        this.logger.warn({ nav }, 'init: NAV reading incomplete, deferring day_open_nav baseline to first clean reading');
+        this._state.day_open_nav = 0;   // sentinel: "no valid baseline yet"
+      }
       this._state.day_date = today;
       await this._persistState();
     }
@@ -132,12 +142,29 @@ export class RiskEngine {
     const { open, reason: cbReason } = await this.cb.isOpen();
     if (open) return { allowed: false, reason: cbReason ?? 'Circuit breaker tripped' };
 
-    const nav = await this._computeNav();
+    const { nav, complete } = await this._computeNav();
+
+    // Skip the loss/drawdown gates when NAV is degraded. Comparing an incomplete
+    // reading against the persisted day_open_nav produces the 100% phantom-loss
+    // trip. We still allow the trade — the dispatcher's own pre-place checks
+    // (cash, drift) catch real broker-state problems with first-hand data.
+    if (!complete) {
+      this.logger.warn({ nav }, 'canTrade: NAV reading incomplete, skipping daily-loss + drawdown gates');
+      return { allowed: true, reason: null };
+    }
 
     if (this._state.hwm === 0) {
       this._state.hwm = nav;
       this._state.day_open_nav = nav;
       await this._persistState();
+    }
+
+    // Lazy baseline: init() defers day_open_nav when NAV was incomplete at boot.
+    // First complete reading of the day sets it here.
+    if (this._state.day_open_nav === 0 && nav > 0) {
+      this._state.day_open_nav = nav;
+      await this._persistState();
+      this.logger.info({ nav }, 'canTrade: established day_open_nav baseline from first complete reading');
     }
 
     if (nav > this._state.hwm) {
@@ -179,7 +206,7 @@ export class RiskEngine {
   }
 
   async status(): Promise<RiskStatus> {
-    const nav = await this._computeNav();
+    const { nav } = await this._computeNav();
     const dailyLossPct = this._state.day_open_nav > 0
       ? (this._state.day_open_nav - nav) / this._state.day_open_nav
       : 0;
@@ -211,22 +238,31 @@ export class RiskEngine {
   //     single FX call. No dual-write, no currentValueGBP cache to drift from reality.
   //   - cash: HTTP-fetched from trading-service /internal/trading/cash; T212 reports GBP.
   //
-  // If FX is unavailable past the 24h stale window, sumPositionsGBP throws and NAV
-  // degrades to cash-only with a warning. Better than blocking every signal during a
-  // transient Yahoo outage; the alternative (silently substituting native scalars for
-  // GBP) was the 2026-05-15 bug class this rewrite retires.
+  // Returns `{ nav, complete }` — `complete=false` when either source silently
+  // degraded (cash fetch failed, FX unavailable, etc.). Callers must NOT compare a
+  // degraded reading against the persisted `day_open_nav`: doing so produced the
+  // 100% phantom-loss circuit trip we saw when trading-service was unreachable
+  // (positions=0 + cash fetch error → nav=0 vs persisted day_open_nav=X → 100% loss).
   //
-  // If cash fetch fails we degrade to positions-only with a warning.
-  private async _computeNav(): Promise<number> {
+  // If cash fetch fails we degrade to positions-only with a warning AND mark incomplete.
+  // If positions FX conversion fails we degrade to cash-only AND mark incomplete.
+  // If both succeed AND positions table is empty AND cash is genuinely 0, that's a
+  // "real zero" — `complete=true`, NAV=0 is a legitimate reading (paper mode, fresh
+  // account, etc.). The day_open_nav check below treats that as "no comparison
+  // baseline" if day_open_nav was also 0, or "real loss" if it was positive.
+  private async _computeNav(): Promise<{ nav: number; complete: boolean }> {
     const positions = await this.positions.find({}).toArray() as unknown as PositionDoc[];
     let positionsGBP = 0;
+    let positionsOk = true;
     try {
       positionsGBP = await sumPositionsGBP(positions, this.fx);
     } catch (err) {
-      this.logger.warn({ err }, 'FX unavailable for NAV, degrading to cash-only');
+      this.logger.warn({ err }, 'FX unavailable for NAV, degrading to cash-only (NAV reading INCOMPLETE)');
+      positionsOk = false;
     }
 
     let cashGBP = 0;
+    let cashOk = true;
     try {
       const cash = await this.trading.getCash();
       // Wire format post-FX-fix: free + total are Money in GBP. We want free + positions to avoid
@@ -234,13 +270,15 @@ export class RiskEngine {
       if (cash.free.currency === 'GBP') {
         cashGBP = cash.free.amount;
       } else {
-        this.logger.warn({ currency: cash.free.currency }, 'cash response not in GBP, using 0');
+        this.logger.warn({ currency: cash.free.currency }, 'cash response not in GBP, using 0 (NAV reading INCOMPLETE)');
+        cashOk = false;
       }
     } catch (err) {
-      this.logger.warn({ err }, 'cash fetch failed, NAV degrades to positions-only');
+      this.logger.warn({ err }, 'cash fetch failed, NAV degrades to positions-only (NAV reading INCOMPLETE)');
+      cashOk = false;
     }
 
-    return positionsGBP + cashGBP;
+    return { nav: positionsGBP + cashGBP, complete: positionsOk && cashOk };
   }
 
   private async _logRejection(reason: string, detail: Record<string, unknown>): Promise<void> {
