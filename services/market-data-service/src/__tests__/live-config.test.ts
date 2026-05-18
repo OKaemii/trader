@@ -15,8 +15,9 @@ const liveConfig = await import('../live-config.ts');
 describe('live-config', () => {
   beforeEach(() => {
     liveConfig.invalidateLiveConfig();
-    delete process.env.BAR_FREQUENCY;
-    delete process.env.POLL_INTERVAL_MS;
+    // Reset to a known baseline. Each test calls configureLiveConfig() again with the
+    // specific env defaults it wants to assert against.
+    liveConfig.configureLiveConfig({ barFrequency: 'daily', pollIntervalMs: 24 * 60 * 60_000 });
   });
   afterEach(() => {
     findOneImpl = async () => null;
@@ -24,7 +25,7 @@ describe('live-config', () => {
 
   it('falls back to env defaults when override doc is missing', async () => {
     findOneImpl = async () => null;
-    process.env.BAR_FREQUENCY = 'daily';
+    liveConfig.configureLiveConfig({ barFrequency: 'daily', pollIntervalMs: 24 * 60 * 60_000 });
     const cfg = await liveConfig.getLiveConfig();
     expect(cfg.barFrequency).toBe('daily');
     expect(cfg.pollIntervalMs).toBe(24 * 60 * 60_000);
@@ -32,7 +33,7 @@ describe('live-config', () => {
 
   it('uses intraday env default when set', async () => {
     findOneImpl = async () => null;
-    process.env.BAR_FREQUENCY = 'intraday';
+    liveConfig.configureLiveConfig({ barFrequency: 'intraday', pollIntervalMs: 15 * 60_000 });
     liveConfig.invalidateLiveConfig();
     const cfg = await liveConfig.getLiveConfig();
     expect(cfg.barFrequency).toBe('intraday');
@@ -47,7 +48,7 @@ describe('live-config', () => {
       updatedBy: 'tester',
       updatedAt: new Date(),
     });
-    process.env.BAR_FREQUENCY = 'daily';
+    liveConfig.configureLiveConfig({ barFrequency: 'daily', pollIntervalMs: 24 * 60 * 60_000 });
     liveConfig.invalidateLiveConfig();
     const cfg = await liveConfig.getLiveConfig();
     expect(cfg.barFrequency).toBe('intraday');     // from override
@@ -76,7 +77,7 @@ describe('live-config', () => {
 
   it('returns env defaults when mongo read throws', async () => {
     findOneImpl = async () => { throw new Error('mongo down'); };
-    process.env.BAR_FREQUENCY = 'daily';
+    liveConfig.configureLiveConfig({ barFrequency: 'daily', pollIntervalMs: 24 * 60 * 60_000 });
     liveConfig.invalidateLiveConfig();
     const cfg = await liveConfig.getLiveConfig();
     expect(cfg.barFrequency).toBe('daily');

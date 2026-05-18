@@ -13,14 +13,14 @@ import { AccountCache } from "./infrastructure/account-cache.ts";
 import { OrderDispatcher } from "./infrastructure/order-dispatcher.ts";
 import { FillsPoller } from "./application/services/FillsPoller.ts";
 import { TradingMode } from "./domain/entities/Order.ts";
-import { invalidateSignalOrderType, setLiveConfigLogger } from "./infrastructure/live-config.ts";
+import { invalidateSignalOrderType, configureLiveConfig, parseSignalOrderType } from "./infrastructure/live-config.ts";
 
 export async function wireDependencies(env: TradingEnv, logger: Logger) {
-    setLiveConfigLogger(logger);
+    configureLiveConfig({ logger, envDefault: parseSignalOrderType(env.SIGNAL_ORDER_TYPE) });
     const live   = env.TRADING_MODE === TradingMode.Live;
     const apiKey   = live ? env.T212_API_KEY    ?? "" : env.T212_API_KEY_DEMO    ?? "";
     const apiKeyId = live ? env.T212_API_KEY_ID ?? "" : env.T212_API_KEY_ID_DEMO ?? "";
-    const sharedClient = new Trading212Client(apiKey, apiKeyId);
+    const sharedClient = new Trading212Client({ apiKey, apiKeyId, live });
 
     const sharedAccountCache = new AccountCache(sharedClient, { ttlMs: env.ACCOUNT_CACHE_TTL_MS, logger });
 

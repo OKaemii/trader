@@ -22,12 +22,14 @@ import {
 import { backfillTickers, tickersMissingHistory, healMissingHistory } from './backfill.ts';
 import { msUntilNextTick } from './poll-scheduling.ts';
 import { log } from './logger.ts';
+import { getRuntimeEnv } from './runtime-env.ts';
+import { REDIS_STREAMS, type OHLCVBar, type BarInterval } from '@trader/shared-types';
+
+const env = getRuntimeEnv();
 
 // Wall-clock anchor for the poll grid. 24h ticks land at this UTC offset (~1h after
-// US close = 22:00 UTC); shorter intervals land at the same phase. Override via env
-// for environments on a non-US calendar.
-const POLL_ANCHOR_OFFSET_MS = parseInt(process.env.POLL_ANCHOR_OFFSET_MS ?? String(22 * 60 * 60_000), 10);
-import { REDIS_STREAMS, type OHLCVBar, type BarInterval } from '@trader/shared-types';
+// US close = 22:00 UTC); shorter intervals land at the same phase.
+const POLL_ANCHOR_OFFSET_MS = env.POLL_ANCHOR_OFFSET_MS;
 
 const app = new Hono();
 // BAR_FREQUENCY=daily   → re-poll Yahoo every POLL_INTERVAL_MS (default 20m) until the
@@ -39,17 +41,14 @@ const app = new Hono();
 // Env values are used as the fallback when no override is set.
 
 // Universe refresh cadence: monthly in production; override via env for testing
-const UNIVERSE_REFRESH_MS = parseInt(process.env.UNIVERSE_REFRESH_MS ?? String(30 * 24 * 60 * 60 * 1000));
+const UNIVERSE_REFRESH_MS = env.UNIVERSE_REFRESH_MS;
 // Gap threshold: skip cycle if more than this fraction of universe is missing.
-// Raise via GAP_THRESHOLD env for demo universes with many T212-only tickers (no Yahoo equivalent).
-const GAP_THRESHOLD = parseFloat(process.env.GAP_THRESHOLD ?? '0.20');
+const GAP_THRESHOLD = env.GAP_THRESHOLD;
 
 const validator  = new BarValidator();
 // Gap/stale detectors are initialized with the env-default poll interval; their
 // thresholds aren't latency-critical so live-config changes don't need to rewire them.
-const INITIAL_POLL_MS = parseInt(process.env.POLL_INTERVAL_MS ?? String(
-  (process.env.BAR_FREQUENCY ?? 'daily') === 'daily' ? 20 * 60 * 1000 : 60 * 1000,
-));
+const INITIAL_POLL_MS = env.POLL_INTERVAL_MS ?? (env.BAR_FREQUENCY === 'daily' ? 20 * 60 * 1000 : 60 * 1000);
 const gapDetector = new GapDetector(INITIAL_POLL_MS);
 const staleDetector = new StaleDetector(INITIAL_POLL_MS * 3);
 const universeManager = new UniverseManager(async (amount, currency) => {
@@ -200,7 +199,7 @@ async function pollLoop(): Promise<void> {
   let activeTickers = await universeManager.refresh();
   if (activeTickers.length === 0) {
     // Fallback to env var seed list if registry is empty
-    activeTickers = (process.env.TICKER_UNIVERSE ?? 'AAPL_US_EQ,MSFT_US_EQ,GOOGL_US_EQ,AMZN_US_EQ,NVDA_US_EQ,TSLA_US_EQ,FB_US_EQ,NFLX_US_EQ,AMD_US_EQ,INTC_US_EQ').split(',');
+    activeTickers = (env.TICKER_UNIVERSE ?? 'AAPL_US_EQ,MSFT_US_EQ,GOOGL_US_EQ,AMZN_US_EQ,NVDA_US_EQ,TSLA_US_EQ,FB_US_EQ,NFLX_US_EQ,AMD_US_EQ,INTC_US_EQ').split(',');
     log.warn(`[market-data] universe empty — using TICKER_UNIVERSE env: ${activeTickers.join(',')}`);
   }
   let lastUniverseRefresh = Date.now();
@@ -442,7 +441,7 @@ async function bootstrap(): Promise<void> {
     log.warn('[market-data] universe refresh failed during bootstrap, skipping backfill:', err);
   }
   if (universe.length === 0) {
-    universe = (process.env.TICKER_UNIVERSE ?? '').split(',').filter(Boolean);
+    universe = (env.TICKER_UNIVERSE ?? '').split(',').filter(Boolean);
   }
 
   if (universe.length > 0) {
@@ -475,7 +474,7 @@ async function bootstrap(): Promise<void> {
 // helpers from this module via vitest's module loader, which uses a separate process.
 bootstrap();
 
-const port = Number(process.env.PORT ?? 3002);
+const port = env.PORT;
 serve({ fetch: app.fetch, port }, (info) => {
   log.info(`[market-data-service] listening on :${info.port}`);
 });

@@ -26,6 +26,11 @@ const EnvSchema = z.object({
     MONGODB_URL: z.string().url().default("mongodb://mongodb:27017"),
     REDIS_URL:   z.string().url().default("redis://redis:6379"),
 
+    // SIGNAL_ORDER_TYPE: the default order shape signal-driven orders use (operator can
+    // override at runtime via the portal). Helm sets it as the enum member name; we also
+    // accept the integer for parameterised setups. Resolved to OrderType in wiring.ts.
+    SIGNAL_ORDER_TYPE: z.string().default("Limit"),
+
     OTLP_ENDPOINT: z.string().url().optional(),
 }).superRefine((env, ctx) => {
     if (env.TRADING_MODE !== TradingMode.Paper) {
