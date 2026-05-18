@@ -18,7 +18,7 @@
 //   router.use('/internal/api/signals/*', parseInternalHeaders('trading-service', 'api-gateway'))
 
 import type { Context, Next } from 'hono';
-import { verifyTokenForAudience, type TokenClaims } from './jwt.ts';
+import { verifyTokenForAudience, verifyAccessToken, type TokenClaims } from './jwt.ts';
 import type { Audience } from './audiences.ts';
 
 // Extract the bearer token from either `Authorization: Bearer …` (server-to-server +
@@ -60,10 +60,20 @@ export async function parseAdminHeaders(c: Context, next: Next): Promise<Respons
         c.set('user', claims);
         return next();
     } catch {
-        // 403 not 401: if a user token was supplied but it wasn't an admin token, the
-        // caller is authenticated but unauthorised. Matches the older requireRole('admin')
-        // semantics so existing portal error handling keeps working.
-        return c.json({ error: 'Forbidden — admin only' }, 403);
+        // Distinguish "expired/invalid token" (→ 401, refreshable) from "valid token
+        // but wrong audience" (→ 403, actual permission denial). Without this split,
+        // any expired access token would render the portal's "Admin role required"
+        // message even though the user IS admin — the auth-fetch retry layer only
+        // refreshes on 401, so 403 short-circuits the refresh.
+        try {
+            await verifyAccessToken(token);
+            // Token is structurally valid (signature OK, not expired) but failed the
+            // audience check above — the caller is authenticated but not admin.
+            return c.json({ error: 'Forbidden — admin only' }, 403);
+        } catch {
+            // Signature failed or token expired — let the client refresh.
+            return c.json({ error: 'Invalid or expired token' }, 401);
+        }
     }
 }
 
