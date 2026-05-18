@@ -14,20 +14,22 @@ export function setLogger(logger: Logger): void {
 
 function emit(level: "info" | "warn" | "error" | "fatal" | "debug" | "trace", args: unknown[]): void {
     if (_logger) {
+        // Pino's methods read `this[msgPrefixSym]` internally, so we must call them
+        // bound to the logger — `const fn = logger.info; fn(...)` breaks at runtime.
         // Heuristic: if the first arg is an object (Pino convention), pass through.
         // Otherwise treat everything as msg + ctx — wrap the trailing values into a `ctx` field.
         const [first, ...rest] = args;
-        const fn = (_logger as unknown as Record<string, (...a: unknown[]) => void>)[level]!;
+        const logger = _logger as unknown as Record<string, (...a: unknown[]) => void>;
         if (typeof first === "object" && first !== null) {
-            fn(...args);
+            logger[level]!(...args);
         } else {
             const msg = typeof first === "string" ? first : String(first);
             if (rest.length === 0) {
-                fn(msg);
+                logger[level]!(msg);
             } else {
                 const ctx: Record<string, unknown> = {};
                 rest.forEach((v, i) => { ctx[`arg${i}`] = v; });
-                fn(ctx, msg);
+                logger[level]!(ctx, msg);
             }
         }
         return;
