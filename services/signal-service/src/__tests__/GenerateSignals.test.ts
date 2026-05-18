@@ -151,6 +151,31 @@ describe('GenerateSignalsUseCase', () => {
     expect(publisher.published).toHaveLength(0);
   });
 
+  it('skips tickers that already have an in-flight signal (Approved/Queued/Executing)', async () => {
+    // Regression: without this filter, the strategy reads currentWeights from Mongo
+    // (synced every 5min by portfolio-service) and re-emits a BUY for a ticker whose
+    // prior BUY is still in the dispatcher queue. By the time that newer BUY is claimed,
+    // the position has filled past target and qty rounds to zero, failing the signal.
+    repo.findByLifecycle = async (states) => {
+      if (states.includes(SignalLifecycle.Queued)) {
+        return [new TradeSignal({
+          id: 'inflight-aapl',
+          timestamp: Date.now(),
+          ticker: 'AAPL',
+          strategy_id: 'factor_rank_v1',
+          action: 'BUY',
+          confidence: 0.8,
+          targetWeight: 0.05,
+          rationale: '{}',
+          lifecycle: SignalLifecycle.Queued,
+        })];
+      }
+      return [];
+    };
+    const signals = await useCase.execute(baseFeatures());
+    expect(signals.every((s) => s.ticker !== 'AAPL')).toBe(true);
+  });
+
   it('emits SELL signals when portfolio holds positions that should be exited', async () => {
     // Portfolio holds heavy AAPL; AAPL score is negative → weight → 0 → SELL.
     // Negative composite score gives |score|/0.05 = 0.3/0.05 = 6 → confidence clamped to 1 ≥ threshold.

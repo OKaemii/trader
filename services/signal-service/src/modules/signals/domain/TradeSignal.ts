@@ -1,4 +1,4 @@
-import { SignalLifecycle, SignalFailureReason } from '@trader/shared-types';
+import { SignalLifecycle, SignalFailureReason, type StrategyOutput } from '@trader/shared-types';
 
 export type Action = 'BUY' | 'SELL' | 'HOLD';
 export { SignalLifecycle, SignalFailureReason };
@@ -28,6 +28,13 @@ export class TradeSignal {
   public readonly failureReason?: SignalFailureReason | undefined;
   public readonly failureDetail?: string | undefined;
 
+  // Trimmed StrategyOutput snapshot — populated by GenerateSignals with just enough
+  // context (sector + score for THIS ticker, regime, position multiplier, strategy id)
+  // for downstream notification enrichment. covariance_matrix + ticker_universe are
+  // intentionally empty to keep the wire/Mongo payload small; full StrategyOutputs are
+  // ~75KB at universe=98 due to the NxN covariance matrix.
+  public readonly features_snapshot?: StrategyOutput | undefined;
+
   constructor(params: {
     id: string;
     timestamp: number;
@@ -49,6 +56,7 @@ export class TradeSignal {
     lastAttemptAt?: number;
     failureReason?: SignalFailureReason;
     failureDetail?: string;
+    features_snapshot?: StrategyOutput;
   }) {
     if (params.confidence < 0 || params.confidence > 1)
       throw new Error('confidence must be in [0, 1]');
@@ -84,6 +92,7 @@ export class TradeSignal {
     this.lastAttemptAt = params.lastAttemptAt;
     this.failureReason = params.failureReason;
     this.failureDetail = params.failureDetail;
+    this.features_snapshot = params.features_snapshot;
   }
 
   // minConfidence is strategy policy — not a domain invariant.
