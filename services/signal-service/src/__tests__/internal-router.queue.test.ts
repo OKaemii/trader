@@ -75,14 +75,14 @@ describe('queue endpoints', () => {
   let app: ReturnType<typeof buildApp>;
   beforeEach(() => { repo = new StubRepo(); app = buildApp(repo); });
 
-  describe('POST /internal/queue/claim', () => {
+  describe('POST /internal/api/signals/queue/claim', () => {
     it('rejects no-token requests with 401', async () => {
-      const res = await app.request('/internal/queue/claim', { method: 'POST' });
+      const res = await app.request('/internal/api/signals/queue/claim', { method: 'POST' });
       expect(res.status).toBe(401);
     });
 
     it('rejects wrong-caller tokens with 403 (only trading-service)', async () => {
-      const res = await app.request('/internal/queue/claim', {
+      const res = await app.request('/internal/api/signals/queue/claim', {
         method: 'POST',
         headers: { Authorization: await signalBearer() },
       });
@@ -90,7 +90,7 @@ describe('queue endpoints', () => {
     });
 
     it('returns {signal:null} when queue is empty', async () => {
-      const res = await app.request('/internal/queue/claim', {
+      const res = await app.request('/internal/api/signals/queue/claim', {
         method: 'POST',
         headers: { Authorization: await tradingBearer() },
       });
@@ -105,7 +105,7 @@ describe('queue endpoints', () => {
         action: 'BUY', confidence: 0.5, targetWeight: 0.01, rationale: '{}',
         entryPrice: 100, lifecycle: SignalLifecycle.Executing, attempts: 1,
       });
-      const res = await app.request('/internal/queue/claim', {
+      const res = await app.request('/internal/api/signals/queue/claim', {
         method: 'POST',
         headers: { Authorization: await tradingBearer() },
       });
@@ -118,14 +118,14 @@ describe('queue endpoints', () => {
     });
   });
 
-  describe('POST /internal/queue/:id/requeue', () => {
+  describe('POST /internal/api/signals/queue/:id/requeue', () => {
     it('rejects missing token with 401', async () => {
-      const res = await app.request('/internal/queue/abc/requeue', { method: 'POST' });
+      const res = await app.request('/internal/api/signals/queue/abc/requeue', { method: 'POST' });
       expect(res.status).toBe(401);
     });
 
     it('delegates to repo.requeue with the path id', async () => {
-      const res = await app.request('/internal/queue/abc/requeue', {
+      const res = await app.request('/internal/api/signals/queue/abc/requeue', {
         method: 'POST',
         headers: { Authorization: await tradingBearer() },
       });
@@ -134,9 +134,9 @@ describe('queue endpoints', () => {
     });
   });
 
-  describe('POST /internal/queue/:id/failed', () => {
+  describe('POST /internal/api/signals/queue/:id/failed', () => {
     it('delegates reason + detail to repo.markFailed', async () => {
-      const res = await app.request('/internal/queue/xyz/failed', {
+      const res = await app.request('/internal/api/signals/queue/xyz/failed', {
         method: 'POST',
         headers: { Authorization: await tradingBearer(), 'Content-Type': 'application/json' },
         body: JSON.stringify({ reason: SignalFailureReason.MarketDrift, detail: 'delta=2.5%' }),
@@ -146,7 +146,7 @@ describe('queue endpoints', () => {
     });
 
     it('rejects wrong caller with 403', async () => {
-      const res = await app.request('/internal/queue/xyz/failed', {
+      const res = await app.request('/internal/api/signals/queue/xyz/failed', {
         method: 'POST',
         headers: { Authorization: await signalBearer(), 'Content-Type': 'application/json' },
         body: JSON.stringify({ reason: SignalFailureReason.BrokerRejected }),
@@ -155,10 +155,10 @@ describe('queue endpoints', () => {
     });
   });
 
-  describe('POST /internal/queue/sweep', () => {
+  describe('POST /internal/api/signals/queue/sweep', () => {
     it('returns reverted count from repo.sweepStaleExecuting', async () => {
       repo.sweptCount = 3;
-      const res = await app.request('/internal/queue/sweep', {
+      const res = await app.request('/internal/api/signals/queue/sweep', {
         method: 'POST',
         headers: { Authorization: await tradingBearer(), 'Content-Type': 'application/json' },
         body: JSON.stringify({ thresholdMs: 60_000 }),
@@ -169,7 +169,7 @@ describe('queue endpoints', () => {
     });
 
     it('tolerates empty body — defaults thresholdMs to 60s', async () => {
-      const res = await app.request('/internal/queue/sweep', {
+      const res = await app.request('/internal/api/signals/queue/sweep', {
         method: 'POST',
         headers: { Authorization: await tradingBearer() },
       });

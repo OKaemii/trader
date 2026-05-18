@@ -1,7 +1,7 @@
 import { authedFetch } from '@/app/lib/auth-fetch'
 import { MarketStateBadge, type MarketState } from '@/components/MarketStateBadge'
 
-// Wire shape from market-data-service GET /api/admin/market-data/calendar?days=30.
+// Wire shape from market-data-service GET /admin/api/market-data/calendar?days=30.
 interface ScheduledSession {
   date:      string         // 'YYYY-MM-DD' exchange-local
   market:    'US' | 'LSE'
@@ -32,7 +32,7 @@ interface SourceHealthResponse {
 
 async function fetchCalendar(): Promise<CalendarResponse | null> {
   try {
-    const r = await authedFetch('/api/admin/market-data/calendar?days=30')
+    const r = await authedFetch('/admin/api/market-data/calendar?days=30')
     if (!r.ok) return null
     return (await r.json()) as CalendarResponse
   } catch {
@@ -42,7 +42,7 @@ async function fetchCalendar(): Promise<CalendarResponse | null> {
 
 async function fetchSources(): Promise<SourceHealthResponse | null> {
   try {
-    const r = await authedFetch('/api/admin/market-data/holiday-sources')
+    const r = await authedFetch('/admin/api/market-data/holiday-sources')
     if (!r.ok) return null
     return (await r.json()) as SourceHealthResponse
   } catch {

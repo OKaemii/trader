@@ -6,7 +6,7 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> },
 ) {
   const { id } = await params
-  const upstream = await authedFetch(`/api/admin/signals/approve/${encodeURIComponent(id)}`, {
+  const upstream = await authedFetch(`/admin/api/signals/approve/${encodeURIComponent(id)}`, {
     method: 'POST',
   })
   const data = await upstream.json().catch(() => ({}))

@@ -22,8 +22,10 @@ spec:
           env:
             - name: NEXT_PUBLIC_API_URL
               value: "http://trader.local"
-            - name: GATEWAY_URL
-              value: "http://api-gateway"
+            - name: INGRESS_URL
+              value: "http://ingress-nginx-controller.ingress-nginx.svc.cluster.local"
+            - name: INGRESS_HOST
+              value: "trader.local"
             # Set to "true" only when the portal is fronted by HTTPS — browsers reject
             # Secure cookies over plain HTTP, which breaks the login flow.
             - name: COOKIE_SECURE

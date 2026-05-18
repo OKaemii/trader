@@ -3,7 +3,7 @@
 #
 # Usage:
 #   ./infra/scripts/build-images.sh              # build + load all images
-#   ./infra/scripts/build-images.sh api-gateway  # build + load one service only
+#   ./infra/scripts/build-images.sh signal-service  # build + load one service only
 #
 # Requirements: docker, ssh, scp — SSH key recommended (avoids repeated password prompts).
 #
@@ -27,7 +27,6 @@ chmod 600 "${TMPKEY}"
 trap 'rm -f "${TMPKEY}"' EXIT
 
 TS_SERVICES=(
-  api-gateway
   auth-service
   market-data-service
   signal-service

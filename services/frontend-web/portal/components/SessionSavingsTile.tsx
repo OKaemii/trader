@@ -13,7 +13,7 @@ interface MarketDataHealth {
 
 async function fetchHealth(): Promise<MarketDataHealth | null> {
   try {
-    const r = await authedFetch('/api/admin/market-data/health')
+    const r = await authedFetch('/admin/api/market-data/health')
     if (!r.ok) return null
     return (await r.json()) as MarketDataHealth
   } catch {

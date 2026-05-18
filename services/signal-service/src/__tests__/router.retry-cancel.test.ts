@@ -12,19 +12,19 @@ process.env.JWT_SECRET      = 'test-jwt-secret';
 
 import { describe, it, expect, beforeAll } from "vitest";
 import { Hono } from 'hono';
-import { mintInternalJwt } from '@trader/shared-auth';
+import { signAccessToken } from '@trader/shared-auth';
 import { createRouter } from '../modules/signals/routes/public.ts';
 import type { ISignalRepository } from '../modules/signals/domain/ISignalRepository.ts';
 import { TradeSignal, SignalLifecycle, SignalFailureReason } from '../modules/signals/domain/TradeSignal.ts';
 
-let gatewayJWT: string;
+let adminJWT: string;
 beforeAll(async () => {
   // /api/admin/* is gated as internal-from-gateway. End-user JWTs never reach this service.
-  gatewayJWT = await mintInternalJwt('api-gateway');
+  adminJWT = await signAccessToken({ sub: 'tester', role: 'admin' });
 });
 
 function adminHeaders() {
-  return { Authorization: `Bearer ${gatewayJWT}` };
+  return { Authorization: `Bearer ${adminJWT}` };
 }
 
 class StubRepo implements ISignalRepository {
@@ -71,11 +71,11 @@ function buildApp(repo: StubRepo) {
   return app;
 }
 
-describe('POST /api/admin/signals/retry/:id', () => {
+describe('POST /admin/api/signals/retry/:id', () => {
   it('404s when the signal does not exist', async () => {
     const repo = new StubRepo(null);
     const app  = buildApp(repo);
-    const res  = await app.request('/api/admin/signals/retry/missing', {
+    const res  = await app.request('/admin/api/signals/retry/missing', {
       method: 'POST',
       headers: adminHeaders(),
     });
@@ -85,7 +85,7 @@ describe('POST /api/admin/signals/retry/:id', () => {
   it('400s when the signal is not in lifecycle=failed', async () => {
     const repo = new StubRepo(signal('s1', SignalLifecycle.Executed));
     const app  = buildApp(repo);
-    const res  = await app.request('/api/admin/signals/retry/s1', {
+    const res  = await app.request('/admin/api/signals/retry/s1', {
       method: 'POST',
       headers: adminHeaders(),
     });
@@ -96,7 +96,7 @@ describe('POST /api/admin/signals/retry/:id', () => {
   it('delegates to repo.retry when signal is in lifecycle=failed', async () => {
     const repo = new StubRepo(signal('s1', SignalLifecycle.Failed));
     const app  = buildApp(repo);
-    const res  = await app.request('/api/admin/signals/retry/s1', {
+    const res  = await app.request('/admin/api/signals/retry/s1', {
       method: 'POST',
       headers: adminHeaders(),
     });
@@ -105,11 +105,11 @@ describe('POST /api/admin/signals/retry/:id', () => {
   });
 });
 
-describe('POST /api/admin/signals/cancel/:id', () => {
+describe('POST /admin/api/signals/cancel/:id', () => {
   it('404s when the signal does not exist', async () => {
     const repo = new StubRepo(null);
     const app  = buildApp(repo);
-    const res  = await app.request('/api/admin/signals/cancel/missing', {
+    const res  = await app.request('/admin/api/signals/cancel/missing', {
       method: 'POST',
       headers: adminHeaders(),
     });
@@ -126,7 +126,7 @@ describe('POST /api/admin/signals/cancel/:id', () => {
     ]) {
       const repo = new StubRepo(signal('s1', lc));
       const app  = buildApp(repo);
-      const res  = await app.request('/api/admin/signals/cancel/s1', {
+      const res  = await app.request('/admin/api/signals/cancel/s1', {
         method: 'POST',
         headers: adminHeaders(),
       });
@@ -142,7 +142,7 @@ describe('POST /api/admin/signals/cancel/:id', () => {
     ]) {
       const repo = new StubRepo(signal('s1', lc));
       const app  = buildApp(repo);
-      const res  = await app.request('/api/admin/signals/cancel/s1', {
+      const res  = await app.request('/admin/api/signals/cancel/s1', {
         method: 'POST',
         headers: adminHeaders(),
       });

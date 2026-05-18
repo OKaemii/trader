@@ -20,7 +20,7 @@ const TRADING = ["trading-service"] as const;
 
 export const markExecutedContract = defineContract({
     method: "POST",
-    path: "/internal/trading/signals/:id/executed",
+    path: "/internal/api/signals/:id/executed",
     callerScope: TRADING,
     paramsSchema: IdParamSchema,
     requestSchema: ExecutedNotificationSchema,
@@ -29,7 +29,7 @@ export const markExecutedContract = defineContract({
 
 export const markClosedContract = defineContract({
     method: "POST",
-    path: "/internal/trading/signals/:id/closed",
+    path: "/internal/api/signals/:id/closed",
     callerScope: TRADING,
     paramsSchema: IdParamSchema,
     requestSchema: ClosedNotificationSchema,
@@ -38,7 +38,7 @@ export const markClosedContract = defineContract({
 
 export const decrementQuantityContract = defineContract({
     method: "POST",
-    path: "/internal/trading/signals/:id/decrement-quantity",
+    path: "/internal/api/signals/:id/decrement-quantity",
     callerScope: TRADING,
     paramsSchema: IdParamSchema,
     requestSchema: DecrementQuantityRequestSchema,
@@ -47,7 +47,7 @@ export const decrementQuantityContract = defineContract({
 
 export const openBuysContract = defineContract({
     method: "GET",
-    path: "/internal/trading/signals/open-buys/:ticker",
+    path: "/internal/api/signals/open-buys/:ticker",
     callerScope: TRADING,
     paramsSchema: TickerParamSchema,
     responseSchema: OpenBuysResponseSchema,
@@ -55,14 +55,14 @@ export const openBuysContract = defineContract({
 
 export const claimQueueContract = defineContract({
     method: "POST",
-    path: "/internal/queue/claim",
+    path: "/internal/api/signals/queue/claim",
     callerScope: TRADING,
     responseSchema: ClaimResponseSchema,
 });
 
 export const requeueContract = defineContract({
     method: "POST",
-    path: "/internal/queue/:id/requeue",
+    path: "/internal/api/signals/queue/:id/requeue",
     callerScope: TRADING,
     paramsSchema: IdParamSchema,
     responseSchema: QueueRequeueResponseSchema,
@@ -70,7 +70,7 @@ export const requeueContract = defineContract({
 
 export const failQueueContract = defineContract({
     method: "POST",
-    path: "/internal/queue/:id/failed",
+    path: "/internal/api/signals/queue/:id/failed",
     callerScope: TRADING,
     paramsSchema: IdParamSchema,
     requestSchema: QueueFailedRequestSchema,
@@ -78,7 +78,7 @@ export const failQueueContract = defineContract({
 
 export const sweepQueueContract = defineContract({
     method: "POST",
-    path: "/internal/queue/sweep",
+    path: "/internal/api/signals/queue/sweep",
     callerScope: TRADING,
     requestSchema: QueueSweepRequestSchema,
     responseSchema: QueueSweepResponseSchema,

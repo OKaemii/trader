@@ -57,12 +57,12 @@ describe("schemas", () => {
 describe("contract objects", () => {
     it("Trading.getCashContract carries the path + callerScope", () => {
         expect(Trading.getCashContract.method).toBe("GET");
-        expect(Trading.getCashContract.path).toBe("/internal/trading/cash");
+        expect(Trading.getCashContract.path).toBe("/internal/api/trading/cash");
         expect(Trading.getCashContract.callerScope).toEqual(["portfolio-service", "signal-service"]);
     });
 
     it("Signals.markExecutedContract has :id path param", () => {
-        expect(Signals.markExecutedContract.path).toBe("/internal/trading/signals/:id/executed");
+        expect(Signals.markExecutedContract.path).toBe("/internal/api/signals/:id/executed");
         expect(Signals.markExecutedContract.callerScope).toEqual(["trading-service"]);
     });
 });
@@ -70,7 +70,7 @@ describe("contract objects", () => {
 describe("createInternalCaller", () => {
     it("round-trips through a fake fetcher with full type inference", async () => {
         const fakeFetch: typeof fetch = async (url, init) => {
-            expect(String(url)).toBe("http://trading/internal/trading/cash");
+            expect(String(url)).toBe("http://trading/internal/api/trading/cash");
             expect(init?.method).toBe("GET");
             expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer fake-jwt");
             return new Response(JSON.stringify({
@@ -105,7 +105,7 @@ describe("createInternalCaller", () => {
             fetcher: fakeFetch,
         });
         await call(Signals.markExecutedContract, { params: { id: "sig-1" }, body: { at: 123 } });
-        expect(captured[0]).toBe("http://signal/internal/trading/signals/sig-1/executed");
+        expect(captured[0]).toBe("http://signal/internal/api/signals/sig-1/executed");
     });
 
     it("throws on non-2xx with status + body in the error", async () => {

@@ -1,10 +1,29 @@
 import 'server-only'
-import { getAccessToken, getRefreshToken, rotateAccessToken, deleteSession } from './session'
+import { getAccessToken, getRefreshToken, rotateAccessToken } from './session'
 
-const GATEWAY = process.env.GATEWAY_URL ?? 'http://api-gateway:3000'
+// One dumb pipe. The portal's server-side fetches go through nginx-ingress, which
+// path-prefix-routes to the right service. Each service authenticates itself via its
+// own audience-based middleware — no central gateway, no central auth.
+//
+// INGRESS_URL points at the cluster's nginx-ingress-controller (in-cluster) by default;
+// override for local dev where the ingress controller has a different name. INGRESS_HOST
+// is the virtual host the cluster ingress rules are scoped to (matches the `host:` field
+// in each service's Ingress resource).
+const INGRESS_URL  = process.env.INGRESS_URL  ?? 'http://ingress-nginx-controller.ingress-nginx.svc.cluster.local:80'
+const INGRESS_HOST = process.env.INGRESS_HOST ?? 'trader.local'
+
+function ingressFetch(path: string, init?: RequestInit): Promise<Response> {
+  return fetch(`${INGRESS_URL}${path}`, {
+    ...init,
+    headers: {
+      ...(init?.headers ?? {}),
+      Host: INGRESS_HOST,
+    },
+  })
+}
 
 async function refreshAccessToken(refreshToken: string): Promise<string | null> {
-  const res = await fetch(`${GATEWAY}/api/auth/refresh`, {
+  const res = await ingressFetch('/api/auth/refresh', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ refreshToken }),
@@ -26,7 +45,7 @@ export async function authedFetch(path: string, init?: RequestInit): Promise<Res
   }
 
   const tryFetch = (token: string) =>
-    fetch(`${GATEWAY}${path}`, {
+    ingressFetch(path, {
       ...init,
       headers: { ...(init?.headers ?? {}), Authorization: `Bearer ${token}` },
     })
@@ -54,15 +73,12 @@ export async function authedFetch(path: string, init?: RequestInit): Promise<Res
     })
   }
 
-  // rotateAccessToken would persist the refreshed token, but cookie mutations are only
-  // legal in Server Actions / Route Handlers. Swallow the error so callers from RSCs
-  // still get a valid response — the next call will just refresh again.
   try {
     await rotateAccessToken(newAt)
   } catch {
-    // intentionally ignored — see comment above
+    // intentionally ignored — cookie mutations are only legal in Server Actions / Route Handlers
   }
   return tryFetch(newAt)
 }
 
-export { GATEWAY }
+export { INGRESS_URL, INGRESS_HOST }

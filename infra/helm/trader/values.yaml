@@ -76,10 +76,6 @@ ingress:
   className: nginx
 
 services:
-  apiGateway:
-    replicaCount: 1
-    image: trader/api-gateway:latest
-    port: 3000
   authService:
     replicaCount: 1
     image: trader/auth-service:latest

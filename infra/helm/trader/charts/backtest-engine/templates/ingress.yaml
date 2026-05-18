@@ -1,0 +1,19 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: backtest-engine
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    kubernetes.io/ingress.class: nginx
+spec:
+  rules:
+    - host: trader.local
+      http:
+        paths:
+          - path: /admin/api/backtest
+            pathType: Prefix
+            backend:
+              service:
+                name: backtest-engine
+                port:
+                  number: 8001
