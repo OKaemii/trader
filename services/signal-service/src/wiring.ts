@@ -49,7 +49,12 @@ export async function wireDependencies(env: SignalEnv, logger: Logger) {
     const generateSignals = new GenerateSignalsUseCase(
         signalRepo, publisher, portfolioState, riskEngine,
         logger,
-        { minActionableConfidence: env.MIN_ACTIONABLE_CONFIDENCE, volTarget: env.VOL_TARGET },
+        {
+            minActionableConfidence: env.MIN_ACTIONABLE_CONFIDENCE,
+            volTarget:               env.VOL_TARGET,
+            minPositivePeers:        env.MIN_POSITIVE_PEERS,
+            minScoreEpsilon:         env.MIN_SCORE_EPSILON,
+        },
         undefined, decayMonitor, priceLookup, autoApprovalGate,
     );
     const findRecent      = { execute: (limit: number) => signalRepo.findRecent(limit) };

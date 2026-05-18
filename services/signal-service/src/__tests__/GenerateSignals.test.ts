@@ -200,27 +200,31 @@ describe('GenerateSignalsUseCase', () => {
   // which clamped to 1.0 for every realistic composite score (live scores were ~[-4, 4]).
   // The fix normalises by the cross-sectional p95 of |score|, so confidence spreads across
   // [0, 1] instead of being uniformly 1.0.
-  it('confidence spreads across [0, 1] under realistic score magnitudes', async () => {
-    const features = baseFeatures();
-    // Three tickers with distinctly different conviction. The top score should saturate
-    // (it equals p95 in this 3-element distribution); the bottom should be well under 1.0.
-    // Pick magnitudes such that after p95 normalisation, ratios land above the
-    // MIN_ACTIONABLE_CONFIDENCE threshold (default 0.3) so multiple signals survive.
-    features.composite_scores = { AAPL: 4.0, MSFT: 3.0, GOOG: 1.5 };
-    // Ensure all three tickers produce a signal regardless of weight thresholds by giving
-    // them disjoint weight targets via the score sign + magnitude.
+  it('confidence spreads across [0, 1] under realistic score magnitudes (p95 path)', async () => {
+    // Universe expanded to 6 tickers so the positive cohort exceeds minPositivePeers
+    // (default 5) and the p95 path engages — the original 3-ticker version now falls
+    // into the sparse-positive fallback (divisor=1.0), which is correct but not what
+    // this regression documents.
+    const features: StrategyOutput = {
+      ...baseFeatures(),
+      ticker_universe: ['AAPL', 'MSFT', 'GOOG', 'AMZN', 'META', 'NFLX'],
+      composite_scores: { AAPL: 4.0, MSFT: 3.0, GOOG: 1.5, AMZN: 2.5, META: 2.0, NFLX: 0.5 },
+      sectors: { AAPL: 'T', MSFT: 'T', GOOG: 'C', AMZN: 'T', META: 'C', NFLX: 'C' },
+      factor_attributions: Object.fromEntries(['AAPL','MSFT','GOOG','AMZN','META','NFLX'].map((t) => [
+        t, { momentum: 0.5, reversal: 0.1, low_vol: 0.05, topology: 0.05, residual_alpha: 0.1 },
+      ])),
+      covariance_matrix: Array.from({ length: 6 }, (_, i) =>
+        Array.from({ length: 6 }, (_, j) => (i === j ? 1 : 0.2))),
+    };
     const signals = await useCase.execute(features);
-
-    // The set of confidences should NOT all be 1.0 — at least one should be < 1.
     const confidences = signals.map((s) => s.confidence);
     expect(confidences.length).toBeGreaterThan(0);
+    // At least one confidence is < 1 — p95 spreads the values.
     expect(Math.min(...confidences)).toBeLessThan(1);
-
-    // The signal for the highest-conviction ticker (AAPL: 4.0) should be at or near the cap,
-    // while the lowest (GOOG: 0.1) should be well below.
+    // Top score (AAPL at 4.0) should exceed bottom (NFLX at 0.5).
     const byTicker = Object.fromEntries(signals.map((s) => [s.ticker, s.confidence]));
-    if (byTicker.AAPL !== undefined && byTicker.GOOG !== undefined) {
-      expect(byTicker.AAPL).toBeGreaterThan(byTicker.GOOG);
+    if (byTicker.AAPL !== undefined && byTicker.NFLX !== undefined) {
+      expect(byTicker.AAPL).toBeGreaterThan(byTicker.NFLX);
     }
   });
 
@@ -231,14 +235,26 @@ describe('GenerateSignalsUseCase', () => {
   // silently filtered — `db.signals.count() == 0`. Sign-aware normalisation measures each
   // side's conviction against its own dispersion, so a long-side ticker at the +p95 of the
   // positive cohort saturates at 1.0 regardless of how heavy the short tail is.
-  it('long-side confidence is not crushed by an asymmetric bearish tail', async () => {
-    const features = baseFeatures();
-    features.composite_scores = { AAPL: 0.5, MSFT: 0.3, GOOG: -2.0 };
+  it('long-side confidence is not crushed by an asymmetric bearish tail (sign-aware p95)', async () => {
+    // 5 positive tickers (meets minPositivePeers) + 1 large negative outlier. Pre-fix
+    // (pooled-|score| divisor) the −2.0 tail dominated and crushed every long
+    // confidence below MIN_ACTIONABLE_CONFIDENCE. Sign-aware p95 measures each side
+    // against its own dispersion, so AAPL at the top of the positive cohort saturates
+    // at 1.0 regardless of how heavy the short tail is.
+    const features: StrategyOutput = {
+      ...baseFeatures(),
+      ticker_universe: ['AAPL', 'MSFT', 'GOOG', 'AMZN', 'META', 'NEG'],
+      composite_scores: { AAPL: 0.5, MSFT: 0.45, GOOG: 0.4, AMZN: 0.35, META: 0.3, NEG: -2.0 },
+      sectors: { AAPL: 'T', MSFT: 'T', GOOG: 'C', AMZN: 'T', META: 'C', NEG: 'C' },
+      factor_attributions: Object.fromEntries(['AAPL','MSFT','GOOG','AMZN','META','NEG'].map((t) => [
+        t, { momentum: 0.5, reversal: 0.1, low_vol: 0.05, topology: 0.05, residual_alpha: 0.1 },
+      ])),
+      covariance_matrix: Array.from({ length: 6 }, (_, i) =>
+        Array.from({ length: 6 }, (_, j) => (i === j ? 1 : 0.2))),
+    };
     const signals = await useCase.execute(features);
     const buys = signals.filter((s) => s.action === 'BUY');
     expect(buys.length).toBeGreaterThan(0);
-    // Top long-side conviction (AAPL at the positive p95) should saturate at 1.0,
-    // independent of the −2.0 short-side outlier.
     const aapl = signals.find((s) => s.ticker === 'AAPL');
     expect(aapl?.confidence).toBeCloseTo(1.0, 5);
   });
@@ -278,6 +294,100 @@ describe('GenerateSignalsUseCase', () => {
   it('emitted signals start with lifecycle="pending"', async () => {
     const signals = await useCase.execute(baseFeatures());
     for (const s of signals) expect(s.lifecycle).toBe(SignalLifecycle.Pending);
+  });
+
+  // ── Confidence math — sparse-positive / tiny-score / SELL bypass / normal ──
+  //
+  // Regression: previously a 1-element positive cohort had p95 = the element itself →
+  // ratio = 1 → confidence pinned to 1.0 regardless of how small the score was. The
+  // operator saw 100%-confidence BUYs whose displayed score rounded to 0.000.
+  // Fix: when posScores.length < minPositivePeers (default 5), divisor falls back to
+  // an absolute 1.0; an |score| < minScoreEpsilon (default 0.1) forces confidence to 0.
+  //
+  // Universe is 3 tickers, well below the default 5-peer threshold, so the fallback
+  // path fires in every case below — exactly the production scenario.
+
+  it('singleton-positive cohort: confidence reflects the actual score magnitude, not 1.0', async () => {
+    // One positive cohort member, two flat. Pre-fix: p95 = 0.0008 → ratio = 1.
+    // Post-fix: divisor = 1.0 (sparse path) → confidence = 0.0008 ≪ 1.0.
+    const features = baseFeatures();
+    features.composite_scores = { AAPL: 0.0008, MSFT: 0, GOOG: 0 };
+    const localConfig: GenerateSignalsConfig = {
+      ...stubConfig,
+      minActionableConfidence: 0,   // disable the BUY gate so the signal survives
+      minScoreEpsilon:         0,   // disable the tiny-score gate for this assertion
+    };
+    const local = new GenerateSignalsUseCase(repo, publisher, portfolioState, makeMockRiskEngine(), stubLogger, localConfig);
+    const signals = await local.execute(features);
+    const aapl = signals.find((s) => s.ticker === 'AAPL');
+    expect(aapl).toBeDefined();
+    expect(aapl!.confidence).toBeLessThan(0.01);
+    expect(aapl!.confidence).toBeGreaterThan(0);
+  });
+
+  it('tiny-score gate forces confidence=0 and BUY is dropped (MIN_SCORE_EPSILON)', async () => {
+    // |score| = 0.05 < 0.1 (default minScoreEpsilon) → confidence forced to 0 →
+    // isActionable(minActionableConfidence=0.30) returns false → BUY filtered out.
+    const features = baseFeatures();
+    features.composite_scores = { AAPL: 0.05, MSFT: 0, GOOG: 0 };
+    const signals = await useCase.execute(features);
+    expect(signals.find((s) => s.ticker === 'AAPL' && s.action === 'BUY')).toBeUndefined();
+  });
+
+  it('tiny-score gate still allows SELLs through (exits are portfolio-driven)', async () => {
+    // Same tiny score, but the portfolio holds the position heavily — strategy emits
+    // SELL to free capital. Confidence is forced to 0 but the SELL bypasses the
+    // confidence floor (see filter rule in GenerateSignals).
+    const features = baseFeatures();
+    features.composite_scores = { AAPL: -0.05, MSFT: 0.9, GOOG: 0.1 };
+    const heavyAAPL = new MockPortfolioState({ AAPL: 0.9, MSFT: 0.05, GOOG: 0.05 });
+    const sellUseCase = new GenerateSignalsUseCase(
+      repo, publisher, heavyAAPL, makeMockRiskEngine(), stubLogger, stubConfig,
+    );
+    const signals = await sellUseCase.execute(features);
+    const aaplSell = signals.find((s) => s.ticker === 'AAPL' && s.action === 'SELL');
+    expect(aaplSell).toBeDefined();
+    // Even though confidence is 0 (|score| < epsilon), the SELL is preserved.
+    expect(aaplSell!.confidence).toBe(0);
+  });
+
+  it('normal cross-section (>= minPositivePeers): p95 normalisation unchanged', async () => {
+    // 6 positive tickers — exceeds default minPositivePeers (5) → divisor uses p95,
+    // not the absolute fallback. Spread of confidences across [low, 1] is preserved.
+    const features: StrategyOutput = {
+      ...baseFeatures(),
+      ticker_universe: ['A', 'B', 'C', 'D', 'E', 'F'],
+      composite_scores: { A: 1.0, B: 0.9, C: 0.7, D: 0.5, E: 0.3, F: 0.2 },
+      sectors: { A: 'X', B: 'X', C: 'X', D: 'X', E: 'X', F: 'X' },
+      factor_attributions: Object.fromEntries(['A','B','C','D','E','F'].map((t) => [
+        t, { momentum: 0.5, reversal: 0.1, low_vol: 0.05, topology: 0.05, residual_alpha: 0.1 },
+      ])),
+      covariance_matrix: Array.from({ length: 6 }, (_, i) =>
+        Array.from({ length: 6 }, (_, j) => (i === j ? 1 : 0.2))),
+    };
+    const signals = await useCase.execute(features);
+    expect(signals.length).toBeGreaterThan(0);
+    const confidences = signals.map((s) => s.confidence);
+    // p95 path is in play — at least one confidence saturates at 1, at least one is < 1.
+    expect(Math.max(...confidences)).toBeCloseTo(1.0, 5);
+    expect(Math.min(...confidences)).toBeLessThan(1);
+  });
+
+  it('persists features_snapshot onto every emitted signal for downstream notification enrichment', async () => {
+    const features = baseFeatures();
+    const signals = await useCase.execute(features);
+    expect(signals.length).toBeGreaterThan(0);
+    for (const s of signals) {
+      expect(s.features_snapshot).toBeDefined();
+      expect(s.features_snapshot?.strategy_id).toBe(features.strategy_id);
+      // Per-ticker slice: only this signal's score + sector survive the trim.
+      expect(s.features_snapshot?.composite_scores[s.ticker]).toBeDefined();
+      expect(s.features_snapshot?.sectors[s.ticker]).toBeDefined();
+      // Universe + covariance are deliberately stripped to keep the Mongo doc small.
+      expect(s.features_snapshot?.ticker_universe).toEqual([]);
+      expect(s.features_snapshot?.covariance_matrix).toEqual([]);
+      expect(s.features_snapshot?.regime_confidence).toBe(features.regime_confidence);
+    }
   });
 });
 

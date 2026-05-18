@@ -16,6 +16,12 @@ const EnvSchema = z.object({
     // Strategy knobs read by GenerateSignals + LongOnlyOptimiser.
     MIN_ACTIONABLE_CONFIDENCE: z.coerce.number().min(0).max(1).default(0.30),
     VOL_TARGET:                z.coerce.number().min(0).max(1).default(0.10),
+    // Confidence-math calibration. MIN_POSITIVE_PEERS = below this, the cross-sectional
+    // p95 collapses to a singleton and the divisor falls back to a fixed 1.0 (keeps
+    // confidence honest on sparse universes). MIN_SCORE_EPSILON = |score| floor below
+    // which confidence is forced to 0 regardless of the cross-section.
+    MIN_POSITIVE_PEERS:        z.coerce.number().int().min(1).default(5),
+    MIN_SCORE_EPSILON:         z.coerce.number().min(0).default(0.1),
 
     // Per-pod consumer name on Redis-stream subscriber.
     POD_NAME: z.string().default("local"),

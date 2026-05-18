@@ -15,7 +15,20 @@ import { randomUUID } from 'node:crypto';
 export interface GenerateSignalsConfig {
   minActionableConfidence: number;
   volTarget: number;
+  // Minimum positive (resp. negative) cross-section size below which the p95-based
+  // divisor is meaningless. On a singleton the p95 IS the element → ratio = 1 →
+  // confidence pins to 1.0 regardless of how small the score actually is. Falling back
+  // to a fixed absolute divisor (1.0) prevents the false-positive but doesn't suppress
+  // a real high-conviction pick. Tunable per environment via env (default 5).
+  minPositivePeers?: number;
+  // |score| below this is treated as "no real conviction" — confidence forced to 0
+  // (BUY gate then drops it). Independent of the cross-section size; covers the
+  // factor-collapse case where every score rounds to ~0. Default 0.1.
+  minScoreEpsilon?: number;
 }
+
+const DEFAULT_MIN_POSITIVE_PEERS = 5;
+const DEFAULT_MIN_SCORE_EPSILON  = 0.1;
 
 export class GenerateSignalsUseCase {
   constructor(
@@ -111,8 +124,24 @@ export class GenerateSignalsUseCase {
       .map((t) => features.composite_scores[t] ?? 0)
       .filter((v) => v < 0)
       .map((v) => -v);
-    const divisorPos = p95(posScores);
-    const divisorNeg = p95(negScores);
+    // Singleton / sparse-cross-section fallback. Below `minPositivePeers`, p95 collapses
+    // to "the score itself" and every emitted confidence pins to 1.0 — the operator
+    // reads a 100%-confidence BUY for what is in fact a near-zero composite. Switching
+    // to an absolute divisor of 1.0 keeps the value in [0, 1] but lets it scale honestly
+    // with the actual score magnitude. Surfaced as `confidence_sparse_positive` /
+    // `_sparse_negative` flags so downstream sanity checks can warn.
+    const minPositivePeers = this.config.minPositivePeers ?? DEFAULT_MIN_POSITIVE_PEERS;
+    const minScoreEpsilon  = this.config.minScoreEpsilon  ?? DEFAULT_MIN_SCORE_EPSILON;
+    const sparsePositive = posScores.length < minPositivePeers;
+    const sparseNegative = negScores.length < minPositivePeers;
+    const divisorPos = sparsePositive ? 1.0 : p95(posScores);
+    const divisorNeg = sparseNegative ? 1.0 : p95(negScores);
+    if (sparsePositive || sparseNegative) {
+      this.logger.info({
+        posCount: posScores.length, negCount: negScores.length,
+        sparsePositive, sparseNegative, minPositivePeers,
+      }, 'GenerateSignals.execute: sparse cross-section — using absolute divisor fallback');
+    }
 
     // Look up last close for every universe ticker in one round-trip — used as entryPrice
     // when emitting BUY/SELL signals. Optional dependency: tests can omit priceLookup.
@@ -183,13 +212,19 @@ export class GenerateSignalsUseCase {
               ? { position_size_multiplier: features.position_size_multiplier }
               : {}),
           };
+          // Tiny-score gate: a |score| below `minScoreEpsilon` is operationally
+          // indistinguishable from noise, even if the cross-section is healthy. Force
+          // confidence to 0 so the BUY filter drops it — keeps the operator from
+          // seeing a 100%-confidence pick whose displayed score rounds to 0.000.
+          const rawConfidence = Math.min(Math.abs(score) / divisor, 1) * decayFactor;
+          const confidence = Math.abs(score) < minScoreEpsilon ? 0 : rawConfidence;
           return new TradeSignal({
             id: randomUUID(),
             timestamp: features.timestamp,
             ticker,
             strategy_id: features.strategy_id,
             action,
-            confidence: Math.min(Math.abs(score) / divisor, 1) * decayFactor,
+            confidence,
             targetWeight: w,
             rationale: JSON.stringify(rationale),
             ...(entry && entry > 0 ? { entryPrice: entry } : {}),
