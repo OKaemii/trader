@@ -6,6 +6,7 @@ import type { ApproveSignalUseCase } from '../../approval/application/ApproveSig
 import type { GetSignalProgressUseCase } from '../application/GetSignalProgress.ts';
 import type { AutoApprovalGate } from '../../approval/application/AutoApprovalGate.ts';
 import type { ISignalRepository } from '../domain/ISignalRepository.ts';
+import type { RiskEngine } from '../../risk/application/RiskEngine.ts';
 import { SignalLifecycle, SignalFailureReason } from '@trader/shared-types';
 
 interface Deps {
@@ -14,6 +15,7 @@ interface Deps {
   getProgress: GetSignalProgressUseCase;
   autoApprovalGate: AutoApprovalGate;
   signalRepo: ISignalRepository;
+  riskEngine: RiskEngine;
 }
 
 export function createRouter(deps: Deps): Hono {
@@ -93,6 +95,25 @@ export function createRouter(deps: Deps): Hono {
     }
     await deps.signalRepo.markFailed(id, SignalFailureReason.ManualCancel, 'cancelled by admin from portal');
     return c.json({ id, lifecycle: SignalLifecycle.Failed, reason: SignalFailureReason.ManualCancel });
+  });
+
+  // History — most-recent signals (admin's primary feed view on the portal).
+  router.get('/api/admin/signals/history', requireRole('admin'), async (c) => {
+    const limit = Math.min(parseInt(c.req.query('limit') ?? '50'), 200);
+    const signals = await deps.findRecent.execute(limit);
+    return c.json({ signals });
+  });
+
+  // Risk engine status — circuit-breaker state, NAV snapshot, current drawdown.
+  router.get('/api/admin/risk/status', requireRole('admin'), async (c) => {
+    const status = await deps.riskEngine.status();
+    return c.json(status);
+  });
+
+  // Reset the circuit breaker manually (after investigating the trip cause).
+  router.post('/api/admin/risk/circuit-breaker/reset', requireRole('admin'), async (c) => {
+    await deps.riskEngine.resetCircuitBreaker();
+    return c.json({ reset: true, ts: Date.now() });
   });
 
   return router;

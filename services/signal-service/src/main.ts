@@ -24,6 +24,7 @@ async function main(): Promise<void> {
                 getProgress: d.getProgress,
                 autoApprovalGate: d.autoApprovalGate,
                 signalRepo: d.signalRepo,
+                riskEngine: d.riskEngine,
             }));
             app.route("/", createInternalRouter({
                 findRecent: d.findRecent,

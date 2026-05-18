@@ -7,6 +7,7 @@ RUN corepack enable && corepack prepare pnpm@9.12.0 --activate
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 
 # Copy all package manifests to satisfy --frozen-lockfile workspace validation
+COPY packages/contracts/package.json          ./packages/contracts/
 COPY packages/core/package.json               ./packages/core/
 COPY packages/shared-auth/package.json        ./packages/shared-auth/
 COPY packages/shared-bars/package.json        ./packages/shared-bars/
@@ -17,6 +18,7 @@ COPY packages/shared-mongo/package.json       ./packages/shared-mongo/
 COPY packages/shared-portfolio/package.json   ./packages/shared-portfolio/
 COPY packages/shared-redis/package.json       ./packages/shared-redis/
 COPY packages/shared-types/package.json       ./packages/shared-types/
+COPY packages/telemetry/package.json          ./packages/telemetry/
 COPY services/api-gateway/package.json        ./services/api-gateway/
 COPY services/auth-service/package.json       ./services/auth-service/
 COPY services/frontend-web/package.json       ./services/frontend-web/
