@@ -15,6 +15,12 @@ const EnvSchema = z.object({
     EMAIL_FROM:     z.string().email().optional(),
     EMAIL_TO:       z.string().email().optional(),
 
+    // DeepSeek API key. When set, notification-service runs a per-cycle batcher that
+    // sends ONE enriched analysis email per strategy cycle (covering all picks together
+    // with company profiles + sector-relative reasoning). Empty disables the analysis
+    // path; per-signal quick emails keep firing.
+    DEEPSEEK_API_KEY: z.string().optional(),
+
     OTLP_ENDPOINT: z.string().url().optional(),
 });
 
