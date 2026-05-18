@@ -137,22 +137,34 @@ async function backfillOne(
 }
 
 /**
- * Bootstrap-time check: returns the subset of tickers that have NO 5m bars in the
- * cache. Used by market-data-service on startup to decide whether to backfill.
- * Cheap — single Mongo aggregation grouped by ticker.
+ * Bootstrap-time check: returns the subset of tickers that have INSUFFICIENT 5m
+ * history for the strategy's rolling window.
+ *
+ * The old behaviour ("tickers with ZERO bars") caused a real production issue:
+ * when the universe rotates to include a ticker that has 1-50 stale bars from a
+ * previous run, bootstrap treated it as "fine" and never deep-backfilled. The
+ * strategy then sees ready=0 for that ticker forever (or until 15h of live polling
+ * accumulates enough). Symptom: `ready=0/N` on every strategy cycle despite the
+ * pod claiming bootstrap is healthy.
+ *
+ * `minBars` defaults to 250 (≈ 1 trading day of 5m bars × 3 — enough headroom for
+ * the strategy's 60-bar 15m rolling window plus the regime engine's 126-cycle
+ * prewarm at intraday cadence). Override per call when bootstrapping a different
+ * mode.
  */
 export async function tickersMissingHistory(
   db: Db,
   tickers: string[],
+  minBars = 250,
 ): Promise<string[]> {
   if (tickers.length === 0) return [];
   const collection = db.collection(COLLECTIONS.OHLCV_BARS);
-  const present = await collection.aggregate([
+  const counts = await collection.aggregate([
     { $match: { ticker: { $in: tickers }, interval: '5m' } },
-    { $group: { _id: '$ticker' } },
+    { $group: { _id: '$ticker', count: { $sum: 1 } } },
   ]).toArray();
-  const seen = new Set(present.map((d: any) => d._id));
-  return tickers.filter((t) => !seen.has(t));
+  const sufficient = new Set(counts.filter((d: any) => d.count >= minBars).map((d: any) => d._id));
+  return tickers.filter((t) => !sufficient.has(t));
 }
 
 /**

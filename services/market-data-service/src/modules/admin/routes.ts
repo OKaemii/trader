@@ -56,7 +56,7 @@ const MIN_POLL_MS = 5_000;
 const MAX_POLL_MS = 24 * 60 * 60_000;
 
 const VALID_INTERVALS: BarInterval[] = ['5m', '15m', '1h', 'daily'];
-const VALID_RANGES: RangeKey[]     = ['30d', '60d', '90d'];
+const VALID_RANGES: RangeKey[]     = ['30d', '60d', '90d', '180d'];
 
 export interface CalendarDeps {
   holidayCache: () => HolidayCache;

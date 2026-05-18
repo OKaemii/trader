@@ -20,12 +20,13 @@ import type { RedisClientType } from 'redis';
 import type { OHLCVBar, BarInterval } from '@trader/shared-types';
 import { COLLECTIONS } from '@trader/shared-mongo';
 
-export type RangeKey = '30d' | '60d' | '90d';
+export type RangeKey = '30d' | '60d' | '90d' | '180d';
 
 const RANGE_DAYS: Record<RangeKey, number> = {
   '30d': 30,
   '60d': 60,
   '90d': 90,
+  '180d': 180,
 };
 
 // Bucket size in ms for each interval the consumer might request. Storage is always
@@ -183,7 +184,7 @@ export async function invalidateBars(
   ticker: string,
   interval: BarInterval,
 ): Promise<number> {
-  const ranges: RangeKey[] = ['30d', '60d', '90d'];
+  const ranges: RangeKey[] = ['30d', '60d', '90d', '180d'];
   const keys = ranges.map((r) => cacheKey(ticker, interval, r));
   keys.push(metaKey(ticker, interval));
   // del accepts variadic keys; some clients want an array. The node-redis v4 API
