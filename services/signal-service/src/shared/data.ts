@@ -33,6 +33,12 @@ const toSignalDoc = (s: TradeSignal): any => ({
   lastAttemptAt: s.lastAttemptAt ? new Date(s.lastAttemptAt) : undefined,
   failureReason: s.failureReason,
   failureDetail: s.failureDetail,
+  // Per-signal slice of the cycle's StrategyOutput, attached by GenerateSignals for
+  // downstream notification enrichment (sector, score, regime, multiplier). Compact
+  // by construction (ticker_universe + covariance_matrix are stripped at emit time)
+  // — typical doc ~300 bytes. Old signals without this field round-trip as undefined
+  // and renderers fall back to defaults.
+  features_snapshot: s.features_snapshot,
 });
 
 const fromSignalDoc = (doc: any): TradeSignal => {
@@ -58,6 +64,9 @@ const fromSignalDoc = (doc: any): TradeSignal => {
   const executedAt = toMs(doc.executedAt);   if (executedAt   !== undefined) params.executedAt    = executedAt;
   const closedAt   = toMs(doc.closedAt);     if (closedAt     !== undefined) params.closedAt      = closedAt;
   const lastAt     = toMs(doc.lastAttemptAt); if (lastAt      !== undefined) params.lastAttemptAt = lastAt;
+  if (doc.features_snapshot && typeof doc.features_snapshot === 'object') {
+    params.features_snapshot = doc.features_snapshot;
+  }
   return new TradeSignal(params);
 };
 

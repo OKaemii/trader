@@ -47,6 +47,18 @@ spec:
               value: {{ .Values.global.env.volTarget | default "0.10" | quote }}
             - name: MIN_ACTIONABLE_CONFIDENCE
               value: {{ .Values.global.env.minActionableConfidence | default "0.30" | quote }}
+            # Singleton-positive guardrail: below this many positive composite scores in
+            # the cross-section, the p95 divisor collapses to "the score itself" and every
+            # emitted confidence pins to 1.0 — operator sees 100%-confidence BUYs whose
+            # displayed score rounds to 0.000. Falling back to an absolute divisor of 1.0
+            # keeps the math honest on sparse universes.
+            - name: MIN_POSITIVE_PEERS
+              value: {{ .Values.global.env.minPositivePeers | default "5" | quote }}
+            # |composite_score| floor — below this, confidence is forced to 0 (BUY gate
+            # then drops the signal). Covers the factor-collapse case where every score
+            # rounds to ~0 even on a healthy cross-section.
+            - name: MIN_SCORE_EPSILON
+              value: {{ .Values.global.env.minScoreEpsilon | default "0.1" | quote }}
             # WP2.3: comma-separated stream list. Keeps the legacy `signals:strategy`
             # attached during cutover so any in-flight messages drain, then layers on
             # one per-worker stream `signals:strategy:{mode}:{strategyId}` derived from
