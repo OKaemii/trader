@@ -112,9 +112,12 @@ function WeightProgress({ current, target }: { current: number; target: number }
   );
 }
 
-export function SignalFeed() {
-  const [signals, setSignals] = useState<SignalProgressDTO[]>([]);
-  const [loading, setLoading] = useState(true);
+// Initial signals SSR-fetched on the signals page so the feed renders the table on
+// first paint instead of waiting for client hydration + a /portal-api round-trip.
+// 30s polling keeps it fresh.
+export function SignalFeed({ initial = null }: { initial?: SignalProgressDTO[] | null } = {}) {
+  const [signals, setSignals] = useState<SignalProgressDTO[]>(initial ?? []);
+  const [loading, setLoading] = useState(initial === null);
   const [approvingId, setApprovingId] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -132,10 +135,10 @@ export function SignalFeed() {
         })
         .catch(() => { if (!cancelled) setLoading(false); });
     };
-    load();
+    if (initial === null) load();
     const id = setInterval(load, REFRESH_MS);
     return () => { cancelled = true; clearInterval(id); };
-  }, []);
+  }, [initial]);
 
   async function retry(signal: SignalProgressDTO) {
     setErrorMsg(null);

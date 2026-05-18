@@ -1,9 +1,10 @@
 'use client';
 import { useTopologyStream } from '@/hooks/useTopologyStream';
+import type { StrategyOutput } from '@/types/trader';
 import { LineChart, Line, XAxis, YAxis, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 
-export function BettiCurveChart() {
-  const { features } = useTopologyStream();
+export function BettiCurveChart({ initial = null }: { initial?: StrategyOutput | null } = {}) {
+  const { features } = useTopologyStream(initial);
 
   // Strategy state messaging:
   //   - no features yet           → still connecting to the websocket; show skeleton

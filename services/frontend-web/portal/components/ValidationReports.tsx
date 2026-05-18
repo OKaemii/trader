@@ -15,9 +15,14 @@ interface Report {
   run_at: string
 }
 
-export function ValidationReports({ refreshKey }: { refreshKey: number }) {
-  const [reports, setReports] = useState<Report[]>([])
-  const [loading, setLoading] = useState(true)
+interface ValidationReportsProps {
+  refreshKey: number
+  initial?: Report[] | null
+}
+
+export function ValidationReports({ refreshKey, initial = null }: ValidationReportsProps) {
+  const [reports, setReports] = useState<Report[]>(initial ?? [])
+  const [loading, setLoading] = useState(initial === null)
   const [error, setError] = useState<string | null>(null)
 
   const load = useCallback(() => {
@@ -33,7 +38,12 @@ export function ValidationReports({ refreshKey }: { refreshKey: number }) {
       .finally(() => setLoading(false))
   }, [])
 
-  useEffect(() => { load() }, [load, refreshKey])
+  // Skip the initial load when SSR seeded us. Subsequent refreshKey bumps from the
+  // backtest runner still trigger refetches.
+  useEffect(() => {
+    if (initial !== null && refreshKey === 0) return
+    load()
+  }, [load, refreshKey, initial])
 
   return (
     <div className="rounded border border-gray-800 bg-gray-900 p-4">

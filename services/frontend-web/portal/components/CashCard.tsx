@@ -12,9 +12,16 @@ interface CashState {
   error?: string
 }
 
-export function CashCard() {
-  const [cash, setCash] = useState<CashState | null>(null)
-  const [loading, setLoading] = useState(true)
+// Initial value SSR-fetched in the dashboard page so the card renders real data on
+// first paint — no skeleton flicker. The 60s polling interval keeps the value fresh
+// after that.
+interface CashCardProps {
+  initial?: CashState | null
+}
+
+export function CashCard({ initial = null }: CashCardProps = {}) {
+  const [cash, setCash] = useState<CashState | null>(initial)
+  const [loading, setLoading] = useState(initial === null)
 
   useEffect(() => {
     let cancelled = false
@@ -24,10 +31,12 @@ export function CashCard() {
         .then((d) => { if (!cancelled) { setCash(d); setLoading(false) } })
         .catch(() => { if (!cancelled) setLoading(false) })
     }
-    load()
+    // Don't re-fetch immediately when we already have SSR data — let the first
+    // refresh come from the interval so we save one redundant round-trip.
+    if (initial === null) load()
     const id = setInterval(load, 60_000)
     return () => { cancelled = true; clearInterval(id) }
-  }, [])
+  }, [initial])
 
   return (
     <div className="rounded border border-gray-800 bg-gray-900 p-4">

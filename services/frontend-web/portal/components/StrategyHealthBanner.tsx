@@ -7,9 +7,9 @@ interface ServiceHealth {
   status?: number;
 }
 
-export function StrategyHealthBanner() {
-  const [services, setServices] = useState<ServiceHealth[]>([]);
-  const [loading, setLoading] = useState(true);
+export function StrategyHealthBanner({ initial = null }: { initial?: ServiceHealth[] | null } = {}) {
+  const [services, setServices] = useState<ServiceHealth[]>(initial ?? []);
+  const [loading, setLoading] = useState(initial === null);
 
   useEffect(() => {
     const poll = () => {
@@ -18,10 +18,10 @@ export function StrategyHealthBanner() {
         .then((data: ServiceHealth[]) => { setServices(data); setLoading(false); })
         .catch(() => setLoading(false));
     };
-    poll();
+    if (initial === null) poll();
     const id = setInterval(poll, 60_000);
     return () => clearInterval(id);
-  }, []);
+  }, [initial]);
 
   if (loading || services.length === 0) return null;
 

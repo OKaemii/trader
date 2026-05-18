@@ -1,5 +1,6 @@
 'use client';
 import { useTopologyStream } from '@/hooks/useTopologyStream';
+import type { StrategyOutput } from '@/types/trader';
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ReferenceLine,
   ResponsiveContainer, Cell,
@@ -13,8 +14,8 @@ const FACTOR_LABELS: Record<string, string> = {
   residual_alpha: 'Residual α',
 };
 
-export function FactorExposureChart() {
-  const { features } = useTopologyStream();
+export function FactorExposureChart({ initial = null }: { initial?: StrategyOutput | null } = {}) {
+  const { features } = useTopologyStream(initial);
 
   if (!features?.factor_attributions) {
     return (

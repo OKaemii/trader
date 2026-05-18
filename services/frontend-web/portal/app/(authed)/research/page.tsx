@@ -1,6 +1,21 @@
 import { ResearchView } from '@/components/ResearchView'
+import { authedFetch } from '@/app/lib/auth-fetch'
 
-export default function ResearchPage() {
+// SSR-seed the validation-reports table so it renders 10 rows on first paint instead of
+// waiting for client hydration + a backtest results round-trip.
+async function fetchInitialReports(): Promise<Array<Record<string, unknown>> | null> {
+  try {
+    const r = await authedFetch('/admin/api/backtest/results?limit=10')
+    if (!r.ok) return null
+    const d = (await r.json()) as { results?: Array<Record<string, unknown>> }
+    return d.results ?? []
+  } catch {
+    return null
+  }
+}
+
+export default async function ResearchPage() {
+  const initialReports = await fetchInitialReports()
   return (
     <div className="space-y-6 p-6">
       <div>
@@ -11,7 +26,7 @@ export default function ResearchPage() {
         </p>
       </div>
 
-      <ResearchView />
+      <ResearchView initialReports={initialReports} />
 
       <section className="rounded border border-gray-800 bg-gray-900 p-4">
         <h2 className="mb-2 text-sm font-medium text-gray-300">

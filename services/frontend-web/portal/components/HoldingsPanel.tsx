@@ -32,11 +32,20 @@ const SECTOR_COLOURS = [
   '#8b5cf6', '#ec4899', '#14b8a6', '#f97316', '#84cc16',
 ]
 
-export function HoldingsPanel() {
-  const [pos, setPos] = useState<PositionsResp | null>(null)
-  const [universe, setUniverse] = useState<UniverseResp | null>(null)
-  const [signals, setSignals] = useState<SignalProgressDTO[]>([])
-  const [loading, setLoading] = useState(true)
+// SSR-fetched in dashboard/page.tsx (one Promise.all alongside health + cash) so the
+// panel renders the table + sector pie + signals strip on first paint. 60s polling
+// keeps it fresh after that.
+export interface HoldingsInitial {
+  positions?: PositionsResp | null
+  universe?:  UniverseResp  | null
+  signals?:   SignalProgressDTO[]
+}
+
+export function HoldingsPanel({ initial = null }: { initial?: HoldingsInitial | null } = {}) {
+  const [pos, setPos] = useState<PositionsResp | null>(initial?.positions ?? null)
+  const [universe, setUniverse] = useState<UniverseResp | null>(initial?.universe ?? null)
+  const [signals, setSignals] = useState<SignalProgressDTO[]>(initial?.signals ?? [])
+  const [loading, setLoading] = useState(initial === null)
 
   useEffect(() => {
     let cancelled = false
@@ -54,10 +63,11 @@ export function HoldingsPanel() {
       } catch { /* swallow */ }
       finally { if (!cancelled) setLoading(false) }
     }
-    load()
+    // SSR-seeded path: skip the immediate fetch and let the interval take over.
+    if (initial === null) load()
     const id = setInterval(load, 60_000)
     return () => { cancelled = true; clearInterval(id) }
-  }, [])
+  }, [initial])
 
   const sectorMap = universe?.sectorMap ?? {}
   const positions = pos?.positions ?? []

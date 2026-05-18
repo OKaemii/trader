@@ -1,7 +1,7 @@
 import Link from 'next/link'
 import { authedFetch } from '@/app/lib/auth-fetch'
 import { CashCard } from '@/components/CashCard'
-import { HoldingsPanel } from '@/components/HoldingsPanel'
+import { HoldingsPanel, type HoldingsInitial } from '@/components/HoldingsPanel'
 import { AutoApproveToggle } from '@/components/AutoApproveToggle'
 import { DangerZone } from '@/components/DangerZone'
 import { MarketStateBadge, type MarketState } from '@/components/MarketStateBadge'
@@ -38,6 +38,47 @@ async function fetchMarketDataHealth(): Promise<MarketDataHealth | null> {
   }
 }
 
+// SSR-fetch the auto-approve state so the toggle renders in the correct position on
+// first paint — eliminates the on-mount-GET flicker that previously had the slider
+// start OFF and animate to ON after a few hundred ms.
+async function fetchAutoApprove(): Promise<boolean | null> {
+  try {
+    const r = await authedFetch('/admin/api/signals/auto-approve')
+    if (!r.ok) return null
+    const d = (await r.json()) as { enabled?: boolean }
+    return !!d.enabled
+  } catch {
+    return null
+  }
+}
+
+async function fetchJsonOrNull<T>(path: string): Promise<T | null> {
+  try {
+    const r = await authedFetch(path)
+    if (!r.ok) return null
+    return (await r.json()) as T
+  } catch {
+    return null
+  }
+}
+
+// SSR all three holdings-related endpoints in parallel. With this seed the panel paints
+// real positions, sector pie, and held-signals strip on first byte instead of waiting
+// for client hydration → 3 sequential fetches.
+async function fetchHoldingsInitial(): Promise<HoldingsInitial> {
+  const [positions, universe, signalsBody] = await Promise.all([
+    fetchJsonOrNull<HoldingsInitial['positions']>('/admin/api/trading/positions'),
+    fetchJsonOrNull<HoldingsInitial['universe']>('/admin/api/universe/overrides'),
+    fetchJsonOrNull<{ signals?: NonNullable<HoldingsInitial['signals']> }>('/api/signals/progress'),
+  ])
+  return { positions, universe, signals: signalsBody?.signals ?? [] }
+}
+
+interface CashInitial { free?: unknown; total?: unknown; mode?: 'Paper' | 'Demo' | 'Live'; error?: string }
+async function fetchCashInitial(): Promise<CashInitial | null> {
+  return fetchJsonOrNull<CashInitial>('/admin/api/trading/cash')
+}
+
 const cards = [
   { href: '/signals', title: 'Signals', desc: 'Latest strategy signals, regime, factor exposure.' },
   { href: '/research', title: 'Research', desc: 'Run backtests, view validation reports, factor decomposition.' },
@@ -46,7 +87,13 @@ const cards = [
 ]
 
 export default async function DashboardPage() {
-  const [health, mdHealth] = await Promise.all([fetchHealth(), fetchMarketDataHealth()])
+  const [health, mdHealth, autoApprove, holdings, cash] = await Promise.all([
+    fetchHealth(),
+    fetchMarketDataHealth(),
+    fetchAutoApprove(),
+    fetchHoldingsInitial(),
+    fetchCashInitial(),
+  ])
   const nextOpen = mdHealth?.next_session_open_ts
     ? new Date(mdHealth.next_session_open_ts).toUTCString()
     : null
@@ -69,8 +116,8 @@ export default async function DashboardPage() {
       </div>
 
       <section className="grid grid-cols-1 gap-4 lg:grid-cols-4">
-        <CashCard />
-        <AutoApproveToggle />
+        <CashCard initial={cash as never} />
+        <AutoApproveToggle initialEnabled={autoApprove} />
         <div className="rounded border border-gray-800 bg-gray-900 p-4 lg:col-span-2">
           <h2 className="mb-2 text-sm font-medium text-gray-300">System health</h2>
           {health === null ? (
@@ -94,7 +141,7 @@ export default async function DashboardPage() {
       </section>
 
       <section>
-        <HoldingsPanel />
+        <HoldingsPanel initial={holdings} />
       </section>
 
       <DangerZone />

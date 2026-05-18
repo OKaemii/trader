@@ -1,19 +1,19 @@
 'use client'
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 
-export function AutoApproveToggle() {
-  const [enabled, setEnabled] = useState<boolean | null>(null)
+interface AutoApproveToggleProps {
+  // SSR-fetched initial value. Avoids the on-mount GET + state-null flicker that made
+  // the slider appear to start in OFF position before snapping to the real state — the
+  // user-visible "keeps coming off / takes a while to move right" complaint. Pass null
+  // when the upstream fetch failed; the slider then renders OFF + disabled with no
+  // pretence of a known state.
+  initialEnabled: boolean | null
+}
+
+export function AutoApproveToggle({ initialEnabled }: AutoApproveToggleProps) {
+  const [enabled, setEnabled] = useState<boolean | null>(initialEnabled)
   const [pending, setPending] = useState(false)
   const [error, setError] = useState<string | null>(null)
-
-  useEffect(() => {
-    let cancelled = false
-    fetch('/portal-api/admin/signals/auto-approve')
-      .then((r) => r.json())
-      .then((d) => { if (!cancelled) setEnabled(!!d.enabled) })
-      .catch(() => { if (!cancelled) setEnabled(false) })
-    return () => { cancelled = true }
-  }, [])
 
   async function toggle() {
     if (enabled === null || pending) return

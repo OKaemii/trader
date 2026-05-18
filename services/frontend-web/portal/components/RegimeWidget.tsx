@@ -1,8 +1,9 @@
 'use client';
 import { useTopologyStream } from '@/hooks/useTopologyStream';
+import type { StrategyOutput } from '@/types/trader';
 
-export function RegimeWidget() {
-  const { features } = useTopologyStream();
+export function RegimeWidget({ initial = null }: { initial?: StrategyOutput | null } = {}) {
+  const { features } = useTopologyStream(initial);
   const confidence = features?.regime_confidence ?? null;
 
   const label = confidence === null ? 'Loading...'
