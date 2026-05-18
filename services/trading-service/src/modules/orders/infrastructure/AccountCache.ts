@@ -1,6 +1,7 @@
 import type { Logger } from '@trader/core';
 import type { Money } from '@trader/shared-types';
 import type { Trading212Client, T212Position } from '../../t212/infrastructure/Trading212Client.ts';
+import { scaleT212Quote, type PriceLookupForScaler } from '../../../shared/T212PriceScaler.ts';
 
 // AccountCache — coalesces and caches T212 cash + positions reads so the dispatcher
 // doesn't hammer the broker once per signal.
@@ -32,6 +33,10 @@ export interface AccountCacheOpts {
   staleFallbackMs?: number;
   now?: () => number;
   logger?: Logger;
+  // Optional price lookup used to cross-check T212-reported prices against the stored
+  // bar close. Required to detect pence-quoted LSE listings — without it, position
+  // prices for tickers like SUPRl_EQ / SGLNl_EQ are returned 100x inflated.
+  priceLookup?: PriceLookupForScaler;
 }
 
 export class AccountCache {
@@ -41,6 +46,7 @@ export class AccountCache {
   private readonly staleFallbackMs: number;
   private readonly now: () => number;
   private readonly logger: Logger | null;
+  private readonly priceLookup: PriceLookupForScaler | null;
 
   constructor(
     private readonly client: Pick<Trading212Client, 'getCash' | 'getPositions'>,
@@ -50,6 +56,7 @@ export class AccountCache {
     this.staleFallbackMs = opts.staleFallbackMs ?? 5 * 60_000;
     this.now             = opts.now             ?? (() => Date.now());
     this.logger          = opts.logger          ?? null;
+    this.priceLookup     = opts.priceLookup     ?? null;
   }
 
   async get(): Promise<AccountSnapshot> {
@@ -90,11 +97,29 @@ export class AccountCache {
       this.client.getCash(),
       this.client.getPositions(),
     ]);
+    const scaled = this.priceLookup
+      ? await this._scalePositions(positions, this.priceLookup)
+      : positions;
     return {
       free:      cash.free,
       total:     cash.total,
-      positions,
+      positions: scaled,
       fetchedAt: this.now(),
     };
+  }
+
+  private async _scalePositions(positions: T212Position[], lookup: PriceLookupForScaler): Promise<T212Position[]> {
+    const logger = this.logger ?? undefined;
+    return Promise.all(positions.map(async (p): Promise<T212Position> => {
+      const avg  = await scaleT212Quote(p.ticker, p.averagePrice.amount, lookup, logger);
+      const curr = await scaleT212Quote(p.ticker, p.currentPrice.amount, lookup, logger);
+      if (avg === p.averagePrice.amount && curr === p.currentPrice.amount) return p;
+      return {
+        ...p,
+        averagePrice: { amount: avg,  currency: p.averagePrice.currency },
+        currentPrice: { amount: curr, currency: p.currentPrice.currency },
+        currentValue: { amount: curr * p.quantity, currency: p.currentValue.currency },
+      };
+    }));
   }
 }

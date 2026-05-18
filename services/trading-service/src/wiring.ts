@@ -12,6 +12,7 @@ import { MongoOrderRepository } from "./modules/orders/infrastructure/MongoOrder
 import { AccountCache } from "./modules/orders/infrastructure/AccountCache.ts";
 import { OrderDispatcher } from "./modules/orders/infrastructure/OrderDispatcher.ts";
 import { FillsPoller } from "./modules/fills/application/FillsPoller.ts";
+import { MongoPriceLookup } from "./shared/MongoPriceLookup.ts";
 import { TradingMode } from "./modules/orders/domain/Order.ts";
 import { invalidateSignalOrderType, configureLiveConfig, parseSignalOrderType } from "./modules/orders/infrastructure/live-config.ts";
 
@@ -22,7 +23,15 @@ export async function wireDependencies(env: TradingEnv, logger: Logger) {
     const apiKeyId = live ? env.T212_API_KEY_ID ?? "" : env.T212_API_KEY_ID_DEMO ?? "";
     const sharedClient = new Trading212Client({ apiKey, apiKeyId, live });
 
-    const sharedAccountCache = new AccountCache(sharedClient, { ttlMs: env.ACCOUNT_CACHE_TTL_MS, logger });
+    // Shared price lookup is reused by AccountCache + FillsPoller to detect pence-quoted
+    // LSE listings (T212 reports pence, our bars are GBP — ratio ≈100 → scale /100).
+    const priceLookup = new MongoPriceLookup(await getMongoDb());
+
+    const sharedAccountCache = new AccountCache(sharedClient, {
+        ttlMs: env.ACCOUNT_CACHE_TTL_MS,
+        logger,
+        priceLookup,
+    });
 
     let fxClient: FxClient | null = null;
     const getFxClient = async (): Promise<FxClient> => {
@@ -47,6 +56,7 @@ export async function wireDependencies(env: TradingEnv, logger: Logger) {
             signal,
             env.FILL_POLL_INTERVAL_MS,
             logger,
+            priceLookup,
         )
         : null;
 
