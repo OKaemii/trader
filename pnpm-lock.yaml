@@ -59,6 +59,12 @@ importers:
       '@hono/node-server':
         specifier: ^1.13
         version: 1.19.14(hono@4.12.19)
+      '@hono/zod-validator':
+        specifier: ^0.4.0
+        version: 0.4.3(hono@4.12.19)(zod@3.25.76)
+      '@trader/contracts':
+        specifier: workspace:*
+        version: link:../contracts
       hono:
         specifier: ^4.3.0
         version: 4.12.19
@@ -176,6 +182,9 @@ importers:
       '@hono/zod-validator':
         specifier: ^0.8.0
         version: 0.8.0(hono@4.12.19)(zod@3.25.76)
+      '@trader/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
       '@trader/core':
         specifier: workspace:*
         version: link:../../packages/core
@@ -209,6 +218,9 @@ importers:
       '@hono/zod-validator':
         specifier: ^0.8.0
         version: 0.8.0(hono@4.12.19)(zod@3.25.76)
+      '@trader/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
       '@trader/core':
         specifier: workspace:*
         version: link:../../packages/core
@@ -280,6 +292,9 @@ importers:
       '@hono/zod-validator':
         specifier: ^0.8.0
         version: 0.8.0(hono@4.12.19)(zod@3.25.76)
+      '@trader/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
       '@trader/core':
         specifier: workspace:*
         version: link:../../packages/core
@@ -325,6 +340,9 @@ importers:
       '@hono/zod-validator':
         specifier: ^0.8.0
         version: 0.8.0(hono@4.12.19)(zod@3.25.76)
+      '@trader/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
       '@trader/core':
         specifier: workspace:*
         version: link:../../packages/core
@@ -346,6 +364,9 @@ importers:
       hono:
         specifier: ^4.3.0
         version: 4.12.19
+      redis:
+        specifier: ^4.7.0
+        version: 4.7.1
       resend:
         specifier: ^3.2.0
         version: 3.5.0(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
@@ -361,6 +382,9 @@ importers:
       '@hono/zod-validator':
         specifier: ^0.8.0
         version: 0.8.0(hono@4.12.19)(zod@3.25.76)
+      '@trader/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
       '@trader/core':
         specifier: workspace:*
         version: link:../../packages/core
@@ -385,6 +409,12 @@ importers:
       hono:
         specifier: ^4.3.0
         version: 4.12.19
+      mongodb:
+        specifier: ^6.5.0
+        version: 6.21.0
+      redis:
+        specifier: ^4.7.0
+        version: 4.7.1
       zod:
         specifier: ^3.23.0
         version: 3.25.76
@@ -397,6 +427,9 @@ importers:
       '@hono/zod-validator':
         specifier: ^0.8.0
         version: 0.8.0(hono@4.12.19)(zod@3.25.76)
+      '@trader/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
       '@trader/core':
         specifier: workspace:*
         version: link:../../packages/core
@@ -445,6 +478,9 @@ importers:
       '@hono/zod-validator':
         specifier: ^0.8.0
         version: 0.8.0(hono@4.12.19)(zod@3.25.76)
+      '@trader/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
       '@trader/core':
         specifier: workspace:*
         version: link:../../packages/core
@@ -686,6 +722,12 @@ packages:
     peerDependencies:
       '@hono/node-server': ^1.19.11
       hono: ^4.6.0
+
+  '@hono/zod-validator@0.4.3':
+    resolution: {integrity: sha512-xIgMYXDyJ4Hj6ekm9T9Y27s080Nl9NXHcJkOvkXPhubOLj8hZkOL8pDnnXfvCf5xEE8Q4oMFenQUZZREUY2gqQ==}
+    peerDependencies:
+      hono: '>=3.9.0'
+      zod: ^3.19.1
 
   '@hono/zod-validator@0.8.0':
     resolution: {integrity: sha512-5uS4S1/LKtZQYvD4BtpPUFkOv8d1wNxHHrChm26buMiEYc1FrHWvDUaKVBwkiVtvSExHSpLGDvcnpI2Copyj9w==}
@@ -3899,6 +3941,11 @@ snapshots:
     transitivePeerDependencies:
       - bufferutil
       - utf-8-validate
+
+  '@hono/zod-validator@0.4.3(hono@4.12.19)(zod@3.25.76)':
+    dependencies:
+      hono: 4.12.19
+      zod: 3.25.76
 
   '@hono/zod-validator@0.8.0(hono@4.12.19)(zod@3.25.76)':
     dependencies:

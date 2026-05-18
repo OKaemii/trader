@@ -5,6 +5,21 @@ import { PortfolioConstructor } from '../application/services/PortfolioConstruct
 import type { RankingInput } from '../application/services/LongOnlyOptimiser.ts';
 import type { FxConverter } from '@trader/shared-portfolio';
 import type { Money } from '@trader/shared-types';
+import type { Logger } from '@trader/core';
+import type { TradingServiceClient, CashResponse, PositionsResponse } from '@trader/contracts';
+
+// Stub logger + TradingServiceClient for RiskEngine fixtures. RiskEngine reads cash via
+// the injected TradingServiceClient (was a direct fetch in the pre-contracts version).
+const noopLogger: Logger = {
+    info: () => {}, warn: () => {}, error: () => {}, debug: () => {},
+    trace: () => {}, fatal: () => {}, child: () => noopLogger, level: 'info',
+} as unknown as Logger;
+function stubTradingClient(cash: CashResponse): TradingServiceClient {
+    return {
+        getCash:      async () => cash,
+        getPositions: async (): Promise<PositionsResponse> => ({ positions: [] }),
+    } as unknown as TradingServiceClient;
+}
 
 // ── RISK_LIMITS — hard-limit values pinned as regression guards ───────────────
 describe('RISK_LIMITS hard limits', () => {
@@ -186,58 +201,40 @@ describe('RiskEngine NAV — currency-aware via sumPositionsGBP', () => {
     } as any;
   }
 
-  function installCashStub(amountGBP: number) {
-    const original = globalThis.fetch;
-    globalThis.fetch = (async (url: any) => {
-      if (String(url).includes('/internal/trading/cash')) {
-        return new Response(JSON.stringify({
-          free:  { amount: amountGBP, currency: 'GBP' },
-          total: { amount: amountGBP, currency: 'GBP' },
-        }), { status: 200, headers: { 'content-type': 'application/json' } });
-      }
-      return new Response('{}', { status: 200 });
-    }) as any;
-    return () => { globalThis.fetch = original; };
+  function cashFixture(amountGBP: number): CashResponse {
+    return {
+      free:  { amount: amountGBP, currency: 'GBP' },
+      total: { amount: amountGBP, currency: 'GBP' },
+    };
   }
 
   it('sums GBP + (USD × rate) + cashGBP via injected FxClient', async () => {
-    process.env.INTERNAL_SECRET = 'test-internal-secret';
-    const restore = installCashStub(500);   // £500 cash
-    try {
-      const positions = [
-        { ticker: 'VOD_l_EQ',   quantity: 10, currency: 'GBP',
-          currentValue: { amount: 1000, currency: 'GBP' } },
-        { ticker: 'AAPL_US_EQ', quantity: 5,  currency: 'USD',
-          currentValue: { amount: 1000, currency: 'USD' } },
-      ];
-      const engine = new RiskEngine(makeDb(positions), makeRedis(), makeFx(0.8));
-      const status = await engine.status();
-      // 1000 GBP + 1000 USD * 0.8 + 500 cash = 1000 + 800 + 500 = 2300
-      expect(status.nav).toBeCloseTo(2300, 4);
-    } finally {
-      restore();
-    }
+    const positions = [
+      { ticker: 'VOD_l_EQ',   quantity: 10, currency: 'GBP',
+        currentValue: { amount: 1000, currency: 'GBP' } },
+      { ticker: 'AAPL_US_EQ', quantity: 5,  currency: 'USD',
+        currentValue: { amount: 1000, currency: 'USD' } },
+    ];
+    const engine = new RiskEngine(
+      makeDb(positions), makeRedis(), makeFx(0.8), stubTradingClient(cashFixture(500)), noopLogger,
+    );
+    const status = await engine.status();
+    // 1000 GBP + 1000 USD * 0.8 + 500 cash = 1000 + 800 + 500 = 2300
+    expect(status.nav).toBeCloseTo(2300, 4);
   });
 
   it('degrades to cash-only when FX throws (does not silently substitute native)', async () => {
-    process.env.INTERNAL_SECRET = 'test-internal-secret';
-    const restore = installCashStub(500);
-    const origWarn = console.warn;
-    console.warn = () => {};
-    try {
-      const positions = [
-        { ticker: 'AAPL_US_EQ', quantity: 5, currency: 'USD',
-          currentValue: { amount: 1000, currency: 'USD' } },
-      ];
-      const throwingFx: FxConverter = { async toGBP() { throw new Error('fx down'); } };
-      const engine = new RiskEngine(makeDb(positions), makeRedis(), throwingFx);
-      const status = await engine.status();
-      // FX-throw → positionsGBP = 0; NAV is cash-only. Critically, it is NOT 1000
-      // (which would be the pre-fix silent native-as-GBP substitution).
-      expect(status.nav).toBe(500);
-    } finally {
-      console.warn = origWarn;
-      restore();
-    }
+    const positions = [
+      { ticker: 'AAPL_US_EQ', quantity: 5, currency: 'USD',
+        currentValue: { amount: 1000, currency: 'USD' } },
+    ];
+    const throwingFx: FxConverter = { async toGBP() { throw new Error('fx down'); } };
+    const engine = new RiskEngine(
+      makeDb(positions), makeRedis(), throwingFx, stubTradingClient(cashFixture(500)), noopLogger,
+    );
+    const status = await engine.status();
+    // FX-throw → positionsGBP = 0; NAV is cash-only. Critically, it is NOT 1000
+    // (which would be the pre-fix silent native-as-GBP substitution).
+    expect(status.nav).toBe(500);
   });
 });

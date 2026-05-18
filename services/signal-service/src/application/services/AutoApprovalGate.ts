@@ -19,19 +19,21 @@
 //     paper). This is intentional: paper mode has no real cash to size against.
 
 import type { RedisClientType } from 'redis';
+import type { Logger } from '@trader/core';
+import type { TradingServiceClient } from '@trader/contracts';
 import type { TradeSignal } from '../../domain/entities/TradeSignal.ts';
 import type { ISignalRepository } from '../../domain/interfaces/ISignalRepository.ts';
 import type { ApproveSignalUseCase } from '../use-cases/ApproveSignal.ts';
-import { mintInternalJwt } from '@trader/shared-auth';
 
 const REDIS_KEY = 'signal:auto_approve';
-const TRADING_SERVICE = process.env.TRADING_SERVICE_URL ?? 'http://trading-service:3005';
 
 export class AutoApprovalGate {
   constructor(
     private readonly redis: Pick<RedisClientType, 'get' | 'set' | 'del'>,
     private readonly signalRepo: ISignalRepository,
     private readonly approveSignal: ApproveSignalUseCase,
+    private readonly trading: TradingServiceClient,
+    private readonly logger: Logger,
   ) {}
 
   async isEnabled(): Promise<boolean> {
@@ -60,40 +62,30 @@ export class AutoApprovalGate {
       try {
         await this.approveSignal.execute(s.id);
         approved++;
-      } catch (e) {
-        console.warn(`[AutoApprovalGate] SELL approve failed for ${s.id}:`, e);
+      } catch (err) {
+        this.logger.warn({ err, signalId: s.id }, 'SELL approve failed');
         skipped++;
       }
     }
 
     if (buys.length === 0) return { approved, scaled, skipped };
 
-    // 2. Fetch cash for the pro-rate. Wire format post-FX-fix is Money-shaped:
-    //    { free: { amount, currency }, total: { amount, currency } } in GBP.
+    // 2. Fetch cash for the pro-rate. Both free + total are Money in GBP.
     let cash: { freeGBP: number; totalGBP: number } | null = null;
     try {
-      const res = await fetch(`${TRADING_SERVICE}/internal/trading/cash`, {
-        headers: { Authorization: `Bearer ${await mintInternalJwt('signal-service')}` },
-      });
-      if (res.ok) {
-        const raw = await res.json() as {
-          free?:  { amount?: number; currency?: string };
-          total?: { amount?: number; currency?: string };
-        };
-        const freeAmt  = raw.free?.amount;
-        const totalAmt = raw.total?.amount;
-        if (typeof freeAmt === 'number' && typeof totalAmt === 'number'
-            && raw.free?.currency === 'GBP' && raw.total?.currency === 'GBP') {
-          cash = { freeGBP: freeAmt, totalGBP: totalAmt };
-        } else {
-          console.warn('[AutoApprovalGate] cash response not GBP Money-shaped, skipping BUYs:', raw);
-        }
+      const res = await this.trading.getCash();
+      if (res.free.currency === 'GBP' && res.total.currency === 'GBP') {
+        cash = { freeGBP: res.free.amount, totalGBP: res.total.amount };
+      } else {
+        this.logger.warn({ free: res.free.currency, total: res.total.currency },
+          'cash response not GBP-denominated, skipping BUYs');
       }
-    } catch (e) {
-      console.warn('[AutoApprovalGate] cash fetch failed, skipping BUY auto-approve:', e);
+    } catch (err) {
+      this.logger.warn({ err }, 'cash fetch failed, skipping BUY auto-approve');
     }
     if (!cash || cash.freeGBP <= 0 || cash.totalGBP <= 0) {
-      console.warn(`[AutoApprovalGate] no free cash (free=${cash?.freeGBP} total=${cash?.totalGBP}) — skipping ${buys.length} BUY(s)`);
+      this.logger.warn({ free: cash?.freeGBP, total: cash?.totalGBP, buys: buys.length },
+        'no free cash — skipping BUYs');
       return { approved, scaled, skipped: skipped + buys.length };
     }
 
@@ -103,7 +95,8 @@ export class AutoApprovalGate {
     const scale = totalBuyNotional > cash.freeGBP ? cash.freeGBP / totalBuyNotional : 1.0;
 
     if (scale < 1.0) {
-      console.log(`[AutoApprovalGate] pro-rating ${buys.length} BUYs: notional=${totalBuyNotional.toFixed(2)} > free=${cash.freeGBP.toFixed(2)} → scale=${scale.toFixed(3)}`);
+      this.logger.info({ buys: buys.length, notional: totalBuyNotional, free: cash.freeGBP, scale },
+        'pro-rating BUYs');
     }
 
     // 4. Persist scaled weight + approve
@@ -116,8 +109,8 @@ export class AutoApprovalGate {
         }
         await this.approveSignal.execute(s.id);
         approved++;
-      } catch (e) {
-        console.warn(`[AutoApprovalGate] BUY approve failed for ${s.id}:`, e);
+      } catch (err) {
+        this.logger.warn({ err, signalId: s.id }, 'BUY approve failed');
         skipped++;
       }
     }

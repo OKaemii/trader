@@ -1,11 +1,10 @@
 import type { Collection, Db } from 'mongodb';
 import type { RedisClientType } from 'redis';
-import { mintInternalJwt } from '@trader/shared-auth';
+import type { Logger } from '@trader/core';
+import type { TradingServiceClient } from '@trader/contracts';
 import { sumPositionsGBP, type FxConverter, type PositionDoc } from '@trader/shared-portfolio';
 import { CircuitBreakerRedis } from '../../infrastructure/CircuitBreakerRedis.ts';
 import { RISK_LIMITS } from './LongOnlyOptimiser.ts';
-
-const TRADING_SERVICE_URL = process.env.TRADING_SERVICE_URL ?? 'http://trading-service:3005';
 
 export interface RiskStatus {
   circuit_open: boolean;
@@ -67,7 +66,13 @@ export class RiskEngine {
 
   private _rejectionsToday = 0;
 
-  constructor(db: Db, redis: RedisClientType, private readonly fx: FxConverter) {
+  constructor(
+    db: Db,
+    redis: RedisClientType,
+    private readonly fx: FxConverter,
+    private readonly trading: TradingServiceClient,
+    private readonly logger: Logger,
+  ) {
     this.rejections = db.collection('risk_rejections');
     this.riskState  = db.collection<RiskState>('risk_state');
     this.positions  = db.collection('positions');
@@ -218,29 +223,21 @@ export class RiskEngine {
     try {
       positionsGBP = await sumPositionsGBP(positions, this.fx);
     } catch (err) {
-      console.warn('[RiskEngine] FX unavailable for NAV, degrading to cash-only:', err);
+      this.logger.warn({ err }, 'FX unavailable for NAV, degrading to cash-only');
     }
 
     let cashGBP = 0;
     try {
-      const res = await fetch(`${TRADING_SERVICE_URL}/internal/trading/cash`, {
-        headers: { Authorization: `Bearer ${await mintInternalJwt('signal-service')}` },
-      });
-      if (res.ok) {
-        // Wire format post-FX-fix: { free: { amount, currency }, total: { amount, currency } }.
-        // total includes invested capital + free cash; we want free + positions to avoid
-        // double-counting (positions are already in positionsGBP).
-        const body = await res.json() as { free?: { amount?: number; currency?: string } };
-        if (body.free && typeof body.free.amount === 'number' && body.free.currency === 'GBP') {
-          cashGBP = body.free.amount;
-        } else {
-          console.warn('[RiskEngine] cash response missing GBP free amount, using 0:', body);
-        }
+      const cash = await this.trading.getCash();
+      // Wire format post-FX-fix: free + total are Money in GBP. We want free + positions to avoid
+      // double-counting (positions are already in positionsGBP).
+      if (cash.free.currency === 'GBP') {
+        cashGBP = cash.free.amount;
       } else {
-        console.warn(`[RiskEngine] cash HTTP ${res.status}, NAV degrades to positions-only`);
+        this.logger.warn({ currency: cash.free.currency }, 'cash response not in GBP, using 0');
       }
     } catch (err) {
-      console.warn('[RiskEngine] cash fetch failed, NAV degrades to positions-only:', err);
+      this.logger.warn({ err }, 'cash fetch failed, NAV degrades to positions-only');
     }
 
     return positionsGBP + cashGBP;

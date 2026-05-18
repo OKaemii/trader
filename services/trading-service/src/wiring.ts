@@ -1,5 +1,7 @@
 import type { RedisClientType } from "redis";
 import type { Logger } from "@trader/core";
+import { SignalServiceClient } from "@trader/contracts";
+import { mintInternalJwt } from "@trader/shared-auth";
 import { getMongoDb } from "@trader/shared-mongo";
 import { getRedisClient, subscribe } from "@trader/shared-redis";
 import { FxClient, YahooFxProvider } from "@trader/shared-fx";
@@ -29,19 +31,30 @@ export async function wireDependencies(env: TradingEnv, logger: Logger) {
         return fxClient;
     };
 
+    // Typed peer client for signal-service. Single source of truth for the JWT mint +
+    // base URL + per-endpoint contract. Used by dispatcher, FillsPoller, PlaceOrderUseCase.
+    const signal = new SignalServiceClient({
+        baseUrl:       env.SIGNAL_SERVICE_URL,
+        callerService: "trading-service",
+        mintToken:     mintInternalJwt,
+    });
+
     const fillsPoller = env.TRADING_MODE !== TradingMode.Paper
         ? new FillsPoller(
             new MongoOrderRepository(await getMongoDb()),
             sharedClient,
+            signal,
             env.FILL_POLL_INTERVAL_MS,
+            logger,
         )
         : null;
 
     const dispatcher = new OrderDispatcher({
-        signalServiceUrl:    env.SIGNAL_SERVICE_URL,
         tradingMode:         env.TRADING_MODE,
         client:              sharedClient,
         accountCache:        sharedAccountCache,
+        signal,
+        logger,
         getDb:               () => getMongoDb(),
         getRedis:            () => getRedisClient() as unknown as Promise<Pick<RedisClientType, "get">>,
         fxFromGBP:           async (amount, target) => (await getFxClient()).fromGBP(amount, target),
@@ -56,6 +69,7 @@ export async function wireDependencies(env: TradingEnv, logger: Logger) {
         env,
         sharedClient,
         sharedAccountCache,
+        signal,
         fillsPoller,
         dispatcher,
         getFxClient,

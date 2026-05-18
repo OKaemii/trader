@@ -71,7 +71,8 @@ function buildApp() {
   // UniverseManager is required by the admin router. We hand it a minimal stub —
   // the provider-info route doesn't touch the universe manager at all.
   const stubUM: any = { activeTickers: [], refresh: async () => [] };
-  app.route('/', createAdminRouter(stubUM, new YahooProvider()));
+  const noopLog = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {}, trace: () => {}, fatal: () => {}, child: () => noopLog, level: 'info' } as never;
+  app.route('/', createAdminRouter(stubUM, new YahooProvider(), noopLog));
   return app;
 }
 

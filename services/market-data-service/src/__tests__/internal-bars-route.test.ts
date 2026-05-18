@@ -179,7 +179,8 @@ describe('admin + internal-bars on the same app (mounting regression)', () => {
 
     const app = new Hono();
     // Admin first, then internal — same order as production wiring (index.ts).
-    app.route('/', createAdminRouter(stubUM, new YahooProvider()));
+    const noopLog = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {}, trace: () => {}, fatal: () => {}, child: () => noopLog, level: 'info' } as never;
+    app.route('/', createAdminRouter(stubUM, new YahooProvider(), noopLog));
     app.route('/', createInternalBarsRouter());
 
     const res = await app.request('/internal/bars', {
