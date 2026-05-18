@@ -27,6 +27,7 @@ async function main(): Promise<void> {
         email: deps.email,
         push: deps.push,
         logger,
+        analysisBatcher: deps.analysisBatcher,
     });
     void loop.run().catch((err: unknown) => {
         logger.error({ err }, "notification loop crashed");
@@ -38,6 +39,12 @@ async function main(): Promise<void> {
     registerGracefulShutdown(logger, {
         onSignal: async () => {
             loop.stop();
+            // Flush any in-flight analysis batch so the cycle that was mid-collection
+            // when SIGTERM arrived still produces its consolidated email.
+            if (deps.analysisBatcher) {
+                try { await deps.analysisBatcher.drain(); }
+                catch (err) { logger.warn({ err }, "analysis batcher drain failed during shutdown"); }
+            }
             await handle.close();
             await deps.redis.quit();
         },
