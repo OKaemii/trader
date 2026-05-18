@@ -3,7 +3,7 @@ import { z } from "zod";
 export const BarIntervalSchema = z.enum(["5m", "15m", "1h", "daily"]);
 export type BarInterval = z.infer<typeof BarIntervalSchema>;
 
-export const RangeKeySchema = z.enum(["30d", "60d", "90d"]);
+export const RangeKeySchema = z.enum(["30d", "60d", "90d", "180d"]);
 export type RangeKey = z.infer<typeof RangeKeySchema>;
 
 export const UniverseOverridesRequestSchema = z.object({
