@@ -1,10 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { GetSignalProgressUseCase } from '../application/use-cases/GetSignalProgress.ts';
-import { TradeSignal } from '../domain/entities/TradeSignal.ts';
+import { GetSignalProgressUseCase } from '../modules/signals/application/GetSignalProgress.ts';
+import { TradeSignal } from '../modules/signals/domain/TradeSignal.ts';
 import { SignalLifecycle } from '@trader/shared-types';
-import type { ISignalRepository } from '../domain/interfaces/ISignalRepository.ts';
-import type { IPortfolioState } from '../domain/interfaces/IPortfolioState.ts';
-import type { IPriceLookup } from '../domain/interfaces/IPriceLookup.ts';
+import type { ISignalRepository } from '../modules/signals/domain/ISignalRepository.ts';
+import type { IPortfolioState } from '../modules/risk/application/IPortfolioState.ts';
+import type { IPriceLookup } from '../modules/signals/domain/IPriceLookup.ts';
 
 class StubRepo implements ISignalRepository {
   constructor(private signals: TradeSignal[]) {}

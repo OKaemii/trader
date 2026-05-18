@@ -1,8 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { RiskEngine, TurnoverBudget, OrderRouter } from '../application/services/RiskEngine.ts';
-import { RISK_LIMITS } from '../application/services/LongOnlyOptimiser.ts';
-import { PortfolioConstructor } from '../application/services/PortfolioConstructor.ts';
-import type { RankingInput } from '../application/services/LongOnlyOptimiser.ts';
+import { RiskEngine, TurnoverBudget, OrderRouter } from '../modules/risk/application/RiskEngine.ts';
+import { RISK_LIMITS } from '../modules/signals/application/LongOnlyOptimiser.ts';
+import { PortfolioConstructor } from '../modules/signals/application/PortfolioConstructor.ts';
+import type { RankingInput } from '../modules/signals/application/LongOnlyOptimiser.ts';
 import type { FxConverter } from '@trader/shared-portfolio';
 import type { Money } from '@trader/shared-types';
 import type { Logger } from '@trader/core';

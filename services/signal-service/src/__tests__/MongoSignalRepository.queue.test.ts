@@ -11,9 +11,9 @@
 //   - retry: failed → queued, attempts reset to 0
 
 import { describe, it, expect } from "vitest";
-import { MongoSignalRepository } from '../infrastructure/repositories/MongoSignalRepository.ts';
-import { TradeSignal } from '../domain/entities/TradeSignal.ts';
-import { toSignalDoc } from '../infrastructure/data.ts';
+import { MongoSignalRepository } from '../modules/signals/infrastructure/MongoSignalRepository.ts';
+import { TradeSignal } from '../modules/signals/domain/TradeSignal.ts';
+import { toSignalDoc } from '../shared/data.ts';
 import { SignalLifecycle, SignalFailureReason } from '@trader/shared-types';
 
 // Minimal in-memory IDataManager + invalidation bus + cache stubs.

@@ -13,9 +13,9 @@ process.env.JWT_SECRET      = 'test-jwt-secret';
 import { describe, it, expect, beforeAll } from "vitest";
 import { Hono } from 'hono';
 import { signAccessToken } from '@trader/shared-auth/jwt';
-import { createRouter } from '../infrastructure/http/router.ts';
-import type { ISignalRepository } from '../domain/interfaces/ISignalRepository.ts';
-import { TradeSignal, SignalLifecycle, SignalFailureReason } from '../domain/entities/TradeSignal.ts';
+import { createRouter } from '../modules/signals/routes/public.ts';
+import type { ISignalRepository } from '../modules/signals/domain/ISignalRepository.ts';
+import { TradeSignal, SignalLifecycle, SignalFailureReason } from '../modules/signals/domain/TradeSignal.ts';
 
 let adminJWT: string;
 beforeAll(async () => {

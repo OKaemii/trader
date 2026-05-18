@@ -8,13 +8,13 @@ import type { RedisClientType } from "redis";
 import { requireAuth, requireRole, requireInternal, requireCaller } from '@trader/shared-auth/middleware';
 import { money, BASE_CURRENCY } from "@trader/shared-types";
 
-import { Trading212Client } from "./infrastructure/t212.ts";
-import { MongoOrderRepository } from "./infrastructure/MongoOrderRepository.ts";
-import { T212OrderExecutor } from "./infrastructure/T212OrderExecutor.ts";
-import { PlaceOrderUseCase } from "./application/use-cases/PlaceOrderUseCase.ts";
-import { AccountCache } from "./infrastructure/account-cache.ts";
-import { getSignalOrderType } from "./infrastructure/live-config.ts";
-import { TradingMode, type OrderType } from "./domain/entities/Order.ts";
+import { Trading212Client } from "./modules/t212/infrastructure/Trading212Client.ts";
+import { MongoOrderRepository } from "./modules/orders/infrastructure/MongoOrderRepository.ts";
+import { T212OrderExecutor } from "./modules/t212/infrastructure/T212OrderExecutor.ts";
+import { PlaceOrderUseCase } from "./modules/orders/application/PlaceOrderUseCase.ts";
+import { AccountCache } from "./modules/orders/infrastructure/AccountCache.ts";
+import { getSignalOrderType } from "./modules/orders/infrastructure/live-config.ts";
+import { TradingMode, type OrderType } from "./modules/orders/domain/Order.ts";
 
 // Live-trading admin approval gate. Stored in Redis so it survives restarts.
 const LIVE_GATE_KEY = "trading:live_approved";

@@ -3,8 +3,8 @@ import { createServer, createLogger, listen, registerGracefulShutdown } from "@t
 
 import { loadNotificationEnv } from "./env.ts";
 import { wireDependencies, type NotificationDeps } from "./wiring.ts";
-import { createPublicRouter } from "./routes/public.ts";
-import { NotificationLoop } from "./application/NotificationLoop.ts";
+import { createPublicRouter } from "./modules/notifications/routes/public.ts";
+import { NotificationLoop } from "./modules/notifications/application/NotificationLoop.ts";
 
 async function main(): Promise<void> {
     const env    = loadNotificationEnv();

@@ -8,8 +8,8 @@
 process.env.INTERNAL_SECRET = 'test-internal-secret';
 
 import { describe, it, expect } from "vitest";
-import { backfillTickers } from '../backfill.ts';
-import type { MarketDataProvider } from '../providers/market-data-provider.ts';
+import { backfillTickers } from '../modules/bars/infrastructure/backfill.ts';
+import type { MarketDataProvider } from '../modules/bars/infrastructure/providers/market-data-provider.ts';
 import type { OHLCVBar, PollIntervalKey } from '@trader/shared-types';
 
 function bar(ticker: string, ts: number): OHLCVBar {

@@ -4,13 +4,13 @@ import { serve } from '@hono/node-server';
 import { getRedisClient, xAdd, ensureConsumerGroup } from '@trader/shared-redis';
 import { getMongoDb } from '@trader/shared-mongo';
 import { COLLECTIONS } from '@trader/shared-mongo';
-import { BarValidator } from './bar-validator.ts';
-import { GapDetector } from './gap-detector.ts';
-import { StaleDetector } from './stale-detector.ts';
-import { UniverseManager } from './universe-manager.ts';
-import { getLiveConfig } from './live-config.ts';
-import { createAdminRouter, createInternalBarsRouter } from './admin-routes.ts';
-import { YahooProvider } from './providers/yahoo-provider.ts';
+import { BarValidator } from './modules/bars/infrastructure/bar-validator.ts';
+import { GapDetector } from './modules/bars/infrastructure/gap-detector.ts';
+import { StaleDetector } from './modules/bars/infrastructure/stale-detector.ts';
+import { UniverseManager } from './modules/universe/application/UniverseManager.ts';
+import { getLiveConfig } from './shared/live-config.ts';
+import { createAdminRouter, createInternalBarsRouter } from './modules/admin/routes.ts';
+import { YahooProvider } from './modules/bars/infrastructure/providers/yahoo-provider.ts';
 import { FxClient, YahooFxProvider } from '@trader/shared-fx';
 import { aggregateBars } from '@trader/shared-bars';
 import {
@@ -19,8 +19,8 @@ import {
   soonestNextOpen, expectedLatestBarMs,
   type Market, type MarketState, type ExchangeCalendar,
 } from '@trader/shared-calendar';
-import { backfillTickers, tickersMissingHistory, healMissingHistory } from './backfill.ts';
-import { msUntilNextTick } from './poll-scheduling.ts';
+import { backfillTickers, tickersMissingHistory, healMissingHistory } from './modules/bars/infrastructure/backfill.ts';
+import { msUntilNextTick } from './modules/bars/application/poll-scheduling.ts';
 import { log } from './logger.ts';
 import { getRuntimeEnv } from './runtime-env.ts';
 import { REDIS_STREAMS, type OHLCVBar, type BarInterval } from '@trader/shared-types';

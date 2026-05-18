@@ -12,10 +12,10 @@ process.env.JWT_SECRET = 'test-jwt-secret-min-16-chars';
 import { describe, it, expect, beforeEach } from "vitest";
 import { Hono } from 'hono';
 import { mintInternalJwt } from '@trader/shared-auth';
-import { createInternalRouter } from '../infrastructure/http/internal-router.ts';
-import type { ISignalRepository } from '../domain/interfaces/ISignalRepository.ts';
-import { TradeSignal } from '../domain/entities/TradeSignal.ts';
-import type { ISignalPublisher } from '../domain/interfaces/ISignalPublisher.ts';
+import { createInternalRouter } from '../modules/signals/routes/internal.ts';
+import type { ISignalRepository } from '../modules/signals/domain/ISignalRepository.ts';
+import { TradeSignal } from '../modules/signals/domain/TradeSignal.ts';
+import type { ISignalPublisher } from '../modules/signals/domain/ISignalPublisher.ts';
 import { SignalLifecycle, SignalFailureReason } from '@trader/shared-types';
 
 class StubRepo implements ISignalRepository {

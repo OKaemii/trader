@@ -2,9 +2,9 @@
 // currency-mismatch reject path (the 100x bug-class guard).
 
 import { describe, it, expect, vi } from "vitest";
-import { PlaceOrderUseCase, type PlaceOrderInput } from '../application/use-cases/PlaceOrderUseCase.ts';
-import { OrderStatus, OrderType, TradingMode } from '../domain/entities/Order.ts';
-import type { Order } from '../domain/entities/Order.ts';
+import { PlaceOrderUseCase, type PlaceOrderInput } from '../modules/orders/application/PlaceOrderUseCase.ts';
+import { OrderStatus, OrderType, TradingMode } from '../modules/orders/domain/Order.ts';
+import type { Order } from '../modules/orders/domain/Order.ts';
 import type { Logger } from '@trader/core';
 import type { SignalServiceClient } from '@trader/contracts';
 

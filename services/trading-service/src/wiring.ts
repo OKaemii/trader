@@ -7,13 +7,13 @@ import { getRedisClient, subscribe } from "@trader/shared-redis";
 import { FxClient, YahooFxProvider } from "@trader/shared-fx";
 
 import type { TradingEnv } from "./env.ts";
-import { Trading212Client } from "./infrastructure/t212.ts";
-import { MongoOrderRepository } from "./infrastructure/MongoOrderRepository.ts";
-import { AccountCache } from "./infrastructure/account-cache.ts";
-import { OrderDispatcher } from "./infrastructure/order-dispatcher.ts";
-import { FillsPoller } from "./application/services/FillsPoller.ts";
-import { TradingMode } from "./domain/entities/Order.ts";
-import { invalidateSignalOrderType, configureLiveConfig, parseSignalOrderType } from "./infrastructure/live-config.ts";
+import { Trading212Client } from "./modules/t212/infrastructure/Trading212Client.ts";
+import { MongoOrderRepository } from "./modules/orders/infrastructure/MongoOrderRepository.ts";
+import { AccountCache } from "./modules/orders/infrastructure/AccountCache.ts";
+import { OrderDispatcher } from "./modules/orders/infrastructure/OrderDispatcher.ts";
+import { FillsPoller } from "./modules/fills/application/FillsPoller.ts";
+import { TradingMode } from "./modules/orders/domain/Order.ts";
+import { invalidateSignalOrderType, configureLiveConfig, parseSignalOrderType } from "./modules/orders/infrastructure/live-config.ts";
 
 export async function wireDependencies(env: TradingEnv, logger: Logger) {
     configureLiveConfig({ logger, envDefault: parseSignalOrderType(env.SIGNAL_ORDER_TYPE) });

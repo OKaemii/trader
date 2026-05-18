@@ -10,7 +10,7 @@ vi.mock('@trader/shared-mongo', () => ({
   }),
 }));
 
-const liveConfig = await import('../live-config.ts');
+const liveConfig = await import('../shared/live-config.ts');
 
 describe('live-config', () => {
   beforeEach(() => {

@@ -1,9 +1,9 @@
 import type { Logger } from "@trader/core";
-import { MongoUserRepository } from "./infrastructure/repositories/MongoUserRepository.ts";
-import { RedisRefreshTokenStore } from "./infrastructure/repositories/RedisRefreshTokenStore.ts";
-import { LoginUseCase } from "./application/use-cases/LoginUseCase.ts";
-import { RegisterUseCase } from "./application/use-cases/RegisterUseCase.ts";
-import { SeedAdminUseCase } from "./application/use-cases/SeedAdminUseCase.ts";
+import { MongoUserRepository } from "./modules/auth/infrastructure/MongoUserRepository.ts";
+import { RedisRefreshTokenStore } from "./modules/auth/infrastructure/RedisRefreshTokenStore.ts";
+import { LoginUseCase } from "./modules/auth/application/LoginUseCase.ts";
+import { RegisterUseCase } from "./modules/auth/application/RegisterUseCase.ts";
+import { SeedAdminUseCase } from "./modules/auth/application/SeedAdminUseCase.ts";
 import type { AuthEnv } from "./env.ts";
 
 export interface AuthDeps {

@@ -58,7 +58,7 @@ vi.mock('@trader/shared-redis', () => ({
 
 const { Hono } = await import('hono');
 const { mintInternalJwt } = await import('@trader/shared-auth');
-const { createInternalBarsRouter } = await import('../admin-routes.ts');
+const { createInternalBarsRouter } = await import('../modules/admin/routes.ts');
 
 function buildApp() {
   const app = new Hono();
@@ -173,8 +173,8 @@ describe('POST /internal/bars (batch)', () => {
 // the bled middleware demanded caller='api-gateway'. This test fails if that pattern returns.
 describe('admin + internal-bars on the same app (mounting regression)', () => {
   it('strategy-engine token is accepted on /internal/bars when both routers are mounted', async () => {
-    const { createAdminRouter } = await import('../admin-routes.ts');
-    const { YahooProvider } = await import('../providers/yahoo-provider.ts');
+    const { createAdminRouter } = await import('../modules/admin/routes.ts');
+    const { YahooProvider } = await import('../modules/bars/infrastructure/providers/yahoo-provider.ts');
     const stubUM: any = { activeTickers: [], sectorMap: {}, refresh: async () => [] };
 
     const app = new Hono();

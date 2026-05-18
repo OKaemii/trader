@@ -6,7 +6,7 @@ import { getRedisClient } from "@trader/shared-redis";
 import { loadTradingEnv } from "./env.ts";
 import { wireDependencies } from "./wiring.ts";
 import { buildApp, type AppDeps } from "./routes.ts";
-import { TradingMode } from "./domain/entities/Order.ts";
+import { TradingMode } from "./modules/orders/domain/Order.ts";
 
 async function main(): Promise<void> {
     const env    = loadTradingEnv();

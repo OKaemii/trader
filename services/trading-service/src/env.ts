@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { loadEnv } from "@trader/core";
-import { TradingMode } from "./domain/entities/Order.ts";
+import { TradingMode } from "./modules/orders/domain/Order.ts";
 
 const EnvSchema = z.object({
     NODE_ENV: z.enum(["development", "test", "production"]).default("production"),

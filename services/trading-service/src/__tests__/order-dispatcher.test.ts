@@ -6,9 +6,9 @@
 // claimed signal and a stub SignalServiceClient so each transition is observable.
 
 import { describe, it, expect } from "vitest";
-import { OrderDispatcher, type ClaimedSignal, type OrderDispatcherDeps } from '../infrastructure/order-dispatcher.ts';
-import { AccountCache } from '../infrastructure/account-cache.ts';
-import { TradingMode } from '../domain/entities/Order.ts';
+import { OrderDispatcher, type ClaimedSignal, type OrderDispatcherDeps } from '../modules/orders/infrastructure/OrderDispatcher.ts';
+import { AccountCache } from '../modules/orders/infrastructure/AccountCache.ts';
+import { TradingMode } from '../modules/orders/domain/Order.ts';
 import { SignalFailureReason } from '@trader/shared-types';
 import type { Logger } from '@trader/core';
 import type { SignalServiceClient } from '@trader/contracts';

@@ -7,7 +7,7 @@
 //     into a GBP-named column)
 
 import { describe, it, expect } from "vitest";
-import { buildPositionUpdate } from '../sync.ts';
+import { buildPositionUpdate } from '../modules/positions/application/sync.ts';
 import { sumPositionsGBP, type FxConverter, type PositionDoc } from '@trader/shared-portfolio';
 import type { Money } from '@trader/shared-types';
 

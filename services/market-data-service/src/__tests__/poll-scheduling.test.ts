@@ -4,7 +4,7 @@
 // on a tick, otherwise the loop would never sleep.
 
 import { describe, it, expect } from "vitest";
-import { nextAlignedTick, msUntilNextTick } from '../poll-scheduling.ts';
+import { nextAlignedTick, msUntilNextTick } from '../modules/bars/application/poll-scheduling.ts';
 
 const HOUR = 3_600_000;
 const DAY  = 24 * HOUR;

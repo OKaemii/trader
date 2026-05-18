@@ -3,8 +3,8 @@
 // closed-window-resume case), and DOES flag tickers with bars older than that.
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { healMissingHistory } from '../backfill.ts';
-import type { MarketDataProvider } from '../providers/market-data-provider.ts';
+import { healMissingHistory } from '../modules/bars/infrastructure/backfill.ts';
+import type { MarketDataProvider } from '../modules/bars/infrastructure/providers/market-data-provider.ts';
 
 const FRIDAY_CLOSE_MS = Date.parse('2026-05-15T20:00:00Z');   // NYSE Fri 16:00 EDT = 20:00 UTC
 const THU_CLOSE_MS    = Date.parse('2026-05-14T20:00:00Z');

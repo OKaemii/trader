@@ -19,8 +19,8 @@ import { createLogger } from "@trader/core";
 import { loadMarketDataEnv } from "./env.ts";
 import { setRuntimeEnv } from "./runtime-env.ts";
 import { setLogger } from "./logger.ts";
-import { configureT212Client } from "./t212-client.ts";
-import { configureLiveConfig } from "./live-config.ts";
+import { configureT212Client } from "./modules/universe/infrastructure/t212-client.ts";
+import { configureLiveConfig } from "./shared/live-config.ts";
 
 const env = loadMarketDataEnv();
 setRuntimeEnv(env);

@@ -1,8 +1,8 @@
 import type { Logger } from "@trader/core";
 import { getRedisClient } from "@trader/shared-redis";
 import type { NotificationEnv } from "./env.ts";
-import { EmailSender } from "./email.ts";
-import { PushSender } from "./push.ts";
+import { EmailSender } from "./modules/notifications/infrastructure/email.ts";
+import { PushSender } from "./modules/notifications/infrastructure/push.ts";
 
 export interface NotificationDeps {
     readonly logger: Logger;

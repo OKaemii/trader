@@ -7,7 +7,7 @@
 // (chunk dispatch, truncation, timestamp normalisation).
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { YahooProvider } from '../providers/yahoo-provider.ts';
+import { YahooProvider } from '../modules/bars/infrastructure/providers/yahoo-provider.ts';
 
 interface FetchCall { url: string }
 

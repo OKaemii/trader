@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { solveLongOnly, RISK_LIMITS, type RankingInput } from '../application/services/LongOnlyOptimiser.ts';
+import { solveLongOnly, RISK_LIMITS, type RankingInput } from '../modules/signals/application/LongOnlyOptimiser.ts';
 
 const baseInput = (overrides: Partial<RankingInput> = {}): RankingInput => ({
   scores: [0.8, 0.5, 0.3, -0.1],
