@@ -5,7 +5,7 @@ import type { SignalServiceClient } from "@trader/contracts";
 import { Trading as TradingContracts } from "@trader/contracts";
 import type { Db } from "mongodb";
 import type { RedisClientType } from "redis";
-import { requireAuth, requireRole, requireInternal, requireCaller } from '@trader/shared-auth/middleware';
+import { requireInternal, requireCaller } from '@trader/shared-auth/middleware';
 import { money, BASE_CURRENCY } from "@trader/shared-types";
 
 import { Trading212Client } from "./modules/t212/infrastructure/Trading212Client.ts";
@@ -62,7 +62,11 @@ export function buildApp(deps: AppDeps): Hono {
         }, 200);
     });
 
-    app.use("/api/admin/*", requireAuth, requireRole("admin"));
+    // Gateway is the user-auth perimeter. All `/api/admin/*` traffic here arrives only
+    // via the gateway proxy, which mints a fresh internal JWT (sub='api-gateway') per
+    // request. The /internal/* routes above pin different requireCaller subjects for
+    // their peer services.
+    app.use("/api/admin/*", requireInternal, requireCaller("api-gateway"));
     const admin = app;
 
     admin.post("/api/admin/trading/toggle", (c) => {

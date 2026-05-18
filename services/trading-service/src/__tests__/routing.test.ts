@@ -18,7 +18,7 @@ process.env.JWT_SECRET = 'test-jwt-secret-min-16-chars';
 import { describe, it, expect, beforeAll } from "vitest";
 import { buildApp, type AppDeps } from '../index.ts';
 import { AccountCache } from '../modules/orders/infrastructure/AccountCache.ts';
-import { signAccessToken } from '@trader/shared-auth/jwt';
+import { mintInternalJwt } from '@trader/shared-auth';
 import { mintInternalJwt } from '@trader/shared-auth/internal-jwt';
 import { TradingMode } from '../modules/orders/domain/Order.ts';
 
@@ -58,12 +58,14 @@ function paperDeps(): AppDeps {
   };
 }
 
-let adminJWT: string;
-let userJWT:  string;
+// /api/admin/* is gated as internal-from-gateway. End-user JWTs never reach this service —
+// the gateway is the user-auth perimeter.
+let gatewayJWT: string;
+let peerJWT:    string;
 
 beforeAll(async () => {
-  adminJWT = await signAccessToken({ sub: 'admin-user', role: 'admin' });
-  userJWT  = await signAccessToken({ sub: 'regular-user', role: 'user' });
+  gatewayJWT = await mintInternalJwt('api-gateway');
+  peerJWT    = await mintInternalJwt('portfolio-service');   // wrong-caller fixture
 });
 
 describe('trading-service routing', () => {
@@ -77,11 +79,11 @@ describe('trading-service routing', () => {
 
   // ── Admin routes. The regression bug returned 403 here because internal-subapp wildcard
   // middleware bled onto the admin path. These tests catch that regression.
-  describe('/api/admin/trading/* (JWT, admin role)', () => {
-    it('returns 200 on /status with an admin JWT', async () => {
+  describe('/api/admin/trading/* (internal JWT, caller=api-gateway)', () => {
+    it('returns 200 on /status with the gateway internal token', async () => {
       const app = buildApp(paperDeps());
       const res = await app.request('/api/admin/trading/status', {
-        headers: { Authorization: `Bearer ${adminJWT}` },
+        headers: { Authorization: `Bearer ${gatewayJWT}` },
       });
       expect(res.status).toBe(200);
       const body = await res.json();
@@ -89,11 +91,7 @@ describe('trading-service routing', () => {
       expect(body).toEqual({ trading_mode: 'Paper', live_gate_approved: false });
     });
 
-    it('returns 200 on /orders with an admin JWT', async () => {
-      // /orders touches the db — give it a stub repo via a minimal db that satisfies
-      // MongoOrderRepository.findRecent. Easier: use a deps that returns a fake "db" whose
-      // .collection().find().sort().limit().toArray() resolves to []. We bypass that here
-      // by short-circuiting at the route boundary — assert status, not body content.
+    it('returns 200 on /orders with the gateway internal token', async () => {
       const deps: AppDeps = {
         ...paperDeps(),
         getDb: async () => ({
@@ -104,7 +102,7 @@ describe('trading-service routing', () => {
       };
       const app = buildApp(deps);
       const res = await app.request('/api/admin/trading/orders', {
-        headers: { Authorization: `Bearer ${adminJWT}` },
+        headers: { Authorization: `Bearer ${gatewayJWT}` },
       });
       expect(res.status).toBe(200);
     });
@@ -115,10 +113,10 @@ describe('trading-service routing', () => {
       expect(res.status).toBe(401);
     });
 
-    it('returns 403 on /status with a non-admin JWT', async () => {
+    it('returns 403 on /status with a wrong-caller internal token', async () => {
       const app = buildApp(paperDeps());
       const res = await app.request('/api/admin/trading/status', {
-        headers: { Authorization: `Bearer ${userJWT}` },
+        headers: { Authorization: `Bearer ${peerJWT}` },
       });
       expect(res.status).toBe(403);
     });

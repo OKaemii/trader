@@ -1,20 +1,17 @@
 import type { Context } from "hono";
+import { mintInternalJwt } from "@trader/shared-auth";
 
 /**
- * HTTP proxy helper. Forwards the inbound request to `upstream` with the path + query
- * intact, **preserves the inbound Authorization header** so downstream services see the
- * end-user's JWT (admins keep aud='admin'; users keep aud='user'), and unwraps the
- * upstream response into Hono's mutable-headered Response so downstream cors middleware
- * can mutate headers without crashing on `TypeError: immutable`.
+ * HTTP proxy helper. The gateway is the only edge that sees a user JWT — it authorises
+ * the request (requireAuth / requireRole('admin')) and then swaps the Authorization
+ * header for a freshly minted internal JWT (sub='api-gateway', aud='internal') before
+ * forwarding to the downstream service. Downstream services gate their `/api/*` routes
+ * with `requireInternal + requireCaller('api-gateway')` — they never inspect a user JWT
+ * directly; trust flows by service identity, not by user identity.
  *
- * Why preserve user auth instead of minting an internal JWT here:
- *   Downstream services need to know *who* the request is for so role checks
- *   (requireRole('admin')) and per-user filtering work. The previous behaviour
- *   replaced the Authorization header with an internal JWT (sub='api-gateway',
- *   no role), which forced every downstream admin route to 403. Internal JWT
- *   minting is reserved for peer-to-peer service calls (TradingServiceClient,
- *   SignalServiceClient, etc.); the gateway is *not* acting as itself when
- *   proxying — it's the user's reverse proxy.
+ * Response side: we unwrap the upstream Response into Hono's mutable-headered Response
+ * so downstream cors middleware can mutate headers without crashing on `TypeError:
+ * immutable`.
  */
 export async function proxy(upstream: string, c: Context): Promise<Response> {
     const path = c.req.path;
@@ -24,7 +21,9 @@ export async function proxy(upstream: string, c: Context): Promise<Response> {
     // Node's fetch (undici) rejects streamed request bodies without `duplex: 'half'`.
     // Buffer the body up front so undici sees plain bytes.
     const body = hasBody ? await c.req.raw.arrayBuffer() : undefined;
-    const init: RequestInit = { method: c.req.method, headers: new Headers(c.req.raw.headers) };
+    const headers = new Headers(c.req.raw.headers);
+    headers.set("Authorization", `Bearer ${await mintInternalJwt("api-gateway")}`);
+    const init: RequestInit = { method: c.req.method, headers };
     if (body !== undefined) init.body = body;
     const upstreamRes = await fetch(url, init);
     const responseBody = await upstreamRes.arrayBuffer();
