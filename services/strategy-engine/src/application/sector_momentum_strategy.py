@@ -1,3 +1,4 @@
+import os
 import time
 import numpy as np
 from typing import Optional
@@ -33,6 +34,13 @@ class SectorMomentumStrategy(BaseStrategy):
     @property
     def rolling_window(self) -> int:
         return ROLLING_WINDOW
+
+    @property
+    def report_cadence(self) -> str:
+        # Same cadence policy as the other strategies — daily emits per cycle; intraday
+        # buckets to hourly. SectorMomentum can be deployed at either cadence depending
+        # on BAR_FREQUENCY.
+        return 'per_cycle' if os.getenv('BAR_FREQUENCY', 'daily') == 'daily' else 'hourly'
 
     def __init__(self) -> None:
         self._sectors: dict[str, str] = {}
@@ -78,9 +86,19 @@ class SectorMomentumStrategy(BaseStrategy):
 
         composite = zscore(sector_adj)
 
+        # Per-strategy sanity signal. SectorMomentum's whole premise is sector-relative
+        # ranking; when >50% of the universe maps to 'Unknown', subtracting the
+        # 'Unknown'-mean from itself produces a near-zero adjustment for the majority of
+        # tickers and the strategy degenerates to plain (non-sector-relative) momentum.
+        # Surfacing the fraction lets the notification SectorMomentumRenderer raise
+        # SECTOR_DATA_MISSING ahead of the narrative.
+        unknown_fraction = sum(1 for s in sectors if s == 'Unknown') / len(sectors)
+        degraded_flag = float(unknown_fraction) if unknown_fraction > 0.5 else 0.0
+
         attributions = {
             t: {'sector_momentum': float(composite[i]), 'momentum': float(cum_returns[i]),
-                'topology': 0.0, 'residual_alpha': float(composite[i])}
+                'topology': 0.0, 'residual_alpha': float(composite[i]),
+                'degraded_unknown_sectors': degraded_flag}
             for i, t in enumerate(tickers)
         }
 
@@ -96,4 +114,5 @@ class SectorMomentumStrategy(BaseStrategy):
             sectors=self._sectors,
             covariance_matrix=cov.tolist(),
             regime_confidence=regime.confidence,
+            report_cadence=self.report_cadence,
         )

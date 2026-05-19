@@ -204,13 +204,26 @@ export class GenerateSignalsUseCase {
             strategy_id:              features.strategy_id,
             ticker_universe:          [],
             composite_scores:         { [ticker]: score },
-            factor_attributions:      {},
+            factor_attributions:      features.factor_attributions[ticker]
+              ? { [ticker]: features.factor_attributions[ticker] }
+              : {},
             sectors:                  { [ticker]: features.sectors[ticker] ?? 'Unknown' },
             covariance_matrix:        [],
             regime_confidence:        features.regime_confidence,
             ...(features.position_size_multiplier !== undefined
               ? { position_size_multiplier: features.position_size_multiplier }
               : {}),
+            ...(features.signal_weights !== undefined ? { signal_weights: features.signal_weights } : {}),
+            ...(features.feature_stability !== undefined ? { feature_stability: features.feature_stability } : {}),
+            ...(features.betti_curves !== undefined ? { betti_curves: features.betti_curves } : {}),
+            ...(features.laplacian_residuals !== undefined && features.laplacian_residuals[ticker] !== undefined
+              ? { laplacian_residuals: { [ticker]: features.laplacian_residuals[ticker] } }
+              : {}),
+            // report_cadence drives notification-service CycleAnalysisBatcher windowing.
+            // Copy at emit time so each persisted signal carries the cadence in force on
+            // the cycle that produced it — operator can flip BAR_FREQUENCY mid-stream and
+            // older signals retain their original cadence label.
+            ...(features.report_cadence !== undefined ? { report_cadence: features.report_cadence } : {}),
           };
           // Tiny-score gate: a |score| below `minScoreEpsilon` is operationally
           // indistinguishable from noise, even if the cross-section is healthy. Force

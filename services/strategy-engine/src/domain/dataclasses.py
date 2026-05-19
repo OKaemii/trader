@@ -33,3 +33,9 @@ class StrategyOutput:
     betti_curves: Optional[dict] = None
     persistence_pairs: Optional[list] = None
     laplacian_residuals: Optional[dict[str, float]] = None
+    # Reporting cadence — drives the notification-service CycleAnalysisBatcher window.
+    # Daily strategies emit `per_cycle` (one email per rebalance). Intraday strategies
+    # emit `hourly` by default so the operator gets one rolled-up digest per hour
+    # instead of 12 single-cycle emails. Operator-overridable per strategy via the
+    # REPORT_INTRADAY_CADENCE env (notification-service).
+    report_cadence: str = 'per_cycle'
