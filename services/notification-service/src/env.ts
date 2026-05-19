@@ -15,7 +15,7 @@ const EnvSchema = z.object({
     // the telemetry-snapshot endpoint (realised P&L, lifecycle counters, decay state);
     // market-data-service hosts the sectors map used for universe-coverage telemetry.
     SIGNAL_SERVICE_URL:      z.string().url().default("http://signal-service:3003"),
-    MARKET_DATA_SERVICE_URL: z.string().url().default("http://market-data-service:3001"),
+    MARKET_DATA_SERVICE_URL: z.string().url().default("http://market-data-service:3002"),
 
     PORTAL_BASE_URL: z.string().url().default("http://trader.local"),
 

@@ -82,7 +82,13 @@ export class SignalServiceClient {
         return this.call(sweepQueueContract, { body });
     }
 
-    telemetrySnapshot(since: number): Promise<TelemetrySnapshotResponse> {
-        return this.call(telemetrySnapshotContract, { query: { since } });
+    telemetrySnapshot(
+        since: number,
+        opts: { tickers?: readonly string[]; strategyId?: string } = {},
+    ): Promise<TelemetrySnapshotResponse> {
+        const query: { since: number; tickers?: string; strategyId?: string } = { since };
+        if (opts.tickers && opts.tickers.length > 0) query.tickers = opts.tickers.join(',');
+        if (opts.strategyId) query.strategyId = opts.strategyId;
+        return this.call(telemetrySnapshotContract, { query });
     }
 }

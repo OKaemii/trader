@@ -46,6 +46,17 @@ spec:
             # `per_cycle`) ignore this — see CycleAnalysisBatcher.resolveEffectiveCadence.
             - name: REPORT_INTRADAY_CADENCE
               value: {{ .Values.global.env.reportIntradayCadence | default "hourly" | quote }}
+            # Peer-service URLs for the analysis-email telemetry path. signal-service
+            # supplies the telemetry-snapshot endpoint (realised P&L, lifecycle counters,
+            # decay state); market-data-service supplies the sectors map used for
+            # universe-coverage telemetry. Both default to k8s service DNS — kept
+            # explicit here so deploys are grep-able.
+            - name: SIGNAL_SERVICE_URL
+              value: "http://signal-service:3003"
+            - name: MARKET_DATA_SERVICE_URL
+              value: "http://market-data-service:3002"
+            - name: PORTAL_BASE_URL
+              value: {{ .Values.global.env.portalBaseUrl | default "http://trader.local" | quote }}
           livenessProbe:
             httpGet:
               path: /health

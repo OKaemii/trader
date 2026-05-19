@@ -77,6 +77,14 @@ const snapshot: TelemetrySnapshotResponse = {
             icTStat: 1.0, featureDriftKL: 0.3, computedAt: 1700000000000,
         },
     },
+    history: {
+        previousDigestAt:       1699913600000,                       // 24h before since
+        signalsSinceLastDigest: 3,
+        priorAppearances:       {
+            AAPL_US_EQ: { lastSignalAt: 1699913600000, action: 'BUY',  ageDays: 1.0, lifecycle: 'Closed',   pnlPct: 0.021 },
+            JPM_US_EQ:  { lastSignalAt: 1699740800000, action: 'SELL', ageDays: 3.0, lifecycle: 'Executed', pnlPct: null  },
+        },
+    },
 };
 
 const sectorsResp = {
@@ -213,10 +221,42 @@ describe('TelemetryBuilder', () => {
         expect(t.circuitBreaker.open).toBe(false);
     });
 
-    it('passes batch.cycleTs as `since` to the snapshot fetcher', async () => {
+    it('passes batch.cycleTs as `since` and propagates tickers + strategyId to the snapshot fetcher', async () => {
         const fetcher = { telemetrySnapshot: vi.fn(async () => snapshot) };
         const tb = new TelemetryBuilder(fetcher, { fetchSectors: async () => sectorsResp }, noopLogger);
-        await tb.build(makeBatch([]));
-        expect(fetcher.telemetrySnapshot).toHaveBeenCalledWith(1700000000000);
+        const batch = makeBatch([
+            makeSignal({ ticker: 'AAPL_US_EQ', action: 'BUY', confidence: 0.5, targetWeight: 0.05 }),
+            makeSignal({ ticker: 'AAPL_US_EQ', action: 'BUY', confidence: 0.5, targetWeight: 0.05 }),  // dedup
+            makeSignal({ ticker: 'MSFT_US_EQ', action: 'BUY', confidence: 0.4, targetWeight: 0.04 }),
+        ]);
+        await tb.build(batch);
+        expect(fetcher.telemetrySnapshot).toHaveBeenCalledWith(1700000000000, {
+            tickers:    ['AAPL_US_EQ', 'MSFT_US_EQ'],
+            strategyId: 'factor_rank_v1',
+        });
+    });
+
+    it('surfaces history block from snapshot (previousDigestAt + timeSinceLastDigestMs + priorAppearances)', async () => {
+        const fx = stubFetchers();
+        const tb = new TelemetryBuilder(fx.signals, fx.universe, noopLogger);
+        const t = await tb.build(makeBatch([]));
+        expect(t.history.previousDigestAt).toBe(1699913600000);
+        // batch.cycleTs - previousDigestAt = 86_400_000 (24h in ms)
+        expect(t.history.timeSinceLastDigestMs).toBe(86_400_000);
+        expect(t.history.signalsSinceLastDigest).toBe(3);
+        expect(t.history.priorAppearances['AAPL_US_EQ']?.pnlPct).toBeCloseTo(0.021);
+    });
+
+    it('returns null timeSinceLastDigestMs when previousDigestAt is missing (first digest case)', async () => {
+        const firstDigestSnap = { ...snapshot, history: { previousDigestAt: null, signalsSinceLastDigest: 0, priorAppearances: {} } };
+        const fetchers: { signals: ISignalTelemetryFetcher; universe: ISectorsFetcher } = {
+            signals:  { telemetrySnapshot: async () => firstDigestSnap },
+            universe: { fetchSectors:      async () => sectorsResp },
+        };
+        const tb = new TelemetryBuilder(fetchers.signals, fetchers.universe, noopLogger);
+        const t = await tb.build(makeBatch([]));
+        expect(t.history.previousDigestAt).toBeNull();
+        expect(t.history.timeSinceLastDigestMs).toBeNull();
+        expect(t.history.signalsSinceLastDigest).toBe(0);
     });
 });

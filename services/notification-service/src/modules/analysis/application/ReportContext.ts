@@ -55,6 +55,22 @@ export interface TelemetryBlock {
         unknownSectorFraction: number;
     };
     circuitBreaker: { open: boolean; reason: string | null };
+    history: {
+        previousDigestAt:       number | null;
+        timeSinceLastDigestMs:  number | null;        // null when previousDigestAt is null
+        signalsSinceLastDigest: number;
+        priorAppearances:       Record<string, PriorAppearance>;
+    };
+}
+
+// Per-ticker "what happened last time we picked this" — surfaced beside each pick in
+// the email so the narrative can frame the new signal relative to its predecessor.
+export interface PriorAppearance {
+    lastSignalAt: number;
+    action:       'BUY' | 'SELL' | 'HOLD';
+    ageDays:      number;
+    lifecycle:    string;
+    pnlPct:       number | null;          // populated when prior was Closed
 }
 
 // Typed anomaly. Each rule emits one of these (or null when silent). Renderers display

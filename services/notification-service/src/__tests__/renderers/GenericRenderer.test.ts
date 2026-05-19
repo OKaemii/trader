@@ -40,6 +40,7 @@ function tel(overrides: Partial<TelemetryBlock> = {}): TelemetryBlock {
         decay:          { health: 'healthy', multiplier: 1.0, ic_30d: 0.8 },
         universe:       { activeCount: 100, readyCount: 100, unknownSectorFraction: 0 },
         circuitBreaker: { open: false, reason: null },
+        history: { previousDigestAt: null, timeSinceLastDigestMs: null, signalsSinceLastDigest: 0, priorAppearances: {} },
         ...overrides,
     };
 }
@@ -60,8 +61,13 @@ describe('GenericRenderer', () => {
         expect(ctx.windowLabel).toMatch(/Cycle —/);
         expect(ctx.narrative).toMatch(/grounded in the telemetry/);
         expect(ctx.sectionsHtml).toBe('');
-        // Prompt is locked to "do not invent any number" — important contract for hallucination control.
-        expect(receivedPrompt).toContain('Do NOT invent any number');
+        // Phase 8 prompt contract — three load-bearing constraints the LLM must see:
+        // (a) headline-first shape, (b) ban filler adjectives, (c) "Watch:" close.
+        expect(receivedPrompt).toContain('HEADLINE');
+        expect(receivedPrompt).toContain('Banned filler words');
+        expect(receivedPrompt).toContain('Watch:');
+        // And the no-hallucination invariant.
+        expect(receivedPrompt).toContain('Never invent numbers');
         expect(receivedPrompt).toContain('TELEMETRY');
         expect(receivedPrompt).toContain('SANITY');
     });

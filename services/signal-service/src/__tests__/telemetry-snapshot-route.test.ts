@@ -85,6 +85,11 @@ const sampleResponse: TelemetrySnapshotResponse = {
       computedAt:       1700000000000,
     },
   },
+  history: {
+    previousDigestAt:       1699913600000,
+    signalsSinceLastDigest: 4,
+    priorAppearances:       {},
+  },
 };
 
 describe('GET /internal/api/signals/telemetry-snapshot', () => {
@@ -132,6 +137,25 @@ describe('GET /internal/api/signals/telemetry-snapshot', () => {
     expect(body.openPositions.mtmGbp).toBe(5000);
     expect(body.lifecycleCounters.closed).toBe(4);
     expect(body.decay.health).toBe('healthy');
+    expect(body.history.signalsSinceLastDigest).toBe(4);
+  });
+
+  it('threads `tickers` (csv) + `strategyId` query params into the use-case', async () => {
+    let capturedSince  = -1;
+    let capturedOpts: { tickers?: readonly string[]; strategyId?: string } | undefined;
+    const app = buildApp({
+      execute: async (since: number, opts?: { tickers?: readonly string[]; strategyId?: string }) => {
+        capturedSince = since; capturedOpts = opts; return sampleResponse;
+      },
+    } as unknown as GetTelemetrySnapshotUseCase);
+    const res = await app.request(
+      '/internal/api/signals/telemetry-snapshot?since=1700000000000&tickers=AAPL_US_EQ,MSFT_US_EQ&strategyId=factor_rank_v1',
+      { headers: { Authorization: await notificationBearer() } },
+    );
+    expect(res.status).toBe(200);
+    expect(capturedSince).toBe(1700000000000);
+    expect(capturedOpts?.tickers).toEqual(['AAPL_US_EQ', 'MSFT_US_EQ']);
+    expect(capturedOpts?.strategyId).toBe('factor_rank_v1');
   });
 
   it('500s when the use-case isn\'t wired (defensive — production always injects it)', async () => {

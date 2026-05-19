@@ -8,7 +8,10 @@ import type { TelemetryBlock } from './ReportContext.ts';
 // HTTP client implementation. Mirrored by SignalServiceClient + a thin sectors fetcher in
 // wiring.ts. Keeping them as interfaces makes the unit tests trivial (pass plain objects).
 export interface ISignalTelemetryFetcher {
-    telemetrySnapshot(since: number): Promise<Awaited<ReturnType<SignalServiceClient['telemetrySnapshot']>>>;
+    telemetrySnapshot(
+        since: number,
+        opts?: { tickers?: readonly string[]; strategyId?: string },
+    ): Promise<Awaited<ReturnType<SignalServiceClient['telemetrySnapshot']>>>;
 }
 
 export interface ISectorsFetcher {
@@ -44,8 +47,12 @@ export class TelemetryBuilder {
         // Two remote fetches in parallel. Both individually tolerant of failure — the
         // telemetry block degrades to default zeros so the report still renders rather
         // than blocking the operator on an upstream blip.
+        const batchTickers = Array.from(new Set(batch.signals.map((s) => s.ticker)));
         const [snapshot, sectorsResp] = await Promise.all([
-            this.signals.telemetrySnapshot(batch.cycleTs).catch((err) => {
+            this.signals.telemetrySnapshot(batch.cycleTs, {
+                tickers:    batchTickers,
+                strategyId: batch.strategyId,
+            }).catch((err) => {
                 this.logger.warn({ err, cycleKey: batch.cycleKey }, 'telemetry-snapshot fetch failed; degrading');
                 return null;
             }),
@@ -113,6 +120,14 @@ export class TelemetryBuilder {
                 unknownSectorFraction: unknownFraction,
             },
             circuitBreaker: snapshot?.risk.circuit ?? { open: false, reason: null },
+            history: {
+                previousDigestAt:      snapshot?.history.previousDigestAt      ?? null,
+                timeSinceLastDigestMs: snapshot?.history.previousDigestAt != null
+                    ? Math.max(0, batch.cycleTs - snapshot.history.previousDigestAt)
+                    : null,
+                signalsSinceLastDigest: snapshot?.history.signalsSinceLastDigest ?? 0,
+                priorAppearances:       snapshot?.history.priorAppearances       ?? {},
+            },
         };
     }
 
