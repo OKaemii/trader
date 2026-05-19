@@ -469,7 +469,7 @@ export function createInternalBarsRouter(universeManager: UniverseManager): Hono
   // returned set (caller can compute staleness without a second round-trip).
   r.get(
     '/internal/api/universe/sectors',
-    parseInternalHeaders('strategy-engine'),
+    parseInternalHeaders('strategy-engine', 'notification-service'),
     async (c) => {
       const tickers = universeManager.activeTickers;
       const db = await getMongoDb();
