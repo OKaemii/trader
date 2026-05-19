@@ -117,7 +117,13 @@ export function createInternalRouter(deps: Deps): Hono {
         if (!deps.telemetrySnapshot) {
             throw new Error('telemetrySnapshot use-case not wired — required for notification-service callers');
         }
-        return deps.telemetrySnapshot.execute(query.since);
+        const opts: { tickers?: readonly string[]; strategyId?: string } = {};
+        if (query.tickers) {
+            const parsed = query.tickers.split(',').map((t) => t.trim()).filter(Boolean);
+            if (parsed.length > 0) opts.tickers = parsed;
+        }
+        if (query.strategyId) opts.strategyId = query.strategyId;
+        return deps.telemetrySnapshot.execute(query.since, opts);
     });
 
     return router;

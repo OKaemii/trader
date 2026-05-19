@@ -126,8 +126,15 @@ export class AnalysisEmailSender {
                 <div style="font-size:14px;line-height:1.55;white-space:pre-wrap">${escapeHtml(ctx.narrative)}</div>
             </div>` : '';
 
+        const priorAppearances = ctx.telemetry.history.priorAppearances;
         const signalBlocks = enriched.map((e) => {
             const sigEmoji = e.signal.action === 'BUY' ? '📈' : '📉';
+            const prior = priorAppearances[e.signal.ticker];
+            const priorBlock = prior ? `
+                <p style="margin:6px 0 0 0;font-size:12px;color:#555">
+                    <b>Prior appearance:</b> ${escapeHtml(prior.action)} ${prior.ageDays.toFixed(1)}d ago
+                    — lifecycle <code>${escapeHtml(prior.lifecycle)}</code>${prior.pnlPct !== null ? ` · closed ${prior.pnlPct >= 0 ? '+' : ''}${(prior.pnlPct * 100).toFixed(2)}%` : ''}
+                </p>` : `<p style="margin:6px 0 0 0;font-size:12px;color:#888"><i>No prior appearance for this ticker.</i></p>`;
             const profileBlock = e.profile ? `
                 <h4 style="margin:14px 0 6px 0;color:#222">${escapeHtml(e.profile.name)}</h4>
                 <p style="margin:4px 0;font-size:13px"><b>History:</b> ${escapeHtml(e.profile.history)}</p>
@@ -145,6 +152,7 @@ export class AnalysisEmailSender {
                     <tr><td><b>Entry price</b></td><td>${e.signal.entryPrice ?? '—'}</td>
                         <td style="padding-left:18px"><b>Uncertainty</b></td><td>${escapeHtml(e.rationale.uncertainty ?? 'n/a')}</td></tr>
                 </table>
+                ${priorBlock}
                 ${profileBlock}
                 <p style="margin:10px 0 4px 0;font-size:13px"><b>Strategy rationale:</b> ${escapeHtml(e.rationale.plain_english ?? '')}</p>
                 <p style="margin:4px 0;font-size:12px;color:#666"><i>${escapeHtml(e.rationale.economic_mechanism ?? '')}</i></p>

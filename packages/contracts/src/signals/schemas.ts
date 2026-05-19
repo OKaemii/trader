@@ -109,8 +109,15 @@ export type AutoApproveBody = z.infer<typeof AutoApproveBodySchema>;
 // open-position GBP MTM, and the latest decay metrics. Consumed by
 // notification-service's TelemetryBuilder to populate the TelemetryBlock that
 // grounds every quant-grade analysis email.
+// `tickers` (CSV) lets the caller request per-ticker prior-appearance lookups in the
+// same round trip — used by notification-service's TelemetryBuilder to surface "AAPL was
+// last picked 6d ago and closed +2.1%" alongside each new signal. `strategyId` scopes the
+// digest-history queries (previousDigestAt, signalsSinceLastDigest) to one strategy so a
+// factor_rank report's history doesn't include topology cycles.
 export const TelemetrySnapshotQuerySchema = z.object({
-    since: z.coerce.number().int().nonnegative(),
+    since:      z.coerce.number().int().nonnegative(),
+    tickers:    z.string().optional(),     // CSV; route handler splits.
+    strategyId: z.string().optional(),
 });
 export type TelemetrySnapshotQuery = z.infer<typeof TelemetrySnapshotQuerySchema>;
 
@@ -119,6 +126,18 @@ const PickSchema = z.object({
     pnlPct: z.number(),
     pnlGbp: z.number(),
 });
+
+// One ticker's most recent prior signal — surfaced per pick so the narrative can compare
+// to its predecessor ("AAPL was last picked 6d ago and closed +2.1%"). lifecycle is the
+// SignalLifecycle member name (string) so renderers don't have to import the numeric enum.
+const PriorAppearanceSchema = z.object({
+    lastSignalAt: z.number().int().nonnegative(),
+    action:       z.enum(['BUY', 'SELL', 'HOLD']),
+    ageDays:      z.number().nonnegative(),
+    lifecycle:    z.string(),
+    pnlPct:       z.number().nullable(),         // populated when prior was Closed
+});
+export type PriorAppearance = z.infer<typeof PriorAppearanceSchema>;
 
 const DecayMetricsSchema = z.object({
     rollingSharpe30d: z.number(),
@@ -163,6 +182,19 @@ export const TelemetrySnapshotResponseSchema = z.object({
     decay: z.object({
         health: z.enum(['healthy', 'warning', 'degraded', 'suspended']),
         metrics: DecayMetricsSchema.nullable(),
+    }),
+    // History block — anchors "what changed since the prior digest" narrative.
+    // previousDigestAt: timestamp of the most recent signal for the same strategy
+    //                   emitted strictly before `since`. null on first-ever digest.
+    // signalsSinceLastDigest: cycles the operator slept through (count between previous
+    //                         digest and `since`).
+    // priorAppearances: keyed by ticker (only those passed in `tickers` query param).
+    //                   Most recent prior signal per ticker — pre-existing context
+    //                   so each pick can be framed relative to its predecessor.
+    history: z.object({
+        previousDigestAt:       z.number().int().nonnegative().nullable(),
+        signalsSinceLastDigest: z.number().int().nonnegative(),
+        priorAppearances:       z.record(z.string(), PriorAppearanceSchema),
     }),
 });
 export type TelemetrySnapshotResponse = z.infer<typeof TelemetrySnapshotResponseSchema>;

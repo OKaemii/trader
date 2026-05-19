@@ -20,7 +20,7 @@ export type {
     OpenBuysResponse, OpenBuy, ClaimResponse, QueueRequeueResponse, QueueSweepResponse,
     ClaimedSignal, ExecutedNotification, ClosedNotification, DecrementQuantityRequest,
     QueueFailedRequest, QueueSweepRequest, AutoApproveBody,
-    TelemetrySnapshotQuery, TelemetrySnapshotResponse,
+    TelemetrySnapshotQuery, TelemetrySnapshotResponse, PriorAppearance,
 } from "./signals/schemas.ts";
 
 export type {

@@ -49,43 +49,77 @@ export interface NarrativeRequest {
 export async function buildNarrative(llm: NarrativeLLM, req: NarrativeRequest): Promise<string> {
     const telemetryJson = JSON.stringify(req.telemetry, null, 2);
     const sanityJson    = JSON.stringify(req.sanity,    null, 2);
-    const picks = req.batch.signals.map((s) => ({
-        action: s.action, ticker: s.ticker,
-        confidence:   Number(s.confidence.toFixed(3)),
-        targetWeight: Number(s.targetWeight.toFixed(4)),
-        score:        Number((s.features_snapshot?.composite_scores?.[s.ticker] ?? 0).toFixed(3)),
-        sector:       s.features_snapshot?.sectors?.[s.ticker] ?? 'Unknown',
-    }));
+    const picks = req.batch.signals.map((s) => {
+        const prior = req.telemetry.history.priorAppearances[s.ticker];
+        return {
+            action: s.action, ticker: s.ticker,
+            confidence:   Number(s.confidence.toFixed(3)),
+            targetWeight: Number(s.targetWeight.toFixed(4)),
+            score:        Number((s.features_snapshot?.composite_scores?.[s.ticker] ?? 0).toFixed(3)),
+            sector:       s.features_snapshot?.sectors?.[s.ticker] ?? 'Unknown',
+            priorAppearance: prior ? {
+                action:    prior.action,
+                ageDays:   Number(prior.ageDays.toFixed(1)),
+                lifecycle: prior.lifecycle,
+                pnlPct:    prior.pnlPct === null ? null : Number(prior.pnlPct.toFixed(4)),
+            } : null,
+        };
+    });
 
-    const prompt = `You are a sell-side strategist writing a cycle digest.
+    // Curated prompt. Three rules drive the rewrite from the previous version:
+    //   1. Headline-first — one sentence captures the single most important thing about
+    //      this window. Operator scanning their inbox sees the punchline immediately.
+    //   2. Forbid generic adjectives — "balanced/moderate/cautious/supportive" are filler
+    //      that say nothing. Specific numbers + their implications only.
+    //   3. Force comparison to history when present — every paragraph must reference
+    //      `telemetry.history` or a prior appearance, OR a specific number from
+    //      TELEMETRY. No floating prose.
+    // The "watch next" close converts the report from descriptive → actionable: name one
+    // observation that would change the read.
+    const prompt = `You are a sell-side strategist writing a cycle digest for a quant operator.
 
 WINDOW: ${req.windowLabel}
 STRATEGY: ${req.strategyId}
 
-PICKS (${picks.length}):
+PICKS (${picks.length}, each with prior appearance if any):
 ${JSON.stringify(picks, null, 2)}
 
-TELEMETRY (pre-computed; these are the ONLY numbers you may cite):
+TELEMETRY (pre-computed — the ONLY numbers you may cite):
 ${telemetryJson}
 
-SANITY FLAGS (anomalies — call out any 'critical' explicitly; warn/info may be summarised):
+SANITY FLAGS:
 ${sanityJson}
 ${req.extraContext ? `\nSTRATEGY-SPECIFIC CONTEXT:\n${req.extraContext}\n` : ''}
-Write 3–4 short paragraphs covering:
-  1. The dominant theme this window (sector concentration, factor tilt, regime).
-  2. Why these picks make sense TOGETHER — refer to TELEMETRY numbers only.
-  3. Realised P&L since last digest + open exposure read.
-  4. Notable anomalies from SANITY (especially 'critical' codes) and what they imply.
+WRITE the digest in EXACTLY this shape:
 
-Constraints:
-- Do NOT invent any number that is not present in TELEMETRY or SANITY.
-- Do NOT speculate beyond what the numbers support.
-- Plain prose, no bullet points, no markdown headers. Professional analyst voice.`;
+  Line 1 — HEADLINE: one sentence, max 25 words, naming the single most important thing
+  about THIS window. No throat-clearing.
+
+  Then 2–3 short paragraphs covering:
+    • What changed vs the prior digest (use telemetry.history.signalsSinceLastDigest,
+      telemetry.history.timeSinceLastDigestMs, and the priorAppearance of each pick).
+      If history is empty, say "first digest" explicitly.
+    • What the picks ARGUE — refer to specific telemetry numbers AND prior appearances.
+      A pick whose predecessor closed +X% means something different than a pick on a
+      fresh ticker; say so.
+    • Critical anomalies from SANITY only. Skip info/warn unless they materially change
+      the read.
+
+  Final line — WATCH NEXT: one sentence naming the specific number or event that would
+  invalidate the read. Start with "Watch:".
+
+HARD RULES:
+- Never invent numbers. Every figure must trace to TELEMETRY, SANITY, or PICKS.
+- Banned filler words: "balanced", "moderate", "cautious", "supportive", "robust",
+  "solid", "healthy" (the decay-health field can be quoted, but don't editorialise
+  with it). If you need an adjective, replace it with the number.
+- No bullet points. No markdown headers. No "in conclusion" or similar.
+- If a paragraph isn't anchored to a specific number or prior appearance, delete it.`;
 
     return llm.chat({
         messages:    [{ role: 'user', content: prompt }],
         maxTokens:   900,
-        temperature: 0.4,
+        temperature: 0.3,
     });
 }
 
@@ -106,6 +140,18 @@ export function renderSanityHtml(flags: SanityFlag[]): string {
             ${f.hint ? `<div style="font-size:12px;color:#666;font-style:italic;margin-top:2px">${escapeHtml(f.hint)}</div>` : ''}
         </div>`).join('');
     return `<div style="margin:10px 0 14px 0"><h3 style="margin:0 0 6px 0;font-size:14px">Sanity flags</h3>${rows}</div>`;
+}
+
+// "vs last digest" row appended to the telemetry table. Surfaces previousDigestAt
+// (formatted relative) + signalsSinceLastDigest so the operator sees how big a gap
+// the digest spans without leaving the email.
+function renderHistoryRow(h: TelemetryBlock['history']): string {
+    if (h.previousDigestAt === null) {
+        return `<tr><td><b>vs last digest</b></td><td><i>first digest for this strategy</i></td></tr>`;
+    }
+    const hours = (h.timeSinceLastDigestMs ?? 0) / 3_600_000;
+    const ago   = hours >= 24 ? `${(hours / 24).toFixed(1)}d` : `${hours.toFixed(1)}h`;
+    return `<tr><td><b>vs last digest</b></td><td>${ago} ago · ${h.signalsSinceLastDigest} signal(s) in between</td></tr>`;
 }
 
 // Render a TelemetryBlock as a compact HTML table. The narrative riffs on these numbers;
@@ -151,6 +197,7 @@ export function renderTelemetryHtml(t: TelemetryBlock): string {
                 <td>active=${t.universe.activeCount} · ready=${t.universe.readyCount} · unknown sector=${(t.universe.unknownSectorFraction*100).toFixed(1)}%</td>
             </tr>
             ${t.circuitBreaker.open ? `<tr style="background:#fdecea"><td><b>Circuit breaker</b></td><td><b style="color:#c0392b">OPEN</b>${t.circuitBreaker.reason ? ` — ${escapeHtml(t.circuitBreaker.reason)}` : ''}</td></tr>` : ''}
+            ${renderHistoryRow(t.history)}
         </table>
         ${bySectorRows ? `<h4 style="margin:8px 0 4px 0;font-size:12px">By sector</h4>
             <table cellpadding="3" style="border-collapse:collapse;font-size:12px">

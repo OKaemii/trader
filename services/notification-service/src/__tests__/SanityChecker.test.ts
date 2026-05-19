@@ -24,6 +24,7 @@ function baseTelemetry(overrides: Partial<TelemetryBlock> = {}): TelemetryBlock 
         decay:          { health: 'healthy', multiplier: 1.0, ic_30d: 1.2 },
         universe:       { activeCount: 100, readyCount: 100, unknownSectorFraction: 0.1 },
         circuitBreaker: { open: false, reason: null },
+        history: { previousDigestAt: null, timeSinceLastDigestMs: null, signalsSinceLastDigest: 0, priorAppearances: {} },
         ...overrides,
     };
 }

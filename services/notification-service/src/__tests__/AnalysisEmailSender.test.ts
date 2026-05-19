@@ -77,6 +77,13 @@ const signalFetcher: ISignalTelemetryFetcher = {
             lifecycleCounters: { pending: 0, approved: 0, queued: 1, executing: 0, executed: 2, closed: 0, failed: 0, cancelled: 0 },
             risk: { navGbp: 1000, circuit: { open: false, reason: null } },
             decay: { health: 'healthy', metrics: { icTStat: 1.2 } as never },
+            history: {
+                previousDigestAt: 1699913600000,
+                signalsSinceLastDigest: 2,
+                priorAppearances: {
+                    AAPL_US_EQ: { lastSignalAt: 1699913600000, action: 'BUY', ageDays: 1.5, lifecycle: 'Closed', pnlPct: 0.021 },
+                },
+            },
         } as never;
     },
 };
@@ -148,6 +155,10 @@ describe('AnalysisEmailSender (orchestrated)', () => {
         expect(html).toContain('momentum-dominated');
         // Portal link uses the configured base
         expect(html).toContain('http://portal/signals/');
+        // Phase 8: history block + per-pick prior-appearance line surface
+        expect(html).toContain('vs last digest');
+        expect(html).toContain('Prior appearance');
+        expect(html).toContain('+2.10%');                  // AAPL closed pnl from prior appearance
     });
 
     it('falls back to GenericRenderer when no specific renderer is registered for strategyId', async () => {

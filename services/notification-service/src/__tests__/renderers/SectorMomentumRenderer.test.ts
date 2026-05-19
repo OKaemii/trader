@@ -59,6 +59,7 @@ function tel(unknownFraction = 0.0): TelemetryBlock {
         decay: { health: 'healthy', multiplier: 1.0, ic_30d: 0.8 },
         universe: { activeCount: 100, readyCount: 100, unknownSectorFraction: unknownFraction },
         circuitBreaker: { open: false, reason: null },
+        history: { previousDigestAt: null, timeSinceLastDigestMs: null, signalsSinceLastDigest: 0, priorAppearances: {} },
     };
 }
 

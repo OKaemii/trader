@@ -1,6 +1,6 @@
 import type { Db } from 'mongodb';
 import type { Logger } from '@trader/core';
-import type { TelemetrySnapshotResponse } from '@trader/contracts';
+import type { PriorAppearance, TelemetrySnapshotResponse } from '@trader/contracts';
 import { COLLECTIONS } from '@trader/shared-mongo';
 import { SignalLifecycle } from '@trader/shared-types';
 import { sumPositionsGBP, type FxConverter, type PositionDoc } from '@trader/shared-portfolio';
@@ -48,7 +48,10 @@ export class GetTelemetrySnapshotUseCase {
     private readonly logger: Logger,
   ) {}
 
-  async execute(since: number): Promise<TelemetrySnapshotResponse> {
+  async execute(
+    since: number,
+    opts: { tickers?: readonly string[]; strategyId?: string } = {},
+  ): Promise<TelemetrySnapshotResponse> {
     const computedAt = Date.now();
     const signals   = this.db.collection(COLLECTIONS.SIGNALS);
     const positions = this.db.collection(COLLECTIONS.POSITIONS);
@@ -132,6 +135,58 @@ export class GetTelemetrySnapshotUseCase {
       return null;
     });
 
+    // ── History block ──────────────────────────────────────────────────
+    // previousDigestAt: timestamp of the most recent signal for `strategyId` strictly
+    // before `since` — proxy for "when did the prior digest fire" (one signal-cluster
+    // = one digest). signalsSinceLastDigest counts signals emitted between that point
+    // and `since`. priorAppearances: per-ticker, the most recent prior signal regardless
+    // of strategy (operator wants to know if this ticker was *anywhere* before).
+    let previousDigestAt: number | null = null;
+    let signalsSinceLastDigest = 0;
+    if (opts.strategyId) {
+      const prior = await signals
+        .find({ strategy_id: opts.strategyId, timestamp: { $lt: since } })
+        .project<{ timestamp: number }>({ timestamp: 1 })
+        .sort({ timestamp: -1 })
+        .limit(1)
+        .toArray();
+      previousDigestAt = prior[0]?.timestamp ?? null;
+      if (previousDigestAt !== null) {
+        signalsSinceLastDigest = await signals.countDocuments({
+          strategy_id: opts.strategyId,
+          timestamp:   { $gte: previousDigestAt, $lt: since },
+        });
+      }
+    }
+
+    const priorAppearances: Record<string, PriorAppearance> = {};
+    for (const ticker of opts.tickers ?? []) {
+      const prior = await signals
+        .find({ ticker, timestamp: { $lt: since } })
+        .project<{ timestamp: number; action: string; lifecycle?: number; entryPrice?: number; exitPrice?: number }>(
+          { timestamp: 1, action: 1, lifecycle: 1, entryPrice: 1, exitPrice: 1 },
+        )
+        .sort({ timestamp: -1 })
+        .limit(1)
+        .toArray();
+      const p = prior[0];
+      if (!p) continue;
+      const action = p.action === 'BUY' || p.action === 'SELL' || p.action === 'HOLD' ? p.action : 'BUY';
+      const lifecycleName = typeof p.lifecycle === 'number'
+        ? (LIFECYCLE_NAMES[p.lifecycle] ?? 'Pending')
+        : 'Pending';
+      const pnlPct = (p.lifecycle === SignalLifecycle.Closed && p.entryPrice && p.exitPrice && p.entryPrice > 0)
+        ? ((p.exitPrice - p.entryPrice) / p.entryPrice) * (action === 'SELL' ? -1 : 1)
+        : null;
+      priorAppearances[ticker] = {
+        lastSignalAt: p.timestamp,
+        action,
+        ageDays:      Math.max(0, (since - p.timestamp) / 86_400_000),
+        lifecycle:    lifecycleName,
+        pnlPct,
+      };
+    }
+
     return {
       since,
       computedAt,
@@ -161,6 +216,22 @@ export class GetTelemetrySnapshotUseCase {
         health: decayHealth,
         metrics: lastDecay,
       },
+      history: {
+        previousDigestAt,
+        signalsSinceLastDigest,
+        priorAppearances,
+      },
     };
   }
 }
+
+const LIFECYCLE_NAMES: Record<number, string> = {
+  [SignalLifecycle.Pending]:   'Pending',
+  [SignalLifecycle.Approved]:  'Approved',
+  [SignalLifecycle.Queued]:    'Queued',
+  [SignalLifecycle.Executing]: 'Executing',
+  [SignalLifecycle.Executed]:  'Executed',
+  [SignalLifecycle.Closed]:    'Closed',
+  [SignalLifecycle.Failed]:    'Failed',
+  [SignalLifecycle.Cancelled]: 'Cancelled',
+};
