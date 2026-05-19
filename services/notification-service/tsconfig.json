@@ -12,6 +12,7 @@
         { "path": "../../packages/contracts" },
         { "path": "../../packages/core" },
         { "path": "../../packages/shared-auth" },
+        { "path": "../../packages/shared-calendar" },
         { "path": "../../packages/shared-mongo" },
         { "path": "../../packages/shared-redis" },
         { "path": "../../packages/shared-types" }

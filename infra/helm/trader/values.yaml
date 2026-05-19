@@ -46,6 +46,10 @@ global:
     #   confidence is forced to 0 (drops factor-collapse noise even on healthy cross-sections).
     minPositivePeers:       "5"
     minScoreEpsilon:        "0.1"
+    # Notification-service operator override for intraday strategies' reporting cadence.
+    # See services/notification-service/src/modules/analysis/application/CycleAnalysisBatcher.ts.
+    # hourly (default) | four_hourly | eod. Daily strategies (declared 'per_cycle') ignore this.
+    reportIntradayCadence:  "hourly"
     # Raised from 0.20: demo T212 universe contains ETPs/small-caps with no Yahoo Finance equivalent.
     # Lower back to 0.20 once a real-data universe (standard tickers only) is in use.
     gapThreshold: "0.60"

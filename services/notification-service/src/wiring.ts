@@ -7,7 +7,10 @@ import { PushSender } from "./modules/notifications/infrastructure/push.ts";
 import { DeepSeekClient } from "./modules/analysis/infrastructure/DeepSeekClient.ts";
 import { CompanyProfileService } from "./modules/analysis/application/CompanyProfileService.ts";
 import { AnalysisEmailSender } from "./modules/analysis/infrastructure/AnalysisEmailSender.ts";
-import { CycleAnalysisBatcher } from "./modules/analysis/application/CycleAnalysisBatcher.ts";
+import { CycleAnalysisBatcher, nyseCalendar, lseCalendar } from "./modules/analysis/application/CycleAnalysisBatcher.ts";
+import {
+    HolidayCache, NyseIcalProvider, UkGovBankHolidayProvider, STATIC_FALLBACK,
+} from "@trader/shared-calendar";
 
 export interface NotificationDeps {
     readonly logger: Logger;
@@ -46,8 +49,25 @@ export async function wireDependencies(env: NotificationEnv, logger: Logger): Pr
             { apiKey: env.RESEND_API_KEY, toEmail: env.EMAIL_TO },
             profiles, deepseek, logger,
         );
+        // Exchange calendars for the EOD cadence. Shared HolidayCache reads the same
+        // gov.uk + NYSE iCal sources as market-data-service. STATIC_FALLBACK is the
+        // baked-in closure table the cache reaches for when both Mongo and the live
+        // provider are unavailable (currently the source of truth for US, since the
+        // NYSE iCal URL is a 404 — see CLAUDE.md).
+        const holidayCache = new HolidayCache(
+            db,
+            { US: new NyseIcalProvider(), LSE: new UkGovBankHolidayProvider() },
+            STATIC_FALLBACK,
+        );
+        const calendars = {
+            US:  nyseCalendar(holidayCache),
+            LSE: lseCalendar(holidayCache),
+        };
+
         analysisBatcher = new CycleAnalysisBatcher({
             logger,
+            calendars,
+            intradayOverride: env.REPORT_INTRADAY_CADENCE,
             onFlush: async (batch) => {
                 if (!analysisEmail) return;
                 try { await analysisEmail.send(batch); }
