@@ -213,10 +213,15 @@ export class GenerateSignalsUseCase {
             ...(features.position_size_multiplier !== undefined
               ? { position_size_multiplier: features.position_size_multiplier }
               : {}),
-            ...(features.signal_weights !== undefined ? { signal_weights: features.signal_weights } : {}),
-            ...(features.feature_stability !== undefined ? { feature_stability: features.feature_stability } : {}),
-            ...(features.betti_curves !== undefined ? { betti_curves: features.betti_curves } : {}),
-            ...(features.laplacian_residuals !== undefined && features.laplacian_residuals[ticker] !== undefined
+            // `!= null` (loose) catches both undefined AND explicit null. Python strategies
+            // serialise None as JSON null for optional fields (laplacian_residuals,
+            // betti_curves, persistence_pairs, signal_weights, feature_stability), so
+            // `!== undefined` lets null slip through and `null[ticker]` throws inside the try
+            // block — silently dropping every candidate signal.
+            ...(features.signal_weights      != null ? { signal_weights:      features.signal_weights      } : {}),
+            ...(features.feature_stability   != null ? { feature_stability:   features.feature_stability   } : {}),
+            ...(features.betti_curves        != null ? { betti_curves:        features.betti_curves        } : {}),
+            ...(features.laplacian_residuals != null && features.laplacian_residuals[ticker] !== undefined
               ? { laplacian_residuals: { [ticker]: features.laplacian_residuals[ticker] } }
               : {}),
             // report_cadence drives notification-service CycleAnalysisBatcher windowing.
