@@ -63,8 +63,11 @@ describe('GenericRenderer', () => {
         expect(ctx.sectionsHtml).toBe('');
         // Phase 8 prompt contract — three load-bearing constraints the LLM must see:
         // (a) headline-first shape, (b) ban filler adjectives, (c) "Watch:" close.
-        expect(receivedPrompt).toContain('HEADLINE');
+        // Phase 8.1: the headline marker was dropped (LLM was bolding it literally);
+        // the contract now is "no label prefix" + the explicit ban.
+        expect(receivedPrompt).toContain('No label prefix');
         expect(receivedPrompt).toContain('Banned filler words');
+        expect(receivedPrompt).toContain('NEVER quote raw milliseconds');
         expect(receivedPrompt).toContain('Watch:');
         // And the no-hallucination invariant.
         expect(receivedPrompt).toContain('Never invent numbers');
