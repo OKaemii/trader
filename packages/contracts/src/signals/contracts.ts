@@ -12,11 +12,14 @@ import {
     QueueRequeueResponseSchema,
     QueueSweepRequestSchema,
     QueueSweepResponseSchema,
+    TelemetrySnapshotQuerySchema,
+    TelemetrySnapshotResponseSchema,
     IdParamSchema,
     TickerParamSchema,
 } from "./schemas.ts";
 
 const TRADING = ["trading-service"] as const;
+const NOTIFICATION = ["notification-service"] as const;
 
 export const markExecutedContract = defineContract({
     method: "POST",
@@ -82,4 +85,16 @@ export const sweepQueueContract = defineContract({
     callerScope: TRADING,
     requestSchema: QueueSweepRequestSchema,
     responseSchema: QueueSweepResponseSchema,
+});
+
+// Read-only reporting telemetry feed. notification-service's TelemetryBuilder pulls
+// realised P&L since the last report window, open MTM, lifecycle counters, and decay
+// state on every flush — assembled into the TelemetryBlock that grounds the
+// strategy-aware quant-grade analysis email.
+export const telemetrySnapshotContract = defineContract({
+    method: "GET",
+    path: "/internal/api/signals/telemetry-snapshot",
+    callerScope: NOTIFICATION,
+    querySchema: TelemetrySnapshotQuerySchema,
+    responseSchema: TelemetrySnapshotResponseSchema,
 });

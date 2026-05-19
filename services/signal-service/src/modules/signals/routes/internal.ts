@@ -10,10 +10,12 @@ import {
     type OpenBuysResponse,
     type QueueRequeueResponse,
     type QueueSweepResponse,
+    type TelemetrySnapshotResponse,
 } from '@trader/contracts';
 import { SignalLifecycle, SignalFailureReason } from '@trader/shared-types';
 import type { ISignalRepository } from '../domain/ISignalRepository.ts';
 import type { ISignalPublisher } from '../domain/ISignalPublisher.ts';
+import type { GetTelemetrySnapshotUseCase } from '../application/GetTelemetrySnapshot.ts';
 
 interface Deps {
     signalRepo: ISignalRepository;
@@ -21,6 +23,9 @@ interface Deps {
     // signals that actually went through to T212 (policy b — see CLAUDE.md).
     publisher: ISignalPublisher;
     logger: Logger;
+    // Optional in tests that only exercise the queue endpoints. Production wiring always
+    // injects this — notification-service polls it once per report-cadence flush.
+    telemetrySnapshot?: GetTelemetrySnapshotUseCase;
 }
 
 /**
@@ -30,7 +35,8 @@ interface Deps {
  */
 export function createInternalRouter(deps: Deps): Hono {
     const router = new Hono();
-    const fromTrading = parseInternalHeaders('trading-service');
+    const fromTrading      = parseInternalHeaders('trading-service');
+    const fromNotification = parseInternalHeaders('notification-service');
 
     bindContract(router, Signals.markExecutedContract, fromTrading, async ({ params, body }): Promise<ExecutedResponse> => {
         const at = body.at ?? Date.now();
@@ -103,6 +109,15 @@ export function createInternalRouter(deps: Deps): Hono {
         const ms = body?.thresholdMs ?? 60_000;
         const reverted = await deps.signalRepo.sweepStaleExecuting(ms);
         return { reverted };
+    });
+
+    // Reporting telemetry feed for notification-service's TelemetryBuilder. GET-with-query
+    // keeps the contract idempotent (no state change on the producer side).
+    bindContract(router, Signals.telemetrySnapshotContract, fromNotification, async ({ query }): Promise<TelemetrySnapshotResponse> => {
+        if (!deps.telemetrySnapshot) {
+            throw new Error('telemetrySnapshot use-case not wired — required for notification-service callers');
+        }
+        return deps.telemetrySnapshot.execute(query.since);
     });
 
     return router;

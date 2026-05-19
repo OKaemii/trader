@@ -38,9 +38,10 @@ async function main(): Promise<void> {
         riskEngine:       deps.riskEngine,
     }));
     app.route("/", createInternalRouter({
-        signalRepo: deps.signalRepo,
-        publisher:  deps.publisher,
-        logger:     deps.logger,
+        signalRepo:        deps.signalRepo,
+        publisher:         deps.publisher,
+        logger:            deps.logger,
+        telemetrySnapshot: deps.telemetrySnapshot,
     }));
 
     // WebSocket + system-reset moved here from the (deleted) api-gateway. Both belong

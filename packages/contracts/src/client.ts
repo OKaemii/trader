@@ -1,5 +1,5 @@
 import type { ZodTypeAny } from "zod";
-import type { InternalContract, InferParams, InferRequest, InferResponse } from "./contract.ts";
+import type { InternalContract, InferParams, InferQuery, InferRequest, InferResponse } from "./contract.ts";
 
 /**
  * Mints a bearer token for a peer-to-peer call. Caller supplies its own service name
@@ -40,13 +40,15 @@ export interface InternalCallerOptions {
 export function createInternalCaller(opts: InternalCallerOptions) {
     const fetcher = opts.fetcher ?? fetch;
     return async function call<
-        C extends InternalContract<ZodTypeAny | undefined, ZodTypeAny | undefined, ZodTypeAny | undefined>,
+        C extends InternalContract<ZodTypeAny | undefined, ZodTypeAny | undefined, ZodTypeAny | undefined, ZodTypeAny | undefined>,
     >(
         contract: C,
-        args?: { params?: InferParams<C>; body?: InferRequest<C> },
+        args?: { params?: InferParams<C>; query?: InferQuery<C>; body?: InferRequest<C> },
     ): Promise<InferResponse<C>> {
         const token = await opts.mintToken(opts.callerService);
-        const url = `${opts.baseUrl}${interpolatePath(contract.path, args?.params as Record<string, unknown> | undefined)}`;
+        const path = interpolatePath(contract.path, args?.params as Record<string, unknown> | undefined);
+        const qs = args?.query ? buildQueryString(args.query as Record<string, unknown>) : "";
+        const url = `${opts.baseUrl}${path}${qs}`;
         const init: RequestInit = {
             method: contract.method,
             headers: {
@@ -86,4 +88,13 @@ function interpolatePath(path: string, params: Record<string, unknown> | undefin
         }
         return encodeURIComponent(String(value));
     });
+}
+
+function buildQueryString(query: Record<string, unknown>): string {
+    const pairs: string[] = [];
+    for (const [key, value] of Object.entries(query)) {
+        if (value === undefined || value === null) continue;
+        pairs.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
+    }
+    return pairs.length ? `?${pairs.join("&")}` : "";
 }
