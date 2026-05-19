@@ -41,6 +41,11 @@ spec:
               value: {{ .Values.global.env.tradingMode | default "Paper" | quote }}
             - name: ACTIVE_STRATEGY
               value: {{ .Values.global.env.activeStrategy | default "factor_rank_v1" | quote }}
+            # Operator override for intraday strategies' reporting cadence. One of
+            # `hourly` (default) | `four_hourly` | `eod`. Daily strategies (declared
+            # `per_cycle`) ignore this — see CycleAnalysisBatcher.resolveEffectiveCadence.
+            - name: REPORT_INTRADAY_CADENCE
+              value: {{ .Values.global.env.reportIntradayCadence | default "hourly" | quote }}
           livenessProbe:
             httpGet:
               path: /health

@@ -17,6 +17,7 @@
     "@trader/contracts": "workspace:*",
     "@trader/core": "workspace:*",
     "@trader/shared-auth": "workspace:*",
+    "@trader/shared-calendar": "workspace:*",
     "@trader/shared-mongo": "workspace:*",
     "@trader/shared-redis": "workspace:*",
     "@trader/shared-types": "workspace:*",

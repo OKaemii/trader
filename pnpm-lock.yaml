@@ -310,6 +310,9 @@ importers:
       '@trader/shared-auth':
         specifier: workspace:*
         version: link:../../packages/shared-auth
+      '@trader/shared-calendar':
+        specifier: workspace:*
+        version: link:../../packages/shared-calendar
       '@trader/shared-mongo':
         specifier: workspace:*
         version: link:../../packages/shared-mongo

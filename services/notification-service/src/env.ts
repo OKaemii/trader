@@ -21,6 +21,14 @@ const EnvSchema = z.object({
     // path; per-signal quick emails keep firing.
     DEEPSEEK_API_KEY: z.string().optional(),
 
+    // Operator override for intraday strategies' reporting cadence. When an intraday
+    // strategy advertises `report_cadence='hourly'` (the default), this env can dial
+    // it DOWN to `four_hourly` or `eod` for less email volume. `per_cycle` is rejected
+    // for intraday strategies — would reintroduce the 12-emails-per-hour problem the
+    // cadence design was created to fix. Daily strategies (declared `per_cycle`) ignore
+    // this override entirely.
+    REPORT_INTRADAY_CADENCE: z.enum(['hourly', 'four_hourly', 'eod']).default('hourly'),
+
     OTLP_ENDPOINT: z.string().url().optional(),
 });
 
