@@ -11,6 +11,14 @@ const EnvSchema = z.object({
     MONGODB_URL: z.string().url().default("mongodb://mongodb:27017"),
     REDIS_URL:   z.string().url().default("redis://redis:6379"),
 
+    // Peer-service base URLs for the analysis-email telemetry path. signal-service hosts
+    // the telemetry-snapshot endpoint (realised P&L, lifecycle counters, decay state);
+    // market-data-service hosts the sectors map used for universe-coverage telemetry.
+    SIGNAL_SERVICE_URL:      z.string().url().default("http://signal-service:3003"),
+    MARKET_DATA_SERVICE_URL: z.string().url().default("http://market-data-service:3001"),
+
+    PORTAL_BASE_URL: z.string().url().default("http://trader.local"),
+
     RESEND_API_KEY: z.string().optional(),
     EMAIL_FROM:     z.string().email().optional(),
     EMAIL_TO:       z.string().email().optional(),
