@@ -8,6 +8,7 @@ import { FxClient, YahooFxProvider } from "@trader/shared-fx";
 
 import type { TradingEnv } from "./env.ts";
 import { Trading212Client } from "./modules/t212/infrastructure/Trading212Client.ts";
+import { InstrumentMetadataCache } from "./modules/t212/infrastructure/InstrumentMetadataCache.ts";
 import { MongoOrderRepository } from "./modules/orders/infrastructure/MongoOrderRepository.ts";
 import { AccountCache } from "./modules/orders/infrastructure/AccountCache.ts";
 import { OrderDispatcher } from "./modules/orders/infrastructure/OrderDispatcher.ts";
@@ -60,10 +61,23 @@ export async function wireDependencies(env: TradingEnv, logger: Logger) {
         )
         : null;
 
+    // Instrument metadata cache — only wired in demo/live (paper mode never calls T212
+    // so a metadata fetch on boot would fail with missing credentials). Eager-load in
+    // background; the first signal that arrives before completion gets the in-memory
+    // fallback rules (4 dp / 0.0001 minQuantity) for one cycle, then the populated cache.
+    let instrumentMetadata: InstrumentMetadataCache | undefined;
+    if (env.TRADING_MODE !== TradingMode.Paper) {
+        instrumentMetadata = new InstrumentMetadataCache(sharedClient, logger);
+        instrumentMetadata.load().catch((err) => {
+            logger.warn({ err }, 'initial instrument-metadata load failed — will retry on first lookup');
+        });
+    }
+
     const dispatcher = new OrderDispatcher({
         tradingMode:         env.TRADING_MODE,
         client:              sharedClient,
         accountCache:        sharedAccountCache,
+        ...(instrumentMetadata ? { instrumentMetadata } : {}),
         signal,
         logger,
         getDb:               () => getMongoDb(),

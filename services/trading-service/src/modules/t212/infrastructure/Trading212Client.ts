@@ -109,6 +109,25 @@ export class Trading212Client {
     return (data ?? []).map((o) => ({ id: String(o.id ?? o.orderId ?? '') }));
   }
 
+  // Instrument metadata — per-ticker quantity rules. T212 returns a large array (typ.
+  // 5k+ instruments, several MB). Fetch once on boot and cache; the metadata changes only
+  // when T212 adds/removes tickers, which is rare. minTradeQuantity also implicitly defines
+  // the allowed quantity precision (number of decimals). Without this, our dispatcher sends
+  // 4-decimal quantities and the broker rejects with `quantity-precision-mismatch` or
+  // `min-quantity-exceeded` 4xx — the dominant failure class on small-NAV accounts.
+  async getInstruments(): Promise<T212Instrument[]> {
+    const res = await fetch(`${this.baseUrl}/equity/metadata/instruments`, { headers: this.headers });
+    if (!res.ok) throw new Error(`T212 instruments: ${res.status}`);
+    const data = await res.json() as Array<Record<string, unknown>>;
+    return (data ?? []).map((p) => ({
+      ticker:           String(p.ticker ?? ''),
+      minTradeQuantity: Number(p.minTradeQuantity ?? 0),
+      maxOpenQuantity:  Number(p.maxOpenQuantity ?? 0),
+      currencyCode:     String(p.currencyCode ?? ''),
+      type:             String(p.type ?? ''),
+    }));
+  }
+
   // History of orders that have reached a terminal state (FILLED / CANCELLED / REJECTED /
   // EXPIRED). T212 paginates with `nextPagePath`, a path to follow until null. Caller drives
   // the loop. Shape confirmed via demo probe — see PROGRESS.md.
@@ -123,6 +142,14 @@ export class Trading212Client {
     const data = await res.json() as { items?: T212HistoryItem[]; nextPagePath?: string | null };
     return { items: data.items ?? [], nextPagePath: data.nextPagePath ?? null };
   }
+}
+
+export interface T212Instrument {
+  ticker:           string;
+  minTradeQuantity: number;   // e.g. 0.01 (US fractional), 1 (whole-share), 0.01510719 (some LSE ETFs)
+  maxOpenQuantity:  number;
+  currencyCode:     string;   // ISO 4217
+  type:             string;   // 'STOCK' | 'ETF' | ...
 }
 
 // Subset of fields we actually use. T212 returns more (currency, walletImpact, taxes, etc.)

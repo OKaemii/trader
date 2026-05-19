@@ -130,4 +130,59 @@ describe('PlaceOrderUseCase', () => {
     });
     expect(order).toBeNull();
   });
+
+  describe('quantityRules', () => {
+    it('floors raw qty to the broker-allowed precision', async () => {
+      // raw qty = 0.10 * 100 / 23.4349 = 0.42672… → at precision=3 → 0.426
+      const useCase = makeUseCase();
+      const order = await useCase.execute({
+        signalId:        'sig-prec',
+        ticker:          'KHC_US_EQ',
+        action:          'BUY',
+        targetWeight:    0.10,
+        confidence:      0.7,
+        totalNAV:        { amount: 100, currency: 'USD' },
+        currentPrice:    { amount: 23.4349, currency: 'USD' },
+        currentQuantity: 0,
+        quantityRules:   { minQuantity: 0.001, precision: 3 },
+      });
+      expect(order).not.toBeNull();
+      expect(order!.quantity).toBeCloseTo(0.426, 5);
+    });
+
+    it('returns null when floored qty falls below minQuantity (would have been broker-rejected)', async () => {
+      // raw qty = 0.005 * 100 / 23.43 ≈ 0.0213 → flooring to precision=2 → 0.02
+      // minQuantity = 0.05 → reject.
+      const useCase = makeUseCase();
+      const order = await useCase.execute({
+        signalId:        'sig-tiny',
+        ticker:          'SUPRl_EQ',
+        action:          'BUY',
+        targetWeight:    0.005,
+        confidence:      0.7,
+        totalNAV:        { amount: 100, currency: 'GBP' },
+        currentPrice:    { amount: 23.43, currency: 'GBP' },
+        currentQuantity: 0,
+        quantityRules:   { minQuantity: 0.05, precision: 2 },
+      });
+      expect(order).toBeNull();
+    });
+
+    it('whole-share precision (0) rejects fractional submissions', async () => {
+      // raw qty = 0.5 * 100 / 80 = 0.625 → floor to precision=0 → 0 → reject.
+      const useCase = makeUseCase();
+      const order = await useCase.execute({
+        signalId:        'sig-whole',
+        ticker:          'WHOLEl_EQ',
+        action:          'BUY',
+        targetWeight:    0.5,
+        confidence:      0.7,
+        totalNAV:        { amount: 100, currency: 'GBP' },
+        currentPrice:    { amount: 80,  currency: 'GBP' },
+        currentQuantity: 0,
+        quantityRules:   { minQuantity: 1, precision: 0 },
+      });
+      expect(order).toBeNull();
+    });
+  });
 });
