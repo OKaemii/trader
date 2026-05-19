@@ -5,6 +5,7 @@ import type { SignalServiceClient } from '@trader/contracts';
 import { type Currency, type Money, SignalFailureReason } from '@trader/shared-types';
 
 import type { Trading212Client } from '../../t212/infrastructure/Trading212Client.ts';
+import type { InstrumentMetadataCache } from '../../t212/infrastructure/InstrumentMetadataCache.ts';
 import type { AccountCache } from './AccountCache.ts';
 import { MongoOrderRepository } from './MongoOrderRepository.ts';
 import { MongoPriceLookup } from '../../../shared/MongoPriceLookup.ts';
@@ -53,6 +54,10 @@ export interface OrderDispatcherDeps {
     tradingMode:      TradingMode;
     client:           Trading212Client;
     accountCache:     AccountCache;
+    // Per-ticker quantity rules from T212 metadata. Optional so paper-mode and tests
+    // skip the lookup — in those paths the legacy 4-dp / 0.0001 fallback in
+    // PlaceOrderUseCase still applies. Wired by index.ts on boot in demo/live mode.
+    instrumentMetadata?: InstrumentMetadataCache;
     signal:           SignalServiceClient;
     logger:           Logger;
     getDb:            () => Promise<Db>;
@@ -297,6 +302,25 @@ export class OrderDispatcher {
             targetWeight: signal.targetWeight,
         }, 'dispatcher: sized inputs — handing off to PlaceOrderUseCase');
 
+        // Per-instrument quantity rules. Fetched once per pod per day; an empty cache
+        // (failed metadata load) falls back to the permissive default inside
+        // PlaceOrderUseCase. We pass through `undefined` rather than the fallback object
+        // so the PlaceOrderUseCase log line clearly distinguishes "rules unavailable"
+        // from "rules say this is fine".
+        let quantityRules;
+        if (this.deps.instrumentMetadata) {
+            try {
+                quantityRules = await this.deps.instrumentMetadata.getRules(signal.ticker);
+                this.deps.logger.info({
+                    signalId: signal.id, ticker: signal.ticker,
+                    minQuantity: quantityRules.minQuantity, precision: quantityRules.precision,
+                }, 'dispatcher: instrument rules');
+            } catch (err) {
+                this.deps.logger.warn({ err, signalId: signal.id, ticker: signal.ticker },
+                    'dispatcher: instrument-metadata lookup failed — using fallback rules');
+            }
+        }
+
         try {
             const order = await useCase.execute({
                 signalId:        signal.id,
@@ -307,6 +331,7 @@ export class OrderDispatcher {
                 totalNAV,
                 ...(currentPrice ? { currentPrice } : {}),
                 currentQuantity: effectiveQuantity,
+                ...(quantityRules ? { quantityRules } : {}),
             });
 
             if (!order) {

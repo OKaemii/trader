@@ -12,6 +12,7 @@ import {
 import type { IOrderRepository } from '../domain/IOrderRepository.ts';
 import type { IOrderExecutor } from '../domain/IOrderExecutor.ts';
 import { OrderRouter, OrderReason } from './OrderRouter.ts';
+import { applyQuantityRules, type QuantityRules } from '../../t212/infrastructure/InstrumentMetadataCache.ts';
 
 export interface PlaceOrderInput {
     signalId:     string;
@@ -28,6 +29,12 @@ export interface PlaceOrderInput {
     totalNAV?:        Money;
     currentPrice?:    Money;
     currentQuantity?: number;
+    // Per-instrument quantity rules from T212. When supplied, the sized quantity is
+    // floored to the broker's allowed precision and rejected (returned as 0) if it
+    // falls below minQuantity — pre-empting the `quantity-precision-mismatch` and
+    // `min-quantity-exceeded` 4xx round-trips that dominate broker-rejection failures
+    // on small accounts. Optional so tests and paper-mode skip the lookup.
+    quantityRules?:   QuantityRules;
 }
 
 export interface PlaceOrderDeps {
@@ -181,7 +188,7 @@ export class PlaceOrderUseCase {
     }
 
     private _computeQuantity(input: PlaceOrderInput): number {
-        const { totalNAV, currentPrice, currentQuantity = 0, targetWeight, action } = input;
+        const { totalNAV, currentPrice, currentQuantity = 0, targetWeight, action, quantityRules } = input;
         if (!totalNAV || !currentPrice || currentPrice.amount <= 0) {
             // Cannot size without price data — caller must supply these or quantity defaults to 0
             return 0;
@@ -201,16 +208,14 @@ export class PlaceOrderUseCase {
         const currentValue = currentQuantity * currentPrice.amount;
         const delta        = (targetValue - currentValue) / currentPrice.amount;
 
-        // Fractional shares. T212 supports them natively (demo + most US/UK tickers);
-        // the previous `Math.floor` destroyed up to 70% of the optimiser's intended
-        // risk allocation on small accounts — e.g. a £50 target on a $100 ticker is
-        // 0.5 shares, not 0. 4 dp ≈ 1/10000th of a share, well within T212's precision.
-        // Floor at 0.0001 to skip infinitesimal orders T212 would reject anyway.
-        const round4 = (x: number): number => Math.round(x * 10000) / 10000;
-        const minQty = 0.0001;
-
-        if (action === 'BUY'  && delta >=  minQty) return round4(delta);
-        if (action === 'SELL' && delta <= -minQty) return round4(Math.abs(delta));
-        return 0;
+        // Per-instrument quantity rules. When the broker tells us "min 0.01510719 with 8 dp",
+        // we floor to 8 dp and reject anything below 0.01510719 here rather than letting the
+        // submission round-trip to T212 for a guaranteed 4xx. Falls back to a permissive
+        // 4-dp / 0.0001 floor when no rules are wired (tests, cold start before metadata loads).
+        const rules: QuantityRules = quantityRules ?? { minQuantity: 0.0001, precision: 4 };
+        const sized = action === 'BUY'  ? delta
+                    : action === 'SELL' ? Math.abs(delta < 0 ? delta : 0)
+                    : 0;
+        return applyQuantityRules(sized, rules);
     }
 }
