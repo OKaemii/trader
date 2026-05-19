@@ -47,7 +47,19 @@ export interface NarrativeRequest {
 }
 
 export async function buildNarrative(llm: NarrativeLLM, req: NarrativeRequest): Promise<string> {
-    const telemetryJson = JSON.stringify(req.telemetry, null, 2);
+    // Pre-humanise the duration field the LLM tends to quote verbatim. Raw `ms ago`
+    // leaked into the first Phase 8 output ("prior digest was 1,012,980 ms ago"); we
+    // surface a `timeSinceLastDigestLabel: "0.3h"` field next to the raw ms so the
+    // model has a natural-language version to grab without us having to fight it
+    // post-hoc on every iteration.
+    const enrichedTelemetry = {
+        ...req.telemetry,
+        history: {
+            ...req.telemetry.history,
+            timeSinceLastDigestLabel: humaniseDuration(req.telemetry.history.timeSinceLastDigestMs),
+        },
+    };
+    const telemetryJson = JSON.stringify(enrichedTelemetry, null, 2);
     const sanityJson    = JSON.stringify(req.sanity,    null, 2);
     const picks = req.batch.signals.map((s) => {
         const prior = req.telemetry.history.priorAppearances[s.ticker];
@@ -92,8 +104,9 @@ ${sanityJson}
 ${req.extraContext ? `\nSTRATEGY-SPECIFIC CONTEXT:\n${req.extraContext}\n` : ''}
 WRITE the digest in EXACTLY this shape:
 
-  Line 1 — HEADLINE: one sentence, max 25 words, naming the single most important thing
-  about THIS window. No throat-clearing.
+  First line: one sentence, max 25 words, naming the single most important thing about
+  THIS window. No throat-clearing. No label prefix — just the sentence. Do NOT prefix
+  it with "Headline:", "**Headline:**", or any other marker.
 
   Then 2–3 short paragraphs covering:
     • What changed vs the prior digest (use telemetry.history.signalsSinceLastDigest,
@@ -110,10 +123,13 @@ WRITE the digest in EXACTLY this shape:
 
 HARD RULES:
 - Never invent numbers. Every figure must trace to TELEMETRY, SANITY, or PICKS.
+- Express durations as hours or days (use telemetry.history.timeSinceLastDigestLabel
+  when referring to the gap since the prior digest). NEVER quote raw milliseconds.
 - Banned filler words: "balanced", "moderate", "cautious", "supportive", "robust",
   "solid", "healthy" (the decay-health field can be quoted, but don't editorialise
   with it). If you need an adjective, replace it with the number.
-- No bullet points. No markdown headers. No "in conclusion" or similar.
+- No bullet points. No markdown headers, bold, or italics. No "in conclusion" or
+  similar. Plain prose only.
 - If a paragraph isn't anchored to a specific number or prior appearance, delete it.`;
 
     return llm.chat({
@@ -140,6 +156,14 @@ export function renderSanityHtml(flags: SanityFlag[]): string {
             ${f.hint ? `<div style="font-size:12px;color:#666;font-style:italic;margin-top:2px">${escapeHtml(f.hint)}</div>` : ''}
         </div>`).join('');
     return `<div style="margin:10px 0 14px 0"><h3 style="margin:0 0 6px 0;font-size:14px">Sanity flags</h3>${rows}</div>`;
+}
+
+// Convert ms-since-last-digest to a human label the LLM can safely quote.
+// Mirrors renderHistoryRow's heuristic so the prose and the inline row agree.
+function humaniseDuration(ms: number | null): string | null {
+    if (ms === null) return null;
+    const hours = ms / 3_600_000;
+    return hours >= 24 ? `${(hours / 24).toFixed(1)}d` : `${hours.toFixed(1)}h`;
 }
 
 // "vs last digest" row appended to the telemetry table. Surfaces previousDigestAt
