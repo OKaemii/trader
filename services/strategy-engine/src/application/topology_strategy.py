@@ -1,3 +1,4 @@
+import os
 import time
 import numpy as np
 from typing import Optional
@@ -42,6 +43,12 @@ class TopologyStrategy(BaseStrategy):
         # Topology needs more history than the other strategies — Betti curves stabilize
         # with at least MIN_HISTORY observations. Engine host fetches this many bars.
         return MIN_HISTORY
+
+    @property
+    def report_cadence(self) -> str:
+        # Same cadence policy as FactorRank — daily emits one email per cycle; intraday
+        # buckets to hourly so the operator isn't flooded with 5m-window slices.
+        return 'per_cycle' if os.getenv('BAR_FREQUENCY', 'daily') == 'daily' else 'hourly'
 
     def update(
         self,
@@ -110,4 +117,5 @@ class TopologyStrategy(BaseStrategy):
             },
             persistence_pairs=pairs,
             laplacian_residuals={t: float(residuals[i]) for i, t in enumerate(tickers)},
+            report_cadence=self.report_cadence,
         )

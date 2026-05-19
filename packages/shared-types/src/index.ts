@@ -102,6 +102,10 @@ export interface StrategyOutput {
   betti_curves?: { epsilon_range: number[]; beta0: number[]; beta1: number[] };
   persistence_pairs?: Array<[number, number, number]>;
   laplacian_residuals?: Record<string, number>;
+  // Reporting cadence — drives notification-service CycleAnalysisBatcher windowing.
+  // Daily strategies emit `per_cycle`; intraday strategies emit `hourly` by default
+  // so the operator gets one digest per hour instead of 12 single-cycle emails.
+  report_cadence?: 'per_cycle' | 'hourly' | 'four_hourly' | 'eod';
 }
 
 // TopologyFeatures — retained for backward-compatible dashboard reads only.

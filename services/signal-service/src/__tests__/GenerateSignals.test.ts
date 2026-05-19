@@ -389,6 +389,26 @@ describe('GenerateSignalsUseCase', () => {
       expect(s.features_snapshot?.regime_confidence).toBe(features.regime_confidence);
     }
   });
+
+  it('plumbs report_cadence from StrategyOutput onto the analysisContext on every emitted signal', async () => {
+    const features = baseFeatures();
+    features.report_cadence = 'hourly';
+    const signals = await useCase.execute(features);
+    expect(signals.length).toBeGreaterThan(0);
+    for (const s of signals) {
+      expect(s.features_snapshot?.report_cadence).toBe('hourly');
+    }
+  });
+
+  it('omits report_cadence on the analysisContext when the strategy did not declare one', async () => {
+    const features = baseFeatures();
+    delete (features as { report_cadence?: unknown }).report_cadence;
+    const signals = await useCase.execute(features);
+    expect(signals.length).toBeGreaterThan(0);
+    for (const s of signals) {
+      expect(s.features_snapshot?.report_cadence).toBeUndefined();
+    }
+  });
 });
 
 describe('TradeSignal.pnlPct', () => {

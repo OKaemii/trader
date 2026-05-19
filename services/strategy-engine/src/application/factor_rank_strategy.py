@@ -62,6 +62,13 @@ class FactorRankStrategy(BaseStrategy):
         # the oldest vector, so feeding more is wasted compute.
         return RegimeEngine.HISTORY_MIN * 2
 
+    @property
+    def report_cadence(self) -> str:
+        # Daily rebalance → one email per cycle. Intraday (5m bars) fires every 5min;
+        # without bucketing that's 12 emails/hour of individually-too-small slices.
+        # Hourly digest preserves "what happened this hour" without spamming.
+        return 'per_cycle' if os.getenv('BAR_FREQUENCY', 'daily') == 'daily' else 'hourly'
+
     def update(
         self,
         bars: list[OHLCVBar],
@@ -137,4 +144,5 @@ class FactorRankStrategy(BaseStrategy):
             position_size_multiplier=regime.position_size_multiplier,
             signal_weights=regime.signal_weights,
             feature_stability=stability_report,
+            report_cadence=self.report_cadence,
         )

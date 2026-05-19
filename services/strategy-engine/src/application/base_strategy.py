@@ -59,3 +59,21 @@ class BaseStrategy(ABC):
         See main.historical_prewarm() for the replay implementation.
         """
         return 0
+
+    @property
+    def report_cadence(self) -> str:
+        """
+        How often the notification-service should produce an enriched analysis email
+        for this strategy. One of:
+            'per_cycle'    — one email per StrategyOutput emit (daily rebalances).
+            'hourly'       — bucketed across cycles, flushed top-of-hour.
+            'four_hourly'  — bucketed, flushed every 4h.
+            'eod'          — bucketed, flushed at the relevant exchange's session close.
+
+        Daily strategies should stay at 'per_cycle'. Intraday strategies should return
+        'hourly' so the 5m-cycle firehose collapses into one digest per hour. The
+        operator can override down (e.g. `four_hourly`) via REPORT_INTRADAY_CADENCE
+        but cannot override an intraday strategy back to `per_cycle` — that would
+        reintroduce the 12-emails-per-hour problem the cadence was designed to fix.
+        """
+        return 'per_cycle'
