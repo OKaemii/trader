@@ -545,7 +545,7 @@ app.route('/', createAdminRouter(universeManager, provider, adminLogger, {
   holidayCache: () => _holidayCache ?? (() => { throw new Error('holiday cache not bootstrapped'); })(),
   calendarFor,
 }));
-app.route('/', createInternalBarsRouter());
+app.route('/', createInternalBarsRouter(universeManager));
 
 app.get('/latest/:ticker', async (c) => {
   const redis = await getRedisClient();

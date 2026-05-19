@@ -352,6 +352,23 @@ async def process_cycle(
 
         cycle_id = f"{cycle_n}:{entry_id or source}"
         _bars_client.start_cycle(cycle_id)
+
+        # Sector hydration. One HTTP call per cycle (cheap; market-data-service serves
+        # this from a read-through Mongo cache that itself refreshes from Yahoo only
+        # when rows are stale). Failure is non-fatal — keep the stale `_strategy._sectors`
+        # so a transient market-data-service blip doesn't downgrade the cycle to all-Unknown.
+        # Strategies that don't carry stateful sectors (none of the current three) are
+        # still safe because the dict is just used as a lookup.
+        try:
+            fetched_sectors = await _bars_client.fetch_sectors()
+            if fetched_sectors:
+                _strategy._sectors.update(fetched_sectors)   # type: ignore[attr-defined]
+                print(f"[strategy-engine] cycle {cycle_n} sectors hydrated: "
+                      f"{len(fetched_sectors)} ticker(s) — Unknown count="
+                      f"{sum(1 for v in fetched_sectors.values() if v == 'Unknown')}", flush=True)
+        except Exception as exc:   # noqa: BLE001 — best-effort hydration; log + continue
+            print(f"[strategy-engine] cycle {cycle_n} sector hydration failed (keeping stale): {exc}", flush=True)
+
         _fetch_start = _t.time()
         history_map = await _bars_client.fetch_bars_batch(
             tickers=active_tickers,

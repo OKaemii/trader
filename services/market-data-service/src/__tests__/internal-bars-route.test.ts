@@ -60,9 +60,15 @@ const { Hono } = await import('hono');
 const { mintInternalJwt } = await import('@trader/shared-auth');
 const { createInternalBarsRouter } = await import('../modules/admin/routes.ts');
 
+const stubUM: { activeTickers: string[]; sectorMap: Record<string, string>; refresh: () => Promise<string[]> } = {
+  activeTickers: [],
+  sectorMap: {},
+  refresh: async () => [],
+};
+
 function buildApp() {
   const app = new Hono();
-  app.route('/', createInternalBarsRouter());
+  app.route('/', createInternalBarsRouter(stubUM as never));
   return app;
 }
 
@@ -181,7 +187,7 @@ describe('admin + internal-bars on the same app (mounting regression)', () => {
     // Admin first, then internal — same order as production wiring (index.ts).
     const noopLog = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {}, trace: () => {}, fatal: () => {}, child: () => noopLog, level: 'info' } as never;
     app.route('/', createAdminRouter(stubUM, new YahooProvider(), noopLog));
-    app.route('/', createInternalBarsRouter());
+    app.route('/', createInternalBarsRouter(stubUM));
 
     const res = await app.request('/internal/api/market-data/bars', {
       method: 'POST',
