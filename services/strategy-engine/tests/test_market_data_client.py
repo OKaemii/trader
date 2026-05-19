@@ -208,3 +208,90 @@ async def test_batch_fetch_empty_tickers_returns_empty_dict_no_http():
         result = await client.fetch_bars_batch([])
     assert result == {}
     assert route.call_count == 0
+
+
+# ── fetch_sectors ────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_fetch_sectors_returns_ticker_to_sector_map():
+    """Happy path — server returns {sectors, fetchedAt}, client returns just the sectors."""
+    client = MarketDataClient(base_url=BASE_URL, secret=SECRET)
+    with respx.mock() as mock:
+        mock.get(f"{BASE_URL}/internal/api/universe/sectors").mock(
+            return_value=httpx.Response(200, json={
+                "sectors": {
+                    "AAPL_US_EQ": "Technology",
+                    "SHELl_EQ":   "Energy",
+                    "NEW_US_EQ":  "Unknown",
+                },
+                "fetchedAt": 1_700_000_000_000,
+            }),
+        )
+        sectors = await client.fetch_sectors()
+
+    assert sectors == {
+        "AAPL_US_EQ": "Technology",
+        "SHELl_EQ":   "Energy",
+        "NEW_US_EQ":  "Unknown",
+    }
+
+
+@pytest.mark.asyncio
+async def test_fetch_sectors_signs_jwt_correctly():
+    """Same JWT scheme as fetch_bars — defence in depth against auth drift."""
+    client = MarketDataClient(base_url=BASE_URL, secret=SECRET)
+
+    captured: list[str] = []
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(_bearer(request))
+        return httpx.Response(200, json={"sectors": {}, "fetchedAt": 0})
+
+    with respx.mock() as mock:
+        mock.get(f"{BASE_URL}/internal/api/universe/sectors").mock(side_effect=handler)
+        await client.fetch_sectors()
+
+    assert len(captured) == 1
+    assert _verify_jwt(captured[0])
+
+
+@pytest.mark.asyncio
+async def test_fetch_sectors_handles_empty_sectors_object():
+    """Cold-start state — server returns {sectors: {}, fetchedAt: 0}. Client returns {}."""
+    client = MarketDataClient(base_url=BASE_URL, secret=SECRET)
+    with respx.mock() as mock:
+        mock.get(f"{BASE_URL}/internal/api/universe/sectors").mock(
+            return_value=httpx.Response(200, json={"sectors": {}, "fetchedAt": 0}),
+        )
+        sectors = await client.fetch_sectors()
+    assert sectors == {}
+
+
+@pytest.mark.asyncio
+async def test_fetch_sectors_raises_on_http_error():
+    """Network/upstream failures bubble up so the engine host can decide what to do."""
+    client = MarketDataClient(base_url=BASE_URL, secret=SECRET)
+    with respx.mock() as mock:
+        mock.get(f"{BASE_URL}/internal/api/universe/sectors").mock(
+            return_value=httpx.Response(500),
+        )
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.fetch_sectors()
+
+
+@pytest.mark.asyncio
+async def test_fetch_sectors_returns_defensive_copy():
+    """Caller mutating the returned dict must NOT leak into the next call."""
+    client = MarketDataClient(base_url=BASE_URL, secret=SECRET)
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(f"{BASE_URL}/internal/api/universe/sectors").mock(
+            return_value=httpx.Response(200, json={
+                "sectors": {"AAPL_US_EQ": "Technology"},
+                "fetchedAt": 1_700_000_000_000,
+            }),
+        )
+        first = await client.fetch_sectors()
+        first["MUTATED"] = "Junk"   # caller pollutes the returned dict
+
+        second = await client.fetch_sectors()
+        assert "MUTATED" not in second
+        assert second == {"AAPL_US_EQ": "Technology"}

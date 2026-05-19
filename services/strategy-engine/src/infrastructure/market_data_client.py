@@ -159,3 +159,27 @@ class MarketDataClient:
             close=float(d["close"]),
             volume=float(d.get("volume") or 0),
         )
+
+    async def fetch_sectors(self) -> dict[str, str]:
+        """
+        Hit market-data-service's /internal/api/universe/sectors endpoint and return
+        the ticker → GICS-sector map for the current active universe.
+
+        Server-side, market-data-service reads its `_sectorMap` (read-through cached
+        in Mongo `instrument_metadata`, refreshed from Yahoo on universe rebuild).
+        Tickers without a Mongo row come back as 'Unknown' — strategies can rely on
+        every active-universe ticker being present in the returned dict.
+
+        Failures (HTTP error, JSON parse) raise; the engine host catches and keeps
+        the stale `_strategy._sectors` so an upstream blip doesn't degrade the cycle.
+        """
+        url = f"{self._base_url}/internal/api/universe/sectors"
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            r = await client.get(url, headers=self._auth_header())
+            r.raise_for_status()
+            payload = r.json()
+        sectors = payload.get("sectors") or {}
+        # Defensive copy — caller is expected to do `self._sectors.update(returned)`,
+        # and we don't want a downstream mutation of the dict to leak back into the
+        # next call's response.
+        return dict(sectors)

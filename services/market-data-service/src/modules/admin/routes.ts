@@ -11,6 +11,7 @@ import { getRedisClient, xAdd } from '@trader/shared-redis';
 import { getLiveConfig, invalidateLiveConfig, _envDefaultsForTest } from '../../shared/live-config.ts';
 import { getRuntimeEnv } from '../../runtime-env.ts';
 import type { UniverseManager } from '../universe/application/UniverseManager.ts';
+import { MongoInstrumentMeta } from '../universe/infrastructure/MongoInstrumentMeta.ts';
 import type { MarketDataProvider } from '../bars/infrastructure/providers/market-data-provider.ts';
 import { aggregateBars, getBars, invalidateBars, type RangeKey } from '@trader/shared-bars';
 import { backfillTickers, CACHE_INVALIDATED_TOPIC } from '../bars/infrastructure/backfill.ts';
@@ -414,9 +415,9 @@ export function createAdminRouter(
 // Batch endpoint (POST with tickers[]) is the hot path during boot: strategy-engine
 // fetches the full universe's history in one HTTP round-trip per cycle rather than
 // N round-trips. Single-ticker GET stays for ad-hoc tooling.
-export function createInternalBarsRouter(): Hono {
+export function createInternalBarsRouter(universeManager: UniverseManager): Hono {
   const r = new Hono();
-  
+
 
   r.get('/internal/api/market-data/bars/:ticker', parseInternalHeaders('strategy-engine'), async (c) => {
     const ticker   = c.req.param('ticker')!;
@@ -457,6 +458,32 @@ export function createInternalBarsRouter(): Hono {
         out[ticker] = aggregateBars(base, interval);
       }
       return c.json({ interval, range, bars: out });
+    },
+  );
+
+  // Universe → sector lookup. strategy-engine hits this once per cycle to hydrate
+  // its `_strategy._sectors` dict from the read-through Mongo cache that UniverseManager
+  // refreshes from Yahoo (`assetProfile.sector`). Always returns one entry per active
+  // universe ticker — `'Unknown'` is the documented fallback when neither cache nor
+  // Yahoo has resolved a sector. fetchedAt is the timestamp of the freshest row in the
+  // returned set (caller can compute staleness without a second round-trip).
+  r.get(
+    '/internal/api/universe/sectors',
+    parseInternalHeaders('strategy-engine'),
+    async (c) => {
+      const tickers = universeManager.activeTickers;
+      const db = await getMongoDb();
+      const metaRepo = new MongoInstrumentMeta(db);
+      const rows = await metaRepo.findMany(tickers);
+
+      const sectors: Record<string, string> = {};
+      let freshest = 0;
+      for (const t of tickers) {
+        const row = rows[t];
+        sectors[t] = row?.sector ?? 'Unknown';
+        if (row?.fetchedAt) freshest = Math.max(freshest, row.fetchedAt.getTime());
+      }
+      return c.json({ sectors, fetchedAt: freshest });
     },
   );
 

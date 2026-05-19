@@ -18,6 +18,13 @@ export const COLLECTIONS = {
   PORTAL_MARKET_CONFIG:      'portal_market_config',
   MARKET_CALENDAR:           'market_calendar',
   COMPANY_PROFILES:          'company_profiles',
+  // Per-ticker GICS metadata sourced from Yahoo `quoteSummary(assetProfile)`. Owned by
+  // market-data-service's UniverseManager: looked up + refreshed (>30d stale) on every
+  // universe rebuild. Replaces the no-op T212-derived `sector='Unknown'` path so
+  // sector-relative strategies (SectorMomentum) and the notification renderer see real
+  // GICS labels. Operator can pin a manual override via `source='manual'` — the periodic
+  // Yahoo refresh skips those rows.
+  INSTRUMENT_METADATA:       'instrument_metadata',
 } as const;
 
 export type CollectionName = typeof COLLECTIONS[keyof typeof COLLECTIONS];

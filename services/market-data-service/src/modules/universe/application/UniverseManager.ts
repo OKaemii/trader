@@ -7,7 +7,15 @@ import { COLLECTIONS } from '@trader/shared-mongo';
 import type { Currency } from '@trader/shared-types';
 import { fetchT212Instruments } from '../infrastructure/t212-client.ts';
 import { fetchYahooLiquidity } from '../../bars/infrastructure/providers/yahoo-client.ts';
+import { MongoInstrumentMeta } from '../infrastructure/MongoInstrumentMeta.ts';
+import { YahooSectorClient } from '../infrastructure/yahoo-sector-client.ts';
 import { log } from '../../../logger.ts';
+
+// Rows older than this are re-fetched from Yahoo on the next refresh. Sectors are
+// stable for months so a long stale window is fine; the lower bound keeps us
+// covered for the rare GICS reclassification (~quarterly) and lets the operator
+// drop the env to force a re-pull.
+const SECTOR_STALE_MS_DEFAULT = 30 * 24 * 60 * 60 * 1000;   // 30 days
 
 // FX converter callback; same shape as the one we pass to YahooProvider. Provided by
 // the bootstrap (index.ts) so the manager stays independent of @trader/shared-fx.
@@ -195,17 +203,35 @@ async function selectCurated(
   return selected;
 }
 
+export interface UniverseManagerOptions {
+  // Optional injected sector client — defaults to the real Yahoo HTTP client. Tests
+  // pass a stub. When set to `null`, sector enrichment is skipped entirely (useful
+  // for tests that don't care about sectors and don't want the Yahoo call mocked).
+  sectorClient?: YahooSectorClient | null;
+  // Stale-window override (ms). Defaults to 30 days.
+  sectorStaleMs?: number;
+}
+
 export class UniverseManager {
   private _activeUniverse: string[] = [];
   private _sectorMap: Record<string, string> = {};
   private readonly config: UniverseConfig;
+  private readonly sectorClient: YahooSectorClient | null;
+  private readonly sectorStaleMs: number;
 
   // Optional FX converter for liquidity ranking. Default (identity) keeps tests and
   // any caller that doesn't supply FX working — at the cost of incorrect cross-currency
   // ranking. Production wiring (services/market-data-service/src/index.ts) always
   // injects the live Yahoo-backed FxClient.
-  constructor(private readonly fxToGBP: FxToGBP = IDENTITY_FX, config: Partial<UniverseConfig> = {}) {
+  constructor(
+    private readonly fxToGBP: FxToGBP = IDENTITY_FX,
+    config: Partial<UniverseConfig> = {},
+    options: UniverseManagerOptions = {},
+  ) {
     this.config = { ...DEFAULT_CONFIG, ...config };
+    // `undefined` = use the default client; explicit `null` = disable enrichment.
+    this.sectorClient = options.sectorClient === undefined ? new YahooSectorClient() : options.sectorClient;
+    this.sectorStaleMs = options.sectorStaleMs ?? SECTOR_STALE_MS_DEFAULT;
   }
 
   /** Call once at startup, then monthly. */
@@ -318,6 +344,51 @@ export class UniverseManager {
     selected = overrideResult.result;
     if (overrideResult.added || overrideResult.removed) {
       log.info(`[universe] overrides applied: +${overrideResult.added} -${overrideResult.removed}`);
+    }
+
+    // ── 4c. Sector enrichment — Mongo cache (read-through) + Yahoo refresh ─────
+    // Replaces the T212-derived `sector='Unknown'` placeholder with a real GICS label.
+    // - Pulled at the END of selection so we only spend Yahoo budget on universe members.
+    // - Cache lives in `instrument_metadata` collection; rows older than `sectorStaleMs`
+    //   (default 30d) get re-fetched; manual overrides (source='manual') are never
+    //   touched by auto-refresh.
+    // - Failures (Yahoo down, ticker unresolvable) keep the existing entry as-is and
+    //   the strategy continues to see 'Unknown' for that ticker — never blocks refresh.
+    const metaRepo = new MongoInstrumentMeta(db);
+    const universeTickers = selected.map((i) => i.ticker);
+    if (universeTickers.length > 0) {
+      try {
+        const existingMeta = await metaRepo.findMany(universeTickers);
+        const needFetch = this.sectorClient
+          ? await metaRepo.needsRefresh(universeTickers, this.sectorStaleMs)
+          : [];
+
+        if (needFetch.length > 0 && this.sectorClient) {
+          log.info(`[universe] sector enrichment: ${needFetch.length}/${universeTickers.length} tickers need Yahoo lookup`);
+          const fetched = await this.sectorClient.fetchSectors(needFetch);
+          for (const ticker of needFetch) {
+            const hit = fetched[ticker];
+            if (!hit) continue;   // Yahoo didn't resolve it — leave existing value (or absence)
+            await metaRepo.upsert({
+              ticker,
+              sector:   hit.sector,
+              source:   'yahoo',
+              ...(hit.industry !== undefined ? { industry: hit.industry } : {}),
+            });
+          }
+        }
+
+        // Build the in-memory sector map. Order of precedence: just-fetched > existing
+        // cache (incl. manual overrides) > 'Unknown'. Falls back to the T212 placeholder
+        // only when Yahoo returns nothing AND no historical row exists.
+        const refreshed = await metaRepo.findMany(universeTickers);
+        for (const inst of selected) {
+          const row = refreshed[inst.ticker] ?? existingMeta[inst.ticker];
+          if (row) inst.sector = row.sector;
+        }
+      } catch (err) {
+        log.warn('[universe] sector enrichment failed — keeping previous sector map:', err);
+      }
     }
 
     const newTickers = new Set(selected.map((i) => i.ticker));

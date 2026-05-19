@@ -5,6 +5,7 @@ export * from "./client.ts";
 export * as Trading       from "./trading/index.ts";
 export * as Signals       from "./signals/index.ts";
 export * as MarketData    from "./market-data/index.ts";
+export * as Universe      from "./universe/index.ts";
 export * as Auth          from "./auth/index.ts";
 export * as Notification  from "./notification/index.ts";
 export * as Gateway       from "./gateway/index.ts";
@@ -30,3 +31,5 @@ export type {
     UniverseOverridesRequest, BackfillRequest, ClearCacheRequest, MarketConfigRequest,
     InternalBarsRequest, InternalBarsResponse,
 } from "./market-data/schemas.ts";
+
+export type { InternalSectorsResponse } from "./universe/schemas.ts";
