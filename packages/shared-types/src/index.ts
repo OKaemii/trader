@@ -106,6 +106,13 @@ export interface StrategyOutput {
   // Daily strategies emit `per_cycle`; intraday strategies emit `hourly` by default
   // so the operator gets one digest per hour instead of 12 single-cycle emails.
   report_cadence?: 'per_cycle' | 'hourly' | 'four_hourly' | 'eod';
+  // Top-K truncation: only the K highest-scoring positive names get non-zero weight.
+  // Names outside top-K go to weight=0 — which produces a clean SELL signal if currently
+  // held (rotation), and skips emission if not. Why: at small NAV, score-proportional
+  // weights across ~90 positive-score names produce 1% targets per name → share counts
+  // below T212 per-instrument minQuantity → ZeroQuantity / min-quantity-exceeded failures.
+  // Set per strategy; omitted/0 means "no truncation" (legacy behaviour).
+  top_k?: number;
 }
 
 // TopologyFeatures — retained for backward-compatible dashboard reads only.

@@ -11,6 +11,10 @@ from ..domain.dataclasses import OHLCVBar, StrategyOutput
 
 ROLLING_WINDOW = 20
 MIN_HISTORY = 30
+# Top-K for topology. Persistence-diagram noise dominates outside the highest-conviction
+# names; keep K low until backtests validate. 15 = mid-point between factor-rank (20) and
+# sector-momentum (12). Override via TOPOLOGY_TOP_K.
+TOP_K = int(os.getenv("TOPOLOGY_TOP_K", "15"))
 
 
 class TopologyStrategy(BaseStrategy):
@@ -118,4 +122,5 @@ class TopologyStrategy(BaseStrategy):
             persistence_pairs=pairs,
             laplacian_residuals={t: float(residuals[i]) for i, t in enumerate(tickers)},
             report_cadence=self.report_cadence,
+            top_k=TOP_K,
         )

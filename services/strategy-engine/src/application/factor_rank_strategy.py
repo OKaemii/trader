@@ -12,6 +12,11 @@ from ..domain.dataclasses import OHLCVBar, StrategyOutput
 # BAR_FREQUENCY=daily → 20 bars = 20 trading days; BAR_FREQUENCY=intraday → 60 bars (shorter horizon)
 ROLLING_WINDOW = int(os.getenv("ROLLING_WINDOW_BARS", "20" if os.getenv("BAR_FREQUENCY", "daily") == "daily" else "60"))
 STABILITY_WINDOW = 30  # cycles to accumulate before running stability analysis
+# Top-K positions for factor-rank. 20 is the standard "top quintile of a 100-name universe"
+# starting point — captures most of the long-side factor alpha while keeping per-position
+# weight (~5% at equal-weight) above T212 fractional-share minima at small NAV. Override
+# via FACTOR_RANK_TOP_K env for ablation. 0 disables truncation (legacy full-universe).
+TOP_K = int(os.getenv("FACTOR_RANK_TOP_K", "20"))
 
 
 class FactorRankStrategy(BaseStrategy):
@@ -145,4 +150,5 @@ class FactorRankStrategy(BaseStrategy):
             signal_weights=regime.signal_weights,
             feature_stability=stability_report,
             report_cadence=self.report_cadence,
+            top_k=TOP_K,
         )

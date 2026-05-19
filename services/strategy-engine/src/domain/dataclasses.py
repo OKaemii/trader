@@ -39,3 +39,7 @@ class StrategyOutput:
     # instead of 12 single-cycle emails. Operator-overridable per strategy via the
     # REPORT_INTRADAY_CADENCE env (notification-service).
     report_cadence: str = 'per_cycle'
+    # Top-K positions the optimiser is allowed to hold. Names outside the top-K (by
+    # composite score) get weight=0 → clean SELL on demotion, no BUY on noise. 0 means
+    # "no truncation" — the legacy score-proportional behaviour across all positive scores.
+    top_k: int = 0
