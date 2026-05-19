@@ -8,6 +8,10 @@ from .regime_engine import RegimeEngine
 from ..domain.dataclasses import OHLCVBar, StrategyOutput
 
 ROLLING_WINDOW = 20
+# Top-K positions for sector-momentum. 12 = top-3 sectors × 4 names by default, gives
+# ~8% target per name at equal-weight — well above T212 minima at small NAV and large
+# enough that a sector bet is actually a sector bet (≥3 names per top sector).
+TOP_K = int(os.getenv("SECTOR_MOMENTUM_TOP_K", "12"))
 
 
 class SectorMomentumStrategy(BaseStrategy):
@@ -115,4 +119,5 @@ class SectorMomentumStrategy(BaseStrategy):
             covariance_matrix=cov.tolist(),
             regime_confidence=regime.confidence,
             report_cadence=self.report_cadence,
+            top_k=TOP_K,
         )

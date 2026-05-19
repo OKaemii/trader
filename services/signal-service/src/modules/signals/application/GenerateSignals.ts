@@ -88,6 +88,7 @@ export class GenerateSignalsUseCase {
           currentWeights: features.ticker_universe.map((t) => currentWeights[t] ?? 0),
           targetVol: this.config.volTarget,
           covariance: features.covariance_matrix,
+          ...(features.top_k && features.top_k > 0 ? { topK: features.top_k } : {}),
         },
         features.factor_attributions ?? {},
       );
