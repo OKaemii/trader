@@ -201,6 +201,17 @@ export class RiskEngine {
     await this.cb.reset();
   }
 
+  // Public NAV accessor — used by GenerateSignals to scale `top_k` with portfolio size.
+  // Returns 0 when the underlying read is incomplete (cash fetch failed, FX unavailable);
+  // callers must treat that as "no signal" and fall back to the strategy-emitted top_k.
+  // This is a deliberate second read per cycle on top of canTrade()'s NAV fetch — generate
+  // cycles fire every 5min so the cost (one Mongo aggregation + one HTTP) is negligible
+  // versus the architectural cost of threading NAV through canTrade()'s return shape.
+  async currentNavGBP(): Promise<number> {
+    const { nav, complete } = await this._computeNav();
+    return complete ? nav : 0;
+  }
+
   async logRejection(reason: string, detail: Record<string, unknown>): Promise<void> {
     await this._logRejection(reason, detail);
   }

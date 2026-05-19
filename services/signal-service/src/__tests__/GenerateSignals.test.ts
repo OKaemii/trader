@@ -62,12 +62,13 @@ class MockPriceLookup implements IPriceLookup {
   }
 }
 
-function makeMockRiskEngine(allowed = true): RiskEngine {
+function makeMockRiskEngine(allowed = true, navGBP = 0): RiskEngine {
   return {
     canTrade: async () => ({ allowed, reason: allowed ? null : 'circuit open' }),
     applyRegimeScaling: (weights: number[], multiplier: number) =>
       weights.map((w) => w * Math.max(0.25, Math.min(1.0, multiplier))),
     confidenceDecayFactor: () => 1.0,
+    currentNavGBP: async () => navGBP,
     init: async () => {},
     logRejection: async () => {},
     status: async () => ({} as any),

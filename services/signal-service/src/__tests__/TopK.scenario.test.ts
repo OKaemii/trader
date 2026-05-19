@@ -8,7 +8,7 @@
 // produce ≤20 BUYs at ~5% target each plus SELLs for held names that fell out.
 
 import { describe, it, expect } from 'vitest';
-import { GenerateSignalsUseCase, type GenerateSignalsConfig } from '../modules/signals/application/GenerateSignals.ts';
+import { GenerateSignalsUseCase, computeNavAdaptiveTopK, type GenerateSignalsConfig } from '../modules/signals/application/GenerateSignals.ts';
 import { TradeSignal } from '../modules/signals/domain/TradeSignal.ts';
 import type { ISignalRepository } from '../modules/signals/domain/ISignalRepository.ts';
 import type { ISignalPublisher } from '../modules/signals/domain/ISignalPublisher.ts';
@@ -59,11 +59,12 @@ class StubPriceLookup implements IPriceLookup {
     return out;
   }
 }
-function stubRiskEngine(): RiskEngine {
+function stubRiskEngine(navGBP = 0): RiskEngine {
   return {
     canTrade: async () => ({ allowed: true, reason: null }),
     applyRegimeScaling: (weights: number[], mult: number) => weights.map((w) => w * mult),
     confidenceDecayFactor: () => 1.0,
+    currentNavGBP: async () => navGBP,
   } as unknown as RiskEngine;
 }
 
@@ -195,6 +196,68 @@ describe('top-K scenario — rotation', () => {
     for (let i = 5; i < 10; i++) {
       expect(sellTickers.has(tickers[i]!)).toBe(false);
     }
+  });
+});
+
+describe('NAV-adaptive top-K (computeNavAdaptiveTopK)', () => {
+  it('returns the strategy floor when NAV is small', () => {
+    // £5000 / £500 = 10 → quantise → 10 → clamp to floor=20.
+    expect(computeNavAdaptiveTopK(5000, 20)).toBe(20);
+  });
+  it('returns the strategy floor when NAV is zero or unknown', () => {
+    expect(computeNavAdaptiveTopK(0, 20)).toBe(20);
+    expect(computeNavAdaptiveTopK(-1, 20)).toBe(20);
+  });
+  it('expands K linearly with NAV inside the band', () => {
+    // £20k / £500 = 40 → quantise step 5 → 40 → clamped within [20, 60].
+    expect(computeNavAdaptiveTopK(20_000, 20)).toBe(40);
+    // £15k / £500 = 30
+    expect(computeNavAdaptiveTopK(15_000, 20)).toBe(30);
+  });
+  it('caps K at the paper §6.1 upper bound (n=60)', () => {
+    // £50k / £500 = 100 → clamp down to 60.
+    expect(computeNavAdaptiveTopK(50_000, 20)).toBe(60);
+    expect(computeNavAdaptiveTopK(500_000, 20)).toBe(60);
+    expect(computeNavAdaptiveTopK(5_000_000, 20)).toBe(60);
+  });
+  it('quantises in steps of 5 — small NAV drift does not change K (hysteresis)', () => {
+    // NAV moves from £15,000 to £15,500 — same K (both round to 30 at step 5).
+    expect(computeNavAdaptiveTopK(15_000, 20)).toBe(30);
+    expect(computeNavAdaptiveTopK(15_500, 20)).toBe(30);
+    // Boundary: K=30 covers NAV/500 ∈ [27.5, 32.5) → NAV ∈ [£13,750, £16,250).
+    // At NAV=£16,250 the rounding pushes K up to 35.
+    expect(computeNavAdaptiveTopK(16_249, 20)).toBe(30);
+    expect(computeNavAdaptiveTopK(16_250, 20)).toBe(35);
+  });
+  it('respects a custom strategy floor (sector_momentum=12)', () => {
+    expect(computeNavAdaptiveTopK(3000, 12)).toBe(12);   // £3k → 6 → floor 12
+    expect(computeNavAdaptiveTopK(10_000, 12)).toBe(20); // £10k → 20
+  });
+  it('respects a custom target notional', () => {
+    // Larger target = fewer positions for the same NAV.
+    expect(computeNavAdaptiveTopK(20_000, 20, /*target*/ 1000)).toBe(20);
+  });
+});
+
+describe('NAV-adaptive top-K — end-to-end smoke', () => {
+  // The single guarantee we can make in a single-cycle synthetic test is that the
+  // pipeline doesn't crash when NAV adaptation kicks in — the formula-level unit
+  // tests above prove the K math; the LongOnlyOptimiser top-K tests prove the
+  // optimiser truncates correctly. The full interaction across multi-cycle rotation
+  // with turnover guard, sector cap, and emission thresholds is a backtest concern,
+  // not a unit-test concern.
+  it('larger NAV → pipeline executes without error and emits some action set', async () => {
+    const { features, prices } = buildScenario({ topK: 20 });
+    const useCase = new GenerateSignalsUseCase(
+      new StubRepo(), new StubPublisher(), new StubPortfolioState(),
+      stubRiskEngine(500_000),   // £500k → K clamps to paper ceiling 60
+      stubLogger, config, undefined, undefined, new StubPriceLookup(prices),
+    );
+    const signals = await useCase.execute(features);
+    // We don't assert on the count (turnover blending + emission thresholds drive
+    // single-cycle counts that don't cleanly mirror K). We assert the pipeline
+    // completed and produced a valid signal array.
+    expect(Array.isArray(signals)).toBe(true);
   });
 });
 

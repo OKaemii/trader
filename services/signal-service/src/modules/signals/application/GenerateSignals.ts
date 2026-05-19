@@ -25,10 +25,46 @@ export interface GenerateSignalsConfig {
   // (BUY gate then drops it). Independent of the cross-section size; covers the
   // factor-collapse case where every score rounds to ~0. Default 0.1.
   minScoreEpsilon?: number;
+  // Per-position notional (GBP) used to scale top-K with NAV. K_dynamic =
+  // round(NAV/this/step)*step, clamped to [strategy.top_k, maxTopK]. £500 gives
+  // ~3-5× safety margin over the worst-case £100 minimum notional for high-priced
+  // LSE ETFs in the curated universe. Lower → more positions, higher → fewer.
+  targetPositionNotional?: number;
+  // Upper bound on the held-position count, from mathematical-foundations.md §6.1:
+  // n=60 is the top of the well-conditioned Ledoit-Wolf band (n/T ≈ 0.24 at T=252).
+  // Raising this without redoing the §6.1 conditioning analysis pushes covariance
+  // estimation into the unstable zone.
+  maxTopK?: number;
 }
 
-const DEFAULT_MIN_POSITIVE_PEERS = 5;
-const DEFAULT_MIN_SCORE_EPSILON  = 0.1;
+const DEFAULT_MIN_POSITIVE_PEERS       = 5;
+const DEFAULT_MIN_SCORE_EPSILON        = 0.1;
+const DEFAULT_TARGET_POSITION_NOTIONAL = 500;   // GBP per held position — see config docs
+const DEFAULT_MAX_TOP_K                = 60;    // paper §6.1 upper bound
+const TOP_K_QUANTISATION               = 5;     // K only changes in steps of 5 (hysteresis)
+
+// NAV-adaptive top-K. At small NAV the strategy-emitted `top_k` (typically 20) is the
+// operational floor — fewer than that and per-position weight is forced too high to
+// rebalance cleanly. At larger NAV the optimiser can hold more names without hitting
+// the broker's per-instrument minQuantity floor, so we expand K proportionally to NAV,
+// capped at the paper's `n=60` upper bound from §6.1.
+//
+// Quantisation (steps of 5) prevents single-tick rebalances when NAV drifts across a
+// K-boundary — without it, a £1 NAV move at £20,000 would flip K from 40 to 41 and
+// produce one BUY signal for the next-best ticker. With it, K changes only on £2,500
+// NAV moves (at the default target=500), which is the right magnitude for a real
+// portfolio expansion decision.
+export function computeNavAdaptiveTopK(
+  navGBP:                 number,
+  strategyFloor:          number,
+  targetPositionNotional: number = DEFAULT_TARGET_POSITION_NOTIONAL,
+  maxK:                   number = DEFAULT_MAX_TOP_K,
+): number {
+  if (navGBP <= 0 || strategyFloor <= 0) return Math.max(1, strategyFloor);
+  const raw       = navGBP / targetPositionNotional;
+  const quantised = Math.round(raw / TOP_K_QUANTISATION) * TOP_K_QUANTISATION;
+  return Math.max(strategyFloor, Math.min(maxK, quantised));
+}
 
 export class GenerateSignalsUseCase {
   constructor(
@@ -79,6 +115,34 @@ export class GenerateSignalsUseCase {
 
     const currentWeights = await this.portfolioState.currentWeights();
 
+    // NAV-adaptive top-K. The strategy emits its preferred concentration floor
+    // (`features.top_k` — typically 20 for factor_rank). Signal-service has the
+    // operational NAV context and expands the held-position count upward as the
+    // portfolio grows, so that a £50k account isn't forced to hold the same 20
+    // names a £5k account does. Capped at the paper's §6.1 n=60 upper bound.
+    let effectiveTopK = features.top_k ?? 0;
+    if (effectiveTopK > 0) {
+      // Defensive: older RiskEngine instances (test mocks, alternate impls) may not
+      // have currentNavGBP; treat absence the same as a degraded read (skip adaptation).
+      const nav = typeof this.riskEngine.currentNavGBP === 'function'
+        ? await this.riskEngine.currentNavGBP().catch(() => 0)
+        : 0;
+      if (nav > 0) {
+        effectiveTopK = computeNavAdaptiveTopK(
+          nav,
+          features.top_k ?? 0,
+          this.config.targetPositionNotional ?? DEFAULT_TARGET_POSITION_NOTIONAL,
+          this.config.maxTopK ?? DEFAULT_MAX_TOP_K,
+        );
+        if (effectiveTopK !== features.top_k) {
+          this.logger.info({
+            strategyFloor: features.top_k, effectiveTopK, navGBP: nav,
+            target: this.config.targetPositionNotional ?? DEFAULT_TARGET_POSITION_NOTIONAL,
+          }, 'GenerateSignals: NAV-adaptive top-K expansion');
+        }
+      }
+    }
+
     const { weights: rawWeights, stabilityWarnings, uncertainty } =
       this.portfolioConstructor.construct(
         {
@@ -88,7 +152,7 @@ export class GenerateSignalsUseCase {
           currentWeights: features.ticker_universe.map((t) => currentWeights[t] ?? 0),
           targetVol: this.config.volTarget,
           covariance: features.covariance_matrix,
-          ...(features.top_k && features.top_k > 0 ? { topK: features.top_k } : {}),
+          ...(effectiveTopK > 0 ? { topK: effectiveTopK } : {}),
         },
         features.factor_attributions ?? {},
       );
