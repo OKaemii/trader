@@ -1,0 +1,161 @@
+import type { Cadence, CycleBatch } from '../CycleAnalysisBatcher.ts';
+import type { ChatCompletionOptions } from '../../infrastructure/DeepSeekClient.ts';
+import type { SanityFlag, TelemetryBlock } from '../ReportContext.ts';
+
+// Narrow LLM surface — anything that has `.chat(req)` plugs in. Lets tests pass a stub
+// instead of needing a real DeepSeekClient + API key.
+export interface NarrativeLLM {
+    chat(req: ChatCompletionOptions): Promise<string>;
+}
+
+export function escapeHtml(s: string): string {
+    return s
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// Window label is renderer-agnostic; e.g. "Daily — 2026-05-18" or "Hourly digest 14:00–15:00 UTC".
+// Used in the email subject and header. Derived purely from cadence + bucket timestamps so
+// renderers don't drift on labelling conventions.
+export function formatWindowLabel(batch: CycleBatch): string {
+    const cadence: Cadence = batch.cadence;
+    const start = new Date(batch.cycleTs);
+    if (cadence === 'per_cycle') {
+        return `Cycle — ${start.toISOString().slice(0, 19).replace('T', ' ')} UTC`;
+    }
+    if (cadence === 'eod') {
+        const day = start.toISOString().slice(0, 10);
+        const mkt = batch.market ?? 'OTHER';
+        return `EOD ${mkt} — ${day}`;
+    }
+    const windowMs = cadence === 'hourly' ? 60 * 60_000 : 4 * 60 * 60_000;
+    const end = new Date(start.getTime() + windowMs);
+    const fmt = (d: Date) => d.toISOString().slice(11, 16);
+    return `${cadence === 'hourly' ? 'Hourly' : 'Four-hourly'} digest ${fmt(start)}–${fmt(end)} UTC ${start.toISOString().slice(0, 10)}`;
+}
+
+// Builds the LLM prompt. Telemetry + sanity are passed in as JSON; the prompt locks
+// the model to "only restate or interpret numbers below" — hallucination becomes a
+// post-render signal we can flag rather than the default failure mode.
+export interface NarrativeRequest {
+    strategyId:   string;
+    windowLabel:  string;
+    batch:        CycleBatch;
+    telemetry:    TelemetryBlock;
+    sanity:       SanityFlag[];
+    extraContext?: string | undefined;   // strategy-specific addendum (factor mix, betti curve summary, …)
+}
+
+export async function buildNarrative(llm: NarrativeLLM, req: NarrativeRequest): Promise<string> {
+    const telemetryJson = JSON.stringify(req.telemetry, null, 2);
+    const sanityJson    = JSON.stringify(req.sanity,    null, 2);
+    const picks = req.batch.signals.map((s) => ({
+        action: s.action, ticker: s.ticker,
+        confidence:   Number(s.confidence.toFixed(3)),
+        targetWeight: Number(s.targetWeight.toFixed(4)),
+        score:        Number((s.features_snapshot?.composite_scores?.[s.ticker] ?? 0).toFixed(3)),
+        sector:       s.features_snapshot?.sectors?.[s.ticker] ?? 'Unknown',
+    }));
+
+    const prompt = `You are a sell-side strategist writing a cycle digest.
+
+WINDOW: ${req.windowLabel}
+STRATEGY: ${req.strategyId}
+
+PICKS (${picks.length}):
+${JSON.stringify(picks, null, 2)}
+
+TELEMETRY (pre-computed; these are the ONLY numbers you may cite):
+${telemetryJson}
+
+SANITY FLAGS (anomalies — call out any 'critical' explicitly; warn/info may be summarised):
+${sanityJson}
+${req.extraContext ? `\nSTRATEGY-SPECIFIC CONTEXT:\n${req.extraContext}\n` : ''}
+Write 3–4 short paragraphs covering:
+  1. The dominant theme this window (sector concentration, factor tilt, regime).
+  2. Why these picks make sense TOGETHER — refer to TELEMETRY numbers only.
+  3. Realised P&L since last digest + open exposure read.
+  4. Notable anomalies from SANITY (especially 'critical' codes) and what they imply.
+
+Constraints:
+- Do NOT invent any number that is not present in TELEMETRY or SANITY.
+- Do NOT speculate beyond what the numbers support.
+- Plain prose, no bullet points, no markdown headers. Professional analyst voice.`;
+
+    return llm.chat({
+        messages:    [{ role: 'user', content: prompt }],
+        maxTokens:   900,
+        temperature: 0.4,
+    });
+}
+
+// Render a SanityFlag list as an HTML block. Critical → red, warn → amber, info → grey.
+// Strategy renderers concatenate this above their own sectionsHtml; AnalysisEmailSender
+// renders it again at the top of the email to guarantee anomalies aren't buried.
+export function renderSanityHtml(flags: SanityFlag[]): string {
+    if (flags.length === 0) return '';
+    const color = (sev: SanityFlag['severity']) =>
+        sev === 'critical' ? '#c0392b' :
+        sev === 'warn'     ? '#b58900' :
+                             '#586e75';
+    const rows = flags.map((f) => `
+        <div style="border-left:4px solid ${color(f.severity)};padding:6px 10px;margin:4px 0;background:#fafafa">
+            <b style="color:${color(f.severity)};text-transform:uppercase;font-size:11px">${escapeHtml(f.severity)}</b>
+            <code style="font-size:11px;color:#666;margin-left:6px">${escapeHtml(f.code)}</code>
+            <div style="font-size:13px;margin-top:2px">${escapeHtml(f.message)}</div>
+            ${f.hint ? `<div style="font-size:12px;color:#666;font-style:italic;margin-top:2px">${escapeHtml(f.hint)}</div>` : ''}
+        </div>`).join('');
+    return `<div style="margin:10px 0 14px 0"><h3 style="margin:0 0 6px 0;font-size:14px">Sanity flags</h3>${rows}</div>`;
+}
+
+// Render a TelemetryBlock as a compact HTML table. The narrative riffs on these numbers;
+// rendering them inline lets the operator verify each claim without leaving the email.
+export function renderTelemetryHtml(t: TelemetryBlock): string {
+    const fmtMoney = (n: number) => `£${n.toFixed(2)}`;
+    const fmtPct   = (n: number | null) => n === null ? '—' : `${(n * 100).toFixed(1)}%`;
+    const fmtNum   = (n: number | null) => n === null ? '—' : n.toFixed(3);
+    const bySectorRows = t.signals.bySector.map((s) => `
+        <tr><td>${escapeHtml(s.sector)}</td><td style="text-align:center">${s.n}</td>
+            <td style="text-align:right">${fmtPct(s.avgConfidence)}</td>
+            <td style="text-align:right">${s.avgScore.toFixed(3)}</td></tr>`).join('');
+
+    const best  = t.realisedSinceLast.bestPick;
+    const worst = t.realisedSinceLast.worstPick;
+
+    return `
+    <div style="margin:10px 0 14px 0">
+        <h3 style="margin:0 0 6px 0;font-size:14px">Telemetry</h3>
+        <table cellpadding="4" style="border-collapse:collapse;font-size:12px;width:100%">
+            <tr style="background:#fafafa">
+                <td><b>Signals</b></td>
+                <td>buys=${t.signals.buys} sells=${t.signals.sells} holds=${t.signals.holds} (total ${t.signals.total})</td>
+            </tr>
+            <tr>
+                <td><b>Realised since last</b></td>
+                <td>closed=${t.realisedSinceLast.closedSignals} · P&amp;L ${fmtMoney(t.realisedSinceLast.pnlGbp)}${best ? ` · best ${escapeHtml(best.ticker)} ${(best.pnlPct*100).toFixed(2)}%` : ''}${worst ? ` · worst ${escapeHtml(worst.ticker)} ${(worst.pnlPct*100).toFixed(2)}%` : ''}</td>
+            </tr>
+            <tr style="background:#fafafa">
+                <td><b>Open exposure</b></td>
+                <td>NAV ${fmtMoney(t.openExposure.navGbp)} · cash≈${fmtPct(t.openExposure.cashFractionApprox)} · top3=${(t.openExposure.top3Concentration*100).toFixed(1)}% · HHI=${t.openExposure.hhi.toFixed(3)}</td>
+            </tr>
+            <tr>
+                <td><b>Regime</b></td>
+                <td>conf=${fmtNum(t.regime.confidence)} · size×=${fmtNum(t.regime.positionSizeMultiplier)}${t.regime.coldStart ? ' · <b style="color:#b58900">cold-start</b>' : ''}</td>
+            </tr>
+            <tr style="background:#fafafa">
+                <td><b>Decay</b></td>
+                <td>${escapeHtml(t.decay.health)} · multiplier=${t.decay.multiplier.toFixed(2)} · IC₃₀ₐ=${fmtNum(t.decay.ic_30d)}</td>
+            </tr>
+            <tr>
+                <td><b>Universe</b></td>
+                <td>active=${t.universe.activeCount} · ready=${t.universe.readyCount} · unknown sector=${(t.universe.unknownSectorFraction*100).toFixed(1)}%</td>
+            </tr>
+            ${t.circuitBreaker.open ? `<tr style="background:#fdecea"><td><b>Circuit breaker</b></td><td><b style="color:#c0392b">OPEN</b>${t.circuitBreaker.reason ? ` — ${escapeHtml(t.circuitBreaker.reason)}` : ''}</td></tr>` : ''}
+        </table>
+        ${bySectorRows ? `<h4 style="margin:8px 0 4px 0;font-size:12px">By sector</h4>
+            <table cellpadding="3" style="border-collapse:collapse;font-size:12px">
+                <thead><tr style="background:#fafafa"><th align="left">Sector</th><th>n</th><th align="right">avg conf</th><th align="right">avg score</th></tr></thead>
+                <tbody>${bySectorRows}</tbody>
+            </table>` : ''}
+    </div>`;
+}
