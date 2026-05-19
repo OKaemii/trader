@@ -141,20 +141,25 @@ export class GetTelemetrySnapshotUseCase {
     // = one digest). signalsSinceLastDigest counts signals emitted between that point
     // and `since`. priorAppearances: per-ticker, the most recent prior signal regardless
     // of strategy (operator wants to know if this ticker was *anywhere* before).
+    // Note: `timestamp` is persisted as a Mongo `Date` (see toSignalDoc), so range
+    // queries MUST cross the type boundary with `new Date(...)`. Comparing a Date
+    // field against a Number uses BSON type-ordering and returns no matches — a
+    // silent bug we hit on the first deploy.
+    const sinceDate = new Date(since);
     let previousDigestAt: number | null = null;
     let signalsSinceLastDigest = 0;
     if (opts.strategyId) {
       const prior = await signals
-        .find({ strategy_id: opts.strategyId, timestamp: { $lt: since } })
-        .project<{ timestamp: number }>({ timestamp: 1 })
+        .find({ strategy_id: opts.strategyId, timestamp: { $lt: sinceDate } })
+        .project<{ timestamp: Date }>({ timestamp: 1 })
         .sort({ timestamp: -1 })
         .limit(1)
         .toArray();
-      previousDigestAt = prior[0]?.timestamp ?? null;
+      previousDigestAt = prior[0]?.timestamp.getTime() ?? null;
       if (previousDigestAt !== null) {
         signalsSinceLastDigest = await signals.countDocuments({
           strategy_id: opts.strategyId,
-          timestamp:   { $gte: previousDigestAt, $lt: since },
+          timestamp:   { $gte: new Date(previousDigestAt), $lt: sinceDate },
         });
       }
     }
@@ -162,8 +167,8 @@ export class GetTelemetrySnapshotUseCase {
     const priorAppearances: Record<string, PriorAppearance> = {};
     for (const ticker of opts.tickers ?? []) {
       const prior = await signals
-        .find({ ticker, timestamp: { $lt: since } })
-        .project<{ timestamp: number; action: string; lifecycle?: number; entryPrice?: number; exitPrice?: number }>(
+        .find({ ticker, timestamp: { $lt: sinceDate } })
+        .project<{ timestamp: Date; action: string; lifecycle?: number; entryPrice?: number; exitPrice?: number }>(
           { timestamp: 1, action: 1, lifecycle: 1, entryPrice: 1, exitPrice: 1 },
         )
         .sort({ timestamp: -1 })
@@ -178,10 +183,11 @@ export class GetTelemetrySnapshotUseCase {
       const pnlPct = (p.lifecycle === SignalLifecycle.Closed && p.entryPrice && p.exitPrice && p.entryPrice > 0)
         ? ((p.exitPrice - p.entryPrice) / p.entryPrice) * (action === 'SELL' ? -1 : 1)
         : null;
+      const priorTs = p.timestamp.getTime();
       priorAppearances[ticker] = {
-        lastSignalAt: p.timestamp,
+        lastSignalAt: priorTs,
         action,
-        ageDays:      Math.max(0, (since - p.timestamp) / 86_400_000),
+        ageDays:      Math.max(0, (since - priorTs) / 86_400_000),
         lifecycle:    lifecycleName,
         pnlPct,
       };
