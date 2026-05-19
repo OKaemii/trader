@@ -9,6 +9,7 @@ import {
     requeueContract,
     failQueueContract,
     sweepQueueContract,
+    telemetrySnapshotContract,
 } from "./contracts.ts";
 import type {
     ExecutedResponse,
@@ -18,6 +19,7 @@ import type {
     ClaimResponse,
     QueueRequeueResponse,
     QueueSweepResponse,
+    TelemetrySnapshotResponse,
 } from "./schemas.ts";
 
 /**
@@ -78,5 +80,9 @@ export class SignalServiceClient {
         const body: { thresholdMs?: number } = {};
         if (thresholdMs !== undefined) body.thresholdMs = thresholdMs;
         return this.call(sweepQueueContract, { body });
+    }
+
+    telemetrySnapshot(since: number): Promise<TelemetrySnapshotResponse> {
+        return this.call(telemetrySnapshotContract, { query: { since } });
     }
 }

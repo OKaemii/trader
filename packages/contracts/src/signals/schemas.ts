@@ -102,6 +102,71 @@ export const AutoApproveBodySchema = z.object({
 });
 export type AutoApproveBody = z.infer<typeof AutoApproveBodySchema>;
 
+// /internal/api/signals/telemetry-snapshot
+//
+// Pre-computed reporting telemetry derived from signal-service's authoritative
+// stores — closed-signal realised P&L since `since`, in-flight lifecycle counts,
+// open-position GBP MTM, and the latest decay metrics. Consumed by
+// notification-service's TelemetryBuilder to populate the TelemetryBlock that
+// grounds every quant-grade analysis email.
+export const TelemetrySnapshotQuerySchema = z.object({
+    since: z.coerce.number().int().nonnegative(),
+});
+export type TelemetrySnapshotQuery = z.infer<typeof TelemetrySnapshotQuerySchema>;
+
+const PickSchema = z.object({
+    ticker: z.string(),
+    pnlPct: z.number(),
+    pnlGbp: z.number(),
+});
+
+const DecayMetricsSchema = z.object({
+    rollingSharpe30d: z.number(),
+    hitRate30d: z.number(),
+    turnoverRatio: z.number(),
+    icTStat: z.number(),
+    featureDriftKL: z.number(),
+    computedAt: z.number().int().nonnegative(),
+});
+
+export const TelemetrySnapshotResponseSchema = z.object({
+    since: z.number().int().nonnegative(),
+    computedAt: z.number().int().positive(),
+    realisedSinceLast: z.object({
+        closedSignals: z.number().int().nonnegative(),
+        pnlGbp: z.number(),
+        bestPick: PickSchema.nullable(),
+        worstPick: PickSchema.nullable(),
+    }),
+    lifecycleCounters: z.object({
+        pending:   z.number().int().nonnegative(),
+        approved:  z.number().int().nonnegative(),
+        queued:    z.number().int().nonnegative(),
+        executing: z.number().int().nonnegative(),
+        executed:  z.number().int().nonnegative(),
+        closed:    z.number().int().nonnegative(),
+        failed:    z.number().int().nonnegative(),
+        cancelled: z.number().int().nonnegative(),
+    }),
+    openPositions: z.object({
+        count: z.number().int().nonnegative(),
+        mtmGbp: z.number(),
+        fxDegraded: z.boolean(),
+    }),
+    risk: z.object({
+        navGbp:        z.number(),
+        hwmGbp:        z.number(),
+        dailyLossPct:  z.number(),
+        drawdownPct:   z.number(),
+        circuit:       z.object({ open: z.boolean(), reason: z.string().nullable() }),
+    }),
+    decay: z.object({
+        health: z.enum(['healthy', 'warning', 'degraded', 'suspended']),
+        metrics: DecayMetricsSchema.nullable(),
+    }),
+});
+export type TelemetrySnapshotResponse = z.infer<typeof TelemetrySnapshotResponseSchema>;
+
 // Path params (single :id, single :ticker)
 export const IdParamSchema     = z.object({ id:     z.string().min(1) });
 export const TickerParamSchema = z.object({ ticker: z.string().min(1) });

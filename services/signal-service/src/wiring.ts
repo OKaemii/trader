@@ -13,6 +13,7 @@ import { RedisSignalPublisher } from "./modules/signals/infrastructure/RedisSign
 import { RedisStrategySubscriber } from "./modules/signals/infrastructure/RedisStrategySubscriber.ts";
 import { GenerateSignalsUseCase } from "./modules/signals/application/GenerateSignals.ts";
 import { GetSignalProgressUseCase } from "./modules/signals/application/GetSignalProgress.ts";
+import { GetTelemetrySnapshotUseCase } from "./modules/signals/application/GetTelemetrySnapshot.ts";
 import { MongoPortfolioState } from "./modules/risk/infrastructure/MongoPortfolioState.ts";
 import { RiskEngine } from "./modules/risk/application/RiskEngine.ts";
 import { ApproveSignalUseCase } from "./modules/approval/application/ApproveSignal.ts";
@@ -59,6 +60,7 @@ export async function wireDependencies(env: SignalEnv, logger: Logger) {
     );
     const findRecent      = { execute: (limit: number) => signalRepo.findRecent(limit) };
     const getProgress     = new GetSignalProgressUseCase(signalRepo, portfolioState, priceLookup);
+    const telemetrySnapshot = new GetTelemetrySnapshotUseCase(db, fx, decayMonitor, riskEngine, logger);
     // WP2.3: multiplex across one subscriber per strategy-output stream. Each gets its
     // own consumer group keyed by stream name so multiple signal-service pods can scale
     // horizontally without re-delivering messages, and a stream that goes idle (e.g. the
@@ -80,7 +82,7 @@ export async function wireDependencies(env: SignalEnv, logger: Logger) {
         logger, env, redis, db, fx, tradingClient,
         signalRepo, riskEngine, decayMonitor, portfolioState, priceLookup,
         approveSignal, autoApprovalGate, publisher, generateSignals,
-        findRecent, getProgress, subscribers, cache, bus,
+        findRecent, getProgress, telemetrySnapshot, subscribers, cache, bus,
     } as const;
 }
 
