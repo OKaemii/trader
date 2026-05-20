@@ -3,6 +3,7 @@ import { authedFetch } from '@/app/lib/auth-fetch'
 import { CashCard } from '@/components/CashCard'
 import { HoldingsPanel, type HoldingsInitial } from '@/components/HoldingsPanel'
 import { AutoApproveToggle } from '@/components/AutoApproveToggle'
+import { CircuitBreakerCard } from '@/components/CircuitBreakerCard'
 import { DangerZone } from '@/components/DangerZone'
 import { MarketStateBadge, type MarketState } from '@/components/MarketStateBadge'
 
@@ -52,6 +53,25 @@ async function fetchAutoApprove(): Promise<boolean | null> {
   }
 }
 
+interface RiskStatusInitial {
+  circuit_open: boolean
+  circuit_reason: string | null
+  nav: number
+  hwm: number
+  daily_loss_pct: number
+  drawdown_from_hwm_pct: number
+  rejections_today: number
+}
+async function fetchRiskStatus(): Promise<RiskStatusInitial | null> {
+  try {
+    const r = await authedFetch('/admin/api/signals/risk/status')
+    if (!r.ok) return null
+    return (await r.json()) as RiskStatusInitial
+  } catch {
+    return null
+  }
+}
+
 async function fetchJsonOrNull<T>(path: string): Promise<T | null> {
   try {
     const r = await authedFetch(path)
@@ -87,12 +107,13 @@ const cards = [
 ]
 
 export default async function DashboardPage() {
-  const [health, mdHealth, autoApprove, holdings, cash] = await Promise.all([
+  const [health, mdHealth, autoApprove, holdings, cash, riskStatus] = await Promise.all([
     fetchHealth(),
     fetchMarketDataHealth(),
     fetchAutoApprove(),
     fetchHoldingsInitial(),
     fetchCashInitial(),
+    fetchRiskStatus(),
   ])
   const nextOpen = mdHealth?.next_session_open_ts
     ? new Date(mdHealth.next_session_open_ts).toUTCString()
@@ -118,7 +139,8 @@ export default async function DashboardPage() {
       <section className="grid grid-cols-1 gap-4 lg:grid-cols-4">
         <CashCard initial={cash as never} />
         <AutoApproveToggle initialEnabled={autoApprove} />
-        <div className="rounded border border-gray-800 bg-gray-900 p-4 lg:col-span-2">
+        <CircuitBreakerCard initial={riskStatus} />
+        <div className="rounded border border-gray-800 bg-gray-900 p-4">
           <h2 className="mb-2 text-sm font-medium text-gray-300">System health</h2>
           {health === null ? (
             <div className="text-sm text-gray-500">Health endpoint unavailable (admin role required).</div>

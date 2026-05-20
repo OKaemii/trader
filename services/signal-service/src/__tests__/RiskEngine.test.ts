@@ -201,14 +201,21 @@ describe('RiskEngine NAV — currency-aware via sumPositionsGBP', () => {
     } as any;
   }
 
-  function cashFixture(amountGBP: number): CashResponse {
+  // T212's cash.total is the broker's authoritative NAV: it already bundles
+  // free + blocked + invested + ppl + pieCash. Tests now use `total` as the headline
+  // NAV figure; `free` is decorative for these fixtures since RiskEngine no longer
+  // reads it for the NAV calc.
+  function cashFixture(freeGBP: number, totalGBP: number = freeGBP): CashResponse {
     return {
-      free:  { amount: amountGBP, currency: 'GBP' },
-      total: { amount: amountGBP, currency: 'GBP' },
+      free:  { amount: freeGBP,  currency: 'GBP' },
+      total: { amount: totalGBP, currency: 'GBP' },
     };
   }
 
-  it('sums GBP + (USD × rate) + cashGBP via injected FxClient', async () => {
+  it('uses cash.total directly as NAV — T212 is authoritative', async () => {
+    // Positions are still computed (and FX-converted) for the completeness check, but
+    // the NAV value comes from cash.total. The old free + sum-positions formula has
+    // been retired because it silently dropped T212's `blocked` reserve.
     const positions = [
       { ticker: 'VOD_l_EQ',   quantity: 10, currency: 'GBP',
         currentValue: { amount: 1000, currency: 'GBP' } },
@@ -216,25 +223,58 @@ describe('RiskEngine NAV — currency-aware via sumPositionsGBP', () => {
         currentValue: { amount: 1000, currency: 'USD' } },
     ];
     const engine = new RiskEngine(
-      makeDb(positions), makeRedis(), makeFx(0.8), stubTradingClient(cashFixture(500)), noopLogger,
+      makeDb(positions), makeRedis(), makeFx(0.8),
+      stubTradingClient(cashFixture(500, 2300)),
+      noopLogger,
     );
     const status = await engine.status();
-    // 1000 GBP + 1000 USD * 0.8 + 500 cash = 1000 + 800 + 500 = 2300
     expect(status.nav).toBeCloseTo(2300, 4);
   });
 
-  it('degrades to cash-only when FX throws (does not silently substitute native)', async () => {
+  it('counts T212 blocked cash via cash.total — regression for the phantom-loss trip', async () => {
+    // Reproduction of the bug seen 2026-05-20: T212 reported
+    //   {free: 2301.15, total: 5984.94, blocked: 1626.28, invested: 2065.48, ppl: -7.97}.
+    // The old code summed cash.free (2301) + sumPositions (≈2059) = ~£4360 and tripped
+    // the 3% daily-loss gate at "19% loss" while the actual account was flat.
+    const positions = [
+      // Mirror the real-account shape: ~£2059 of GBP positions (sum of currentValue).
+      { ticker: 'SDRl_EQ', quantity: 15, currency: 'GBP',
+        currentValue: { amount: 87.27, currency: 'GBP' } },
+      { ticker: 'BMEl_EQ', quantity: 171, currency: 'GBP',
+        currentValue: { amount: 273.94, currency: 'GBP' } },
+      { ticker: 'ABFl_EQ', quantity: 12, currency: 'GBP',
+        currentValue: { amount: 217.40, currency: 'GBP' } },
+    ];
+    const engine = new RiskEngine(
+      makeDb(positions), makeRedis(), makeFx(1),
+      stubTradingClient({
+        free:  { amount: 2301.15, currency: 'GBP' },
+        total: { amount: 5984.94, currency: 'GBP' },
+      }),
+      noopLogger,
+    );
+    const status = await engine.status();
+    // NAV matches what the portal + T212 dashboard show, not the under-counted figure.
+    expect(status.nav).toBeCloseTo(5984.94, 4);
+  });
+
+  it('marks NAV incomplete (and skips gates) when FX cross-check throws', async () => {
+    // The positions sum is still computed as an independent cross-check on T212's
+    // total. If FX is unavailable we can't compute that view, so NAV is flagged
+    // incomplete and canTrade skips the loss/drawdown gates rather than gating on
+    // figures we couldn't reconcile.
     const positions = [
       { ticker: 'AAPL_US_EQ', quantity: 5, currency: 'USD',
         currentValue: { amount: 1000, currency: 'USD' } },
     ];
     const throwingFx: FxConverter = { async toGBP() { throw new Error('fx down'); } };
     const engine = new RiskEngine(
-      makeDb(positions), makeRedis(), throwingFx, stubTradingClient(cashFixture(500)), noopLogger,
+      makeDb(positions), makeRedis(), throwingFx,
+      stubTradingClient(cashFixture(500, 2300)),
+      noopLogger,
     );
-    const status = await engine.status();
-    // FX-throw → positionsGBP = 0; NAV is cash-only. Critically, it is NOT 1000
-    // (which would be the pre-fix silent native-as-GBP substitution).
-    expect(status.nav).toBe(500);
+    const allow = await engine.canTrade();
+    expect(allow.allowed).toBe(true);
+    expect(allow.reason).toBeNull();
   });
 });

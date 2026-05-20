@@ -16,6 +16,7 @@ import { GetSignalProgressUseCase } from "./modules/signals/application/GetSigna
 import { GetTelemetrySnapshotUseCase } from "./modules/signals/application/GetTelemetrySnapshot.ts";
 import { MongoPortfolioState } from "./modules/risk/infrastructure/MongoPortfolioState.ts";
 import { RiskEngine } from "./modules/risk/application/RiskEngine.ts";
+import { TripRecorder } from "./modules/risk/application/TripRecorder.ts";
 import { ApproveSignalUseCase } from "./modules/approval/application/ApproveSignal.ts";
 import { AutoApprovalGate } from "./modules/approval/application/AutoApprovalGate.ts";
 import { StrategyDecayMonitor } from "./modules/approval/application/StrategyDecayMonitor.ts";
@@ -39,6 +40,8 @@ export async function wireDependencies(env: SignalEnv, logger: Logger) {
 
     const signalRepo  = new MongoSignalRepository(manager, cache, bus, collection);
     const riskEngine  = new RiskEngine(db, redis, fx, tradingClient, logger);
+    const tripRecorder = new TripRecorder(db, signalRepo, tradingClient, logger);
+    riskEngine.attachTripPipeline(signalRepo, tripRecorder);
     await riskEngine.init();
 
     const decayMonitor    = new StrategyDecayMonitor(db, redis, logger);
@@ -80,7 +83,7 @@ export async function wireDependencies(env: SignalEnv, logger: Logger) {
 
     return {
         logger, env, redis, db, fx, tradingClient,
-        signalRepo, riskEngine, decayMonitor, portfolioState, priceLookup,
+        signalRepo, riskEngine, tripRecorder, decayMonitor, portfolioState, priceLookup,
         approveSignal, autoApprovalGate, publisher, generateSignals,
         findRecent, getProgress, telemetrySnapshot, subscribers, cache, bus,
     } as const;

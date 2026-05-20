@@ -90,7 +90,7 @@ export function registerSystemReset(app: Hono, logger: Logger): void {
                     "signals", "ohlcv_bars", "orders", "positions", "backtest_results",
                     "instrument_registry", "topology_snapshots", "strategy_health_log",
                     "model_versions", "feature_importance_log", "risk_state", "risk_rejections",
-                    "bad_ticks",
+                    "circuit_breaker_trips", "bad_ticks",
                 ];
                 for (const name of wipe) {
                     const r = await db.collection(name).deleteMany({});

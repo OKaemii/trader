@@ -125,6 +125,14 @@ export class Trading212Client {
       maxOpenQuantity:  Number(p.maxOpenQuantity ?? 0),
       currencyCode:     String(p.currencyCode ?? ''),
       type:             String(p.type ?? ''),
+      // T212's public /equity/metadata/instruments doesn't expose per-instrument
+      // quantity precision. The real value varies wildly per ticker (LSE GBX names
+      // typically 2 dp, some US fractional 3 dp, others 4 dp) and the broker rejects
+      // any submission with finer precision than it expects. Until we have a real
+      // source, the cache layer defaults this to DEFAULT_PRECISION (currently 2) —
+      // coarse enough to cover most LSE GBX names without breaking US fractional too
+      // much. Tracked for a proper per-ticker fix.
+      precision:        typeof p.precision === 'number' ? p.precision : undefined,
     }));
   }
 
@@ -150,6 +158,12 @@ export interface T212Instrument {
   maxOpenQuantity:  number;
   currencyCode:     string;   // ISO 4217
   type:             string;   // 'STOCK' | 'ETF' | ...
+  // Per-instrument max quantity precision T212 will accept. T212's public metadata
+  // endpoint does NOT currently expose this — the field is kept on the interface so
+  // (a) downstream callers always have a typed `precision` to read, and (b) when
+  // T212 (or a future authenticated/private endpoint) starts exposing it, the parser
+  // path is in place. Until then it is `undefined` and the cache uses DEFAULT_PRECISION.
+  precision?:       number | undefined;
 }
 
 // Subset of fields we actually use. T212 returns more (currency, walletImpact, taxes, etc.)

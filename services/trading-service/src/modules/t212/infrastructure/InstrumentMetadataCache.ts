@@ -16,7 +16,17 @@ export interface QuantityRules {
 }
 
 const REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24h — T212 ticker set is stable day-to-day.
-const FALLBACK_RULES: QuantityRules = { minQuantity: 0.0001, precision: 4 };
+
+// Default precision applied to every instrument when T212's metadata response doesn't
+// expose a per-ticker precision field (which is the current production reality — the
+// public /equity/metadata/instruments endpoint omits it entirely). 2 was picked from
+// observed broker rejections: LSE GBX names (LANDl, SBRYl, BMEl, CNAl, UUl) require
+// precision ≤ 2; sending 4 dp gets a `quantity-precision-mismatch` 400 from T212.
+// US fractional names that genuinely accept 4 dp will be over-floored at this default
+// (e.g. 0.9148 → 0.91) — that's a small economic cost we eat until we can source the
+// real per-ticker precision (planned follow-up).
+export const DEFAULT_PRECISION = 2;
+const FALLBACK_RULES: QuantityRules = { minQuantity: 10 ** -DEFAULT_PRECISION, precision: DEFAULT_PRECISION };
 
 // Tiny in-process cache. The full instrument list is ~5k entries and a few MB; one
 // fetch per pod per day. Not persisted to Redis — a cold pod just refetches.
@@ -63,16 +73,21 @@ export class InstrumentMetadataCache {
     const t0 = Date.now();
     const list = await this.client.getInstruments();
     const next = new Map<string, QuantityRules>();
+    let defaultedPrecision = 0;
+    let defaultedMin = 0;
     for (const inst of list) {
-      next.set(inst.ticker, {
-        minQuantity: inst.minTradeQuantity,
-        precision:   decimalsOf(inst.minTradeQuantity),
-      });
+      const precision = typeof inst.precision === 'number' && Number.isFinite(inst.precision) && inst.precision >= 0
+        ? inst.precision
+        : (defaultedPrecision++, DEFAULT_PRECISION);
+      const minQuantity = Number.isFinite(inst.minTradeQuantity) && inst.minTradeQuantity > 0
+        ? inst.minTradeQuantity
+        : (defaultedMin++, 10 ** -precision);
+      next.set(inst.ticker, { minQuantity, precision });
     }
     this.rules = next;
     this.lastLoad = Date.now();
     this.logger.info({
-      count: next.size, ms: Date.now() - t0,
+      count: next.size, defaultedPrecision, defaultedMin, ms: Date.now() - t0,
     }, 'instrument-metadata loaded');
   }
 }

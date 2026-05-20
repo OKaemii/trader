@@ -45,4 +45,11 @@ export interface ISignalRepository {
   // List signals whose lifecycle is in `states`, oldest-first by timestamp. Used by the
   // portal "In transit" / "Failed" filter views.
   findByLifecycle(states: TradeSignal['lifecycle'][], limit: number): Promise<TradeSignal[]>;
+  // Bulk-cancel BUY signals currently in {pending, approved, queued} → failed with
+  // the supplied reason. Used by the RiskEngine when the circuit breaker trips: stop
+  // the bleed by killing the BUY pipeline (SELLs are typically risk-exits and stay).
+  // Does NOT touch `executing` rows — those have already shipped to the dispatcher and
+  // racing them against T212 is worse than letting them complete (FillsPoller handles
+  // the eventual state). Returns the affected signal ids for the trip post-mortem doc.
+  bulkCancelOpenBuys(reason: SignalFailureReason, detail: string): Promise<string[]>;
 }
