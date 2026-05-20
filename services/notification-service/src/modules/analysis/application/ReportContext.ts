@@ -116,8 +116,7 @@ export interface HeadFeaturesView {
 }
 
 export function viewHead(batch: CycleBatch): HeadFeaturesView {
-    const head: TradeSignalDTO | undefined = batch.signals[0];
-    const f = head?.features_snapshot;
+    const f = mergeBatchFeatures(batch);
     return {
         snapshot:               f,
         regimeConfidence:       f?.regime_confidence       ?? null,
@@ -125,5 +124,58 @@ export function viewHead(batch: CycleBatch): HeadFeaturesView {
         nStable:                f?.feature_stability ? Math.max(0, f.feature_stability.features.length - (f.feature_stability.n_unstable ?? 0)) : null,
         nUnstable:              f?.feature_stability?.n_unstable ?? null,
         signalWeights:          f?.signal_weights ?? null,
+    };
+}
+
+// Merge the per-signal slices of features_snapshot into a synthetic batch-wide view.
+//
+// Signal-service writes a per-ticker minimal slice on every TradeSignal
+// (GenerateSignals.ts: `analysisContext`) — composite_scores, factor_attributions,
+// sectors, and laplacian_residuals are keyed by exactly the signal's own ticker;
+// ticker_universe is deliberately empty to keep the persisted payload small. Reading
+// only `batch.signals[0].features_snapshot` therefore exposes the first pick's row
+// and pretends every other pick has no score — which silently breaks the factor
+// dominance table, the cross-sectional dispersion histogram, and any sanity rule
+// that counts entries in composite_scores.
+//
+// This helper unions the per-ticker maps across the batch so renderers see one row
+// per pick in the cycle. Scalar/cycle-wide fields (regime_confidence, signal_weights,
+// feature_stability, betti curves, persistence pairs, top_k, report_cadence,
+// covariance_matrix) are identical across all signals in a single emit cycle, so
+// we take them from the first signal. ticker_universe is reconstructed as the union
+// of pick tickers — the strategy's full screening set is NOT in any slice, so this
+// represents "tickers we have data for", not the upstream universe. Sanity rules
+// that need a universe-level view (e.g. CONFIDENCE_SINGLETON_FALLBACK) should guard
+// on `ticker_universe.length` and skip when the head is per-signal-slice shape.
+export function mergeBatchFeatures(batch: CycleBatch): StrategyOutput | undefined {
+    const first = batch.signals[0]?.features_snapshot;
+    if (!first) return undefined;
+
+    const composite_scores:    Record<string, number>                  = {};
+    const factor_attributions: Record<string, Record<string, number>>  = {};
+    const sectors:             Record<string, string>                  = {};
+    const tickerSet:           Set<string>                             = new Set();
+    let   laplacian_residuals: Record<string, number> | undefined      = undefined;
+
+    for (const sig of batch.signals) {
+        const f = sig.features_snapshot;
+        if (!f) continue;
+        for (const [t, v]    of Object.entries(f.composite_scores    ?? {})) composite_scores[t]    = v;
+        for (const [t, row]  of Object.entries(f.factor_attributions ?? {})) factor_attributions[t] = row;
+        for (const [t, sec]  of Object.entries(f.sectors             ?? {})) sectors[t]             = sec;
+        for (const t         of f.ticker_universe                    ?? []) tickerSet.add(t);
+        if (f.laplacian_residuals) {
+            laplacian_residuals = laplacian_residuals ?? {};
+            for (const [t, v] of Object.entries(f.laplacian_residuals)) laplacian_residuals[t] = v;
+        }
+    }
+
+    return {
+        ...first,
+        composite_scores,
+        factor_attributions,
+        sectors,
+        ticker_universe: tickerSet.size > 0 ? Array.from(tickerSet) : first.ticker_universe ?? [],
+        ...(laplacian_residuals ? { laplacian_residuals } : {}),
     };
 }

@@ -125,4 +125,50 @@ describe('FactorRankRenderer', () => {
         expect(ctx.sectionsHtml).toContain('No features_snapshot');
         expect(ctx.sanity.find((f) => f.code === 'FACTOR_DEGENERATE')).toBeUndefined();
     });
+
+    // Regression test for the per-signal-slice bug. signal-service emits each TradeSignal
+    // with a features_snapshot containing ONLY that signal's own ticker in
+    // composite_scores/factor_attributions/sectors (and an empty ticker_universe). The
+    // renderer previously read only batch.signals[0].features_snapshot, so the factor
+    // table showed values for the head pick and "—" for every other pick. The merge
+    // helper unions the per-ticker maps across all signals so each pick's row resolves.
+    it('renders per-pick factor values when each signal carries only its own slice', async () => {
+        const r = new FactorRankRenderer(stubLLM, noopLogger);
+        const sliceFor = (ticker: string, score: number, attr: Record<string, number>): StrategyOutput => ({
+            timestamp: 0, strategy_id: 'factor_rank_v1',
+            ticker_universe: [],
+            composite_scores: { [ticker]: score },
+            factor_attributions: { [ticker]: attr },
+            sectors: { [ticker]: 'Unknown' },
+            covariance_matrix: [],
+            regime_confidence: 0.7,
+            position_size_multiplier: 0.775,
+        });
+        const sig = (ticker: string, snapshot: StrategyOutput): TradeSignalDTO => ({
+            id: `s-${ticker}`, timestamp: 1700_000_000_000, ticker,
+            strategy_id: 'factor_rank_v1', action: 'SELL', confidence: 0.4,
+            targetWeight: 0.0, rationale: '{}',
+            features_snapshot: snapshot,
+        } as TradeSignalDTO);
+        const perSignalBatch: CycleBatch = {
+            cycleKey: 'factor_rank_v1:per_cycle:0',
+            strategyId: 'factor_rank_v1',
+            cadence: 'per_cycle',
+            cycleTs: 1700_000_000_000,
+            signals: [
+                sig('BKGl_EQ',  sliceFor('BKGl_EQ',  -0.395, { momentum: -0.594, reversal: -0.503, low_vol: -0.086 })),
+                sig('CCHl_EQ',  sliceFor('CCHl_EQ',   0.343, { momentum:  0.421, reversal:  0.122, low_vol:  0.085 })),
+                sig('BRBYl_EQ', sliceFor('BRBYl_EQ',  0.667, { momentum:  0.812, reversal:  0.205, low_vol:  0.150 })),
+            ],
+            firstSeenAt: 1700_000_000_000,
+            lastSeenAt:  1700_000_000_000,
+        };
+        const ctx = await r.build(perSignalBatch, tel(), []);
+        // Every pick's composite renders, not just the head's.
+        expect(ctx.sectionsHtml).toContain('-0.395');
+        expect(ctx.sectionsHtml).toContain('0.343');
+        expect(ctx.sectionsHtml).toContain('0.667');
+        // Dispersion histogram is computed across all picks (n=3), not the head only (n=1).
+        expect(ctx.sectionsHtml).toMatch(/n=3/);
+    });
 });

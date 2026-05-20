@@ -2,7 +2,7 @@ import type { Logger } from '@trader/core';
 import type { TradeSignalDTO } from '@trader/shared-types';
 import type { CompanyProfile, CompanyProfileService } from '../application/CompanyProfileService.ts';
 import type { CycleBatch } from '../application/CycleAnalysisBatcher.ts';
-import type { ReportContext, StrategyRenderer } from '../application/ReportContext.ts';
+import { mergeBatchFeatures, type ReportContext, type StrategyRenderer } from '../application/ReportContext.ts';
 import type { SanityChecker } from '../application/SanityChecker.ts';
 import type { TelemetryBuilder } from '../application/TelemetryBuilder.ts';
 import {
@@ -65,7 +65,7 @@ export class AnalysisEmailSender {
 
     async send(batch: CycleBatch): Promise<void> {
         const telemetry = await this.telemetryBuilder.build(batch);
-        const head      = batch.signals[0]?.features_snapshot;
+        const head      = mergeBatchFeatures(batch);
         const sanity    = this.sanityChecker.check({
             signals: batch.signals,
             telemetry,
