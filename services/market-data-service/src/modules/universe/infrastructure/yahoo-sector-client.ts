@@ -32,6 +32,12 @@ export interface SectorLookup {
 
 export interface YahooSectorClientOptions {
   baseUrl?: string;
+  // Yahoo `quoteSummary` no longer accepts anonymous requests — every call needs a
+  // session cookie + crumb token. Bootstrap: GET seedUrl → collect Set-Cookie →
+  // GET crumbUrl with that cookie → response body is the crumb. Both are passed on
+  // every subsequent quoteSummary call. Tests override the URLs to stub the flow.
+  seedUrl?:  string;
+  crumbUrl?: string;
   // Total attempts per ticker including the first. Backoff between attempts is
   // RETRY_BACKOFF_MS * attemptNumber so transient errors recover without hammering
   // upstream. Default 3 mirrors the bar-client.
@@ -47,13 +53,42 @@ export interface YahooSectorClientOptions {
 
 const DEFAULTS: Required<Omit<YahooSectorClientOptions, 'fetchFn'>> = {
   baseUrl:        'https://query2.finance.yahoo.com/v10/finance/quoteSummary',
+  seedUrl:        'https://fc.yahoo.com/',
+  crumbUrl:       'https://query2.finance.yahoo.com/v1/test/getcrumb',
   maxAttempts:    3,
   retryBackoffMs: 200,
   interRequestMs: 200,
 };
 
+// Yahoo refuses default Node user-agents on the crumb endpoint. Sending a real
+// browser UA gets us through; everything else 401s before the cookie is even
+// inspected. Same string for the seed + crumb + quoteSummary calls.
+const BROWSER_UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+interface YahooSession {
+  cookie: string;
+  crumb:  string;
+}
+
+// Extract the Set-Cookie payloads from a fetch Response and collapse them into a
+// single `Cookie:` header value (`name=value; name2=value2`). Node 18+ undici
+// exposes `getSetCookie()` returning string[]; the fallback handles older runtimes
+// + the test path where headers are constructed plainly.
+function extractCookieHeader(res: Response): string {
+  const h = res.headers as Headers & { getSetCookie?: () => string[] };
+  const raw: string[] = typeof h.getSetCookie === 'function'
+    ? h.getSetCookie()
+    : (() => { const r = res.headers.get('set-cookie'); return r ? [r] : []; })();
+  return raw
+    .map((c) => c.split(';', 1)[0]?.trim() ?? '')
+    .filter(Boolean)
+    .join('; ');
+}
+
 export class YahooSectorClient {
   private readonly baseUrl:        string;
+  private readonly seedUrl:        string;
+  private readonly crumbUrl:       string;
   private readonly maxAttempts:    number;
   private readonly retryBackoffMs: number;
   private readonly interRequestMs: number;
@@ -62,13 +97,42 @@ export class YahooSectorClient {
   // when the same shortName resolves into multiple T212 tickers (cross-listings) so
   // we don't double-fetch the same Yahoo symbol within a single refresh cycle.
   private readonly memo: Map<string, SectorLookup | null> = new Map();
+  // Cached session (cookie + crumb). Acquired lazily on first fetchOne; cleared on
+  // any 401/403 so the next retry re-acquires.
+  private session: YahooSession | null = null;
 
   constructor(opts: YahooSectorClientOptions = {}) {
     this.baseUrl        = opts.baseUrl        ?? DEFAULTS.baseUrl;
+    this.seedUrl        = opts.seedUrl        ?? DEFAULTS.seedUrl;
+    this.crumbUrl       = opts.crumbUrl       ?? DEFAULTS.crumbUrl;
     this.maxAttempts    = opts.maxAttempts    ?? DEFAULTS.maxAttempts;
     this.retryBackoffMs = opts.retryBackoffMs ?? DEFAULTS.retryBackoffMs;
     this.interRequestMs = opts.interRequestMs ?? DEFAULTS.interRequestMs;
     this.fetchFn        = opts.fetchFn        ?? ((globalThis.fetch) as typeof fetch);
+  }
+
+  // Bootstrap (or return cached) Yahoo session: hit the seed URL to collect a
+  // session cookie, then fetch a crumb against the same cookie. Yahoo's anti-abuse
+  // layer treats requests without (cookie ∧ crumb) as 401, so this MUST succeed
+  // before any quoteSummary call lands.
+  private async getSession(): Promise<YahooSession> {
+    if (this.session) return this.session;
+    const seedRes = await this.fetchFn(this.seedUrl, {
+      headers: { 'User-Agent': BROWSER_UA, Accept: '*/*' },
+      redirect: 'manual',   // fc.yahoo.com replies 302; we only need the Set-Cookie on this hop
+    });
+    const cookie = extractCookieHeader(seedRes);
+    if (!cookie) throw new Error(`Yahoo session bootstrap: no Set-Cookie from ${this.seedUrl} (HTTP ${seedRes.status})`);
+    const crumbRes = await this.fetchFn(this.crumbUrl, {
+      headers: { 'User-Agent': BROWSER_UA, Accept: '*/*', Cookie: cookie },
+    });
+    if (!crumbRes.ok) throw new Error(`Yahoo crumb fetch: HTTP ${crumbRes.status}`);
+    const crumb = (await crumbRes.text()).trim();
+    // Yahoo occasionally returns an HTML consent page (EU geo) instead of the bare crumb token.
+    // Detect that explicitly so we fail loudly instead of sending '<!DOCTYPE...' as the crumb.
+    if (!crumb || crumb.startsWith('<')) throw new Error('Yahoo crumb fetch: empty or non-token response');
+    this.session = { cookie, crumb };
+    return this.session;
   }
 
   /**
@@ -132,14 +196,23 @@ export class YahooSectorClient {
 
   /** Raw HTTP call. Returns null on 404 (unknown symbol); throws on other failures. */
   private async fetchAssetProfile(yahooSymbol: string): Promise<AssetProfile | null> {
-    const url = `${this.baseUrl}/${encodeURIComponent(yahooSymbol)}?modules=assetProfile`;
+    const sess = await this.getSession();
+    const url = `${this.baseUrl}/${encodeURIComponent(yahooSymbol)}?modules=assetProfile&crumb=${encodeURIComponent(sess.crumb)}`;
     const res = await this.fetchFn(url, {
       headers: {
-        'User-Agent': 'Mozilla/5.0',
+        'User-Agent': BROWSER_UA,
         Accept:       'application/json',
+        Cookie:       sess.cookie,
       },
     });
 
+    // 401/403 = session went stale (crumb rotated, cookie expired). Drop it so the
+    // outer retry loop's next attempt re-acquires. Throwing keeps the retry path
+    // running rather than memoising a permanent miss.
+    if (res.status === 401 || res.status === 403) {
+      this.session = null;
+      throw new Error(`Yahoo quoteSummary ${yahooSymbol}: HTTP ${res.status} (session reset)`);
+    }
     if (res.status === 404) return null;
     if (!res.ok) throw new Error(`Yahoo quoteSummary ${yahooSymbol}: HTTP ${res.status}`);
 
