@@ -56,25 +56,59 @@ function fakeClient(instruments: T212Instrument[]): Trading212Client {
 }
 
 describe('InstrumentMetadataCache', () => {
-  it('returns rules for known tickers after load', async () => {
+  it('respects an explicit precision field on the metadata payload', async () => {
+    // When T212 (or a future authenticated endpoint) ever surfaces per-ticker precision,
+    // the cache must carry it through verbatim. Validates the parse path stays honest
+    // once real data arrives.
     const cache = new InstrumentMetadataCache(
       fakeClient([
-        { ticker: 'AAPL_US_EQ', minTradeQuantity: 0.01, maxOpenQuantity: 1e6, currencyCode: 'USD', type: 'STOCK' },
-        { ticker: 'SUPRl_EQ',   minTradeQuantity: 0.01510719, maxOpenQuantity: 1e6, currencyCode: 'GBP', type: 'ETF' },
+        { ticker: 'AAPL_US_EQ', minTradeQuantity: 0.01, maxOpenQuantity: 1e6, currencyCode: 'USD', type: 'STOCK', precision: 4 },
+        { ticker: 'SUPRl_EQ',   minTradeQuantity: 0.01510719, maxOpenQuantity: 1e6, currencyCode: 'GBP', type: 'ETF', precision: 8 },
       ]),
       silentLogger,
     );
     await cache.load();
-    expect(await cache.getRules('AAPL_US_EQ')).toEqual({ minQuantity: 0.01, precision: 2 });
-    const supr = await cache.getRules('SUPRl_EQ');
-    expect(supr.minQuantity).toBeCloseTo(0.01510719, 8);
-    expect(supr.precision).toBe(8);
+    expect(await cache.getRules('AAPL_US_EQ')).toEqual({ minQuantity: 0.01, precision: 4 });
+    expect(await cache.getRules('SUPRl_EQ')).toEqual({ minQuantity: 0.01510719, precision: 8 });
   });
 
-  it('returns permissive fallback for unknown tickers', async () => {
+  it('applies DEFAULT_PRECISION (2) when T212 omits the precision field', async () => {
+    // Reflects the current production reality: T212's public metadata endpoint does
+    // not expose precision at all. Cache defaults to precision 2 — coarse enough to
+    // satisfy LSE GBX names (LANDl/SBRYl/BMEl/CNAl all require ≤ 2) without bricking
+    // anything that accepts more precision.
+    const cache = new InstrumentMetadataCache(
+      fakeClient([
+        { ticker: 'LANDl_EQ', minTradeQuantity: 0, maxOpenQuantity: 1e6, currencyCode: 'GBX', type: 'STOCK' },
+        { ticker: 'CVX_US_EQ', minTradeQuantity: 0, maxOpenQuantity: 1e6, currencyCode: 'USD', type: 'STOCK' },
+      ]),
+      silentLogger,
+    );
+    await cache.load();
+    expect(await cache.getRules('LANDl_EQ')).toEqual({ minQuantity: 0.01, precision: 2 });
+    expect(await cache.getRules('CVX_US_EQ')).toEqual({ minQuantity: 0.01, precision: 2 });
+    // Sanity: with precision 2, qty 10.2242 floors to 10.22 (matches what T212
+    // accepts for LANDl). The pre-fix path floored to 10.2242 and got rejected.
+    expect(applyQuantityRules(10.2242, await cache.getRules('LANDl_EQ'))).toBeCloseTo(10.22, 4);
+  });
+
+  it('returns the same fallback rules for unknown tickers', async () => {
     const cache = new InstrumentMetadataCache(fakeClient([]), silentLogger);
     await cache.load();
-    expect(await cache.getRules('NEWl_EQ')).toEqual({ minQuantity: 0.0001, precision: 4 });
+    expect(await cache.getRules('NEWl_EQ')).toEqual({ minQuantity: 0.01, precision: 2 });
+  });
+
+  it('still parses an explicit minTradeQuantity when precision is missing', async () => {
+    // The two fields are independent: T212 may provide one without the other.
+    // minQuantity overrides the default-derived floor; precision still falls back to 2.
+    const cache = new InstrumentMetadataCache(
+      fakeClient([
+        { ticker: 'WEIRDl_EQ', minTradeQuantity: 5, maxOpenQuantity: 1e6, currencyCode: 'GBX', type: 'STOCK' },
+      ]),
+      silentLogger,
+    );
+    await cache.load();
+    expect(await cache.getRules('WEIRDl_EQ')).toEqual({ minQuantity: 5, precision: 2 });
   });
 
   it('coalesces concurrent load() calls', async () => {

@@ -49,7 +49,7 @@ export function DangerZone() {
       {open && (
         <div className="space-y-3 border-t border-red-900/50 px-4 py-4">
           <div className="space-y-1 text-xs text-red-200/80">
-            <p><strong>Wipes</strong> Mongo collections: signals, ohlcv_bars, orders, positions, backtest_results, instrument_registry, topology_snapshots, strategy_health_log, model_versions, feature_importance_log, risk_state, risk_rejections, bad_ticks.</p>
+            <p><strong>Wipes</strong> Mongo collections: signals, ohlcv_bars, orders, positions, backtest_results, instrument_registry, topology_snapshots, strategy_health_log, model_versions, feature_importance_log, risk_state, risk_rejections, circuit_breaker_trips, bad_ticks.</p>
             <p><strong>Clears Redis</strong> streams (market:raw, signals:strategy) + state keys (strategy:*, regime:*, trading:*, signal:auto_approve).</p>
             <p><strong>Preserves</strong> users, universe overrides, market-data config.</p>
             <p className="text-red-400">

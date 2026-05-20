@@ -36,6 +36,7 @@ async function main(): Promise<void> {
         autoApprovalGate: deps.autoApprovalGate,
         signalRepo:       deps.signalRepo,
         riskEngine:       deps.riskEngine,
+        tripRecorder:     deps.tripRecorder,
     }));
     app.route("/", createInternalRouter({
         signalRepo:        deps.signalRepo,

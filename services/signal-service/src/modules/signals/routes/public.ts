@@ -7,6 +7,7 @@ import type { GetSignalProgressUseCase } from '../application/GetSignalProgress.
 import type { AutoApprovalGate } from '../../approval/application/AutoApprovalGate.ts';
 import type { ISignalRepository } from '../domain/ISignalRepository.ts';
 import type { RiskEngine } from '../../risk/application/RiskEngine.ts';
+import type { TripRecorder } from '../../risk/application/TripRecorder.ts';
 import { SignalLifecycle, SignalFailureReason } from '@trader/shared-types';
 
 interface Deps {
@@ -16,6 +17,7 @@ interface Deps {
   autoApprovalGate: AutoApprovalGate;
   signalRepo: ISignalRepository;
   riskEngine: RiskEngine;
+  tripRecorder: TripRecorder;
 }
 
 /**
@@ -119,6 +121,24 @@ export function createRouter(deps: Deps): Hono {
   router.post('/admin/api/signals/risk/circuit-breaker/reset', async (c) => {
     await deps.riskEngine.resetCircuitBreaker();
     return c.json({ reset: true, ts: Date.now() });
+  });
+
+  // Post-mortem list — one row per historical trip. Lean projection (no positions,
+  // no signals array) so the portal table renders fast. Detail view fetches the
+  // full doc separately.
+  router.get('/admin/api/signals/risk/trips', async (c) => {
+    const limit = Math.min(parseInt(c.req.query('limit') ?? '50'), 200);
+    const trips = await deps.tripRecorder.list(limit);
+    return c.json({ trips });
+  });
+
+  // Full post-mortem for a single trip — risk numbers, cash/positions snapshot,
+  // last-50 signals at the moment of trip, recent rejections, and the BUY ids the
+  // auto-drain cancelled.
+  router.get('/admin/api/signals/risk/trips/:id', async (c) => {
+    const trip = await deps.tripRecorder.findById(c.req.param('id')!);
+    if (!trip) return c.json({ error: 'not found' }, 404);
+    return c.json(trip);
   });
 
   return router;

@@ -5,6 +5,9 @@ import type { TradingServiceClient } from '@trader/contracts';
 import { sumPositionsGBP, type FxConverter, type PositionDoc } from '@trader/shared-portfolio';
 import { CircuitBreakerRedis } from '../infrastructure/CircuitBreakerRedis.ts';
 import { RISK_LIMITS } from '../../signals/application/LongOnlyOptimiser.ts';
+import type { TripRecorder, TripContext } from './TripRecorder.ts';
+import type { ISignalRepository } from '../../signals/domain/ISignalRepository.ts';
+import { SignalFailureReason } from '@trader/shared-types';
 
 export interface RiskStatus {
   circuit_open: boolean;
@@ -66,6 +69,13 @@ export class RiskEngine {
 
   private _rejectionsToday = 0;
 
+  // Optional collaborators wired by signal-service for the auto-drain + post-mortem
+  // behaviour. Left optional so unit tests and alternate constructions don't have to
+  // build the whole stack — when absent, canTrade still trips the breaker but skips
+  // the drain + record steps.
+  private signalRepo?: ISignalRepository;
+  private tripRecorder?: TripRecorder;
+
   constructor(
     db: Db,
     redis: RedisClientType,
@@ -77,6 +87,13 @@ export class RiskEngine {
     this.riskState  = db.collection<RiskState>('risk_state');
     this.positions  = db.collection('positions');
     this.cb         = new CircuitBreakerRedis(redis);
+  }
+
+  // Wired post-construction because TripRecorder needs the signal repo, and the repo
+  // is built in the same wiring step. Avoids a circular constructor dependency.
+  attachTripPipeline(signalRepo: ISignalRepository, tripRecorder: TripRecorder): void {
+    this.signalRepo = signalRepo;
+    this.tripRecorder = tripRecorder;
   }
 
   async init(): Promise<void> {
@@ -181,17 +198,23 @@ export class RiskEngine {
       : 0;
 
     if (dailyLossPct > RISK_LIMITS.maxDailyLoss) {
-      const reason = `Daily loss ${(dailyLossPct * 100).toFixed(2)}% exceeds ${(RISK_LIMITS.maxDailyLoss * 100).toFixed(0)}% limit`;
-      await this.cb.trip(reason);
-      await this._logRejection('DAILY_LOSS_HALT', { dailyLossPct, nav });
-      return { allowed: false, reason };
+      const reasonText = `Daily loss ${(dailyLossPct * 100).toFixed(2)}% exceeds ${(RISK_LIMITS.maxDailyLoss * 100).toFixed(0)}% limit`;
+      await this._onTrip({
+        reason: 'DAILY_LOSS_HALT', reasonText,
+        nav, hwm: this._state.hwm, dayOpenNav: this._state.day_open_nav,
+        dailyLossPct, drawdownPct,
+      });
+      return { allowed: false, reason: reasonText };
     }
 
     if (drawdownPct > RISK_LIMITS.maxDrawdownHalt) {
-      const reason = `Drawdown ${(drawdownPct * 100).toFixed(2)}% exceeds ${(RISK_LIMITS.maxDrawdownHalt * 100).toFixed(0)}% HWM limit`;
-      await this.cb.trip(reason);
-      await this._logRejection('DRAWDOWN_HALT', { drawdownPct, hwm: this._state.hwm, nav });
-      return { allowed: false, reason };
+      const reasonText = `Drawdown ${(drawdownPct * 100).toFixed(2)}% exceeds ${(RISK_LIMITS.maxDrawdownHalt * 100).toFixed(0)}% HWM limit`;
+      await this._onTrip({
+        reason: 'DRAWDOWN_HALT', reasonText,
+        nav, hwm: this._state.hwm, dayOpenNav: this._state.day_open_nav,
+        dailyLossPct, drawdownPct,
+      });
+      return { allowed: false, reason: reasonText };
     }
 
     return { allowed: true, reason: null };
@@ -262,34 +285,85 @@ export class RiskEngine {
   // account, etc.). The day_open_nav check below treats that as "no comparison
   // baseline" if day_open_nav was also 0, or "real loss" if it was positive.
   private async _computeNav(): Promise<{ nav: number; complete: boolean }> {
+    // NAV comes from T212's `cash.total` — the broker's authoritative figure that already
+    // includes free + blocked + invested + ppl + pieCash. Previously we summed cash.free
+    // (free cash only) + our own positions-from-Mongo, which silently dropped the
+    // `blocked` reserve T212 holds for our pending orders. With one weekly rebalance
+    // worth of pending orders blocked, that under-counted NAV by ~£1.6k on a £6k
+    // account → daily-loss gate read 19% → breaker thrashed on a phantom loss while
+    // the actual portfolio was flat. T212's total is fed by the same fills + market
+    // marks the portal displays, so RiskEngine + portal now agree by construction.
+    //
+    // Our own sumPositionsGBP is still computed for the COMPLETENESS check: if the
+    // independent view disagrees materially with T212's total we mark NAV incomplete
+    // and skip the gates rather than gate on numbers we can't reconcile.
     const positions = await this.positions.find({}).toArray() as unknown as PositionDoc[];
     let positionsGBP = 0;
     let positionsOk = true;
     try {
       positionsGBP = await sumPositionsGBP(positions, this.fx);
     } catch (err) {
-      this.logger.warn({ err }, 'FX unavailable for NAV, degrading to cash-only (NAV reading INCOMPLETE)');
+      this.logger.warn({ err }, 'FX unavailable for cross-check (NAV reading INCOMPLETE)');
       positionsOk = false;
     }
 
-    let cashGBP = 0;
+    let navGBP = 0;
     let cashOk = true;
     try {
       const cash = await this.trading.getCash();
-      // Wire format post-FX-fix: free + total are Money in GBP. We want free + positions to avoid
-      // double-counting (positions are already in positionsGBP).
-      if (cash.free.currency === 'GBP') {
-        cashGBP = cash.free.amount;
+      if (cash.total.currency === 'GBP') {
+        navGBP = cash.total.amount;
       } else {
-        this.logger.warn({ currency: cash.free.currency }, 'cash response not in GBP, using 0 (NAV reading INCOMPLETE)');
+        this.logger.warn({ currency: cash.total.currency }, 'cash response not in GBP (NAV reading INCOMPLETE)');
         cashOk = false;
       }
     } catch (err) {
-      this.logger.warn({ err }, 'cash fetch failed, NAV degrades to positions-only (NAV reading INCOMPLETE)');
+      this.logger.warn({ err }, 'cash fetch failed (NAV reading INCOMPLETE)');
       cashOk = false;
     }
 
-    return { nav: positionsGBP + cashGBP, complete: positionsOk && cashOk };
+    return { nav: navGBP, complete: positionsOk && cashOk };
+  }
+
+  // Single trip transition. Order matters:
+  //   1. Flip the Redis flag so any concurrent generate cycle short-circuits immediately.
+  //   2. Bulk-cancel BUYs in {pending, approved, queued}. SELLs stay — they're typically
+  //      risk-exits and we never want to block the deleveraging path the breaker is meant
+  //      to encourage. `executing` rows are left to FillsPoller (racing T212 is worse).
+  //   3. Capture the post-mortem snapshot (incl. the cancelled ids).
+  //   4. risk_rejections log entry (preserves the older log shape — pre-existing dashboards).
+  // Each step is best-effort: failures are logged but never block the next step. The
+  // breaker MUST end up tripped even if Mongo writes throw.
+  private async _onTrip(ctx: TripContext): Promise<void> {
+    await this.cb.trip(ctx.reasonText);
+
+    let cancelledIds: string[] = [];
+    if (this.signalRepo) {
+      try {
+        cancelledIds = await this.signalRepo.bulkCancelOpenBuys(
+          SignalFailureReason.AutoCancelledCircuitBreaker,
+          `auto-drain on ${ctx.reason}: ${ctx.reasonText}`,
+        );
+        this.logger.warn({ reason: ctx.reason, cancelled: cancelledIds.length },
+          'circuit-breaker auto-drain: cancelled open BUYs');
+      } catch (err) {
+        this.logger.error({ err }, 'circuit-breaker auto-drain failed (breaker still tripped)');
+      }
+    } else {
+      this.logger.warn('circuit-breaker tripped but signalRepo not attached — skipping auto-drain');
+    }
+
+    if (this.tripRecorder) {
+      try { await this.tripRecorder.capture(ctx, cancelledIds); }
+      catch (err) {
+        this.logger.error({ err }, 'trip recorder failed (breaker still tripped, drain still ran)');
+      }
+    }
+
+    await this._logRejection(ctx.reason, {
+      dailyLossPct: ctx.dailyLossPct, drawdownPct: ctx.drawdownPct,
+      nav: ctx.nav, hwm: ctx.hwm, cancelled: cancelledIds.length,
+    });
   }
 
   private async _logRejection(reason: string, detail: Record<string, unknown>): Promise<void> {

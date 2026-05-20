@@ -163,6 +163,30 @@ export class MongoSignalRepository implements ISignalRepository {
     });
   }
 
+  async bulkCancelOpenBuys(reason: SignalFailureReason, detail: string): Promise<string[]> {
+    if (!this.collection) throw new Error('bulkCancelOpenBuys requires raw collection handle');
+    // Snapshot the ids first so the trip post-mortem can list exactly which signals
+    // were cancelled. The two-step (find → updateMany) opens a tiny race where a
+    // dispatcher claim lands between them; the updateMany then misses that row (now
+    // 'executing'), which is the correct outcome — once dispatched we don't cancel.
+    const targets = await this.collection.find(
+      {
+        action: 'BUY',
+        lifecycle: { $in: [SignalLifecycle.Pending, SignalLifecycle.Approved, SignalLifecycle.Queued] },
+      },
+      { projection: { id: 1, _id: 0 } },
+    ).toArray();
+    const ids = targets.map((d) => String((d as { id?: unknown }).id)).filter(Boolean);
+    if (ids.length === 0) return [];
+    await this.collection.updateMany(
+      { id: { $in: ids } },
+      { $set: { lifecycle: SignalLifecycle.Failed, failureReason: reason, failureDetail: detail } },
+    );
+    // Wildcard invalidate — per-id is wasteful for a bulk op.
+    await this.bus.publish('signals', '*');
+    return ids;
+  }
+
   private async invalidate(id: string): Promise<void> {
     await this.cache.invalidate(id);
     await this.bus.publish('signals', id);

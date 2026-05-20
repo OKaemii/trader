@@ -162,6 +162,7 @@ export enum SignalFailureReason {
   RetriesExhausted,      // hit ORDER_MAX_ATTEMPTS on transient errors (429 / network)
   ZeroQuantity,          // computed quantity below the sub-share minimum (e.g. target value < 1 share even fractional). Distinct from CashInsufficient: the cash IS there, the position is just too small to express in shares.
   ManualCancel,          // admin clicked Cancel in the portal
+  AutoCancelledCircuitBreaker,  // bulk-cancelled by RiskEngine on a circuit-breaker trip (BUYs in pending/approved/queued at trip time)
 }
 
 // TradeSignalDTO — wire format for MongoDB storage and notifications.
