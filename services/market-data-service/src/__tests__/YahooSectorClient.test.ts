@@ -129,6 +129,28 @@ describe('YahooSectorClient', () => {
     expect(quoteCalls[1]).toContain('crumb=STUBCRUMB');
   });
 
+  it('skips the rest of the batch when session bootstrap fails — does not hammer Yahoo per-ticker', async () => {
+    let crumbHits = 0;
+    const fetchFn = makeFetchMock({
+      'getcrumb': () => {
+        crumbHits++;
+        return new Response('rate limited', { status: 429 });
+      },
+      'AAPL': () => payload('Technology'),
+      'MSFT': () => payload('Technology'),
+      'GOOG': () => payload('Technology'),
+    });
+    const c = new YahooSectorClient({ fetchFn, ...NO_DELAY, sessionFailureCooldownMs: 1_000 });
+    const map = await c.fetchSectors(['AAPL_US_EQ', 'MSFT_US_EQ', 'GOOG_US_EQ']);
+    expect(Object.keys(map)).toHaveLength(0);
+    // The eager bootstrap fires once, retries up to maxAttempts (3) inside the
+    // batch-level try, then sets the cooldown. The subsequent per-ticker iterations
+    // see the cooldown and short-circuit without touching Yahoo.
+    expect(crumbHits).toBe(1);
+    // And no quoteSummary calls at all — the eager bootstrap stops us before iterating.
+    expect(fetchFn.calls.filter((u) => u.includes('quoteSummary'))).toHaveLength(0);
+  });
+
   it('on 401 invalidates the session and re-acquires on the next attempt', async () => {
     let quoteHits = 0;
     const fetchFn = makeFetchMock({

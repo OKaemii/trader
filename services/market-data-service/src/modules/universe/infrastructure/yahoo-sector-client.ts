@@ -47,6 +47,11 @@ export interface YahooSectorClientOptions {
   // doesn't tolerate bursts well. Default 200ms gives ~5 req/s, well under the
   // soft limits.
   interRequestMs?: number;
+  // How long to skip session-bootstrap attempts after a failed bootstrap. Without
+  // this, every ticker would re-trigger seed + crumb requests, hammering Yahoo's
+  // anti-abuse layer once the IP is already rate-limited. 15min default matches
+  // observed Yahoo cooldown windows; tests pass 0 to disable.
+  sessionFailureCooldownMs?: number;
   // Optional injected fetch for tests. Defaults to global fetch.
   fetchFn?: typeof fetch;
 }
@@ -58,6 +63,7 @@ const DEFAULTS: Required<Omit<YahooSectorClientOptions, 'fetchFn'>> = {
   maxAttempts:    3,
   retryBackoffMs: 200,
   interRequestMs: 200,
+  sessionFailureCooldownMs: 15 * 60_000,
 };
 
 // Yahoo refuses default Node user-agents on the crumb endpoint. Sending a real
@@ -92,6 +98,7 @@ export class YahooSectorClient {
   private readonly maxAttempts:    number;
   private readonly retryBackoffMs: number;
   private readonly interRequestMs: number;
+  private readonly sessionFailureCooldownMs: number;
   private readonly fetchFn:        typeof fetch;
   // In-memory hit cache across the lifetime of one UniverseManager.refresh. Useful
   // when the same shortName resolves into multiple T212 tickers (cross-listings) so
@@ -100,6 +107,10 @@ export class YahooSectorClient {
   // Cached session (cookie + crumb). Acquired lazily on first fetchOne; cleared on
   // any 401/403 so the next retry re-acquires.
   private session: YahooSession | null = null;
+  // Unix-ms timestamp before which getSession() short-circuits without hitting
+  // Yahoo. Set when a bootstrap fails. Without this, every ticker in a 192-ticker
+  // batch would re-trigger seed + crumb requests, pinning the IP at the 429 wall.
+  private sessionRetryAfter: number = 0;
 
   constructor(opts: YahooSectorClientOptions = {}) {
     this.baseUrl        = opts.baseUrl        ?? DEFAULTS.baseUrl;
@@ -108,6 +119,7 @@ export class YahooSectorClient {
     this.maxAttempts    = opts.maxAttempts    ?? DEFAULTS.maxAttempts;
     this.retryBackoffMs = opts.retryBackoffMs ?? DEFAULTS.retryBackoffMs;
     this.interRequestMs = opts.interRequestMs ?? DEFAULTS.interRequestMs;
+    this.sessionFailureCooldownMs = opts.sessionFailureCooldownMs ?? DEFAULTS.sessionFailureCooldownMs;
     this.fetchFn        = opts.fetchFn        ?? ((globalThis.fetch) as typeof fetch);
   }
 
@@ -115,24 +127,46 @@ export class YahooSectorClient {
   // session cookie, then fetch a crumb against the same cookie. Yahoo's anti-abuse
   // layer treats requests without (cookie ∧ crumb) as 401, so this MUST succeed
   // before any quoteSummary call lands.
+  //
+  // Failure cooldown: a failed bootstrap sets `sessionRetryAfter` so subsequent
+  // tickers in the same batch short-circuit (throw immediately) instead of each
+  // re-hitting Yahoo. Without this, the 192-ticker enrichment loop sends 192+
+  // seed/crumb requests in a row — guaranteed 429.
   private async getSession(): Promise<YahooSession> {
     if (this.session) return this.session;
-    const seedRes = await this.fetchFn(this.seedUrl, {
-      headers: { 'User-Agent': BROWSER_UA, Accept: '*/*' },
-      redirect: 'manual',   // fc.yahoo.com replies 302; we only need the Set-Cookie on this hop
-    });
-    const cookie = extractCookieHeader(seedRes);
-    if (!cookie) throw new Error(`Yahoo session bootstrap: no Set-Cookie from ${this.seedUrl} (HTTP ${seedRes.status})`);
-    const crumbRes = await this.fetchFn(this.crumbUrl, {
-      headers: { 'User-Agent': BROWSER_UA, Accept: '*/*', Cookie: cookie },
-    });
-    if (!crumbRes.ok) throw new Error(`Yahoo crumb fetch: HTTP ${crumbRes.status}`);
-    const crumb = (await crumbRes.text()).trim();
-    // Yahoo occasionally returns an HTML consent page (EU geo) instead of the bare crumb token.
-    // Detect that explicitly so we fail loudly instead of sending '<!DOCTYPE...' as the crumb.
-    if (!crumb || crumb.startsWith('<')) throw new Error('Yahoo crumb fetch: empty or non-token response');
-    this.session = { cookie, crumb };
-    return this.session;
+    const now = Date.now();
+    if (now < this.sessionRetryAfter) {
+      const waitMs = this.sessionRetryAfter - now;
+      throw new Error(`Yahoo session bootstrap: cooldown for another ${Math.ceil(waitMs / 1000)}s after recent failure`);
+    }
+    try {
+      const seedRes = await this.fetchFn(this.seedUrl, {
+        headers: { 'User-Agent': BROWSER_UA, Accept: '*/*' },
+        redirect: 'manual',   // fc.yahoo.com replies 302; we only need the Set-Cookie on this hop
+      });
+      const cookie = extractCookieHeader(seedRes);
+      if (!cookie) throw new Error(`Yahoo session bootstrap: no Set-Cookie from ${this.seedUrl} (HTTP ${seedRes.status})`);
+      const crumbRes = await this.fetchFn(this.crumbUrl, {
+        headers: { 'User-Agent': BROWSER_UA, Accept: '*/*', Cookie: cookie },
+      });
+      if (!crumbRes.ok) throw new Error(`Yahoo crumb fetch: HTTP ${crumbRes.status}`);
+      const crumb = (await crumbRes.text()).trim();
+      // Yahoo occasionally returns an HTML consent page (EU geo) instead of the bare crumb token.
+      // Detect that explicitly so we fail loudly instead of sending '<!DOCTYPE...' as the crumb.
+      if (!crumb || crumb.startsWith('<')) throw new Error('Yahoo crumb fetch: empty or non-token response');
+      this.session = { cookie, crumb };
+      return this.session;
+    } catch (err) {
+      // Don't keep hammering Yahoo's anti-abuse layer. Mark a cooldown so every
+      // subsequent fetchOne in this batch fails fast without sending more requests.
+      this.sessionRetryAfter = Date.now() + this.sessionFailureCooldownMs;
+      throw err;
+    }
+  }
+
+  /** Drop the cached session (e.g. after a 401) so the next getSession() re-acquires. */
+  private invalidateSession(): void {
+    this.session = null;
   }
 
   /**
@@ -143,6 +177,17 @@ export class YahooSectorClient {
    */
   async fetchSectors(tickers: string[]): Promise<Record<string, SectorLookup>> {
     const out: Record<string, SectorLookup> = {};
+    if (tickers.length === 0) return out;
+    // Eager bootstrap. If the session can't be acquired (Yahoo IP rate-limit, EU
+    // consent wall, etc.), skip the whole batch instead of iterating 192 tickers
+    // and re-tripping the cooldown. UniverseManager treats an empty return as
+    // "leave existing sectors as 'Unknown', try again next refresh."
+    try {
+      await this.getSession();
+    } catch (err) {
+      log.warn(`[yahoo-sector] session bootstrap failed — skipping ${tickers.length} ticker(s) until next refresh: ${String(err)}`);
+      return out;
+    }
     for (const ticker of tickers) {
       const result = await this.fetchOne(ticker);
       if (result) out[ticker] = result;
@@ -210,7 +255,7 @@ export class YahooSectorClient {
     // outer retry loop's next attempt re-acquires. Throwing keeps the retry path
     // running rather than memoising a permanent miss.
     if (res.status === 401 || res.status === 403) {
-      this.session = null;
+      this.invalidateSession();
       throw new Error(`Yahoo quoteSummary ${yahooSymbol}: HTTP ${res.status} (session reset)`);
     }
     if (res.status === 404) return null;
