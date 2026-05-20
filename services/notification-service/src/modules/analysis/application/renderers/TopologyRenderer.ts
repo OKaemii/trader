@@ -1,8 +1,9 @@
 import type { Logger } from '@trader/core';
 import type { StrategyOutput } from '@trader/shared-types';
 import type { CycleBatch } from '../CycleAnalysisBatcher.ts';
-import type {
-    ReportContext, SanityFlag, StrategyRenderer, TelemetryBlock,
+import {
+    mergeBatchFeatures,
+    type ReportContext, type SanityFlag, type StrategyRenderer, type TelemetryBlock,
 } from '../ReportContext.ts';
 import {
     buildNarrative, escapeHtml, formatWindowLabel, type NarrativeLLM,
@@ -31,7 +32,7 @@ export class TopologyRenderer implements StrategyRenderer {
     ) {}
 
     async build(batch: CycleBatch, telemetry: TelemetryBlock, sanity: SanityFlag[]): Promise<ReportContext> {
-        const head = batch.signals[0]?.features_snapshot;
+        const head = mergeBatchFeatures(batch);
         const extraFlags = head ? this.strategyRules(head) : [];
         const allFlags   = [...sanity, ...extraFlags];
 

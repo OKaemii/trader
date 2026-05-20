@@ -48,6 +48,18 @@ type Rule = (ctx: SanityContext, cfg: Required<SanityCheckerConfig>) => SanityFl
 const ruleConfidenceSingletonFallback: Rule = (ctx, cfg) => {
     const composite = ctx.headFeatures?.composite_scores;
     if (!composite) return null;
+    // The signal-service sparse-positive path is evaluated against the WHOLE universe
+    // (ticker_universe.length entries in composite_scores). The head we see here is
+    // built by mergeBatchFeatures over per-signal slices — composite_scores has one
+    // entry per *pick*, not per universe ticker. For a typical small batch (1-5 picks)
+    // `posCount < minPositivePeers` is mechanically true even when the upstream
+    // universe was fully populated, so the rule false-positives on every cycle.
+    //
+    // We only evaluate when the head looks universe-shaped — meaning composite_scores
+    // is materially larger than the batch's signal count. Otherwise the signal-service
+    // fallback path can't be diagnosed from this side and we silently skip.
+    const universeShaped = Object.keys(composite).length > ctx.signals.length;
+    if (!universeShaped) return null;
     const posCount = Object.values(composite).filter((v) => v > 0).length;
     if (posCount >= cfg.minPositivePeers) return null;
     // The fix-up-the-math rule. factor_rank cares the most (its picks are cross-sectional
