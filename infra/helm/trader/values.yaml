@@ -15,7 +15,7 @@ global:
     # deployment templates can read `.Values.global.env.*` directly. Bump these and redeploy —
     # no code change required for any of the toggles documented in CLAUDE.md.
     tradingMode: Demo                   # Paper (notify only) | Demo (demo.trading212) | Live (trading212; admin gate required)
-    signalOrderType: Limit              # Limit (T212-friendly, weekly) | Market (immediate fill, daily). Risk-exits always Market.
+    signalOrderType: Market             # Limit (T212-friendly, weekly) | Market (immediate fill, daily). Risk-exits always Market. Paired with barFrequency=intraday — 15m signals can't sit on limit orders.
     barFrequency: intraday                 # daily | intraday
     # Default polling cadence for market-data-service live polling. Must be one of the
     # active provider's allowedPollIntervals (Yahoo: 15m / 1h / 24h). The portal renders
