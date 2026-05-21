@@ -12,15 +12,19 @@ export class T212OrderExecutor implements IOrderExecutor {
     quantity:    number;
     limitPrice?: number;
   }): Promise<OrderExecutionResult> {
-    // Long-only: selling means reducing/exiting a long position — quantity must be positive
-    const qty = Math.abs(params.quantity);
-    if (qty === 0) return { t212OrderId: '', status: OrderStatus.Failed, message: 'quantity is 0' };
+    // T212's /equity/orders/{market,limit} uses a signed quantity: positive = BUY,
+    // negative = SELL. Stripping the sign with Math.abs submitted every SELL as a
+    // BUY, which T212 rejected with `/api-errors/insufficient-free-for-stocks-buy`
+    // when cash was tight or — worse — executed as an additional BUY when it wasn't.
+    const magnitude = Math.abs(params.quantity);
+    if (magnitude === 0) return { t212OrderId: '', status: OrderStatus.Failed, message: 'quantity is 0' };
+    const signedQty = params.side === OrderSide.Sell ? -magnitude : magnitude;
 
     if (params.orderType === OrderType.Limit && params.limitPrice) {
-      const result = await this.client.placeLimitOrder(params.ticker, qty, params.limitPrice);
+      const result = await this.client.placeLimitOrder(params.ticker, signedQty, params.limitPrice);
       return { t212OrderId: result.orderId, status: OrderStatus.Submitted };
     } else {
-      const result = await this.client.placeMarketOrder(params.ticker, qty);
+      const result = await this.client.placeMarketOrder(params.ticker, signedQty);
       return { t212OrderId: result.orderId, status: OrderStatus.Submitted };
     }
   }
