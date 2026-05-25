@@ -72,9 +72,9 @@ resource "helm_release" "mongodb" {
     # not node pressure). 4Gi absorbs reconnection + WiredTiger-cache spikes; the
     # eventual barsBackend cutover will re-roll consumers and re-storm.
     { name = "resources.limits.cpu",      value = "1500m" },
-    { name = "resources.limits.memory",   value = "4Gi" },
+    { name = "resources.limits.memory",   value = "3Gi" },
     { name = "resources.requests.cpu",    value = "500m" },
-    { name = "resources.requests.memory", value = "1536Mi" },
+    { name = "resources.requests.memory", value = "1Gi" },
   ]
 }
 
@@ -118,9 +118,9 @@ resource "helm_release" "timescaledb" {
     # query/insert load on the 706k-row hypertable (2026-05-25). Size it for the live
     # bar store (node has ample RAM): 4Gi covers work_mem sorts + compression + WAL.
     { name = "primary.resources.limits.cpu",      value = "2000m" },
-    { name = "primary.resources.limits.memory",   value = "4Gi" },
+    { name = "primary.resources.limits.memory",   value = "2Gi" },
     { name = "primary.resources.requests.cpu",    value = "500m" },
-    { name = "primary.resources.requests.memory", value = "1Gi" },
+    { name = "primary.resources.requests.memory", value = "256Mi" },
   ]
 
   # CREATE EXTENSION inside the trader_ts DB on first boot. Runs as the superuser
