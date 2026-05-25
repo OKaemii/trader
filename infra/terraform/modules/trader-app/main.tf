@@ -66,6 +66,15 @@ resource "helm_release" "mongodb" {
     # that key, so it was patched in manually (2026-05-15) and the chart reads it
     # from there on subsequent applies. If the Secret is ever deleted/recreated
     # the chart will generate a fresh key — harmless for a 1-member rs.
+    # Memory bumped 2026-05-25: the chart's default ~1500Mi limit OOMKilled mongodb
+    # during the connection storm when the three-database-split deploy rolled all
+    # consumers at once (node has ample RAM — this is a per-container cgroup limit,
+    # not node pressure). 4Gi absorbs reconnection + WiredTiger-cache spikes; the
+    # eventual barsBackend cutover will re-roll consumers and re-storm.
+    { name = "resources.limits.cpu",      value = "1500m" },
+    { name = "resources.limits.memory",   value = "4Gi" },
+    { name = "resources.requests.cpu",    value = "500m" },
+    { name = "resources.requests.memory", value = "1536Mi" },
   ]
 }
 
@@ -83,6 +92,10 @@ resource "helm_release" "timescaledb" {
     # hypertable, not a plain table.
     { name = "image.repository", value = "timescale/timescaledb" },
     { name = "image.tag",        value = "2.17.2-pg16" },
+    # Bitnami postgresql 15.x+ verifies images against an allowlist and refuses
+    # non-Bitnami images (bitnami/charts#30850). We intentionally run the upstream
+    # timescale/timescaledb image, so opt out of that verification gate.
+    { name = "global.security.allowInsecureImages", value = "true" },
     { name = "auth.username",       value = "trader" },
     { name = "auth.password",       value = var.timescaledb_password },
     { name = "auth.postgresPassword", value = var.timescaledb_password },
@@ -113,6 +126,14 @@ resource "helm_release" "timescaledb" {
           "00-extension.sql" = "CREATE EXTENSION IF NOT EXISTS timescaledb;\n"
         }
       }
+      # The upstream timescale/timescaledb image is built on the OFFICIAL postgres
+      # image: it creates the initial DB from POSTGRES_DB (Bitnami sets only
+      # POSTGRES_DATABASE, which the official entrypoint ignores) and writes its
+      # socket/lock to /var/run/postgresql, which the chart's read-only rootfs leaves
+      # unwritable. Supply POSTGRES_DB + a writable emptyDir so the image boots.
+      extraEnvVars      = [{ name = "POSTGRES_DB", value = "trader_ts" }]
+      extraVolumes      = [{ name = "pg-run", emptyDir = {} }]
+      extraVolumeMounts = [{ name = "pg-run", mountPath = "/var/run/postgresql" }]
     }
   })]
 }
