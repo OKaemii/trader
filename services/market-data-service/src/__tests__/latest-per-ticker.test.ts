@@ -13,7 +13,10 @@ import type { OHLCVBar } from '@trader/shared-types';
 
 function bar(ticker: string, ts: number, close: number): OHLCVBar {
   return {
-    ticker, timestamp: ts, interval: '5m',
+    ticker,
+    observation_ts: ts,
+    timestamp:      ts,
+    interval:       '5m',
     open: close, high: close, low: close, close, volume: 1,
   };
 }

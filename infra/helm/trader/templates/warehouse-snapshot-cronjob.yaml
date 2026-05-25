@@ -1,0 +1,71 @@
+# Daily snapshot of every Timescale hypertable into Parquet on the research
+# warehouse PV. The snapshotter container (services/warehouse-snapshotter) reads
+# yesterday's day-window from each hypertable and writes Hive-partitioned
+# Parquet files under /srv/warehouse/snapshots/<table>/observation_date=YYYY-MM-DD.parquet.
+#
+# Schedule:
+#   23:30 UTC daily. Picked to land after both US (closes 21:00 UTC) and LSE
+#   (closes 16:30 UTC) so the last bars of the trading day are in Timescale
+#   before we snapshot. Earlier would miss the EOD close; later eats into the
+#   next day's pre-market activity (US pre-market starts 09:00 UTC = 04:00 ET).
+#
+# Idempotency: the snapshotter writes via tmpfile + atomic rename, so any
+# re-run (manual debug, ConcurrencyPolicy=Replace on a still-running job, etc.)
+# safely overwrites the previous day's file without leaving a partial.
+#
+# Retention: successfulJobsHistoryLimit=3 keeps three recent succeeded pods for
+# log inspection; failedJobsHistoryLimit=5 keeps a longer trail so an operator
+# debugging a 4-day-stale snapshot has enough history to find the divergence.
+#
+# Run cost: ~5–30 seconds end-to-end for a typical day (200 tickers, ~78 5m
+# bars/day on `bars`, ~10–50 audit rows per hypertable). Resource limits sized
+# small accordingly.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: warehouse-snapshot
+  namespace: {{ .Release.Namespace }}
+spec:
+  schedule: "30 23 * * *"
+  timeZone: "UTC"
+  concurrencyPolicy: Forbid          # don't stack runs; if yesterday's still going, skip today
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  startingDeadlineSeconds: 1800       # if controller misses the tick by >30min, skip rather than backfill
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app: warehouse-snapshot
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: snapshotter
+              image: {{ .Values.services.warehouseSnapshotter.image | default "trader/warehouse-snapshotter:latest" }}
+              imagePullPolicy: IfNotPresent
+              # The Dockerfile's ENTRYPOINT is `python -m src.snapshot`; no
+              # `--date` arg → defaults to yesterday UTC.
+              env:
+                - name: TIMESCALEDB_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: trader-secrets
+                      key: TIMESCALEDB_PASSWORD
+                - name: TIMESCALE_URL
+                  value: "postgresql://trader:$(TIMESCALEDB_PASSWORD)@timescaledb-postgresql:5432/trader_ts"
+              volumeMounts:
+                - name: warehouse
+                  mountPath: /srv/warehouse
+              resources:
+                limits:
+                  memory: "1Gi"
+                  cpu:    "1000m"
+                requests:
+                  memory: "256Mi"
+                  cpu:    "200m"
+          volumes:
+            - name: warehouse
+              persistentVolumeClaim:
+                claimName: warehouse-pvc

@@ -23,6 +23,8 @@ spec:
             - secretRef:
                 name: trader-secrets
           env:
+            - name: LOG_LEVELS
+              value: {{ .Values.global.env.logLevels | default "error,warn" | quote }}
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -37,6 +39,15 @@ spec:
               value: "redis://:$(REDIS_PASSWORD)@redis-master:6379"
             - name: MONGODB_URL
               value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb-headless:27017/trader?authSource=trader&directConnection=true"
+            - name: TIMESCALEDB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: TIMESCALEDB_PASSWORD
+            - name: TIMESCALE_URL
+              value: "postgresql://trader:$(TIMESCALEDB_PASSWORD)@timescaledb-postgresql:5432/trader_ts"
+            - name: BARS_BACKEND
+              value: {{ .Values.global.env.barsBackend | default "mongo" | quote }}
             - name: TRADING_MODE
               value: {{ .Values.global.env.tradingMode | default "Paper" | quote }}
             - name: SIGNAL_ORDER_TYPE

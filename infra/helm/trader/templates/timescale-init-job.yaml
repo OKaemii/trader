@@ -1,0 +1,61 @@
+# Timescale schema init — runs the @trader/shared-pg migration runner against
+# the trader_ts database on every helm install / upgrade. The runner is
+# idempotent (already-applied files are skipped via the schema_migrations
+# table), so re-execution on every upgrade is safe and intentional.
+#
+# Hook ordering:
+#   - hook-weight: -5  — runs before the application Deployments come up,
+#     so the schema is in place by the time market-data-service/signal-service
+#     try to dual-write or read.
+#   - delete-policy: before-hook-creation,hook-succeeded — old hook pods are
+#     cleaned up so `kubectl get pods` doesn't fill with completed migrate jobs.
+#
+# Image: reuses the market-data-service image (which depends on
+# @trader/shared-pg). The image's normal CMD is overridden to run dist/migrate.js
+# instead of the service entrypoint. No separate image build to maintain.
+#
+# Connection: TIMESCALE_URL is assembled in the env block from the
+# TIMESCALEDB_PASSWORD secret (provisioned by infra/terraform/modules/k8s-bootstrap)
+# and the host/port/database from values.yaml.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: timescale-init
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  # Allow the pod itself a few seconds to come up; the entrypoint already
+  # retries connection failures for ~30s, so the Job-level backoffLimit is just
+  # there to recover from container-crash style failures.
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: timescale-init
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: {{ .Values.services.marketDataService.image | default "trader/market-data-service:latest" }}
+          imagePullPolicy: IfNotPresent
+          command: ["node", "services/market-data-service/dist/migrate.js"]
+          env:
+            - name: TIMESCALEDB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: TIMESCALEDB_PASSWORD
+            - name: TIMESCALE_URL
+              value: "postgresql://{{ .Values.timescaledb.user }}:$(TIMESCALEDB_PASSWORD)@{{ .Values.timescaledb.host }}:{{ .Values.timescaledb.port }}/{{ .Values.timescaledb.database }}"
+            - name: LOG_LEVELS
+              value: {{ .Values.global.env.logLevels | default "error,warn,info" | quote }}
+          resources:
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+            requests:
+              memory: "64Mi"
+              cpu: "50m"

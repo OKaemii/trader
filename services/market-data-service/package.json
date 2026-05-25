@@ -21,11 +21,15 @@
     "@trader/shared-calendar": "workspace:*",
     "@trader/shared-fx": "workspace:*",
     "@trader/shared-mongo": "workspace:*",
+    "@trader/shared-pg": "workspace:*",
     "@trader/shared-redis": "workspace:*",
     "@trader/shared-types": "workspace:*",
     "hono": "^4.3.0",
     "mongodb": "^6.5.0",
     "redis": "^4.7.0",
     "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "testcontainers": "^10.13.2"
   }
 }

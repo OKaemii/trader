@@ -8,8 +8,13 @@ global:
     # set to e.g. "http://otel-collector.observability:4318/v1/traces" once a Tempo/Jaeger
     # collector is stood up. Logger emits traceId/spanId on every line when active.
     otelCollectorUrl: ""
-    # Pino log level for every TS service.
-    logLevel: info
+    # Log-level allowlist for every TS service. The packages/core logger filters by
+    # this set — comma-separated, any subset of {error,warn,info,profile}. `profile`
+    # is the new low-importance tier (health probes / heartbeats / idle ticks); keep
+    # it out of the allowlist unless you're actively debugging. Default ships
+    # error+warn only — `info` is suppressed so the dispatcher / fills-poller idle
+    # chatter doesn't drown out the signal.
+    logLevels: "error,warn"
 
     # Single source of truth for all service-tunable env vars. Lives under `global` so subchart
     # deployment templates can read `.Values.global.env.*` directly. Bump these and redeploy —
@@ -17,6 +22,39 @@ global:
     tradingMode: Demo                   # Paper (notify only) | Demo (demo.trading212) | Live (trading212; admin gate required)
     signalOrderType: Market             # Limit (T212-friendly, weekly) | Market (immediate fill, daily). Risk-exits always Market. Paired with barFrequency=intraday — 15m signals can't sit on limit orders.
     barFrequency: intraday                 # daily | intraday
+    # Live bar-storage backend selector. `mongo` (default) keeps the existing path; `timescale`
+    # flips the shared-bars dispatcher onto the new Timescale hypertable.
+    #
+    # ⚠  DO NOT flip to `timescale` without running this sequence first:
+    #
+    #   1. Deploy Timescale chart (terraform apply with the trader-app module's
+    #      helm_release.timescaledb already in place — Task 1).
+    #   2. Wait for the timescale-init Helm hook job to apply the schema migrations
+    #      (Task 4). Verify with: kubectl logs job/timescale-init -n trader
+    #   3. Set dualWriteBars="true" (below). Redeploy market-data-service. Live polls
+    #      and admin backfills now write both stores; verification job catches drift.
+    #   4. Wait ≥48h with zero rows in the Mongo dual_write_failures collection AND
+    #      zero mismatches from the equivalence verification job.
+    #   5. Run the Mongo→Timescale backfill migration (Task 14):
+    #        pnpm tsx infra/migrations/2026-05-23-bars-mongo-to-timescale.ts
+    #   6. NOW flip this value to `timescale`. terraform apply rolls each consumer
+    #      Deployment (signal/trading/portfolio/backtest) to the new backend.
+    #   7. Watch signal-service logs for read errors for one week; keep dualWriteBars=true
+    #      throughout so Mongo stays current as a rollback target.
+    #   8. After that week, flip dualWriteBars="false" and (Task 20) drop Mongo
+    #      ohlcv_bars.
+    #
+    # Rollback: if reads break after this flip, set back to `mongo` and redeploy —
+    # Mongo is still being dual-written, so the data is current.
+    #
+    # See agent-docs/plans/three-database-split.md §Cutover.
+    barsBackend: mongo                  # mongo | timescale
+    # Migration-window toggle: when true, market-data-service writes every bar to BOTH Mongo
+    # AND Timescale (best-effort on the PG side — Mongo failures fail the request; PG failures
+    # log to the dual_write_failures collection without affecting the Mongo write). Default
+    # off so production keeps single-writing to Mongo until the operator deliberately enables
+    # the cutover sequence.
+    dualWriteBars: "false"              # "true" enables Timescale dual-write
     # Default polling cadence for market-data-service live polling. Must be one of the
     # active provider's allowedPollIntervals (Yahoo: 15m / 1h / 24h). The portal renders
     # the dropdown from those values; this default is what new deploys land on before
@@ -106,6 +144,19 @@ mongodb:
   port: 27017
   database: trader
 
+# Bitnami postgresql chart with the timescale/timescaledb image — the live
+# time-series + append-only audit store. See agent-docs/plans/three-database-split.md.
+# Deployment lives in infra/terraform/modules/trader-app/main.tf (sibling helm_release,
+# same pattern as mongodb/redis above). The password is injected by k8s-bootstrap
+# into the trader-secrets Secret under TIMESCALEDB_PASSWORD; consumer Deployments
+# read it via secretKeyRef (added in three-database-split task 11). The full URL is
+# assembled service-side from {host, port, database, user, $TIMESCALEDB_PASSWORD}.
+timescaledb:
+  host: timescaledb-postgresql
+  port: 5432
+  database: trader_ts
+  user: trader
+
 ingress:
   host: trader.local
   className: nginx
@@ -143,6 +194,12 @@ services:
     replicaCount: 1
     image: trader/backtest-engine:latest
     port: 8001
+  # Warehouse-snapshotter has no replicaCount/port — it runs only as the
+  # warehouse-snapshot CronJob (templates/warehouse-snapshot-cronjob.yaml).
+  # Image tag matches the convention of the other services so build-images.sh
+  # can produce it the same way.
+  warehouseSnapshotter:
+    image: trader/warehouse-snapshotter:latest
   frontendWeb:
     replicaCount: 1
     image: trader/frontend-web:latest

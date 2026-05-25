@@ -3,6 +3,7 @@ variable "jwt_secret" { sensitive = true }
 variable "internal_secret" { sensitive = true }
 variable "redis_password" { sensitive = true }
 variable "mongodb_password" { sensitive = true }
+variable "timescaledb_password" { sensitive = true }
 variable "t212_api_key" { sensitive = true }
 variable "t212_api_key_id" {
   sensitive = true
@@ -42,6 +43,7 @@ resource "kubernetes_secret" "trader_secrets" {
     INTERNAL_SECRET     = var.internal_secret
     REDIS_PASSWORD      = var.redis_password
     MONGODB_PASSWORD    = var.mongodb_password
+    TIMESCALEDB_PASSWORD = var.timescaledb_password
     T212_API_KEY         = var.t212_api_key
     T212_API_KEY_ID      = var.t212_api_key_id
     T212_API_KEY_DEMO    = var.t212_api_key_demo

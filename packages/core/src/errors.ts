@@ -1,5 +1,5 @@
 import type { Context } from "hono";
-import type { Logger } from "pino";
+import type { Logger } from "./logger.ts";
 
 export type AppErrorStatus = 400 | 401 | 403 | 404 | 409 | 422 | 500;
 

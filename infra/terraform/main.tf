@@ -6,6 +6,7 @@ module "k8s_bootstrap" {
   internal_secret     = var.internal_secret
   redis_password      = var.redis_password
   mongodb_password    = var.mongodb_password
+  timescaledb_password = var.timescaledb_password
   t212_api_key         = var.t212_api_key
   t212_api_key_id      = var.t212_api_key_id
   t212_api_key_demo    = var.t212_api_key_demo
@@ -42,6 +43,7 @@ module "trader_app" {
   namespace  = var.namespace
   depends_on = [module.k8s_bootstrap, module.nginx_ingress, module.keda]
 
-  redis_password   = var.redis_password
-  mongodb_password = var.mongodb_password
+  redis_password       = var.redis_password
+  mongodb_password     = var.mongodb_password
+  timescaledb_password = var.timescaledb_password
 }

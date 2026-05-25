@@ -4,11 +4,19 @@
 // market-data-service live polling and the admin backfill endpoint). Redis is a
 // pure read cache: SET on miss with TTL, DEL on invalidate. The cache holds the
 // already-sorted, fully-deserialized time series for a fixed set of range keys
-// (30d/60d/90d/1y) so consumers don't reconstruct it on every call.
+// (30d/60d/90d/180d) so consumers don't reconstruct it on every call.
+//
+// Bi-temporal storage: every row carries an `observation_ts` (wall-clock instant
+// the bar describes) and a `knowledge_ts` (wall-clock instant the row was written).
+// Live reads filter to `is_superseded:false`, which selects exactly one row per
+// (ticker, observation_ts, interval) via a partial unique index. As-of reads pass
+// `asOf` (a knowledge_ts upper bound), bypass the partial index, and aggregate to
+// pick the latest revision known at that time. See
+// agent-docs/plans/point-in-time-bar-history.md.
 //
 // Why a fixed range key set instead of arbitrary day counts:
 //   - cache hit rate is much higher when the same N keys repeat across consumers
-//   - invalidation pattern is simple: `bars:{ticker}:{interval}:*` covers all ranges
+//   - invalidation pattern is simple: `bars:v2:{ticker}:{interval}:*` covers all ranges
 //   - a slightly-too-large range is cheaper than re-querying Mongo; consumers can
 //     trim the returned array themselves
 //
@@ -19,6 +27,10 @@ import type { Db } from 'mongodb';
 import type { RedisClientType } from 'redis';
 import type { OHLCVBar, BarInterval } from '@trader/shared-types';
 import { COLLECTIONS } from '@trader/shared-mongo';
+import { getBarsFromPg, pgCacheKey } from './pg-bar-reader.ts';
+
+export { hashBarContent } from './content-hash.ts';
+export { getBarsFromPg, getLastClosePg, pgCacheKey } from './pg-bar-reader.ts';
 
 export type RangeKey = '30d' | '60d' | '90d' | '180d';
 
@@ -46,14 +58,10 @@ const INTERVAL_MS: Record<BarInterval, number> = {
  *   close  = last bar's close in the bucket
  *   volume = sum of volumes
  *
- * Bucket boundary is `floor(timestamp / bucketMs) * bucketMs`. For `daily` this aligns
- * to 00:00:00Z; an LSE trading session that runs ~07:00-15:30 UTC and a US session
- * ~14:30-21:00 UTC will both fold into the same UTC day bucket, which matches how the
- * existing strategy treats daily bars.
- *
- * Bars NOT aligned to the bucket size (e.g. weekly aggregation when the bucket spans
- * a market close) are still grouped by UTC-day fold; the strategy treats those as
- * a single "day" of price action.
+ * Bucket boundary is `floor(observation_ts / bucketMs) * bucketMs`. For `daily` this
+ * aligns to 00:00:00Z; an LSE trading session that runs ~07:00-15:30 UTC and a US
+ * session ~14:30-21:00 UTC will both fold into the same UTC day bucket, which matches
+ * how the existing strategy treats daily bars.
  */
 export function aggregateBars(source: OHLCVBar[], to: BarInterval): OHLCVBar[] {
   const head = source[0];
@@ -64,7 +72,7 @@ export function aggregateBars(source: OHLCVBar[], to: BarInterval): OHLCVBar[] {
 
   const buckets = new Map<number, OHLCVBar[]>();
   for (const b of source) {
-    const key = Math.floor(b.timestamp / bucketMs) * bucketMs;
+    const key = Math.floor(b.observation_ts / bucketMs) * bucketMs;
     let list = buckets.get(key);
     if (!list) { list = []; buckets.set(key, list); }
     list.push(b);
@@ -73,7 +81,7 @@ export function aggregateBars(source: OHLCVBar[], to: BarInterval): OHLCVBar[] {
   const out: OHLCVBar[] = [];
   const ticker = head.ticker;
   for (const [bucketStart, list] of Array.from(buckets.entries()).sort((a, b) => a[0] - b[0])) {
-    list.sort((a, b) => a.timestamp - b.timestamp);
+    list.sort((a, b) => a.observation_ts - b.observation_ts);
     const first = list[0];
     const last  = list[list.length - 1];
     if (!first || !last) continue;
@@ -85,12 +93,15 @@ export function aggregateBars(source: OHLCVBar[], to: BarInterval): OHLCVBar[] {
     }
     out.push({
       ticker,
-      timestamp: bucketStart,
-      interval:  to,
-      open:      first.open,
+      observation_ts: bucketStart,
+      // Legacy alias for downstream consumers still reading `timestamp`. Removed in the
+      // major schema bump that retires the deprecated field.
+      timestamp:      bucketStart,
+      interval:       to,
+      open:           first.open,
       high,
       low,
-      close:     last.close,
+      close:          last.close,
       volume,
     });
   }
@@ -100,56 +111,133 @@ export function aggregateBars(source: OHLCVBar[], to: BarInterval): OHLCVBar[] {
 const CACHE_TTL_SECONDS = 3600;  // 1h. Backfill/live-write invalidates explicitly anyway.
 
 interface CachedSeries {
-  v: 1;                 // schema version — bump if OHLCVBar shape changes incompatibly
+  v: 2;                 // schema version — bumped from 1 to 2 with the bi-temporal asOf bucket.
   cachedAt: number;
   bars: OHLCVBar[];
 }
 
-function cacheKey(ticker: string, interval: BarInterval, range: RangeKey): string {
-  return `bars:${ticker}:${interval}:${range}`;
+// 60s buckets. Live readers all want "now" ± a few seconds, and a 60s bucket keeps
+// cache hit rate high without serving more than a minute of stale data. Backtests
+// pass exact asOf values (wall-clock minutes from a replay clock) that fall on aligned
+// boundaries, so the bucketing matches them too.
+function asOfBucket(asOf: number | undefined): string {
+  if (asOf === undefined) return 'live';
+  return String(Math.floor(asOf / 60_000));
+}
+
+function cacheKey(ticker: string, interval: BarInterval, range: RangeKey, asOf?: number): string {
+  return `bars:v2:${ticker}:${interval}:${range}:${asOfBucket(asOf)}`;
 }
 
 function metaKey(ticker: string, interval: BarInterval): string {
-  return `bars:meta:${ticker}:${interval}`;
+  return `bars:v2:meta:${ticker}:${interval}`;
+}
+
+export interface GetBarsOpts {
+  /**
+   * Knowledge-time cutoff. When set, returns the latest revision of each
+   * observation_ts whose knowledge_ts <= asOf. Omitting `asOf` is equivalent to
+   * "as of now" — the live-read fast path that hits the partial-unique index
+   * filtered by `is_superseded:false`.
+   */
+  asOf?: number;
 }
 
 /**
- * Read a time-sorted OHLCV series. Tries Redis first; on miss, queries Mongo and
- * populates the cache. Returns oldest-first. Empty array if nothing matches.
+ * Which physical store backs bar reads. Defaults to `mongo` so existing callers
+ * keep working unchanged; flip to `timescale` (Helm values, no code change) once
+ * the dual-write window has converged. Read fresh on every call so a single
+ * process can be re-pointed without restart (relevant during cutover validation).
+ *
+ * See agent-docs/plans/three-database-split.md §Cutover.
+ */
+function activeBackend(): 'mongo' | 'timescale' {
+  return (process.env.BARS_BACKEND ?? 'mongo') === 'timescale' ? 'timescale' : 'mongo';
+}
+
+/**
+ * Read a time-sorted OHLCV series. Tries Redis first; on miss, queries the active
+ * backend (Mongo or Timescale per `BARS_BACKEND`) and populates the cache. Returns
+ * oldest-first. Empty array if nothing matches.
  *
  * The returned array is always a fresh copy — callers may mutate it without affecting
  * the cache.
+ *
+ * @param db  MongoDB handle. Required when `BARS_BACKEND=mongo` (the default);
+ *           may be `undefined` when `BARS_BACKEND=timescale`. The two-arg shape
+ *           preserves the existing call sites verbatim during the cutover.
  */
 export async function getBars(
+  redis: Pick<RedisClientType, 'get' | 'setEx'>,
+  db: Db | undefined,
+  ticker: string,
+  interval: BarInterval,
+  range: RangeKey,
+  opts: GetBarsOpts = {},
+): Promise<OHLCVBar[]> {
+  if (activeBackend() === 'timescale') {
+    return getBarsFromPg(redis, ticker, interval, range, opts);
+  }
+  if (!db) {
+    throw new Error('[shared-bars] getBars: db parameter required when BARS_BACKEND=mongo (the default)');
+  }
+  return getBarsFromMongo(redis, db, ticker, interval, range, opts);
+}
+
+async function getBarsFromMongo(
   redis: Pick<RedisClientType, 'get' | 'setEx'>,
   db: Db,
   ticker: string,
   interval: BarInterval,
   range: RangeKey,
+  opts: GetBarsOpts,
 ): Promise<OHLCVBar[]> {
-  const key = cacheKey(ticker, interval, range);
+  const asOf = opts.asOf;
+  const key = cacheKey(ticker, interval, range, asOf);
   try {
     const cached = await redis.get(key);
     if (cached) {
       const parsed = JSON.parse(cached) as CachedSeries;
-      if (parsed.v === 1 && Array.isArray(parsed.bars)) return parsed.bars;
+      if (parsed.v === 2 && Array.isArray(parsed.bars)) return parsed.bars;
     }
   } catch (err) {
     // Cache read failure should never block a request — fall through to Mongo.
     console.warn(`[shared-bars] cache read failed for ${key}:`, err);
   }
 
-  const sinceTs = new Date(Date.now() - RANGE_DAYS[range] * 24 * 60 * 60 * 1000);
-  const docs = await db
-    .collection(COLLECTIONS.OHLCV_BARS)
-    .find({ ticker, interval, timestamp: { $gte: sinceTs } })
-    .sort({ timestamp: 1 })
-    .toArray();
+  const sinceTs = Date.now() - RANGE_DAYS[range] * 24 * 60 * 60 * 1000;
+  const coll = db.collection(COLLECTIONS.OHLCV_BARS);
 
-  const bars: OHLCVBar[] = docs.map(docToBar);
+  let bars: OHLCVBar[];
+  if (asOf === undefined) {
+    // Live path — partial-index fast lane. is_superseded:false picks exactly one row
+    // per (ticker, observation_ts, interval). observation_ts:{$gte} bounds the range.
+    const docs = await coll
+      .find({ ticker, interval, is_superseded: false, observation_ts: { $gte: sinceTs } })
+      .sort({ observation_ts: 1 })
+      .toArray();
+    bars = docs.map(docToBar);
+  } else {
+    // As-of path — one bar per observation_ts, picking the latest revision known at asOf.
+    // The compound (ticker, observation_ts, interval, knowledge_ts) index covers the
+    // match; $sort+$group selects per-observation-ts.
+    const docs = await coll.aggregate([
+      { $match: {
+          ticker,
+          interval,
+          observation_ts: { $gte: sinceTs },
+          knowledge_ts:   { $lte: asOf },
+      } },
+      { $sort: { observation_ts: 1, knowledge_ts: -1 } },
+      { $group: { _id: '$observation_ts', doc: { $first: '$$ROOT' } } },
+      { $replaceRoot: { newRoot: '$doc' } },
+      { $sort: { observation_ts: 1 } },
+    ]).toArray();
+    bars = docs.map(docToBar);
+  }
 
   try {
-    const payload: CachedSeries = { v: 1, cachedAt: Date.now(), bars };
+    const payload: CachedSeries = { v: 2, cachedAt: Date.now(), bars };
     await redis.setEx(key, CACHE_TTL_SECONDS, JSON.stringify(payload));
   } catch (err) {
     console.warn(`[shared-bars] cache write failed for ${key}:`, err);
@@ -161,15 +249,17 @@ export async function getBars(
 /**
  * Latest close for a ticker at the given interval. Convenience over getBars('30d')
  * for callers that only need the most recent price (e.g. dispatcher drift gate).
- * Returns null if no bars are cached or stored.
+ * Returns null if no bars are cached or stored. Pass `opts.asOf` to ask "what was
+ * the last close known at this knowledge time?".
  */
 export async function getLastClose(
   redis: Pick<RedisClientType, 'get' | 'setEx'>,
-  db: Db,
+  db: Db | undefined,
   ticker: string,
   interval: BarInterval = 'daily',
+  opts: GetBarsOpts = {},
 ): Promise<number | null> {
-  const bars = await getBars(redis, db, ticker, interval, '30d');
+  const bars = await getBars(redis, db, ticker, interval, '30d', opts);
   const last = bars[bars.length - 1];
   return last ? last.close : null;
 }
@@ -178,6 +268,12 @@ export async function getLastClose(
  * Drop every cached range for (ticker, interval). Call after any write that could
  * change the underlying series — backfill, live-poll persist, manual edits. Cheap:
  * a SCAN + DEL over at most ~4 keys per (ticker, interval).
+ *
+ * Note: bi-temporal cache keys also vary by `asOfBucket`. Live readers all share the
+ * `live` bucket, which is what we DEL. As-of readers (backtest, audit) use minute-
+ * resolution buckets that decay naturally (1h TTL) and don't need explicit
+ * invalidation — their asOf is by definition in the past, so a new write doesn't
+ * change what they should see.
  */
 export async function invalidateBars(
   redis: RedisClientType,
@@ -185,10 +281,16 @@ export async function invalidateBars(
   interval: BarInterval,
 ): Promise<number> {
   const ranges: RangeKey[] = ['30d', '60d', '90d', '180d'];
-  const keys = ranges.map((r) => cacheKey(ticker, interval, r));
+  // Clear both namespaces unconditionally — during the dual-write window both
+  // caches may be populated, and after cutover the inactive one is just absent
+  // (the DEL is a cheap no-op). Sidesteps the alternative of having to know
+  // which backend is active inside the invalidator.
+  const keys: string[] = [];
+  for (const r of ranges) {
+    keys.push(cacheKey(ticker, interval, r));
+    keys.push(pgCacheKey(ticker, interval, r));
+  }
   keys.push(metaKey(ticker, interval));
-  // del accepts variadic keys; some clients want an array. The node-redis v4 API
-  // takes either — we spread to be safe across versions.
   let removed = 0;
   for (const k of keys) {
     try { removed += await redis.del(k); } catch { /* skip */ }
@@ -212,21 +314,40 @@ export async function invalidateBarsBulk(
 
 // ---- internal ----
 
+// Reads both the new bi-temporal shape (observation_ts as number) and the legacy
+// pre-migration shape (timestamp as Date). Once the migration has backfilled every
+// row, the `timestamp instanceof Date` branch is dead — kept for the migration
+// window only.
 function docToBar(doc: Record<string, unknown>): OHLCVBar {
-  const ts = doc.timestamp;
-  const tsMs = ts instanceof Date ? ts.getTime() : typeof ts === 'number' ? ts : 0;
+  const obsTs = doc.observation_ts;
+  let observationMs: number;
+  if (typeof obsTs === 'number') {
+    observationMs = obsTs;
+  } else {
+    const legacy = doc.timestamp;
+    observationMs = legacy instanceof Date ? legacy.getTime() : typeof legacy === 'number' ? legacy : 0;
+  }
+  const knowledgeMs = typeof doc.knowledge_ts === 'number' ? doc.knowledge_ts : undefined;
+
   const bar: OHLCVBar = {
-    ticker:    String(doc.ticker ?? ''),
-    timestamp: tsMs,
-    interval:  (doc.interval as BarInterval) ?? 'daily',
-    open:      Number(doc.open   ?? 0),
-    high:      Number(doc.high   ?? 0),
-    low:       Number(doc.low    ?? 0),
-    close:     Number(doc.close  ?? 0),
-    volume:    Number(doc.volume ?? 0),
+    ticker:         String(doc.ticker ?? ''),
+    observation_ts: observationMs,
+    // Carry the legacy alias for any consumer that hasn't migrated yet. Removed when
+    // the deprecation window closes.
+    timestamp:      observationMs,
+    interval:       (doc.interval as BarInterval) ?? 'daily',
+    open:           Number(doc.open   ?? 0),
+    high:           Number(doc.high   ?? 0),
+    low:            Number(doc.low    ?? 0),
+    close:          Number(doc.close  ?? 0),
+    volume:         Number(doc.volume ?? 0),
   };
-  if (typeof doc.rawClose         === 'number') bar.rawClose         = doc.rawClose;
-  if (typeof doc.adjustedClose    === 'number') bar.adjustedClose    = doc.adjustedClose;
-  if (typeof doc.adjustmentFactor === 'number') bar.adjustmentFactor = doc.adjustmentFactor;
+  if (knowledgeMs !== undefined)                          bar.knowledge_ts     = knowledgeMs;
+  if (typeof doc.content_hash      === 'string')          bar.content_hash     = doc.content_hash;
+  if (typeof doc.is_superseded     === 'boolean')         bar.is_superseded    = doc.is_superseded;
+  if (typeof doc.rawClose          === 'number')          bar.rawClose         = doc.rawClose;
+  if (typeof doc.adjustedClose     === 'number')          bar.adjustedClose    = doc.adjustedClose;
+  if (typeof doc.adjustmentFactor  === 'number')          bar.adjustmentFactor = doc.adjustmentFactor;
+  if (doc.currency === 'USD' || doc.currency === 'GBP')   bar.currency         = doc.currency;
   return bar;
 }

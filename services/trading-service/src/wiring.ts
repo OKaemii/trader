@@ -13,7 +13,7 @@ import { MongoOrderRepository } from "./modules/orders/infrastructure/MongoOrder
 import { AccountCache } from "./modules/orders/infrastructure/AccountCache.ts";
 import { OrderDispatcher } from "./modules/orders/infrastructure/OrderDispatcher.ts";
 import { FillsPoller } from "./modules/fills/application/FillsPoller.ts";
-import { MongoPriceLookup } from "./shared/MongoPriceLookup.ts";
+import { PriceLookup } from "./shared/PriceLookup.ts";
 import { TradingMode } from "./modules/orders/domain/Order.ts";
 import { invalidateSignalOrderType, configureLiveConfig, parseSignalOrderType } from "./modules/orders/infrastructure/live-config.ts";
 
@@ -26,7 +26,7 @@ export async function wireDependencies(env: TradingEnv, logger: Logger) {
 
     // Shared price lookup is reused by AccountCache + FillsPoller to detect pence-quoted
     // LSE listings (T212 reports pence, our bars are GBP — ratio ≈100 → scale /100).
-    const priceLookup = new MongoPriceLookup(await getMongoDb());
+    const priceLookup = new PriceLookup(await getMongoDb());
 
     const sharedAccountCache = new AccountCache(sharedClient, {
         ttlMs: env.ACCOUNT_CACHE_TTL_MS,

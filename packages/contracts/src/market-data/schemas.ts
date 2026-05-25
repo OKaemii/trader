@@ -52,6 +52,9 @@ export const InternalBarsRequestSchema = z.object({
     tickers: z.array(z.string().min(1)),
     interval: BarIntervalSchema.optional(),
     range: RangeKeySchema.optional(),
+    // Bi-temporal as-of cutoff in UTC ms. When set, returns the latest revision of
+    // each observation_ts whose knowledge_ts <= asOf. Omitted = "as of now" (live read).
+    asOf: z.number().int().positive().optional(),
 });
 export type InternalBarsRequest = z.infer<typeof InternalBarsRequestSchema>;
 

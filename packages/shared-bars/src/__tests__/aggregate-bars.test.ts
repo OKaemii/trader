@@ -11,7 +11,13 @@ import { aggregateBars } from '../index.ts';
 import type { OHLCVBar } from '@trader/shared-types';
 
 function bar(ts: number, o: number, h: number, l: number, c: number, v: number): OHLCVBar {
-  return { ticker: 'AAPL_US_EQ', timestamp: ts, interval: '5m', open: o, high: h, low: l, close: c, volume: v };
+  return {
+    ticker: 'AAPL_US_EQ',
+    observation_ts: ts,
+    timestamp: ts,
+    interval: '5m',
+    open: o, high: h, low: l, close: c, volume: v,
+  };
 }
 
 describe('aggregateBars', () => {

@@ -74,9 +74,10 @@ class MarketDataClient:
         # on the server side will reject any token signed with the sentinel in prod.
         self._secret = secret or os.getenv("JWT_SECRET", "dev-secret-change-me")
         self._timeout = timeout
-        # Per-cycle in-memory cache. Cleared on start_cycle.
+        # Per-cycle in-memory cache. Cleared on start_cycle. Keyed by (ticker, interval,
+        # range, as_of_ms) so live and as-of reads in the same cycle don't collide.
         self._cycle_id: str | None = None
-        self._cache: dict[tuple[str, str, str], list[OHLCVBar]] = {}
+        self._cache: dict[tuple[str, str, str, int | None], list[OHLCVBar]] = {}
 
     def start_cycle(self, cycle_id: str) -> None:
         """Reset the per-cycle cache. Call once per process_loop iteration."""
@@ -91,14 +92,26 @@ class MarketDataClient:
         ticker: str,
         interval: str = "daily",
         range_key: str = "30d",
+        *,
+        as_of_ms: int | None = None,
     ) -> list[OHLCVBar]:
-        """Single-ticker fetch. Use fetch_bars_batch when you have multiple."""
-        key = (ticker, interval, range_key)
+        """
+        Single-ticker fetch. Use fetch_bars_batch when you have multiple.
+
+        Bi-temporal: pass `as_of_ms` (UTC ms knowledge-time cutoff) to read the bars
+        as known at that wall-clock instant. Omitting it returns the latest
+        unsuperseded revisions — the default "as of now" behaviour. Required for
+        backtest replay; live cycles leave it unset.
+        See agent-docs/plans/point-in-time-bar-history.md.
+        """
+        key = (ticker, interval, range_key, as_of_ms)
         cached = self._cache.get(key)
         if cached is not None:
             return cached
 
         url = f"{self._base_url}/internal/api/market-data/bars/{ticker}?interval={interval}&range={range_key}"
+        if as_of_ms is not None:
+            url += f"&asOf={as_of_ms}"
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             r = await client.get(url, headers=self._auth_header())
             r.raise_for_status()
@@ -112,17 +125,22 @@ class MarketDataClient:
         tickers: list[str],
         interval: str = "daily",
         range_key: str = "30d",
+        *,
+        as_of_ms: int | None = None,
     ) -> dict[str, list[OHLCVBar]]:
         """
         Fetch multiple tickers in one HTTP round-trip. Critical for the warmup
         hydration path where the universe is ~200 tickers — one round-trip beats 200.
         Honours the per-cycle cache: tickers already in the cache are returned from
         memory and only the misses go over the wire.
+
+        Bi-temporal: pass `as_of_ms` to read what was known at that knowledge time
+        across the whole batch. See `fetch_bars` for details.
         """
         out: dict[str, list[OHLCVBar]] = {}
         misses: list[str] = []
         for t in tickers:
-            cached = self._cache.get((t, interval, range_key))
+            cached = self._cache.get((t, interval, range_key, as_of_ms))
             if cached is not None:
                 out[t] = cached
             else:
@@ -132,17 +150,20 @@ class MarketDataClient:
             return out
 
         url = f"{self._base_url}/internal/api/market-data/bars"
+        body: dict[str, object] = {"tickers": misses, "interval": interval, "range": range_key}
+        if as_of_ms is not None:
+            body["asOf"] = as_of_ms
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             r = await client.post(
                 url,
                 headers={**self._auth_header(), "Content-Type": "application/json"},
-                json={"tickers": misses, "interval": interval, "range": range_key},
+                json=body,
             )
             r.raise_for_status()
             payload = r.json()
         for t, raw_bars in (payload.get("bars") or {}).items():
             bars = [self._bar_from_dict(b) for b in raw_bars]
-            self._cache[(t, interval, range_key)] = bars
+            self._cache[(t, interval, range_key, as_of_ms)] = bars
             out[t] = bars
         # Tickers not returned (provider unresolvable etc.) are absent from out — that's
         # intentional. Callers should treat missing as "not enough data" rather than empty.

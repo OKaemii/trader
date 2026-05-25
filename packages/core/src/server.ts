@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import type { Logger } from "pino";
+import type { Logger } from "./logger.ts";
 import { errorHandler } from "./errors.ts";
 
 export interface ServerConfig<Deps extends { logger: Logger }> {

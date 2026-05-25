@@ -16,12 +16,13 @@
 // outage that happened during a closed window). The calendar is not consulted by
 // the functions here — call sites have already decided to hit the upstream.
 
-import type { Collection, Db } from 'mongodb';
+import type { Db } from 'mongodb';
 import type { RedisClientType } from 'redis';
 import { COLLECTIONS } from '@trader/shared-mongo';
 import { invalidateBars } from '@trader/shared-bars';
-import type { OHLCVBar, BarInterval } from '@trader/shared-types';
+import type { BarInterval } from '@trader/shared-types';
 import type { MarketDataProvider } from './providers/market-data-provider.ts';
+import { writeBarRevisions } from './persist-bars.ts';
 import { log } from '../../../logger.ts';
 
 // Topic for the cross-service cache-invalidation pubsub. Anything maintaining a
@@ -57,13 +58,12 @@ export async function backfillTickers(
   const concurrency = opts.concurrency ?? 5;
   const endTs       = Date.now();
   const startTs     = endTs - windowMs;
-  const collection  = db.collection(COLLECTIONS.OHLCV_BARS);
 
   const results: BackfillResult[] = [];
   for (let i = 0; i < tickers.length; i += concurrency) {
     const slice = tickers.slice(i, i + concurrency);
     const settled = await Promise.allSettled(
-      slice.map((t) => backfillOne(collection, redis, provider, t, startTs, endTs)),
+      slice.map((t) => backfillOne(db, redis, provider, t, startTs, endTs)),
     );
     for (let j = 0; j < settled.length; j++) {
       const r = settled[j];
@@ -77,7 +77,7 @@ export async function backfillTickers(
 }
 
 async function backfillOne(
-  collection: Collection,
+  db: Db,
   redis: RedisClientType,
   provider: MarketDataProvider,
   ticker: string,
@@ -88,40 +88,15 @@ async function backfillOne(
   if (bars.length === 0) return { ticker, fetched: 0, upserted: 0 };
 
   const interval: BarInterval = '5m';
-  const ops = bars.map((bar) => ({
-    updateOne: {
-      filter: { ticker, timestamp: new Date(bar.timestamp), interval },
-      update: {
-        $set: {
-          ticker,
-          timestamp: new Date(bar.timestamp),
-          interval,
-          open:   bar.open,
-          high:   bar.high,
-          low:    bar.low,
-          close:  bar.close,
-          volume: bar.volume,
-        },
-      },
-      upsert: true,
-    },
-  }));
-  const res = await collection.bulkWrite(ops, { ordered: false });
-  // Sum all the "this op did something" counters. Different Mongo driver versions and
-  // collection configurations distribute upsert successes across these properties:
-  //   - upsertedCount: new doc created via $setOnInsert / upsert
-  //   - insertedCount: only set for explicit insertOne ops
-  //   - modifiedCount: existing doc actually changed
-  //   - matchedCount: existing doc matched (may equal modifiedCount or differ)
-  // Empirically `upsertedCount` was 0 on a fresh bulkWrite that did create 400k+ docs,
-  // so we sum all four and report whichever is non-zero.
-  const upserted = (res.upsertedCount ?? 0)
-                 + (res.insertedCount ?? 0)
-                 + (res.modifiedCount ?? 0)
-                 + (Object.keys(res.upsertedIds ?? {}).length);
-  // Fall back to ops.length when every counter is zero — guarantees we never report
-  // "0 bars upserted" on a batch that didn't throw.
-  const reported = upserted > 0 ? upserted : ops.length;
+  // Bi-temporal write path: cosmetic re-polls are no-ops (idempotent re-backfill),
+  // genuine revisions append a new row with the prior superseded. Replaces the old
+  // bulkWrite-upsert which silently overwrote every column on each re-run.
+  const stats = await writeBarRevisions(db, bars, interval);
+  // `upserted` keeps its old semantics for the admin caller and portal display: count
+  // of rows that actually changed something. `skipped` (idempotent) doesn't count.
+  // Fall back to fetched count when stats.inserted is zero AND there were no skips —
+  // shouldn't happen but mirrors the previous defensive fallback.
+  const reported = stats.inserted > 0 ? stats.inserted : (stats.skipped > 0 ? 0 : bars.length);
 
   // Cache: drop every cached range for this (ticker, 5m). shared-bars repopulates lazily
   // on the next read. Then publish a notification so other services (signal-service'
@@ -159,11 +134,15 @@ export async function tickersMissingHistory(
 ): Promise<string[]> {
   if (tickers.length === 0) return [];
   const collection = db.collection(COLLECTIONS.OHLCV_BARS);
+  // Count only the latest unsuperseded revision per (ticker, observation_ts). A ticker
+  // with N first-prints and M revisions has N unsuperseded rows, not N+M — without
+  // is_superseded:false the count would inflate after every revision and a brand-new
+  // ticker that revised every bar would falsely appear "well-covered".
   const counts = await collection.aggregate([
-    { $match: { ticker: { $in: tickers }, interval: '5m' } },
+    { $match: { ticker: { $in: tickers }, interval: '5m', is_superseded: false } },
     { $group: { _id: '$ticker', count: { $sum: 1 } } },
   ]).toArray();
-  const sufficient = new Set(counts.filter((d: any) => d.count >= minBars).map((d: any) => d._id));
+  const sufficient = new Set(counts.filter((d: Record<string, unknown>) => (d.count as number) >= minBars).map((d: Record<string, unknown>) => d._id as string));
   return tickers.filter((t) => !sufficient.has(t));
 }
 
@@ -207,16 +186,19 @@ export async function healMissingHistory(
     return now - latestMs > stale;
   };
 
-  // Single aggregation: latest-bar-timestamp per ticker for the 5m series. Tickers
-  // not present in the result have no history at all (handled by bootstrap, not
-  // heal — heal trusts that bootstrap ran).
+  // Single aggregation: latest unsuperseded observation_ts per ticker for the 5m series.
+  // Tickers not present in the result have no history at all (handled by bootstrap, not
+  // heal — heal trusts that bootstrap ran). is_superseded:false keeps the gap check
+  // honest: a revision of a stale bar shouldn't appear as fresh coverage.
   const agg = await collection.aggregate([
-    { $match: { ticker: { $in: tickers }, interval: '5m' } },
-    { $group: { _id: '$ticker', latest: { $max: '$timestamp' } } },
-  ]).toArray() as Array<{ _id: string; latest: Date }>;
+    { $match: { ticker: { $in: tickers }, interval: '5m', is_superseded: false } },
+    { $group: { _id: '$ticker', latest: { $max: '$observation_ts' } } },
+  ]).toArray() as Array<{ _id: string; latest: number | Date }>;
 
   const gapped: Array<{ ticker: string; latestMs: number }> = [];
   for (const row of agg) {
+    // observation_ts is a number; legacy rows pre-migration carried Date. Tolerate both
+    // until the migration has run on every existing deployment.
     const latestMs = row.latest instanceof Date ? row.latest.getTime() : Number(row.latest);
     if (isGapped(latestMs)) gapped.push({ ticker: row._id, latestMs });
   }

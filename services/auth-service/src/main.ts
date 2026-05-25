@@ -6,7 +6,7 @@ import { createPublicRouter } from "./modules/auth/routes/public.ts";
 
 async function main(): Promise<void> {
     const env    = loadAuthEnv();
-    const logger = createLogger({ service: "auth-service", level: env.LOG_LEVEL });
+    const logger = createLogger({ service: "auth-service" });
     const deps   = wireDependencies(env, logger);
 
     const app = await createServer<AuthDeps>({

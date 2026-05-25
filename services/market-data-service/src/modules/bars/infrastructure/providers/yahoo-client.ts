@@ -273,7 +273,8 @@ function extractOHLCV(
 
   return {
     ticker,
-    timestamp: fetchTime,
+    observation_ts: fetchTime,
+    timestamp:      fetchTime,
     ...(currency ? { currency } : {}),
     open,
     high,

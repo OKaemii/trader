@@ -7,8 +7,12 @@
   "dependencies": {
     "@trader/shared-types": "workspace:*",
     "@trader/shared-mongo": "workspace:*",
+    "@trader/shared-pg": "workspace:*",
     "mongodb": "^6.5.0",
     "redis": "^4.6.13"
+  },
+  "devDependencies": {
+    "testcontainers": "^10.13.2"
   },
   "scripts": {
     "build": "tsc -b",

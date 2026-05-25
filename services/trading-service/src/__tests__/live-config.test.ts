@@ -14,7 +14,7 @@ vi.mock('@trader/shared-mongo', () => ({
 
 const liveConfig = await import('../modules/orders/infrastructure/live-config.ts');
 const { OrderType } = await import('../modules/orders/domain/Order.ts');
-const testLogger = createLogger({ service: "trading-service-test", level: "error" });
+const testLogger = createLogger({ service: "trading-service-test", enabledLevels: ["error"] });
 
 function setEnvDefault(raw: string | undefined): void {
   liveConfig.configureLiveConfig({ logger: testLogger, envDefault: liveConfig.parseSignalOrderType(raw) });

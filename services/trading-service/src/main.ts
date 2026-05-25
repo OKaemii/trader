@@ -10,7 +10,7 @@ import { TradingMode } from "./modules/orders/domain/Order.ts";
 
 async function main(): Promise<void> {
     const env    = loadTradingEnv();
-    const logger = createLogger({ service: "trading-service", level: env.LOG_LEVEL });
+    const logger = createLogger({ service: "trading-service" });
     const deps   = await wireDependencies(env, logger);
 
     const appDeps: AppDeps = {
