@@ -54,7 +54,7 @@ global:
     # log to the dual_write_failures collection without affecting the Mongo write). Default
     # off so production keeps single-writing to Mongo until the operator deliberately enables
     # the cutover sequence.
-    dualWriteBars: "false"              # "true" enables Timescale dual-write
+    dualWriteBars: "true"               # "true" enables Timescale dual-write
     # Default polling cadence for market-data-service live polling. Must be one of the
     # active provider's allowedPollIntervals (Yahoo: 15m / 1h / 24h). The portal renders
     # the dropdown from those values; this default is what new deploys land on before
