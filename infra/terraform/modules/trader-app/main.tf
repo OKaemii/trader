@@ -114,6 +114,13 @@ resource "helm_release" "timescaledb" {
     # extendedConfiguration value, which the chart appends to postgresql.conf.
     { name = "primary.extendedConfiguration",
       value = "shared_preload_libraries = 'timescaledb'\n" },
+    # Bitnami's default resourcesPreset gave Timescale only 192Mi → OOMKilled under
+    # query/insert load on the 706k-row hypertable (2026-05-25). Size it for the live
+    # bar store (node has ample RAM): 4Gi covers work_mem sorts + compression + WAL.
+    { name = "primary.resources.limits.cpu",      value = "2000m" },
+    { name = "primary.resources.limits.memory",   value = "4Gi" },
+    { name = "primary.resources.requests.cpu",    value = "500m" },
+    { name = "primary.resources.requests.memory", value = "1Gi" },
   ]
 
   # CREATE EXTENSION inside the trader_ts DB on first boot. Runs as the superuser
