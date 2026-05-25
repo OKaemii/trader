@@ -7,7 +7,7 @@ import { FxClient, YahooFxProvider } from "@trader/shared-fx";
 
 import type { SignalEnv } from "./env.ts";
 import { createSignalDataLayer } from "./shared/data.ts";
-import { MongoPriceLookup } from "./shared/MongoPriceLookup.ts";
+import { PriceLookup } from "./shared/PriceLookup.ts";
 import { MongoSignalRepository } from "./modules/signals/infrastructure/MongoSignalRepository.ts";
 import { RedisSignalPublisher } from "./modules/signals/infrastructure/RedisSignalPublisher.ts";
 import { RedisStrategySubscriber } from "./modules/signals/infrastructure/RedisStrategySubscriber.ts";
@@ -46,7 +46,7 @@ export async function wireDependencies(env: SignalEnv, logger: Logger) {
 
     const decayMonitor    = new StrategyDecayMonitor(db, redis, logger);
     const portfolioState  = new MongoPortfolioState(db.collection("positions"), fx, logger);
-    const priceLookup     = new MongoPriceLookup(db);
+    const priceLookup     = new PriceLookup(db);
     const approveSignal   = new ApproveSignalUseCase(signalRepo);
     const autoApprovalGate = new AutoApprovalGate(redis, signalRepo, approveSignal, tradingClient, logger);
     const publisher       = new RedisSignalPublisher(redis, logger);

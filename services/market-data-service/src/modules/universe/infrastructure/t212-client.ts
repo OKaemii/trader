@@ -56,7 +56,12 @@ function mapT212ToBar(ticker: string, data: unknown, ts: number): OHLCVBar {
     // T212 returns current quote; OHLCV approximation for MVP
     const quote = (data as { items: Array<{ fillPrice: number }> }).items?.[0];
     const price = quote?.fillPrice ?? 0;
-    return { ticker, timestamp: ts, open: price, high: price, low: price, close: price, volume: 0 };
+    return {
+        ticker,
+        observation_ts: ts,
+        timestamp:      ts,
+        open: price, high: price, low: price, close: price, volume: 0,
+    };
 }
 
 export interface T212Instrument {

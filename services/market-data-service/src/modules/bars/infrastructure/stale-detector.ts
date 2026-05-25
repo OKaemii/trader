@@ -5,7 +5,7 @@ export interface StaleCheckResult {
   stale: OHLCVBar[];
 }
 
-// Flags bars whose timestamp is more than `maxAgeMs` behind wall clock.
+// Flags bars whose observation_ts is more than `maxAgeMs` behind wall clock.
 export class StaleDetector {
   constructor(private readonly maxAgeMs: number) {}
 
@@ -14,7 +14,7 @@ export class StaleDetector {
     const fresh: OHLCVBar[] = [];
     const stale: OHLCVBar[] = [];
     for (const bar of bars) {
-      if (now - bar.timestamp > this.maxAgeMs) {
+      if (now - bar.observation_ts > this.maxAgeMs) {
         stale.push(bar);
       } else {
         fresh.push(bar);

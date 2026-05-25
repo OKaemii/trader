@@ -1,0 +1,61 @@
+# Research warehouse storage. hostPath-backed PV + PVC for DuckDB+Parquet
+# snapshots of the Timescale hypertables. See
+# agent-docs/plans/three-database-split.md §Warehouse host.
+#
+# Single-node k3s assumption: the snapshot CronJob (warehouse-snapshot-cronjob.yaml)
+# and backtest-engine both mount this PVC. With hostPath, the data lives at
+# /srv/warehouse on the cluster node — when the cluster grows beyond one node,
+# either migrate this to a real PV (NFS, longhorn, etc.) or pin both consumers
+# to the warehouse node via nodeSelector / affinity.
+#
+# Resilience: the warehouse is fully reconstructible from Timescale (the
+# snapshot job re-creates daily-partitioned Parquet files from the live store).
+# A node loss → "rebuild from snapshot" is a few hours, not an outage; live
+# trading is unaffected. So no Retain/StorageClass-backed PV gymnastics here —
+# the simplest possible storage is correct.
+#
+# Permissions: snapshot job writes; backtest-engine reads. Distinguished by
+# accessModes in the PVC mount (CronJob mounts RW; backtest-engine should mount
+# RO when wiring is added in task 17/18). The PV itself allows RWO (single-node)
+# — k8s doesn't actually enforce ReadOnlyMany without driver support, so the
+# read-only-ness is the consumer's responsibility.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: warehouse-pv
+  labels:
+    trader-storage: warehouse
+spec:
+  capacity:
+    # ~6-12 GB realistic steady state: 200 tickers × 60d × 78 5m bars/day +
+    # 7y of daily history compressed via zstd ≈ 1-2 GB; audit hypertables and
+    # future bid/ask data add headroom. 50 GB is generous and matches the
+    # disk-pressure threshold the homeserver is sized for.
+    storage: 50Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: /srv/warehouse
+    # DirectoryOrCreate lets the k3s kubelet create the directory on first mount
+    # if it doesn't exist yet — saves an out-of-band ssh + mkdir step on a
+    # fresh node.
+    type: DirectoryOrCreate
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: warehouse-hostpath
+---
+# PVC the warehouse-snapshotter CronJob (task 17) and backtest-engine (task 18)
+# both reference by name. ReadWriteOnce is fine on single-node k3s; both pods
+# will land on the same node and k3s handles serialised attach/detach.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: warehouse-pvc
+  namespace: {{ .Release.Namespace }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: warehouse-hostpath
+  volumeName: warehouse-pv

@@ -8,7 +8,7 @@ import type { Trading212Client } from '../../t212/infrastructure/Trading212Clien
 import type { InstrumentMetadataCache } from '../../t212/infrastructure/InstrumentMetadataCache.ts';
 import type { AccountCache } from './AccountCache.ts';
 import { MongoOrderRepository } from './MongoOrderRepository.ts';
-import { MongoPriceLookup } from '../../../shared/MongoPriceLookup.ts';
+import { PriceLookup } from '../../../shared/PriceLookup.ts';
 import { T212OrderExecutor } from '../../t212/infrastructure/T212OrderExecutor.ts';
 import { PlaceOrderUseCase } from '../application/PlaceOrderUseCase.ts';
 import { getSignalOrderType } from './live-config.ts';
@@ -198,7 +198,7 @@ export class OrderDispatcher {
         }, 'dispatcher: account snapshot ok');
 
         const db = await this.deps.getDb();
-        const priceLookup = new MongoPriceLookup(db);
+        const priceLookup = new PriceLookup(db);
         const currentPrice = await priceLookup.lastCloseMoney(signal.ticker);
 
         if (!currentPrice) {

@@ -15,6 +15,7 @@ COPY packages/shared-calendar/package.json    ./packages/shared-calendar/
 COPY packages/shared-data/package.json        ./packages/shared-data/
 COPY packages/shared-fx/package.json          ./packages/shared-fx/
 COPY packages/shared-mongo/package.json       ./packages/shared-mongo/
+COPY packages/shared-pg/package.json          ./packages/shared-pg/
 COPY packages/shared-portfolio/package.json   ./packages/shared-portfolio/
 COPY packages/shared-redis/package.json       ./packages/shared-redis/
 COPY packages/shared-types/package.json       ./packages/shared-types/

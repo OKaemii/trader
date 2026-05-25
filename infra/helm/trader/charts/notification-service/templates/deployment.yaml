@@ -23,6 +23,8 @@ spec:
             - secretRef:
                 name: trader-secrets
           env:
+            - name: LOG_LEVELS
+              value: {{ .Values.global.env.logLevels | default "error,warn" | quote }}
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:

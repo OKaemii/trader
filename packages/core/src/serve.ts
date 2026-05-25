@@ -1,6 +1,6 @@
 import { serve as honoServe, type ServerType } from "@hono/node-server";
 import type { Hono } from "hono";
-import type { Logger } from "pino";
+import type { Logger } from "./logger.ts";
 
 export interface ListenConfig {
     app: Hono;

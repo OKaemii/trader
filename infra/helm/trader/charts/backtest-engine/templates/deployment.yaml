@@ -32,6 +32,23 @@ spec:
               value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb-headless:27017/trader?authSource=trader&directConnection=true"
             - name: MONGODB_DB
               value: trader
+            - name: TIMESCALEDB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: TIMESCALEDB_PASSWORD
+            - name: TIMESCALE_URL
+              value: "postgresql://trader:$(TIMESCALEDB_PASSWORD)@timescaledb-postgresql:5432/trader_ts"
+            - name: BARS_BACKEND
+              value: {{ .Values.global.env.barsBackend | default "mongo" | quote }}
+          # Mount the research warehouse PV so the DuckDB reader
+          # (src/infrastructure/duckdb_reader.py) can open the Parquet snapshots
+          # written daily by the warehouse-snapshot CronJob. Read-only by
+          # convention — the backtest engine never writes to the warehouse.
+          volumeMounts:
+            - name: warehouse
+              mountPath: /srv/warehouse
+              readOnly: true
           resources:
             requests:
               ephemeral-storage: "256Mi"
@@ -49,3 +66,7 @@ spec:
               port: 8001
             initialDelaySeconds: 10
             periodSeconds: 10
+      volumes:
+        - name: warehouse
+          persistentVolumeClaim:
+            claimName: warehouse-pvc

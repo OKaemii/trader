@@ -13,7 +13,7 @@ import { registerTopologyWebSocket, registerSystemReset } from "./modules/signal
 async function main(): Promise<void> {
     const env    = loadSignalEnv();
     startTracer({ service: "signal-service", otlpEndpoint: env.OTLP_ENDPOINT });
-    const logger = createLogger({ service: "signal-service", level: env.LOG_LEVEL, traceMixin });
+    const logger = createLogger({ service: "signal-service", traceMixin });
     const deps   = await wireDependencies(env, logger);
 
     const app = new Hono();

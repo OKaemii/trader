@@ -210,6 +210,94 @@ async def test_batch_fetch_empty_tickers_returns_empty_dict_no_http():
     assert route.call_count == 0
 
 
+# ── Bi-temporal `as_of_ms` plumbing ────────────────────────────────────────
+# These tests pin the wire format the market-data-service expects:
+#   fetch_bars        → &asOf=<ms> query parameter
+#   fetch_bars_batch  → asOf field on the JSON body
+# See agent-docs/plans/point-in-time-bar-history.md.
+
+@pytest.mark.asyncio
+async def test_fetch_bars_appends_asof_query_param_when_set():
+    """as_of_ms=N must show up as &asOf=N on the URL."""
+    client = MarketDataClient(base_url=BASE_URL, secret=SECRET)
+    client.start_cycle("c1")
+    as_of = 1_700_000_000_000
+    with respx.mock() as mock:
+        route = mock.get(
+            f"{BASE_URL}/internal/api/market-data/bars/AAPL_US_EQ"
+            f"?interval=daily&range=30d&asOf={as_of}"
+        ).mock(return_value=httpx.Response(200, json={"ticker": "AAPL_US_EQ", "interval": "daily", "range": "30d", "asOf": as_of, "bars": []}))
+        await client.fetch_bars("AAPL_US_EQ", as_of_ms=as_of)
+    assert route.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_bars_omits_asof_when_unset():
+    """Live reads must NOT include asOf — bare URL preserves the partial-index fast lane."""
+    client = MarketDataClient(base_url=BASE_URL, secret=SECRET)
+    client.start_cycle("c1")
+    captured: list[str] = []
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(str(request.url))
+        return httpx.Response(200, json={"ticker": "AAPL_US_EQ", "interval": "daily", "range": "30d", "bars": []})
+    with respx.mock() as mock:
+        mock.get(f"{BASE_URL}/internal/api/market-data/bars/AAPL_US_EQ?interval=daily&range=30d").mock(side_effect=handler)
+        await client.fetch_bars("AAPL_US_EQ")
+    assert len(captured) == 1
+    assert "asOf" not in captured[0]
+
+
+@pytest.mark.asyncio
+async def test_fetch_bars_cache_keys_by_as_of_ms():
+    """Live and as-of reads for the same (ticker, interval, range) must NOT share cache."""
+    client = MarketDataClient(base_url=BASE_URL, secret=SECRET)
+    client.start_cycle("c1")
+    with respx.mock() as mock:
+        live = mock.get(
+            f"{BASE_URL}/internal/api/market-data/bars/AAPL_US_EQ?interval=daily&range=30d"
+        ).mock(return_value=httpx.Response(200, json={"ticker": "AAPL_US_EQ", "interval": "daily", "range": "30d", "bars": [_bar(1, 100.0)]}))
+        as_of_route = mock.get(
+            f"{BASE_URL}/internal/api/market-data/bars/AAPL_US_EQ?interval=daily&range=30d&asOf=5000"
+        ).mock(return_value=httpx.Response(200, json={"ticker": "AAPL_US_EQ", "interval": "daily", "range": "30d", "asOf": 5000, "bars": [_bar(1, 200.0)]}))
+        live_bars = await client.fetch_bars("AAPL_US_EQ")
+        as_of_bars = await client.fetch_bars("AAPL_US_EQ", as_of_ms=5000)
+    assert live.call_count == 1
+    assert as_of_route.call_count == 1
+    assert live_bars[0].close == 100.0
+    assert as_of_bars[0].close == 200.0
+
+
+@pytest.mark.asyncio
+async def test_batch_fetch_includes_asof_in_body_when_set():
+    """fetch_bars_batch puts asOf in the JSON body, not the URL."""
+    client = MarketDataClient(base_url=BASE_URL, secret=SECRET)
+    client.start_cycle("c1")
+    captured: list[dict] = []
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json={"interval": "daily", "range": "30d", "asOf": 9000, "bars": {}})
+    with respx.mock() as mock:
+        mock.post(f"{BASE_URL}/internal/api/market-data/bars").mock(side_effect=handler)
+        await client.fetch_bars_batch(["AAPL_US_EQ"], as_of_ms=9000)
+    assert captured[0]["asOf"] == 9000
+    assert captured[0]["tickers"] == ["AAPL_US_EQ"]
+
+
+@pytest.mark.asyncio
+async def test_batch_fetch_omits_asof_when_unset():
+    """Live batch reads must NOT include an asOf key — keeps the request payload minimal."""
+    client = MarketDataClient(base_url=BASE_URL, secret=SECRET)
+    client.start_cycle("c1")
+    captured: list[dict] = []
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json={"interval": "daily", "range": "30d", "bars": {}})
+    with respx.mock() as mock:
+        mock.post(f"{BASE_URL}/internal/api/market-data/bars").mock(side_effect=handler)
+        await client.fetch_bars_batch(["AAPL_US_EQ"])
+    assert "asOf" not in captured[0]
+
+
 # ── fetch_sectors ────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio

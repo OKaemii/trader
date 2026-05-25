@@ -133,13 +133,23 @@ async def load_backfill_data(db, months: int = 12) -> list[TopologySnapshot]:
 
 
 def _attach_realized_returns(snapshots: list[TopologySnapshot], ohlcv_bars: list) -> list[TopologySnapshot]:
-    """Attach next-period realized returns to each snapshot (required training signal)."""
+    """Attach next-period realized returns to each snapshot (required training signal).
+
+    Accepts bars in either the new bi-temporal shape (observation_ts:number) or the
+    legacy shape (timestamp:Date or number). Bars MUST already be filtered to the
+    latest unsuperseded revision per observation (callers should do this with
+    `is_superseded:false` at the Mongo layer — see
+    agent-docs/plans/point-in-time-bar-history.md).
+    """
     from collections import defaultdict
 
-    # Build price map: timestamp_date → {ticker: close}
+    # Build price map: observation-date → {ticker: close}
     price_map: dict[str, dict[str, float]] = defaultdict(dict)
     for bar in ohlcv_bars:
-        dt = _to_datetime(bar['timestamp']).strftime('%Y-%m-%d')
+        ts = bar.get('observation_ts', bar.get('timestamp'))
+        if ts is None:
+            continue
+        dt = _to_datetime(ts).strftime('%Y-%m-%d')
         price_map[dt][bar['ticker']] = bar['close']
 
     filled = []

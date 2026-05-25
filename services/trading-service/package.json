@@ -20,6 +20,7 @@
     "@trader/shared-bars": "workspace:*",
     "@trader/shared-fx": "workspace:*",
     "@trader/shared-mongo": "workspace:*",
+    "@trader/shared-pg": "workspace:*",
     "@trader/shared-redis": "workspace:*",
     "@trader/shared-types": "workspace:*",
     "hono": "^4.3.0",

@@ -40,6 +40,13 @@ class BacktestRequest(BaseModel):
     data_end_ms: int
     n_trials: int = 6    # ablation variants tested
     internal_token: str = ''
+    # Bar source — 'live' reads from the live Timescale via market-data-service
+    # HTTP (asOf-aware); 'warehouse' reads from the local DuckDB+Parquet
+    # warehouse populated by the warehouse-snapshotter CronJob. Default 'live'
+    # so existing callers don't shift behaviour. See
+    # agent-docs/plans/three-database-split.md §DuckDB reader and
+    # services/backtest-engine/src/infrastructure/duckdb_reader.py.
+    data_source: str = 'live'   # 'live' | 'warehouse'
 
 
 class BacktestResult(BaseModel):

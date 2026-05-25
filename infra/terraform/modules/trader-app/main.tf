@@ -1,6 +1,7 @@
 variable "namespace" {}
 variable "redis_password" { sensitive = true }
 variable "mongodb_password" { sensitive = true }
+variable "timescaledb_password" { sensitive = true }
 
 resource "helm_release" "redis" {
   name       = "redis"
@@ -68,9 +69,57 @@ resource "helm_release" "mongodb" {
   ]
 }
 
+resource "helm_release" "timescaledb" {
+  name       = "timescaledb"
+  repository = "https://charts.bitnami.com/bitnami"
+  chart      = "postgresql"
+  version    = "16.7.27"
+  namespace  = var.namespace
+
+  set = [
+    # Swap the default Bitnami Postgres image for the upstream Timescale image (same
+    # PG major; ships with the timescaledb extension already compiled in). The
+    # initdbScripts below just CREATE EXTENSION so live and read paths see a Timescale
+    # hypertable, not a plain table.
+    { name = "image.repository", value = "timescale/timescaledb" },
+    { name = "image.tag",        value = "2.17.2-pg16" },
+    { name = "auth.username",       value = "trader" },
+    { name = "auth.password",       value = var.timescaledb_password },
+    { name = "auth.postgresPassword", value = var.timescaledb_password },
+    { name = "auth.database",       value = "trader_ts" },
+    # Single-node k3s — replication off; primary architecture only. Bumping to HA
+    # later means flipping to architecture=replication and replicaCount=N with a
+    # full restore from the logical dump (see CLAUDE.md storage section, task 21).
+    { name = "architecture", value = "standalone" },
+    # Sized to fit the existing homeserver: 60d × 200 tickers × 78 5m bars/day
+    # ≈ 1M rows, compressed to ~200MB after the 7d compression policy kicks in.
+    # 20Gi is generous headroom for the audit hypertables + future doc-#5 quotes.
+    { name = "primary.persistence.size", value = "20Gi" },
+    { name = "primary.persistence.resourcePolicy", value = "keep" },
+    # `shared_preload_libraries=timescaledb` is required — without it, the extension
+    # compiles but CREATE EXTENSION fails at boot. Passed via the Bitnami chart's
+    # extendedConfiguration value, which the chart appends to postgresql.conf.
+    { name = "primary.extendedConfiguration",
+      value = "shared_preload_libraries = 'timescaledb'\n" },
+  ]
+
+  # CREATE EXTENSION inside the trader_ts DB on first boot. Runs as the superuser
+  # on the freshly-initialized cluster, before the regular DB is ready for app
+  # connections. Idempotent (IF NOT EXISTS) so re-deploys are safe.
+  values = [yamlencode({
+    primary = {
+      initdb = {
+        scripts = {
+          "00-extension.sql" = "CREATE EXTENSION IF NOT EXISTS timescaledb;\n"
+        }
+      }
+    }
+  })]
+}
+
 resource "helm_release" "trader_app" {
   name      = "trader-app"
   chart     = "../helm/trader"
   namespace = var.namespace
-  depends_on = [helm_release.redis, helm_release.mongodb]
+  depends_on = [helm_release.redis, helm_release.mongodb, helm_release.timescaledb]
 }

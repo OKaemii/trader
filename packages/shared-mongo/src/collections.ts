@@ -25,6 +25,11 @@ export const COLLECTIONS = {
   // GICS labels. Operator can pin a manual override via `source='manual'` — the periodic
   // Yahoo refresh skips those rows.
   INSTRUMENT_METADATA:       'instrument_metadata',
+  // Append-only audit log written inside the same transaction as every revision insert
+  // into `ohlcv_bars`. Each entry records {ticker, observation_ts, interval,
+  // knowledge_ts, prior_hash, new_hash}. `prior_hash: null` marks the first-print —
+  // useful for revision-rate dashboards. Powers GET /api/admin/market-data/revisions/:ticker.
+  BAR_REVISIONS_LOG:         'bar_revisions_log',
 } as const;
 
 export type CollectionName = typeof COLLECTIONS[keyof typeof COLLECTIONS];

@@ -5,9 +5,12 @@ Fama-MacBeth factor decomposition for the trader strategy engine.
 Measures residual alpha of a strategy after removing four factor premia:
   momentum (20-day), low-volatility, Amihud illiquidity, and log-size proxy.
 
-Data sources (both from the live MongoDB cluster):
-  signals     — TradeSignal documents (strategy_id, factor_exposures in rationale)
-  ohlcv_bars  — raw bars for forward returns, Amihud, and size proxy
+Data sources:
+  signals     — TradeSignal documents from MongoDB (strategy_id, factor_exposures in rationale)
+  bars        — fetched via HTTP from market-data-service /internal/api/market-data/bars
+                (which transparently dispatches between Mongo and Timescale per
+                BARS_BACKEND env — this script doesn't care which physical store
+                holds the bars). See agent-docs/plans/three-database-split.md.
 
 Method:
   1. Group signals by rebalance timestamp to get cross-sections.
@@ -21,6 +24,8 @@ Minimum data: 40 rebalance periods (≈ 40 weeks).
 
 Usage:
     MONGODB_URL=mongodb://trader:password@192.168.50.2:27017/trader \\
+    MARKET_DATA_SERVICE_URL=http://market-data-service:3002 \\
+    JWT_SECRET=$(read from trader-secrets) \\
         python -m src.analysis.factor_decomposition
 
     # Override strategy or horizon:
@@ -33,10 +38,14 @@ import argparse
 import json
 import os
 import sys
+import time
 from collections import defaultdict
 
+import httpx
 import numpy as np
 from scipy.stats import t as t_dist
+
+from ..infrastructure.market_data_client import mint_internal_jwt
 
 
 # --------------------------------------------------------------------------- #
@@ -97,26 +106,72 @@ def load_periods(db, strategy_id: str) -> dict[int, list[dict]]:
 _DAY_MS = 24 * 60 * 60 * 1_000
 
 
-def load_bars(db, tickers: list[str], ref_ts: int,
-              lookback: int, forward: int) -> dict[str, list[dict]]:
+def load_bars(tickers: list[str], ref_ts: int,
+              lookback: int, forward: int,
+              *, as_of_ms: int | None = None) -> dict[str, list[dict]]:
     """
     Load OHLCV bars for the window [ref_ts - lookback*day, ref_ts + forward*day].
-    Returns {ticker: [{'timestamp', 'close', 'volume'}, ...]} sorted ascending.
+    Returns {ticker: [{'timestamp', 'observation_ts', 'close', 'volume'}, ...]}
+    sorted ascending.
+
+    Bi-temporal contract preserved: live reads (`as_of_ms` omitted) get the latest
+    unsuperseded revisions; as-of reads pass `as_of_ms` through to the HTTP layer,
+    which routes to whichever backend (Mongo or Timescale) is currently active.
+    Same semantics as the prior direct-Mongo path; the request now goes via
+    market-data-service /internal/api/market-data/bars so this script doesn't
+    care which physical store the bars live in. See
+    agent-docs/plans/three-database-split.md for the cutover.
+
+    Range constraint: the HTTP endpoint only supports the fixed ranges
+    30d/60d/90d/180d (read window relative to "now"). We pick the smallest one
+    that covers the requested ref_ts window and filter to the exact bounds on
+    the client. Periods older than 180 days from now will return an empty bar
+    set — log a warning and let the caller decide. (Factor strategies rebalance
+    weekly/daily so this only matters for very stale signals.)
     """
     t_lo = ref_ts - lookback * _DAY_MS
     t_hi = ref_ts + forward * _DAY_MS
+    now_ms = int(time.time() * 1_000)
 
+    # Pick the smallest range key that covers the oldest bar we want.
+    earliest_age_days = max(1, (now_ms - t_lo) / _DAY_MS)
+    if   earliest_age_days <=  30: range_key = '30d'
+    elif earliest_age_days <=  60: range_key = '60d'
+    elif earliest_age_days <=  90: range_key = '90d'
+    elif earliest_age_days <= 180: range_key = '180d'
+    else:
+        print(f'[factor-decomp] ref_ts {ref_ts} is older than 180d — outside HTTP endpoint range; bars will be empty')
+        return {}
+
+    base_url = os.getenv('MARKET_DATA_SERVICE_URL', 'http://market-data-service:3002').rstrip('/')
+    secret   = os.getenv('JWT_SECRET', 'dev-secret-change-me')
+    body: dict = {'tickers': tickers, 'interval': '5m', 'range': range_key}
+    if as_of_ms is not None:
+        body['asOf'] = as_of_ms
+
+    headers = {
+        'Authorization': f'Bearer {mint_internal_jwt("strategy-engine", secret)}',
+        'Content-Type':  'application/json',
+    }
+    with httpx.Client(timeout=30.0) as client:
+        r = client.post(f'{base_url}/internal/api/market-data/bars', headers=headers, json=body)
+        r.raise_for_status()
+        payload = r.json()
+
+    raw_bars = payload.get('bars') or {}
     result: dict[str, list[dict]] = defaultdict(list)
-    for doc in db['ohlcv_bars'].find(
-        {'ticker': {'$in': tickers},
-         'timestamp': {'$gte': t_lo, '$lte': t_hi}},
-        {'ticker': 1, 'timestamp': 1, 'close': 1, 'volume': 1},
-    ).sort('timestamp', 1):
-        result[doc['ticker']].append({
-            'timestamp': doc['timestamp'],
-            'close':     float(doc['close']),
-            'volume':    float(doc['volume']),
-        })
+    for ticker, ticker_bars in raw_bars.items():
+        for b in ticker_bars:
+            obs = int(b.get('observation_ts') or b.get('timestamp') or 0)
+            if obs < t_lo or obs > t_hi:
+                continue  # Client-side window filter — endpoint range is broader.
+            result[ticker].append({
+                'timestamp':      obs,
+                'observation_ts': obs,
+                'close':          float(b['close']),
+                'volume':         float(b.get('volume') or 0),
+            })
+        result[ticker].sort(key=lambda x: x['timestamp'])
 
     return dict(result)
 
@@ -247,7 +302,7 @@ def run_fama_macbeth(periods: dict[int, list[dict]], db,
         assets = periods[ref_ts]
         tickers = [a['ticker'] for a in assets]
 
-        ohlcv = load_bars(db, tickers, ref_ts, window, horizon + 7)
+        ohlcv = load_bars(tickers, ref_ts, window, horizon + 7)
 
         rows_y: list[float] = []
         rows_X: list[list[float]] = []

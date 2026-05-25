@@ -170,16 +170,18 @@ export class YahooProvider implements MarketDataProvider {
       const ts = result.timestamp[i];
       if (rawClose == null || rawClose <= 0 || ts === undefined) continue;
       const close = rawClose * priceScale;
+      const obsTs = ts * 1000;
       bars.push({
         ticker,
-        timestamp: ts * 1000,
-        interval:  HISTORY_GRANULARITY,
+        observation_ts: obsTs,
+        timestamp:      obsTs,
+        interval:       HISTORY_GRANULARITY,
         ...(currency ? { currency } : {}),
-        open:      (quote.open[i]  ?? rawClose) * priceScale,
-        high:      (quote.high[i]  ?? rawClose) * priceScale,
-        low:       (quote.low[i]   ?? rawClose) * priceScale,
+        open:           (quote.open[i]  ?? rawClose) * priceScale,
+        high:           (quote.high[i]  ?? rawClose) * priceScale,
+        low:            (quote.low[i]   ?? rawClose) * priceScale,
         close,
-        volume:    quote.volume[i] ?? 0,
+        volume:         quote.volume[i] ?? 0,
       });
     }
     return bars;

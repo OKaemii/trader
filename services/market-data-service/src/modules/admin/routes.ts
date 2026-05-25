@@ -320,46 +320,94 @@ export function createAdminRouter(
 
   // ── Which tickers actually have cached 5m history ──────────────────────────
   // GET /api/admin/market-data/coverage
-  // Returns { ticker: count } for every ticker in ohlcv_bars with at least one 5m bar.
-  // Used by the portal to badge unresolvable tickers in the history picker so an
-  // operator can see at a glance which entries are empty before clicking through.
+  // Returns { ticker: { count, revisions } } for every ticker with at least one 5m bar.
+  // `count` is unsuperseded rows (observation count); `revisions` is the total
+  // bar_revisions_log entries for that ticker — operator dashboards use the ratio to
+  // flag tickers Yahoo has been actively revising.
   r.get('/admin/api/market-data/coverage', async (c) => {
     const db = await getMongoDb();
-    const agg = await db
-      .collection(COLLECTIONS.OHLCV_BARS)
-      .aggregate([
-        { $match: { interval: '5m' } },
+    const [obsAgg, revAgg] = await Promise.all([
+      db.collection(COLLECTIONS.OHLCV_BARS).aggregate([
+        { $match: { interval: '5m', is_superseded: false } },
         { $group: { _id: '$ticker', count: { $sum: 1 } } },
-      ])
-      .toArray();
-    const coverage: Record<string, number> = {};
-    for (const row of agg) coverage[row._id as string] = (row as any).count ?? 0;
+      ]).toArray(),
+      db.collection(COLLECTIONS.BAR_REVISIONS_LOG).aggregate([
+        { $match: { interval: '5m', prior_hash: { $ne: null } } },  // skip first-prints
+        { $group: { _id: '$ticker', revisions: { $sum: 1 } } },
+      ]).toArray(),
+    ]);
+    const coverage: Record<string, { count: number; revisions: number }> = {};
+    for (const row of obsAgg) coverage[row._id as string] = {
+      count:     (row as Record<string, number>).count ?? 0,
+      revisions: 0,
+    };
+    for (const row of revAgg) {
+      const k = row._id as string;
+      if (coverage[k]) coverage[k].revisions = (row as Record<string, number>).revisions ?? 0;
+      else coverage[k] = { count: 0, revisions: (row as Record<string, number>).revisions ?? 0 };
+    }
     return c.json({ coverage });
   });
 
   // ── Read bars (downsampled view) ───────────────────────────────────────────
-  // GET /api/admin/market-data/bars/:ticker?interval=daily&range=60d
-  // Returns the cached 5m series for the ticker, downsampled to the requested interval
-  // and trimmed to the requested range. Cache miss reads Mongo via shared-bars.getBars
-  // and populates the cache.
+  // GET /api/admin/market-data/bars/:ticker?interval=daily&range=60d[&asOf=<ms>]
+  // Returns the 5m series for the ticker, downsampled to the requested interval and
+  // trimmed to the requested range. When asOf is omitted, returns the latest
+  // unsuperseded revision per observation (live view). When set, returns the latest
+  // revision known at that knowledge time (bi-temporal as-of view) — used by audits
+  // and historical backtest replays.
   r.get('/admin/api/market-data/bars/:ticker', async (c) => {
     const ticker   = c.req.param('ticker');
     const interval = (c.req.query('interval') ?? 'daily') as BarInterval;
     const range    = (c.req.query('range')    ?? '30d')   as RangeKey;
+    const asOfRaw  = c.req.query('asOf');
     if (!VALID_INTERVALS.includes(interval)) {
       return c.json({ error: `invalid interval (one of ${VALID_INTERVALS.join(',')})` }, 400);
     }
     if (!VALID_RANGES.includes(range)) {
       return c.json({ error: `invalid range (one of ${VALID_RANGES.join(',')})` }, 400);
     }
+    let asOf: number | undefined;
+    if (asOfRaw != null && asOfRaw !== '') {
+      const parsed = Number(asOfRaw);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        return c.json({ error: 'asOf must be a positive integer (UTC ms)' }, 400);
+      }
+      asOf = parsed;
+    }
     const db    = await getMongoDb();
     const redis = await getRedisClient();
     // getBars currently keys cache by storedInterval — storage is always 5m, so we
     // fetch the 5m series and downsample here. Returning the downsampled view keeps
     // the cache compact (one entry per ticker/range), not bloated per requested-interval.
-    const base = await getBars(redis as any, db, ticker, '5m', range);
+    const base = asOf !== undefined
+      ? await getBars(redis as any, db, ticker, '5m', range, { asOf })
+      : await getBars(redis as any, db, ticker, '5m', range);
     const out  = aggregateBars(base, interval);
-    return c.json({ ticker, interval, range, bars: out });
+    return c.json({ ticker, interval, range, asOf: asOf ?? null, bars: out });
+  });
+
+  // ── Revision log (operator inspection of bi-temporal write history) ────────
+  // GET /api/admin/market-data/revisions/:ticker?since=<ms>&limit=<n>
+  // Returns the per-(ticker, observation_ts) revision audit trail since the given
+  // knowledge_ts. Drives the portal's revisions panel — operator looks here when a
+  // bar value seems suspicious or when a `revision_zscore_anomaly` lands.
+  r.get('/admin/api/market-data/revisions/:ticker', async (c) => {
+    const ticker = c.req.param('ticker');
+    const sinceRaw = c.req.query('since');
+    const limitRaw = c.req.query('limit');
+    const since = sinceRaw != null ? Number(sinceRaw) : 0;
+    const limit = Math.min(500, Math.max(1, limitRaw != null ? Number(limitRaw) : 100));
+    if (!Number.isFinite(since) || since < 0) {
+      return c.json({ error: 'since must be a non-negative integer (UTC ms)' }, 400);
+    }
+    const db = await getMongoDb();
+    const rows = await db.collection(COLLECTIONS.BAR_REVISIONS_LOG)
+      .find({ ticker, knowledge_ts: { $gte: since } })
+      .sort({ knowledge_ts: -1 })
+      .limit(limit)
+      .toArray();
+    return c.json({ ticker, since, count: rows.length, revisions: rows });
   });
 
   // ── Session calendar endpoints ───────────────────────────────────────────
@@ -423,17 +471,28 @@ export function createInternalBarsRouter(universeManager: UniverseManager): Hono
     const ticker   = c.req.param('ticker')!;
     const interval = (c.req.query('interval') ?? 'daily') as BarInterval;
     const range    = (c.req.query('range')    ?? '30d')   as RangeKey;
+    const asOfRaw  = c.req.query('asOf');
     if (!VALID_INTERVALS.includes(interval)) {
       return c.json({ error: `invalid interval (one of ${VALID_INTERVALS.join(',')})` }, 400);
     }
     if (!VALID_RANGES.includes(range)) {
       return c.json({ error: `invalid range (one of ${VALID_RANGES.join(',')})` }, 400);
     }
+    let asOf: number | undefined;
+    if (asOfRaw != null && asOfRaw !== '') {
+      const parsed = Number(asOfRaw);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        return c.json({ error: 'asOf must be a positive integer (UTC ms)' }, 400);
+      }
+      asOf = parsed;
+    }
     const db    = await getMongoDb();
     const redis = await getRedisClient();
-    const base = await getBars(redis as any, db, ticker, '5m', range);
+    const base = asOf !== undefined
+      ? await getBars(redis as any, db, ticker, '5m', range, { asOf })
+      : await getBars(redis as any, db, ticker, '5m', range);
     const out  = aggregateBars(base, interval);
-    return c.json({ ticker, interval, range, bars: out });
+    return c.json({ ticker, interval, range, asOf: asOf ?? null, bars: out });
   });
 
   r.post(
@@ -446,6 +505,7 @@ export function createInternalBarsRouter(universeManager: UniverseManager): Hono
       const body = c.req.valid('json');
       const interval = body.interval ?? 'daily';
       const range    = body.range    ?? '30d';
+      const asOf     = body.asOf;
 
       const db    = await getMongoDb();
       const redis = await getRedisClient();
@@ -454,10 +514,12 @@ export function createInternalBarsRouter(universeManager: UniverseManager): Hono
       // call within a TTL window. We could parallelise with Promise.all if the cache
       // miss path proves slow in production; for now serial is simpler and predictable.
       for (const ticker of body.tickers) {
-        const base = await getBars(redis as any, db, ticker, '5m', range);
+        const base = asOf !== undefined
+          ? await getBars(redis as any, db, ticker, '5m', range, { asOf })
+          : await getBars(redis as any, db, ticker, '5m', range);
         out[ticker] = aggregateBars(base, interval);
       }
-      return c.json({ interval, range, bars: out });
+      return c.json({ interval, range, asOf: asOf ?? null, bars: out });
     },
   );
 

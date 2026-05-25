@@ -25,7 +25,7 @@ import { configureLiveConfig } from "./shared/live-config.ts";
 const env = loadMarketDataEnv();
 setRuntimeEnv(env);
 
-const logger = createLogger({ service: "market-data-service", level: env.LOG_LEVEL });
+const logger = createLogger({ service: "market-data-service" });
 setLogger(logger);
 
 const live = env.TRADING_MODE === "Live";

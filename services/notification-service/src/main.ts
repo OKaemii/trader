@@ -8,7 +8,7 @@ import { NotificationLoop } from "./modules/notifications/application/Notificati
 
 async function main(): Promise<void> {
     const env    = loadNotificationEnv();
-    const logger = createLogger({ service: "notification-service", level: env.LOG_LEVEL });
+    const logger = createLogger({ service: "notification-service" });
     const deps   = await wireDependencies(env, logger);
 
     const app = await createServer<NotificationDeps>({

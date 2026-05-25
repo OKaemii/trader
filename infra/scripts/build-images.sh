@@ -64,6 +64,12 @@ build_and_load() {
         -t "${tag}" \
         "${REPO_ROOT}"
       ;;
+    warehouse-snapshotter)
+      docker build \
+        -f infra/docker/warehouse-snapshotter.Dockerfile \
+        -t "${tag}" \
+        "${REPO_ROOT}"
+      ;;
     *)
       docker build \
         -f infra/docker/node-service.Dockerfile \
@@ -112,6 +118,7 @@ if [[ "${TARGET}" == "all" ]]; then
   build_and_load "strategy-engine"
   build_and_load "backtest-engine"
   build_and_load "frontend-web"
+  build_and_load "warehouse-snapshotter"
   verify_images
 else
   build_and_load "${TARGET}"

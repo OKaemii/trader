@@ -8,7 +8,7 @@ const SYNC_INTERVAL_MS = 5 * 60 * 1000;
 
 async function main(): Promise<void> {
     const env    = loadPortfolioEnv();
-    const logger = createLogger({ service: "portfolio-service", level: env.LOG_LEVEL });
+    const logger = createLogger({ service: "portfolio-service" });
     const deps   = await wireDependencies(env, logger);
 
     const app = await createServer<PortfolioDeps>({

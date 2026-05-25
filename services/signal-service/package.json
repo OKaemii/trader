@@ -21,6 +21,7 @@
     "@trader/shared-data": "workspace:*",
     "@trader/shared-fx": "workspace:*",
     "@trader/shared-mongo": "workspace:*",
+    "@trader/shared-pg": "workspace:*",
     "@trader/shared-portfolio": "workspace:*",
     "@trader/shared-redis": "workspace:*",
     "@trader/shared-types": "workspace:*",

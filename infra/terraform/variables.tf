@@ -12,6 +12,15 @@ variable "mongodb_password" {
   default   = "change-me-in-production"
 }
 
+// Postgres-with-TimescaleDB password. Same shape as mongodb_password; injected
+// into the trader-secrets kube Secret as TIMESCALEDB_PASSWORD so any service that
+// needs the live time-series store can build its connection string from
+// {host, port, db, user, $TIMESCALEDB_PASSWORD}.
+variable "timescaledb_password" {
+  sensitive = true
+  default   = "change-me-in-production"
+}
+
 variable "jwt_secret" {
   sensitive = true
   default   = "change-me-in-production"

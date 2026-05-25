@@ -20,6 +20,7 @@ import {
   type Market, type MarketState, type ExchangeCalendar,
 } from '@trader/shared-calendar';
 import { backfillTickers, tickersMissingHistory, healMissingHistory } from './modules/bars/infrastructure/backfill.ts';
+import { writeBarRevisions, ensureBiTemporalIndexes, fetchFirstPrintCloses } from './modules/bars/infrastructure/persist-bars.ts';
 import { msUntilNextTick } from './modules/bars/application/poll-scheduling.ts';
 import { log } from './logger.ts';
 import { getRuntimeEnv } from './runtime-env.ts';
@@ -72,41 +73,19 @@ const universeManager = new UniverseManager(
   },
 );
 
-// Each insert is an upsert on (ticker, timestamp, interval) so re-polling the same EOD
-// bar — which used to happen every 20m for the entire day and bloat the collection with
-// duplicate rows — now overwrites the same row instead of stacking new copies. The unique
-// index on those three fields is created lazily on startup; bulkWrite respects it.
+// Bi-temporal persist. Cosmetic re-polls (same content hash as the latest stored
+// revision) are no-ops; genuine revisions atomically supersede the prior row and
+// append a new one (plus a bar_revisions_log audit entry) in one transaction.
+// See agent-docs/plans/point-in-time-bar-history.md and persist-bars.ts.
 async function persistBars(bars: OHLCVBar[], interval: BarInterval): Promise<void> {
   if (bars.length === 0) return;
   const db = await getMongoDb();
-  const ops = bars.map((bar) => ({
-    updateOne: {
-      filter: { ticker: bar.ticker, timestamp: new Date(bar.timestamp), interval },
-      update: {
-        $set: {
-          ticker:          bar.ticker,
-          timestamp:       new Date(bar.timestamp),
-          interval,
-          // YahooClient.normaliseYahooCurrency stamps every fetched bar with the listing
-          // currency. Without persisting it, downstream price lookups (signal-service
-          // MongoPriceLookup, trading-service dispatcher) have no way to know whether a
-          // US bar is USD-priced — and the lookup's GBP fallback then mis-sizes orders
-          // by an FX factor (e.g. AIG @ $77 sized as if £77 → rounds to 0 shares).
-          ...(bar.currency ? { currency: bar.currency } : {}),
-          open:            bar.open,
-          high:            bar.high,
-          low:             bar.low,
-          close:           bar.close,
-          volume:          bar.volume,
-          rawClose:        bar.rawClose ?? bar.close,
-          adjustedClose:   bar.adjustedClose,
-          adjustmentFactor: bar.adjustmentFactor,
-        },
-      },
-      upsert: true,
-    },
-  }));
-  await db.collection(COLLECTIONS.OHLCV_BARS).bulkWrite(ops, { ordered: false });
+  const stats = await writeBarRevisions(db, bars, interval);
+  // Surface non-zero revision activity at info — a stable system emits zero per cycle.
+  // Steady-state cycles (all cosmetic skips) don't log at all to keep volume sane.
+  if (stats.revisions > 0 || stats.inserted !== stats.attempted - stats.skipped) {
+    log.info(`[market-data] persist ${interval}: attempted=${stats.attempted} inserted=${stats.inserted} revisions=${stats.revisions} skipped=${stats.skipped}`);
+  }
 }
 
 /**
@@ -164,11 +143,15 @@ async function maybeEmitDailyAtClose(
 
     try {
       const db = await getMongoDb();
+      // Read the latest unsuperseded 5m bars for the UTC day. is_superseded:false
+      // picks one row per (ticker, observation_ts) via the partial-unique index;
+      // observation_ts:$gte bounds the day.
       const docs = await db.collection(COLLECTIONS.OHLCV_BARS)
         .find({
-          ticker:    { $in: tickers },
-          interval:  '5m',
-          timestamp: { $gte: new Date(utcMidnightMs) },
+          ticker:         { $in: tickers },
+          interval:       '5m',
+          is_superseded:  false,
+          observation_ts: { $gte: utcMidnightMs },
         })
         .toArray();
       if (docs.length === 0) {
@@ -179,15 +162,19 @@ async function maybeEmitDailyAtClose(
       // at a time (it folds all rows into a single output bar keyed by the head ticker).
       const byTicker = new Map<string, OHLCVBar[]>();
       for (const d of docs) {
+        const obsTs = typeof d.observation_ts === 'number'
+          ? d.observation_ts
+          : (d.timestamp instanceof Date ? d.timestamp.getTime() : Number(d.timestamp ?? 0));
         const bar: OHLCVBar = {
-          ticker:    d.ticker as string,
-          timestamp: (d.timestamp as Date).getTime(),
-          interval:  '5m',
-          open:      d.open as number,
-          high:      d.high as number,
-          low:       d.low as number,
-          close:     d.close as number,
-          volume:    d.volume as number,
+          ticker:         d.ticker as string,
+          observation_ts: obsTs,
+          timestamp:      obsTs,
+          interval:       '5m',
+          open:           d.open as number,
+          high:           d.high as number,
+          low:            d.low as number,
+          close:          d.close as number,
+          volume:         d.volume as number,
         };
         let list = byTicker.get(bar.ticker);
         if (!list) { list = []; byTicker.set(bar.ticker, list); }
@@ -215,40 +202,24 @@ async function maybeEmitDailyAtClose(
   }
 }
 
-// Ensure the unique compound index on every boot. Mongo no-ops if it already matches.
+// Bi-temporal indexes. Boot-time idempotent setup. Drops the legacy unique index
+// `ticker_timestamp_interval_unique` (new writes don't set `timestamp`; the old
+// index would collide every insert on null), creates the compound + partial-unique
+// + knowledge-time triple required by the new read/write paths.
 //
-// Two failure modes worth knowing about (both caught on first deploy):
-//
-//   1. Existing duplicate rows from before the upsert switch can fail unique-index
-//      creation. Mitigation: admin /clear-cache endpoint wipes legacy rows, then redeploy.
-//
-//   2. **If the collection was ever created as a time-series collection** (Mongo 5+
-//      sometimes does this implicitly under certain Bitnami chart configurations),
-//      it rejects createIndex({...}, {unique: true}) with "Unique indexes are not
-//      supported on time-series collections" — AND rejects every subsequent updateOne
-//      upsert with the same error. The fix is to detect this and re-create the
-//      collection as a regular one. We can't auto-recreate (would lose data) so the
-//      service logs loudly and exits — boot order requires the operator to drop and
-//      recreate the collection manually before the dispatcher can write any bars.
+// Sees ohlcv_bars existing as a time-series collection as fatal — Mongo refuses
+// unique indexes on those, and there's no in-place migration. Operator must drop
+// and recreate as a regular collection.
 async function ensureBarIndexes(): Promise<void> {
   const db = await getMongoDb();
   try {
-    const info = await db.listCollections({ name: COLLECTIONS.OHLCV_BARS }).toArray();
-    const coll = info[0];
-    if (coll && (coll.type === 'timeseries' || (coll as any).options?.timeseries)) {
-      log.error('[market-data] FATAL: ohlcv_bars is a time-series collection — unique indexes + updateOne upserts are unsupported. Run: db.ohlcv_bars.drop(); db.createCollection("ohlcv_bars"); then redeploy.');
+    await ensureBiTemporalIndexes(db);
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('time-series')) {
       process.exit(1);
     }
-  } catch (err) {
-    log.warn('[market-data] could not check collection type:', err);
+    log.warn('[market-data] ensure bi-temporal indexes failed (non-fatal):', err);
   }
-
-  await db.collection(COLLECTIONS.OHLCV_BARS).createIndex(
-    { ticker: 1, timestamp: 1, interval: 1 },
-    { unique: true, name: 'ticker_timestamp_interval_unique' },
-  ).catch((err) => {
-    log.warn('[market-data] unique index ensure failed (likely existing duplicates):', err instanceof Error ? err.message : err);
-  });
 }
 
 // FxClient: lazy-singleton, shared across the service. Backed by Yahoo GBPUSD=X with
@@ -389,15 +360,35 @@ async function pollLoop(): Promise<void> {
         log.info(`[market-data] ${decision.market} fetchRecent: requesting 24h window for ${decision.tickers.length} tickers`);
         const rawBars = await provider.fetchRecent(decision.tickers, 24);
         const fetchMs = Date.now() - fetchStart;
-        const { valid, invalid } = validator.validate(rawBars);
-        log.info(`[market-data] ${decision.market} fetched ${rawBars.length} raw bars in ${fetchMs}ms — valid=${valid.length} invalid=${invalid.length}`);
+        // First-print isolation: batch-fetch the earliest knowledge_ts close per
+        // (ticker, observation_ts) so the validator can identify revisions (and refuse
+        // to let them perturb its rolling z-score window). Cheap aggregation, hits the
+        // (ticker, observation_ts, interval, knowledge_ts) index for the match + group.
+        const db = await getMongoDb();
+        const firstPrintCloseByKey = await fetchFirstPrintCloses(db, rawBars, '5m');
+        const { valid, invalid, revisionAnomalies } = validator.validate(rawBars, { firstPrintCloseByKey });
+        log.info(`[market-data] ${decision.market} fetched ${rawBars.length} raw bars in ${fetchMs}ms — valid=${valid.length} invalid=${invalid.length} revision_anomalies=${revisionAnomalies.length}`);
 
         if (invalid.length > 0) {
-          const db = await getMongoDb();
           await db.collection(COLLECTIONS.BAD_TICKS).insertMany(
             invalid.map(({ bar, reason }) => ({ ...bar, reason, loggedAt: new Date() })),
           );
           log.warn(`[market-data] ${invalid.length} bad ticks rejected (${decision.market}) — sample reasons: ${invalid.slice(0, 3).map((i) => i.reason).join(' | ')}`);
+        }
+
+        if (revisionAnomalies.length > 0) {
+          await db.collection(COLLECTIONS.BAD_TICKS).insertMany(
+            revisionAnomalies.map(({ bar, firstPrintClose, driftFraction }) => ({
+              type:            'revision_zscore_anomaly',
+              ticker:          bar.ticker,
+              observation_ts:  bar.observation_ts,
+              revisedClose:    bar.close,
+              firstPrintClose,
+              driftFraction,
+              loggedAt:        new Date(),
+            })),
+          );
+          log.warn(`[market-data] ${revisionAnomalies.length} revision anomalies (${decision.market}) — sample: ${revisionAnomalies.slice(0, 3).map((a) => `${a.bar.ticker}@${a.bar.observation_ts}: ${(a.driftFraction * 100).toFixed(1)}% drift`).join(' | ')}`);
         }
 
         // Gap detection scoped to the partition — a US-only window shouldn't trip

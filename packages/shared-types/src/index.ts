@@ -66,19 +66,38 @@ export const money = (amount: number, currency: Currency): Money => ({ amount, c
 // Bars carry the listing currency so consumers that need to FX-convert (NAV, position
 // sizing) can. Strategy math reads `close` directly because returns are scale-invariant
 // (np.diff(np.log(prices)) is dimensionless), so currency doesn't enter that path.
+//
+// Bi-temporal storage. Each row carries an `observation_ts` (the wall-clock instant
+// the bar describes) and a `knowledge_ts` (the wall-clock instant we learned about
+// this revision). Re-polls of the same observation_ts insert new rows when their
+// content_hash differs from the latest unsuperseded row; cosmetic re-polls (identical
+// hash) are dropped. `is_superseded:false` selects the latest revision per
+// (ticker, observation_ts, interval) and is the live-read fast path. See
+// agent-docs/plans/point-in-time-bar-history.md.
 export interface OHLCVBar {
   ticker: string;
-  timestamp: number;    // Unix ms — bar START time. Daily bars use 00:00:00Z of the trading day.
+  observation_ts: number;    // Unix ms — bar START time. Daily bars use 00:00:00Z of the trading day.
+  knowledge_ts?: number;     // Unix ms when this revision was first persisted. Set at write time; absent on producer-side payloads (filled in by persistBars).
   interval?: BarInterval;
-  currency?: Currency;  // Set by the provider; absent on legacy rows pre-FX work.
+  currency?: Currency;       // Set by the provider; absent on legacy rows pre-FX work.
   open: number;
   high: number;
   low: number;
-  close: number;        // primary price — adjusted if adjustmentFactor is set, otherwise raw
+  close: number;             // primary price — adjusted if adjustmentFactor is set, otherwise raw
   volume: number;
-  rawClose?: number;    // unadjusted closing price (stored when a corporate-action adjustment is applied)
+  rawClose?: number;         // unadjusted closing price (stored when a corporate-action adjustment is applied)
   adjustedClose?: number;
   adjustmentFactor?: number;
+  content_hash?: string;     // hex SHA-1 of OHLCV+raw+adjustment; computed at write time, absent on producer payloads.
+  is_superseded?: boolean;   // true on every revision except the latest per (ticker, observation_ts, interval). Atomic flip on revision insert.
+
+  /**
+   * Deprecated alias for `observation_ts`. Pre-bi-temporal rows in Mongo were keyed
+   * on this field as a Date. Reader-side helpers (`docToBar` in shared-bars) translate
+   * legacy rows; new code MUST populate `observation_ts` instead.
+   * @deprecated use observation_ts
+   */
+  timestamp?: number;
 }
 
 // StrategyOutput is the inter-service contract between strategy-engine (Python) and signal-service (TS).
