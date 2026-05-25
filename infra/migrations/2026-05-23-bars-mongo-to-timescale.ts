@@ -114,7 +114,7 @@ async function copyBars(mongo: MongoClient, pgPool: pg.Pool): Promise<{ scanned:
          raw_close, adjusted_close, adjustment_factor, currency,
          content_hash)
        VALUES ${placeholders.join(',')}
-       ON CONFLICT (ticker, observation_ts, interval, knowledge_ts) DO NOTHING`;
+       ON CONFLICT (ticker, observation_ts, interval) WHERE is_superseded = false DO NOTHING`;
       const result = await pgPool.query(sql, rows);
       const insertedHere = result.rowCount ?? 0;
       inserted += insertedHere;
