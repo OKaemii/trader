@@ -48,7 +48,7 @@ global:
     # Mongo is still being dual-written, so the data is current.
     #
     # See agent-docs/plans/three-database-split.md §Cutover.
-    barsBackend: mongo                  # mongo | timescale
+    barsBackend: timescale              # mongo | timescale
     # Migration-window toggle: when true, market-data-service writes every bar to BOTH Mongo
     # AND Timescale (best-effort on the PG side — Mongo failures fail the request; PG failures
     # log to the dual_write_failures collection without affecting the Mongo write). Default
