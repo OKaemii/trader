@@ -73,11 +73,24 @@ export interface T212Instrument {
     sector?: string;
 }
 
+// Bound each instruments fetch. T212's endpoint can hold the connection open with no
+// response (no 429, no body) when the IP is throttled; without an abort, a hung fetch
+// stalls UniverseManager.refresh() and thus the entire poll loop (2026-05 incident:
+// market:raw went stale for days because refresh() never returned past this call).
+const T212_FETCH_TIMEOUT_MS = 15_000;
+
 export async function fetchT212Instruments(): Promise<T212Instrument[]> {
     const headers = { Authorization: t212Auth() };
     // Retry with exponential backoff — 429s accumulate when pods restart frequently during debugging.
     for (let attempt = 0; attempt < 3; attempt++) {
-        const res = await fetch(`${t212Base()}/equity/metadata/instruments`, { headers });
+        const ctrl = new AbortController();
+        const abortTimer = setTimeout(() => ctrl.abort(), T212_FETCH_TIMEOUT_MS);
+        let res: Response;
+        try {
+            res = await fetch(`${t212Base()}/equity/metadata/instruments`, { headers, signal: ctrl.signal });
+        } finally {
+            clearTimeout(abortTimer);
+        }
         if (res.ok) return res.json() as Promise<T212Instrument[]>;
         if (res.status === 429) {
             const wait = 30_000 * 2 ** attempt;
