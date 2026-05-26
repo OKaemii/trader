@@ -47,6 +47,35 @@ const DEFAULT_CONFIG: UniverseConfig = {
 const ADV_LOOKBACK_DAYS   = 20;
 const MAX_SECTOR_FRACTION = 0.35;  // Section 29c: no more than 35% from one GICS sector
 
+// Yahoo enrichment is best-effort. Cap each call so a rate-limited (429-walled) or hung
+// upstream can never stall refresh() — and thus can never block the poll loop from
+// starting. (2026-05 incident: refresh() hung on Yahoo's 429 wall during ADV ranking, so
+// market:raw went stale for ~3 days while the poll loop never started.)
+const ADV_RANK_TIMEOUT_MS     = 25_000;
+const SECTOR_FETCH_TIMEOUT_MS = 25_000;
+
+// Race a promise against a timeout; on timeout OR rejection, resolve to `fallback`. The
+// universe is still built from the T212-resolved candidates, just without this enhancement
+// (unranked ADV / stale sectors), which the poll loop tolerates fine.
+async function withTimeout<T>(p: Promise<T>, ms: number, fallback: T, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const guard = new Promise<T>((resolve) => {
+    timer = setTimeout(() => {
+      log.warn(`[universe] ${label} exceeded ${Math.round(ms / 1000)}s — proceeding without it (Yahoo rate-limit/hang)`);
+      resolve(fallback);
+    }, ms);
+  });
+  const guarded = p.catch((err) => {
+    log.warn(`[universe] ${label} failed — proceeding without it:`, err);
+    return fallback;
+  });
+  try {
+    return await Promise.race([guarded, guard]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export interface InstrumentMeta {
   ticker:       string;
   name:         string;
@@ -183,7 +212,10 @@ async function selectCurated(
   // Yahoo liquidity rank. ADV values are normalised to GBP (the base currency) so a
   // USD-denominated $1M ADV and a GBP-denominated £1M ADV are no longer treated as
   // equal-sized — fxToGBP applies the live rate before ranking.
-  const advMap = await fetchYahooLiquidity(candidates.map((c) => c.ticker), fxToGBP);
+  const advMap = await withTimeout(
+    fetchYahooLiquidity(candidates.map((c) => c.ticker), fxToGBP),
+    ADV_RANK_TIMEOUT_MS, {}, 'ADV liquidity ranking',
+  );
   for (const c of candidates) c.adv = advMap[c.ticker] ?? 0;
   candidates.sort((a, b) => (b.adv ?? 0) - (a.adv ?? 0));
 
@@ -365,7 +397,10 @@ export class UniverseManager {
 
         if (needFetch.length > 0 && this.sectorClient) {
           log.info(`[universe] sector enrichment: ${needFetch.length}/${universeTickers.length} tickers need Yahoo lookup`);
-          const fetched = await this.sectorClient.fetchSectors(needFetch);
+          const fetched = await withTimeout(
+            this.sectorClient.fetchSectors(needFetch),
+            SECTOR_FETCH_TIMEOUT_MS, {}, 'sector enrichment',
+          );
           for (const ticker of needFetch) {
             const hit = fetched[ticker];
             if (!hit) continue;   // Yahoo didn't resolve it — leave existing value (or absence)
