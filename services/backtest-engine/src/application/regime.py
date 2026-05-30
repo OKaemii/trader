@@ -54,8 +54,25 @@ def classify_regime(
     )
 
 
-def regime_breakdown(returns: np.ndarray, regime_labels: np.ndarray) -> dict:
-    """IC, Sharpe, and sample count per regime label — surfaced in ValidationReport."""
+def regime_label(state: RegimeState) -> str:
+    """Collapse the soft RegimeState into one discrete label for regime_breakdown.
+
+    Crisis dominates (it is the risk-off tail we most want isolated in the breakdown); below
+    the crisis threshold the label is the trend × volatility quadrant. One of:
+    'crisis' | 'bull_low_vol' | 'bull_high_vol' | 'bear_low_vol' | 'bear_high_vol'.
+    """
+    if state.p_crisis > 0.5:
+        return 'crisis'
+    trend = 'bull' if state.p_trending > 0.5 else 'bear'
+    vol = 'high_vol' if state.p_high_vol > 0.5 else 'low_vol'
+    return f'{trend}_{vol}'
+
+
+def regime_breakdown(returns: np.ndarray, regime_labels: np.ndarray, periods_per_year: int = 252) -> dict:
+    """IC, Sharpe, and sample count per regime label — surfaced in ValidationReport.
+
+    `periods_per_year` annualises the per-regime Sharpe (52 for weekly rebalancing, 252 daily)
+    so a weekly backtest is not reported at ~4.8× its true Sharpe."""
     result = {}
     for label in np.unique(regime_labels):
         mask = regime_labels == label
@@ -65,7 +82,7 @@ def regime_breakdown(returns: np.ndarray, regime_labels: np.ndarray) -> dict:
         r = returns[mask]
         result[str(label)] = {
             'n_obs':  int(mask.sum()),
-            'sharpe': float(r.mean() / r.std() * np.sqrt(252)) if r.std() > 0 else 0.0,
+            'sharpe': float(r.mean() / r.std() * np.sqrt(periods_per_year)) if r.std() > 0 else 0.0,
         }
     return result
 

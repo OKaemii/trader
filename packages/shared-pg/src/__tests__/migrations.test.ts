@@ -10,6 +10,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { GenericContainer, type StartedTestContainer } from 'testcontainers';
 import pg from 'pg';
 import path from 'node:path';
+import { readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { runMigrations } from '../migrations.ts';
 
@@ -58,6 +59,11 @@ describe.skipIf(!dockerAvailable)('runMigrations', () => {
     sqlDir = path.resolve(thisDir, '..', '..', 'sql');
   }, TEST_TIMEOUT_MS);
 
+  // Derived from the directory so adding a migration file never breaks this test —
+  // the runner's contract is "apply every *.sql in lexical order, idempotently".
+  const expectedFiles = (): string[] =>
+    readdirSync(sqlDir).filter((f) => f.endsWith('.sql')).sort();
+
   afterAll(async () => {
     await pool?.end();
     await container?.stop();
@@ -65,11 +71,7 @@ describe.skipIf(!dockerAvailable)('runMigrations', () => {
 
   it('applies every SQL file on first run', async () => {
     const result = await runMigrations(sqlDir, pool);
-    expect(result.applied).toEqual([
-      '0001_init.sql',
-      '0002_bars.sql',
-      '0003_audit_tables.sql',
-    ]);
+    expect(result.applied).toEqual(expectedFiles());
     expect(result.skipped).toEqual([]);
 
     // Spot-check that the expected objects were created.
@@ -81,6 +83,17 @@ describe.skipIf(!dockerAvailable)('runMigrations', () => {
     expect(tableNames).toContain('bars');
     expect(tableNames).toContain('bar_revisions_log');
     expect(tableNames).toContain('fills_history');
+    expect(tableNames).toContain('features');
+    expect(tableNames).toContain('reconciliation_log');
+    expect(tableNames).toContain('nav_history');
+    expect(tableNames).toContain('quotes');
+    expect(tableNames).toContain('tca_log');
+
+    // Feature-store live fast-lane partial index exists.
+    const { rows: featIdx } = await pool.query<{ indexname: string }>(
+      "SELECT indexname FROM pg_indexes WHERE tablename='features'",
+    );
+    expect(featIdx.map((r) => r.indexname)).toContain('features_latest_unique');
 
     // Partial-unique index on bars.
     const { rows: indexes } = await pool.query<{ indexname: string }>(
@@ -98,11 +111,7 @@ describe.skipIf(!dockerAvailable)('runMigrations', () => {
   it('is idempotent on re-run', async () => {
     const result = await runMigrations(sqlDir, pool);
     expect(result.applied).toEqual([]);
-    expect(result.skipped).toEqual([
-      '0001_init.sql',
-      '0002_bars.sql',
-      '0003_audit_tables.sql',
-    ]);
+    expect(result.skipped).toEqual(expectedFiles());
   }, TEST_TIMEOUT_MS);
 });
 

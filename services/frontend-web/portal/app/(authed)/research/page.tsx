@@ -1,4 +1,6 @@
 import { ResearchView } from '@/components/ResearchView'
+import { ValidationView } from '@/components/ValidationView'
+import { FeatureAuditPanel } from '@/components/FeatureAuditPanel'
 import { authedFetch } from '@/app/lib/auth-fetch'
 
 // SSR-seed the validation-reports table so it renders 10 rows on first paint instead of
@@ -21,12 +23,27 @@ export default async function ResearchPage() {
       <div>
         <h1 className="text-2xl font-bold text-white">Research & Investigation</h1>
         <p className="mt-1 text-sm text-gray-400">
-          Run backtests with ablation studies, review validation reports, and inspect factor
-          decomposition output. Results persist to MongoDB and feed the live-trading gate.
+          Run walk-forward backtests and permutation-tested (MCPT) validations, review reports,
+          and inspect factor decomposition. Results persist to MongoDB and <span className="text-gray-300">inform</span>{' '}
+          the live-trading decision — they do not auto-open it. The gate is a separate manual
+          step (the <code className="text-gray-300">trading:live_approved</code> Redis flag).
         </p>
       </div>
 
       <ResearchView initialReports={initialReports} />
+
+      <section className="space-y-3">
+        <div>
+          <h2 className="text-lg font-semibold text-white">Permutation validation (MCPT)</h2>
+          <p className="mt-1 text-xs text-gray-400">
+            The strongest gate: does the strategy beat what the same fitting process produces on
+            signal-free permutations of the market? Runs as a background job (minutes–hours).
+          </p>
+        </div>
+        <ValidationView />
+      </section>
+
+      <FeatureAuditPanel />
 
       <section className="rounded border border-gray-800 bg-gray-900 p-4">
         <h2 className="mb-2 text-sm font-medium text-gray-300">

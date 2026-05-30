@@ -21,6 +21,7 @@ export interface StrategyOutput {
   sectors: Record<string, string>;
   covariance_matrix: number[][];
   regime_confidence: number;
+  top_k?: number;                       // held-position count (top-K by composite score)
   betti_curves?: { epsilon_range: number[]; beta0: number[]; beta1: number[] };
   persistence_pairs?: Array<[number, number, number]>;
   laplacian_residuals?: Record<string, number>;

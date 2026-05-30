@@ -7,6 +7,24 @@ export const COLLECTIONS = {
   MODEL_VERSIONS:        'model_versions',
   FEATURE_IMPORTANCE:    'feature_importance_log',
   INSTRUMENT_REGISTRY:   'instrument_registry',
+  // Walk-forward ValidationReports persisted by backtest-engine's run_backtest (Phase 4).
+  // Each doc carries engine ('replay' real | 'synthetic' placeholder), the gate metrics
+  // (oos_sharpe/mean_ic/dsr/pbo/fdr_p), the benchmark overlay, regime breakdown, and a
+  // data_source string stamping the survivorship caveat. Read by GET /admin/api/backtest/results.
+  BACKTEST_RESULTS:      'backtest_results',
+  // Durable queue for the hours-long MCPT validator (Phase 5). One doc per submitted run:
+  // {status: queued|running|completed|failed, request, report?, error?, createdAt, claimedAt?}.
+  // backtest-engine's in-process JobRunner claims FIFO atomically, runs the 4-step permutation
+  // validator off the event loop, and writes the ValidationReportV2 back. A startup sweep
+  // re-queues jobs left 'running' by a crashed process (replicas: 1). Endpoints under
+  // POST/GET /admin/api/validator/*.
+  VALIDATION_JOBS:       'validation_jobs',
+  // Point-in-time index membership (Phase 6) — one row per {index, ticker, effective_from}
+  // interval (effective_to=null = still a member). Ingested from the fja05680/sp500 community
+  // CSV by src/scripts/ingest_sp500_history.py. quant-core's universe_loader resolves the active
+  // set as-of any historical instant so the validator can run a survivorship-bias-reduced
+  // universe (membership is correct; delisted-name *prices* are best-effort from Yahoo).
+  INDEX_CONSTITUENTS:    'index_constituents',
   USERS:                 'users',
   POSITIONS:             'positions',
   ORDERS:                'orders',

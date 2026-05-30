@@ -43,24 +43,56 @@ def deflated_sharpe_ratio(sharpe: float, returns: np.ndarray, n_trials: int) -> 
 
 
 def compute_pbo(returns_matrix: np.ndarray, n_partitions: int = 16) -> float:
-    """
-    Simplified CSCV-based PBO estimate.
-    returns_matrix: (n_configs, n_periods). Returns PBO ∈ [0, 1]; > 0.5 = likely overfit.
+    """Probability of Backtest Overfitting via CSCV (Bailey, Borwein, López de Prado, Zhu 2014).
+
+    `returns_matrix`: (n_configs, n_periods). Returns PBO ∈ [0, 1]; ≥ 0.5 ⇒ likely overfit
+    (the in-sample-best configuration is no better than a coin flip out-of-sample).
+
+    CSCV partitions the timeline into ``S`` equal **contiguous blocks** (S even), then for
+    every way to assign S/2 blocks to the in-sample set (the rest out-of-sample) it picks the
+    IS-best config and asks whether that config lands below the OOS median across configs.
+    PBO is the fraction of splits where it does.
+
+    Why blocks, not the old ``combinations(range(T), T//2)``: choosing T/2 of T *individual*
+    periods is C(T, T/2) — for a few hundred weekly periods that is ~10⁴⁹ iterations and never
+    terminates (the bug this replaces). C(S, S/2) with S=16 is 12,870 — instant — and blocks
+    also respect the time-series autocorrelation the period-shuffle destroyed.
     """
     from itertools import combinations
-    n_configs, T = returns_matrix.shape
-    half = T // 2
-    oos_underperform = 0
-    total = 0
+    M = np.asarray(returns_matrix, dtype=float)
+    if M.ndim != 2:
+        raise ValueError("returns_matrix must be 2-D (n_configs, n_periods)")
+    n_configs, T = M.shape
+    # PBO across configurations is undefined with <2 configs or <2 periods — return the
+    # uninformative midpoint (the caller annotates this as "single config / too short").
+    if n_configs < 2 or T < 2:
+        return 0.5
 
-    for is_idx in combinations(range(T), half):
-        oos_idx = [i for i in range(T) if i not in is_idx]
-        is_perf = returns_matrix[:, list(is_idx)].mean(axis=1)
-        oos_perf = returns_matrix[:, oos_idx].mean(axis=1)
+    S = min(n_partitions, T)
+    if S % 2 == 1:
+        S -= 1            # CSCV needs an even block count to split S/2 IS vs S/2 OOS
+    if S < 2:
+        return 0.5
+
+    bounds = np.linspace(0, T, S + 1).astype(int)
+    blocks = [list(range(bounds[b], bounds[b + 1])) for b in range(S)]
+    half = S // 2
+
+    below_median = 0
+    total = 0
+    for is_blocks in combinations(range(S), half):
+        is_set = set(is_blocks)
+        is_cols: list[int] = []
+        oos_cols: list[int] = []
+        for b in range(S):
+            (is_cols if b in is_set else oos_cols).extend(blocks[b])
+        if not is_cols or not oos_cols:
+            continue
+        is_perf = M[:, is_cols].mean(axis=1)
+        oos_perf = M[:, oos_cols].mean(axis=1)
         best_is = int(np.argmax(is_perf))
-        median_oos = float(np.median(oos_perf))
-        if oos_perf[best_is] < median_oos:
-            oos_underperform += 1
+        if oos_perf[best_is] < float(np.median(oos_perf)):
+            below_median += 1
         total += 1
 
-    return oos_underperform / total if total > 0 else 0.5
+    return below_median / total if total > 0 else 0.5

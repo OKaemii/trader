@@ -12,6 +12,8 @@ interface Report {
   fdr_p: number
   n_trials: number
   universe_size?: number
+  engine?: string                                 // 'replay' | 'synthetic'
+  benchmark?: { beats_market?: boolean } | null   // BenchmarkComparison subset
   run_at: string
 }
 
@@ -69,7 +71,9 @@ export function ValidationReports({ refreshKey, initial = null }: ValidationRepo
             <tr className="border-b border-gray-800">
               <th className="py-1 text-left font-normal">When</th>
               <th className="py-1 text-left font-normal">Strategy</th>
+              <th className="py-1 text-center font-normal">Engine</th>
               <th className="py-1 text-center font-normal">Pass</th>
+              <th className="py-1 text-center font-normal">Bench</th>
               <th className="py-1 text-right font-normal">OOS SR</th>
               <th className="py-1 text-right font-normal">Mean IC</th>
               <th className="py-1 text-right font-normal">DSR</th>
@@ -85,9 +89,21 @@ export function ValidationReports({ refreshKey, initial = null }: ValidationRepo
                 <td className="py-1.5 font-mono text-gray-400">{new Date(r.run_at).toLocaleString()}</td>
                 <td className="py-1.5 text-gray-300">{r.strategy_id}</td>
                 <td className="py-1.5 text-center">
+                  <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase ${
+                    r.engine === 'synthetic' ? 'bg-red-800 text-red-100' : 'bg-gray-700 text-gray-200'
+                  }`}>{r.engine ?? 'replay'}</span>
+                </td>
+                <td className="py-1.5 text-center">
                   <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${
                     r.passed ? 'bg-emerald-700 text-white' : 'bg-red-700 text-white'
                   }`}>{r.passed ? 'PASS' : 'FAIL'}</span>
+                </td>
+                <td className="py-1.5 text-center font-mono">
+                  {r.benchmark
+                    ? <span className={r.benchmark.beats_market ? 'text-emerald-400' : 'text-amber-300'}>
+                        {r.benchmark.beats_market ? '✓' : '✗'}
+                      </span>
+                    : <span className="text-gray-600">—</span>}
                 </td>
                 <td className="py-1.5 text-right font-mono text-gray-300">{r.oos_sharpe?.toFixed(3) ?? '—'}</td>
                 <td className="py-1.5 text-right font-mono text-gray-300">{r.mean_ic?.toFixed(4) ?? '—'}</td>

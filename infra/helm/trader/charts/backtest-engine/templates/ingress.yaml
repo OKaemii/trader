@@ -5,12 +5,28 @@ metadata:
   namespace: {{ .Release.Namespace }}
   annotations:
     kubernetes.io/ingress.class: nginx
+    # The Phase-4 backtest is synchronous and runs for minutes (asyncio.to_thread keeps /health
+    # alive but the HTTP request stays open until it finishes). nginx's default 60s proxy timeout
+    # returns a 504 *HTML* body that the portal's JSON parse rejects ("unexpected character at
+    # line 1 column 1"). Match signal-service's long-admin-call window. The Phase-5 validator is
+    # async (returns a job_id immediately, runs hours in the background) so it doesn't need this.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
 spec:
   rules:
     - host: trader.local
       http:
         paths:
           - path: /admin/api/backtest
+            pathType: Prefix
+            backend:
+              service:
+                name: backtest-engine
+                port:
+                  number: 8001
+          # Phase 5: the MCPT validation job endpoints (submit/poll). Without this prefix the
+          # ingress 404s /admin/api/validator/* — the endpoints exist but are unreachable.
+          - path: /admin/api/validator
             pathType: Prefix
             backend:
               service:
