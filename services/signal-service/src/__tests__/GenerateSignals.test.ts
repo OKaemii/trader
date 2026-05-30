@@ -189,6 +189,20 @@ describe('GenerateSignalsUseCase', () => {
     expect(hasSell).toBe(true);
   });
 
+  it('liquidates a demoted SUB-1% holding (the legacy-bloat cleanup path)', async () => {
+    // Regression: the old symmetric 1% no-trade band stranded every held position below
+    // 1% — a name demoted out of top-K with currentW≈0.7% produced HOLD, not SELL, so a
+    // bloated book of tiny positions could never be unwound. AAPL held at 0.7%, scored
+    // negative so its target weight is 0 → must now emit a SELL despite being sub-1%.
+    const tinyAAPL = new MockPortfolioState({ AAPL: 0.007, MSFT: 0.5, GOOG: 0.3 });
+    const features = baseFeatures();
+    features.composite_scores = { AAPL: -0.3, MSFT: 0.9, GOOG: 0.5 };
+    const uc = new GenerateSignalsUseCase(repo, publisher, tinyAAPL, makeMockRiskEngine(), stubLogger, stubConfig);
+    const signals = await uc.execute(features);
+    const aaplSell = signals.find((s) => s.ticker === 'AAPL' && s.action === 'SELL');
+    expect(aaplSell).toBeDefined();
+  });
+
   it('confidence is clamped to [0, 1]', async () => {
     const signals = await useCase.execute(baseFeatures());
     for (const s of signals) {
