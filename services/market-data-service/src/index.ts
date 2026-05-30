@@ -8,15 +8,21 @@ import { BarValidator } from './modules/bars/infrastructure/bar-validator.ts';
 import { GapDetector } from './modules/bars/infrastructure/gap-detector.ts';
 import { StaleDetector } from './modules/bars/infrastructure/stale-detector.ts';
 import { UniverseManager } from './modules/universe/application/UniverseManager.ts';
+import { getPgPool } from '@trader/shared-pg';
+import { QuotePoll } from './modules/quotes/application/quote-poll.ts';
+import { QuoteWriter } from './modules/quotes/infrastructure/quote-writer.ts';
+import { buildQuoteProvider } from './modules/quotes/infrastructure/yahoo-quote-provider.ts';
 import { getLiveConfig } from './shared/live-config.ts';
 import { createAdminRouter, createInternalBarsRouter } from './modules/admin/routes.ts';
 import { YahooProvider } from './modules/bars/infrastructure/providers/yahoo-provider.ts';
+import { TwelveDataProvider } from './modules/bars/infrastructure/providers/twelvedata-provider.ts';
+import type { MarketDataProvider } from './modules/bars/infrastructure/providers/market-data-provider.ts';
 import { FxClient, YahooFxProvider } from '@trader/shared-fx';
 import { aggregateBars, invalidateBarsBulk } from '@trader/shared-bars';
 import {
   HolidayCache, NyseIcalProvider, UkGovBankHolidayProvider, StaticFallbackProvider, STATIC_FALLBACK,
   nyseCalendar, lseCalendar, marketStateOf, shouldPollMarket, partitionByMarket,
-  soonestNextOpen, expectedLatestBarMs,
+  soonestNextOpen, expectedLatestBarMs, soonestEodPollInstant,
   type Market, type MarketState, type ExchangeCalendar,
 } from '@trader/shared-calendar';
 import { backfillTickers, tickersMissingHistory, healMissingHistory } from './modules/bars/infrastructure/backfill.ts';
@@ -24,13 +30,19 @@ import { writeBarRevisions, ensureBiTemporalIndexes, fetchFirstPrintCloses } fro
 import { msUntilNextTick } from './modules/bars/application/poll-scheduling.ts';
 import { log } from './logger.ts';
 import { getRuntimeEnv } from './runtime-env.ts';
-import { REDIS_STREAMS, type OHLCVBar, type BarInterval } from '@trader/shared-types';
+import { REDIS_STREAMS, type OHLCVBar, type BarInterval, type Currency } from '@trader/shared-types';
 
 const env = getRuntimeEnv();
 
 // Wall-clock anchor for the poll grid. 24h ticks land at this UTC offset (~1h after
 // US close = 22:00 UTC); shorter intervals land at the same phase.
 const POLL_ANCHOR_OFFSET_MS = env.POLL_ANCHOR_OFFSET_MS;
+
+// Daily (EOD) cadence: how long after a market's close to wake and fetch its
+// just-completed session. Must be > the upstream EOD-print settle window (Yahoo's
+// late 5m bar lands within ~60min; TwelveData is immediate) and ≤ the 90min
+// post-close grace so the market is still POST when we emit the daily bar.
+const EOD_POLL_DELAY_MS = 65 * 60_000;
 
 const app = new Hono();
 // BAR_FREQUENCY=daily   → re-poll Yahoo every POLL_INTERVAL_MS (default 20m) until the
@@ -126,6 +138,7 @@ async function maybeEmitDailyAtClose(
   redis: Awaited<ReturnType<typeof getRedisClient>>,
   groups: { US: string[]; LSE: string[] },
   cycleCounter: number,
+  emitStates: readonly MarketState[] = ['CLOSED'],
 ): Promise<void> {
   const utcDate = new Date().toISOString().slice(0, 10);          // YYYY-MM-DD (UTC)
   const utcMidnightMs = Date.parse(`${utcDate}T00:00:00.000Z`);
@@ -135,7 +148,7 @@ async function maybeEmitDailyAtClose(
     if (tickers.length === 0) continue;
 
     const state = await marketStateOf(calendarFor(market), Date.now());
-    if (state !== 'CLOSED') continue;
+    if (!emitStates.includes(state)) continue;
 
     const gateKey = `market-data:daily-emit:${market}:${utcDate}`;
     const acquired = await redis.set(gateKey, '1', { NX: true, EX: 25 * 60 * 60 });
@@ -233,13 +246,33 @@ async function getFxClient(): Promise<FxClient> {
   return _fxClient;
 }
 
-// Provider is swappable: pass a different MarketDataProvider here once a paid feed
-// or broker-native source is wired. The pollLoop / admin-routes / universe-manager
-// all consume the abstraction, never Yahoo-specific functions directly.
-const provider = new YahooProvider(async (amount, currency) => {
-  const fx = await getFxClient();
-  return fx.toGBP({ amount, currency });
-});
+// Provider is swappable via MARKET_DATA_PROVIDER (default `twelvedata`; `yahoo` is the
+// legacy fallback). The pollLoop / admin-routes / universe-manager all consume the
+// MarketDataProvider abstraction, never provider-specific functions directly — so flipping
+// the env var (and redeploying) is the only change needed to roll back to Yahoo.
+function buildProvider(): MarketDataProvider {
+  const fxToGBP = async (amount: number, currency: Currency) => {
+    const fx = await getFxClient();
+    return fx.toGBP({ amount, currency });
+  };
+  if (env.MARKET_DATA_PROVIDER === 'yahoo') {
+    log.info('[market-data] provider = yahoo (free Yahoo Finance)');
+    return new YahooProvider(fxToGBP);
+  }
+  if (!env.TWELVEDATA_API_KEY) {
+    log.error('[market-data] MARKET_DATA_PROVIDER=twelvedata but TWELVEDATA_API_KEY is unset — provider will return no bars until the secret is wired');
+  }
+  log.info(`[market-data] provider = twelvedata (${env.TWELVEDATA_CREDITS_PER_MIN} credits/min, ${env.TWELVEDATA_DAILY_CREDIT_LIMIT}/day budget)`);
+  return new TwelveDataProvider(
+    {
+      apiKey:           env.TWELVEDATA_API_KEY ?? '',
+      creditsPerMinute: env.TWELVEDATA_CREDITS_PER_MIN,
+      dailyCreditLimit: env.TWELVEDATA_DAILY_CREDIT_LIMIT,
+    },
+    fxToGBP,
+  );
+}
+const provider: MarketDataProvider = buildProvider();
 
 // Calendar wiring: one HolidayCache per process, shared by both ExchangeCalendars.
 // Hydrated in bootstrap() before pollLoop starts. The cache walks
@@ -306,35 +339,59 @@ async function pollLoop(): Promise<void> {
       log.warn(`[market-data] ${groups.OTHER.length} ticker(s) in OTHER bucket — not pollable. Sample: ${groups.OTHER.slice(0, 10).join(',')}`);
     }
     type Decision = { market: Market; tickers: string[]; state: MarketState };
-    const decisions: Decision[] = [];
-    for (const m of ['US', 'LSE'] as Market[]) {
-      if (groups[m].length === 0) continue;
-      const state = await marketStateOf(calendarFor(m), Date.now());
-      decisions.push({ market: m, tickers: groups[m], state });
-      log.info(`[market-data] ${m} session=${state} (tickers=${groups[m].length})`);
-    }
-    const activeDecisions = decisions.filter((d) => d.state === 'REGULAR' || d.state === 'POST' || d.state === 'PRE');
+    // BAR_FREQUENCY drives two distinct polling shapes:
+    //   • daily (EOD) — poll each market exactly once, ~EOD_POLL_DELAY_MS into its own
+    //     post-close window, and fetch only that market's just-completed session. A
+    //     single shared UTC anchor can't serve both markets (no instant has both LSE
+    //     and NYSE freshly closed), so the loop wakes per-market off each calendar.
+    //   • intraday — the original session gate: poll every market in REGULAR/PRE/POST.
+    const isEod = cfg.barFrequency === 'daily';
+    let activeDecisions: Decision[] = [];
 
-    // Daily session-close emit. Runs every cycle regardless of the session-gate skip
-    // below — when all markets are closed, that's exactly when this fires (catches up
-    // markets that closed since the last cycle, including after pod restart).
-    await maybeEmitDailyAtClose(redis, { US: groups.US, LSE: groups.LSE }, cycleCounter)
-      .catch((err) => log.error('[market-data] daily-emit pass failed:', err));
+    if (isEod) {
+      for (const m of ['US', 'LSE'] as Market[]) {
+        if (groups[m].length === 0) continue;
+        const cal = calendarFor(m);
+        const state = await marketStateOf(cal, Date.now());
+        const recentCloseMs = await expectedLatestBarMs(cal, Date.now());
+        if (recentCloseMs == null) {
+          log.info(`[market-data] ${m} session=${state} — no recent session close found, skipping EOD poll`);
+          continue;
+        }
+        const elapsedMin = (Date.now() - recentCloseMs) / 60_000;
+        // Wait until the close has settled. We wake at close+delay, so this only trips
+        // when the loop arrives early (boot mid-POST, clock slip).
+        if (Date.now() - recentCloseMs < EOD_POLL_DELAY_MS - 60_000) {
+          log.info(`[market-data] ${m} session=${state} — last close ${elapsedMin.toFixed(0)}min ago (< ${(EOD_POLL_DELAY_MS / 60_000).toFixed(0)}min EOD delay), waiting`);
+          continue;
+        }
+        // Idempotent per (market, session-date): survives pod restarts and timing slips,
+        // and stops the same session being fetched twice (which would burn TD credits).
+        const sessionDate = new Date(recentCloseMs).toISOString().slice(0, 10);
+        const gateKey = `market-data:eod-poll:${m}:${sessionDate}`;
+        const acquired = await redis.set(gateKey, '1', { NX: true, EX: 25 * 60 * 60 });
+        if (!acquired) {
+          log.info(`[market-data] ${m} session ${sessionDate} already polled (state=${state}) — skipping`);
+          continue;
+        }
+        activeDecisions.push({ market: m, tickers: groups[m], state });
+        log.info(`[market-data] ${m} EOD poll claimed for session ${sessionDate} (state=${state}, +${elapsedMin.toFixed(0)}min)`);
+      }
+    } else {
+      const decisions: Decision[] = [];
+      for (const m of ['US', 'LSE'] as Market[]) {
+        if (groups[m].length === 0) continue;
+        const state = await marketStateOf(calendarFor(m), Date.now());
+        decisions.push({ market: m, tickers: groups[m], state });
+        log.info(`[market-data] ${m} session=${state} (tickers=${groups[m].length})`);
+      }
+      activeDecisions = decisions.filter((d) => d.state === 'REGULAR' || d.state === 'POST' || d.state === 'PRE');
+    }
 
     if (activeDecisions.length === 0) {
-      const summary = decisions.map((d) => `${d.market}=${d.state}`).join(', ');
-      let nextOpenIso = 'unknown';
-      try {
-        const next = await soonestNextOpen(decisions.map((d) => calendarFor(d.market)), Date.now());
-        nextOpenIso = new Date(next).toISOString();
-      } catch { /* calendar exhaustion — surfaced separately on /health */ }
-      log.info(`[market-data] session gate SKIP — ${summary || 'no recognised markets (everything in OTHER bucket)'}; next open ${nextOpenIso}`);
       pollStats.gateSkipsTotal++;
       pollStats.lastGateSkipTs = Date.now();
-      const sleepMs = msUntilNextTick(pollIntervalMs, POLL_ANCHOR_OFFSET_MS);
-      log.info(`[market-data] cycle ${cycleCounter} end (skip) — next poll in ${(sleepMs / 1000).toFixed(0)}s at ${new Date(Date.now() + sleepMs).toISOString()}`);
-      await sleep(sleepMs);
-      continue;
+      log.info(`[market-data] no markets to poll this cycle (mode=${isEod ? 'eod' : 'intraday'})`);
     }
 
     // For each open partition, run the existing pipeline scoped to that market's
@@ -428,13 +485,16 @@ async function pollLoop(): Promise<void> {
           const downsampled = latestPerTicker(valid, targetInterval);
           await xAdd(redis, REDIS_STREAMS.MARKET_RAW, downsampled);
 
-          // WP1: mode-tagged dual-write. 5m bars stream every cycle for intraday workers
-          // regardless of cfg.barFrequency (the producer no longer chooses which mode
-          // gets fed — every active strategy-engine worker picks its own stream). Daily
-          // bars are NOT emitted here; they fire once per session close in the loop's
-          // session-transition handler so daily workers don't re-process the same date.
-          const fivemBars = latestPerTicker(valid, '5m');
-          await xAdd(redis, REDIS_STREAMS.MARKET_RAW_5M, fivemBars);
+          // 5m stream — only fed in intraday cadence. Under daily/EOD cadence the provider
+          // is polled once per session, so the "latest 5m bar" is a single daily-spaced
+          // print: feeding it to the 5m worker (60-bar intraday window) produces mis-windowed
+          // signals that just duplicate the daily worker on a 60-day lag. The daily worker
+          // owns the daily bars via maybeEmitDailyAtClose → market:raw:daily. When the
+          // platform flips to an intraday provider/cadence this resumes automatically.
+          if (cfg.barFrequency === 'intraday') {
+            const fivemBars = latestPerTicker(valid, '5m');
+            await xAdd(redis, REDIS_STREAMS.MARKET_RAW_5M, fivemBars);
+          }
 
           for (const bar of downsampled) {
             await redis.setEx(`market:latest:${bar.ticker}`, 120, JSON.stringify(bar));
@@ -442,7 +502,8 @@ async function pollLoop(): Promise<void> {
           pollStats.lastPollTs   = Date.now();
           pollStats.lastBarCount = downsampled.length;
           pollStats.totalCycles++;
-          log.info(`[market-data] ${decision.market} persisted ${valid.length} 5m bars + invalidated ${writtenTickers.length} cache entries + xAdd ${downsampled.length} ${targetInterval}→market:raw + ${fivemBars.length} 5m→market:raw:5m in ${Date.now() - persistStart}ms (totalCycles=${pollStats.totalCycles})`);
+          const fivemNote = cfg.barFrequency === 'intraday' ? ` + ${downsampled.length} 5m→market:raw:5m` : ' (5m stream skipped — daily cadence)';
+          log.info(`[market-data] ${decision.market} persisted ${valid.length} 5m bars + invalidated ${writtenTickers.length} cache entries + xAdd ${downsampled.length} ${targetInterval}→market:raw${fivemNote} in ${Date.now() - persistStart}ms (totalCycles=${pollStats.totalCycles})`);
         } else {
           log.warn(`[market-data] ${decision.market}: no valid bars to persist this cycle`);
         }
@@ -451,10 +512,34 @@ async function pollLoop(): Promise<void> {
       }
     }
 
-    // Wall-clock alignment: sleep until the next aligned tick rather than for a
-    // fixed pollIntervalMs. Eliminates drift across pod restarts — polls always land
-    // on the same wall-clock minutes regardless of when the pod started.
-    const sleepMs = msUntilNextTick(pollIntervalMs, POLL_ANCHOR_OFFSET_MS);
+    // Daily session-close emit. Runs every cycle (incl. no-poll cycles) so a market
+    // that closed since the last cycle gets its rolled-up daily bar onto market:raw:daily.
+    // In EOD mode we emit as soon as the market is POST (we just fetched its closed
+    // session, +65min); intraday keeps the original CLOSED-only trigger. The internal
+    // Redis NX gate dedupes per (market, UTC-date) either way. Placed AFTER the poll so
+    // it reads the 5m bars this cycle persisted, not a stale snapshot.
+    await maybeEmitDailyAtClose(redis, { US: groups.US, LSE: groups.LSE }, cycleCounter, isEod ? ['POST', 'CLOSED'] : ['CLOSED'])
+      .catch((err) => log.error('[market-data] daily-emit pass failed:', err));
+
+    // Sleep until the next poll. EOD cadence wakes per-market off each calendar's close
+    // (+EOD_POLL_DELAY_MS) — a single shared anchor can't keep both markets fresh.
+    // Intraday keeps the wall-clock-aligned grid (no drift across pod restarts).
+    let sleepMs: number;
+    if (isEod) {
+      try {
+        const cals = (['US', 'LSE'] as Market[])
+          .filter((m) => groups[m].length > 0)
+          .map((m) => calendarFor(m));
+        sleepMs = cals.length > 0
+          ? Math.max(60_000, (await soonestEodPollInstant(cals, EOD_POLL_DELAY_MS, Date.now())) - Date.now())
+          : msUntilNextTick(pollIntervalMs, POLL_ANCHOR_OFFSET_MS);
+      } catch (err) {
+        log.warn('[market-data] EOD wake computation failed — falling back to grid:', err);
+        sleepMs = msUntilNextTick(pollIntervalMs, POLL_ANCHOR_OFFSET_MS);
+      }
+    } else {
+      sleepMs = msUntilNextTick(pollIntervalMs, POLL_ANCHOR_OFFSET_MS);
+    }
     log.info(`[market-data] ── cycle ${cycleCounter} end in ${Date.now() - cycleStartMs}ms — next poll in ${(sleepMs / 1000).toFixed(0)}s at ${new Date(Date.now() + sleepMs).toISOString()}`);
     await sleep(sleepMs);
   }
@@ -610,6 +695,31 @@ async function bootstrap(): Promise<void> {
     log.error('[fatal]', err);
     process.exit(1);
   });
+
+  // Quote poll — separate cadence + endpoint from bars (Yahoo v7/quote), shared rate budget.
+  // Best-effort: a quote-poll crash must never take down the bar pipeline. latestBar feeds the
+  // synthetic high-low fallback from the most recent stored 5m bar.
+  try {
+    const quotePoll = new QuotePoll({
+      provider: buildQuoteProvider(),
+      writer: new QuoteWriter(),
+      activeTickers: () => universeManager.activeTickers,
+      latestBar: async (ticker) => {
+        const { rows } = await getPgPool().query<{ high: number; low: number; close: number }>(
+          `SELECT high, low, close FROM bars
+           WHERE ticker = $1 AND interval = '5m' AND is_superseded = FALSE
+           ORDER BY observation_ts DESC LIMIT 1`,
+          [ticker],
+        );
+        return rows.length ? { high: Number(rows[0]!.high), low: Number(rows[0]!.low), close: Number(rows[0]!.close) } : null;
+      },
+      logger: log as never,
+    });
+    quotePoll.start(env.QUOTE_POLL_INTERVAL_MS);
+    log.info(`[market-data] quote poll started @ ${(env.QUOTE_POLL_INTERVAL_MS / 1000).toFixed(0)}s`);
+  } catch (err) {
+    log.warn('[market-data] quote poll failed to start (bars unaffected):', err);
+  }
 }
 
 // Bootstrap runs unconditionally for prod runtime (node dist/main.js). Tests import

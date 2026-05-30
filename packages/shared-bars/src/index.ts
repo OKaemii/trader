@@ -27,6 +27,7 @@ import type { Db } from 'mongodb';
 import type { RedisClientType } from 'redis';
 import type { OHLCVBar, BarInterval } from '@trader/shared-types';
 import { COLLECTIONS } from '@trader/shared-mongo';
+import { getPgPool } from '@trader/shared-pg';
 import { getBarsFromPg, pgCacheKey } from './pg-bar-reader.ts';
 
 export { hashBarContent } from './content-hash.ts';
@@ -262,6 +263,47 @@ export async function getLastClose(
   const bars = await getBars(redis, db, ticker, interval, '30d', opts);
   const last = bars[bars.length - 1];
   return last ? last.close : null;
+}
+
+export interface MidQuote {
+  mid: number;
+  source: string;
+  spread_bps: number | null;
+  staleness_ms: number;
+  observation_ts: number;
+}
+
+/**
+ * Latest unsuperseded mid-quote for a ticker within a freshness window (Timescale `quotes`,
+ * populated by market-data-service's quote poll). Returns null when no quote is fresh enough —
+ * callers (drift gate, TCA) fall back to last-close. `asOf` reads as-of a knowledge instant for
+ * TCA's arrival/fill lookups; defaults to now.
+ */
+export async function getMidQuote(
+  ticker: string,
+  opts: { freshnessMs?: number; asOf?: number } = {},
+): Promise<MidQuote | null> {
+  const freshness = opts.freshnessMs ?? 15 * 60_000;
+  const asOf = opts.asOf ?? Date.now();
+  const pool = getPgPool();
+  const { rows } = await pool.query<{ mid: number; source: string; spread_bps: number | null; observation_ts: string }>(
+    `SELECT mid, source, spread_bps, observation_ts FROM quotes
+     WHERE ticker = $1 AND is_superseded = FALSE AND observation_ts <= $2
+     ORDER BY observation_ts DESC LIMIT 1`,
+    [ticker, asOf],
+  );
+  if (rows.length === 0) return null;
+  const r = rows[0]!;
+  const observationTs = Number(r.observation_ts);
+  const staleness = asOf - observationTs;
+  if (staleness > freshness) return null;
+  return {
+    mid: Number(r.mid),
+    source: r.source,
+    spread_bps: r.spread_bps != null ? Number(r.spread_bps) : null,
+    staleness_ms: staleness,
+    observation_ts: observationTs,
+  };
 }
 
 /**

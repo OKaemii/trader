@@ -224,6 +224,48 @@ export async function expectedLatestBarMs(cal: ExchangeCalendar, nowMs: number):
   return null;
 }
 
+// ── Per-market EOD poll scheduling ───────────────────────────────────────────
+//
+// Daily-cadence polling can't use a single shared UTC anchor: no instant has both
+// LSE (closes 16:30 London) and NYSE (closes 16:00 New York) freshly closed, so a
+// one-anchor grid leaves whichever market closed earlier perpetually unpolled.
+// Instead the pollLoop wakes once per market, `offsetMs` into that market's own
+// post-close window, and fetches only that market's just-completed session.
+//
+// nextEodPollInstant mirrors nextClose but returns `close + offsetMs` and tolerates
+// being called mid-POST: it returns today's `close + offsetMs` when that instant is
+// still in the future (so a pod that boots shortly after a close still polls today's
+// session rather than skipping to tomorrow).
+
+export async function nextEodPollInstant(
+  cal: ExchangeCalendar,
+  offsetMs: number,
+  nowMs: number,
+): Promise<number> {
+  for (let dayOffset = 0; dayOffset <= 14; dayOffset++) {
+    const probe = nowMs + dayOffset * 86_400_000;
+    const localDate = formatLocalDate(probe, cal.timezone);
+    const dow = dayOfWeekIn(probe, cal.timezone);
+    if (dow === 0 || dow === 6) continue;
+    const table = await cal.holidays.getTable(cal.market, yearOf(probe, cal.timezone));
+    if (table.fullClosures.includes(localDate)) continue;
+    const halfDay = table.halfDays.find((h) => h.date === localDate);
+    const closeLocal = halfDay ? halfDay.closeLocal : cal.regularCloseLocal;
+    const pollMs = localTimeToUtc(localDate, closeLocal, cal.timezone) + offsetMs;
+    if (pollMs > nowMs) return pollMs;
+  }
+  throw new Error(`[shared-calendar] no next EOD poll instant for ${cal.market} within 14 days of ${new Date(nowMs).toISOString()}`);
+}
+
+export async function soonestEodPollInstant(
+  cals: readonly ExchangeCalendar[],
+  offsetMs: number,
+  nowMs: number,
+): Promise<number> {
+  const results = await Promise.all(cals.map((c) => nextEodPollInstant(c, offsetMs, nowMs)));
+  return Math.min(...results);
+}
+
 // ── Schedule iteration (for portal calendar grid) ────────────────────────────
 
 export interface ScheduledSession {

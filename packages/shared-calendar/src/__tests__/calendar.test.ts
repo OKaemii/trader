@@ -5,6 +5,7 @@ import { describe, it, expect } from "vitest";
 import {
   marketStateOf, shouldPollMarket, partitionByMarket, nextOpen, nextClose,
   expectedLatestBarMs, scheduleBetween, localTimeToUtc, formatLocalDate, dayOfWeekIn,
+  nextEodPollInstant, soonestEodPollInstant,
 } from '../calendar.ts';
 import type { ExchangeCalendar, HolidayTable } from '../calendar.ts';
 import { nyseCalendar } from '../nyse.ts';
@@ -208,6 +209,52 @@ describe('nextOpen / nextClose', () => {
     const wed = Date.parse('2026-05-13T09:00:00Z');   // PRE
     const next = await nextClose(nyse(), wed);
     expect(new Date(next).toISOString()).toBe('2026-05-13T20:00:00.000Z');   // 16:00 EDT
+  });
+});
+
+describe('nextEodPollInstant / soonestEodPollInstant', () => {
+  const DELAY = 65 * 60_000;   // matches market-data EOD_POLL_DELAY_MS
+
+  it('mid-session returns today close + delay', async () => {
+    // Wednesday 2026-05-13 15:00 UTC (mid-REGULAR, EDT close 20:00 UTC).
+    const wedMid = Date.parse('2026-05-13T15:00:00Z');
+    const next = await nextEodPollInstant(nyse(), DELAY, wedMid);
+    expect(new Date(next).toISOString()).toBe('2026-05-13T21:05:00.000Z');  // 20:00 + 65min
+  });
+
+  it('mid-POST (boot just after close, before delay) still returns today instant', async () => {
+    // 2026-05-13 20:30 UTC — past close (20:00) but before close+65min.
+    const post = Date.parse('2026-05-13T20:30:00Z');
+    const next = await nextEodPollInstant(nyse(), DELAY, post);
+    expect(new Date(next).toISOString()).toBe('2026-05-13T21:05:00.000Z');
+  });
+
+  it('after today instant rolls to next session day', async () => {
+    // 2026-05-13 21:30 UTC — past close+65min (21:05) → tomorrow's close+delay.
+    const after = Date.parse('2026-05-13T21:30:00Z');
+    const next = await nextEodPollInstant(nyse(), DELAY, after);
+    expect(new Date(next).toISOString()).toBe('2026-05-14T21:05:00.000Z');
+  });
+
+  it('Friday evening rolls to Monday close + delay', async () => {
+    const friEve = Date.parse('2026-05-15T22:00:00Z');   // past Fri close+delay
+    const next = await nextEodPollInstant(nyse(), DELAY, friEve);
+    expect(new Date(next).toISOString()).toBe('2026-05-18T21:05:00.000Z');  // Mon
+  });
+
+  it('soonest picks the earlier-closing market (LSE closes before NYSE)', async () => {
+    // 2026-05-13 09:00 UTC. LSE close 16:30 BST = 15:30 UTC → +65min = 16:35 UTC.
+    // NYSE close 20:00 UTC → +65min = 21:05 UTC. LSE is sooner.
+    const morn = Date.parse('2026-05-13T09:00:00Z');
+    const soonest = await soonestEodPollInstant([nyse(), lse()], DELAY, morn);
+    expect(new Date(soonest).toISOString()).toBe('2026-05-13T16:35:00.000Z');
+  });
+
+  it('after LSE poll instant, soonest becomes NYSE the same day', async () => {
+    // 2026-05-13 17:00 UTC — past LSE+delay (16:35), before NYSE+delay (21:05).
+    const afterLse = Date.parse('2026-05-13T17:00:00Z');
+    const soonest = await soonestEodPollInstant([nyse(), lse()], DELAY, afterLse);
+    expect(new Date(soonest).toISOString()).toBe('2026-05-13T21:05:00.000Z');
   });
 });
 

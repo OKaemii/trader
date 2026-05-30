@@ -4,6 +4,7 @@
 
 import { getMongoDb } from '@trader/shared-mongo';
 import { COLLECTIONS } from '@trader/shared-mongo';
+import { getPgPool } from '@trader/shared-pg';
 import type { Currency } from '@trader/shared-types';
 import { fetchT212Instruments } from '../infrastructure/t212-client.ts';
 import { fetchYahooLiquidity } from '../../bars/infrastructure/providers/yahoo-client.ts';
@@ -46,6 +47,33 @@ const DEFAULT_CONFIG: UniverseConfig = {
 
 const ADV_LOOKBACK_DAYS   = 20;
 const MAX_SECTOR_FRACTION = 0.35;  // Section 29c: no more than 35% from one GICS sector
+const MAX_SPREAD_BPS = 30;          // Section 29b: exclude tickers with trailing-7d median spread > 30bps
+const SPREAD_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Trailing-7d median quoted spread (bps) per ticker, from REAL (non-synthetic) REGULAR-session
+// quotes only. Tickers with no real quote history → absent from the map → pass-through (the
+// filter is inactive until ≥1 real REGULAR quote exists, e.g. the first 7 days post-deploy, or
+// for synthetic-only LSE small-caps where the high-low proxy would unfairly exclude them).
+async function medianSpreadByTicker(tickers: string[]): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  if (tickers.length === 0) return out;
+  try {
+    const pool = getPgPool();
+    const { rows } = await pool.query<{ ticker: string; median_bps: number }>(
+      `SELECT ticker, percentile_cont(0.5) WITHIN GROUP (ORDER BY spread_bps) AS median_bps
+       FROM quotes
+       WHERE ticker = ANY($1) AND is_superseded = FALSE AND is_synthetic = FALSE
+         AND market_state = 'REGULAR' AND spread_bps IS NOT NULL
+         AND observation_ts >= $2
+       GROUP BY ticker`,
+      [tickers, Date.now() - SPREAD_WINDOW_MS],
+    );
+    for (const r of rows) out.set(r.ticker, Number(r.median_bps));
+  } catch (err) {
+    log.warn('[universe] spread-filter query failed — filter inactive this refresh:', err);
+  }
+  return out;
+}
 
 // Yahoo enrichment is best-effort. Cap each call so a rate-limited (429-walled) or hung
 // upstream can never stall refresh() — and thus can never block the poll loop from
@@ -328,8 +356,7 @@ export class UniverseManager {
       }
 
       // ── 3. Apply eligibility filters (Section 29b) ───────────────────────────
-      // Spread filter (≤ 30bps): T212 API does not expose bid-ask spread — cannot implement.
-      const eligible = instruments.filter((i) => {
+      const priceAdvEligible = instruments.filter((i) => {
         if (!i.t212Tradable) return false;
 
         const stats = statsMap[i.ticker];
@@ -344,6 +371,19 @@ export class UniverseManager {
           if (adv < this.config.minAdvGbp) return false;
         }
 
+        return true;
+      });
+
+      // Spread filter (Section 29b: ≤ 30bps) — NOW IMPLEMENTED via the quotes feed (was a no-op
+      // when T212 was the only source). Trailing-7d median over real REGULAR quotes; tickers
+      // without real quote history pass through (filter inactive until data accrues).
+      const spreadMap = await medianSpreadByTicker(priceAdvEligible.map((i) => i.ticker));
+      const eligible = priceAdvEligible.filter((i) => {
+        const median = spreadMap.get(i.ticker);
+        if (median != null && median > MAX_SPREAD_BPS) {
+          log.info(`[universe] excluded ${i.ticker} median_bps=${median.toFixed(1)} > ${MAX_SPREAD_BPS}`);
+          return false;
+        }
         return true;
       });
 

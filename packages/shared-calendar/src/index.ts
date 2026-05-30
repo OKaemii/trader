@@ -11,6 +11,8 @@ export {
   nextClose,
   soonestNextOpen,
   expectedLatestBarMs,
+  nextEodPollInstant,
+  soonestEodPollInstant,
   scheduleBetween,
 } from './calendar.ts';
 
