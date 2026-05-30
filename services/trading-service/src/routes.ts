@@ -7,6 +7,7 @@ import type { Db } from "mongodb";
 import type { RedisClientType } from "redis";
 import { parseAdminHeaders, parseInternalHeaders } from "@trader/shared-auth/middleware";
 import { money, BASE_CURRENCY } from "@trader/shared-types";
+import { getPgPool } from "@trader/shared-pg";
 
 import { Trading212Client } from "./modules/t212/infrastructure/Trading212Client.ts";
 import { MongoOrderRepository } from "./modules/orders/infrastructure/MongoOrderRepository.ts";
@@ -19,6 +20,15 @@ import { TradingMode, type OrderType } from "./modules/orders/domain/Order.ts";
 // Live-trading admin approval gate. Stored in Redis so it survives restarts.
 const LIVE_GATE_KEY = "trading:live_approved";
 
+// Reconciliation runner + ledger reads (built in wiring.ts; null in paper mode — no broker
+// truth to reconcile). The route layer depends on this shape, not on the engine concretion.
+export interface ReconcileRunner {
+    run: (w: { startMs: number; endMs: number; trigger: 'manual' | 'scheduled_4h' | 'scheduled_nightly' | 'pod_catchup' }) => Promise<unknown>;
+    acknowledge: (findingId: number, by: string) => Promise<void>;
+    listFindings: (openOnly: boolean, limit: number) => Promise<Record<string, unknown>[]>;
+    listNav: (limit: number) => Promise<Record<string, unknown>[]>;
+}
+
 export interface AppDeps {
     tradingMode: TradingMode;
     getRedis: () => Promise<Pick<RedisClientType, "get" | "set" | "del">>;
@@ -27,6 +37,7 @@ export interface AppDeps {
     signal?:  SignalServiceClient;
     logger?:  Logger;
     accountCache?: AccountCache;
+    reconcile?: ReconcileRunner | null;
 }
 
 const modeName = (m: TradingMode): string => TradingMode[m]!;
@@ -190,6 +201,82 @@ export function buildApp(deps: AppDeps): Hono {
             return c.json({ positions, mode: modeName(tradingMode) });
         } catch (e) {
             return c.json({ error: e instanceof Error ? e.message : "positions fetch failed", mode: modeName(tradingMode) }, 502);
+        }
+    });
+
+    // ── Reconciliation (demo/live only) ─────────────────────────────────────────
+    const needReconcile = (c: import("hono").Context): ReconcileRunner | null => {
+        if (!deps.reconcile) {
+            c.json({ error: "reconciliation unavailable in paper mode" }, 400);
+            return null;
+        }
+        return deps.reconcile;
+    };
+
+    // Manual / cron-triggered run. Body { window_start_ms?, window_end_ms?, trigger? } —
+    // defaults to the last 4h. The CronJob hits this with explicit windows.
+    app.post("/admin/api/trading/reconcile/run", async (c) => {
+        const r = needReconcile(c);
+        if (!r) return c.res;
+        const body = await c.req.json().catch(() => ({})) as {
+            window_start_ms?: number; window_end_ms?: number;
+            trigger?: 'manual' | 'scheduled_4h' | 'scheduled_nightly' | 'pod_catchup';
+        };
+        const endMs = body.window_end_ms ?? Date.now();
+        const startMs = body.window_start_ms ?? endMs - 4 * 60 * 60 * 1000;
+        const summary = await r.run({ startMs, endMs, trigger: body.trigger ?? 'manual' });
+        return c.json({ summary });
+    });
+
+    app.post("/admin/api/trading/reconcile/findings/:id/acknowledge", async (c) => {
+        const r = needReconcile(c);
+        if (!r) return c.res;
+        const id = Number(c.req.param("id"));
+        if (!Number.isFinite(id)) return c.json({ error: "invalid finding id" }, 400);
+        const body = await c.req.json().catch(() => ({})) as { by?: string };
+        await r.acknowledge(id, body.by ?? "operator");
+        return c.json({ acknowledged: id });
+    });
+
+    app.get("/admin/api/trading/reconcile/findings", async (c) => {
+        const r = needReconcile(c);
+        if (!r) return c.res;
+        const openOnly = c.req.query("open") !== "false";
+        const limit = Math.min(Number(c.req.query("limit") ?? "100"), 500);
+        return c.json({ findings: await r.listFindings(openOnly, limit) });
+    });
+
+    app.get("/admin/api/trading/reconcile/nav", async (c) => {
+        const r = needReconcile(c);
+        if (!r) return c.res;
+        const limit = Math.min(Number(c.req.query("limit") ?? "200"), 1000);
+        return c.json({ nav: await r.listNav(limit) });
+    });
+
+    // ── TCA (transaction-cost analysis) ─────────────────────────────────────────
+    // Per-day cost summary + recent rows from tca_log. Reads Timescale directly (admin-authed).
+    app.get("/admin/api/trading/tca", async (c) => {
+        const limit = Math.min(Number(c.req.query("limit") ?? "100"), 500);
+        try {
+            const pool = getPgPool();
+            const [daily, recent] = await Promise.all([
+                pool.query(
+                    `SELECT date_trunc('day', fill_at) AS day, count(*) AS fills,
+                            avg(total_cost_bps) AS avg_cost_bps, avg(fill_slip_bps) AS avg_fill_slip_bps,
+                            count(total_cost_bps) AS cost_coverage
+                     FROM tca_log GROUP BY 1 ORDER BY 1 DESC LIMIT 30`,
+                ),
+                pool.query(
+                    `SELECT computed_at, ticker, side, signal_id, fill_price, arrival_mid, fill_mid,
+                            arrival_slip_bps, fill_slip_bps, total_cost_bps,
+                            quote_arrival_source, quote_fill_source
+                     FROM tca_log ORDER BY computed_at DESC LIMIT $1`,
+                    [limit],
+                ),
+            ]);
+            return c.json({ daily: daily.rows, recent: recent.rows });
+        } catch (e) {
+            return c.json({ error: e instanceof Error ? e.message : "tca query failed", daily: [], recent: [] }, 200);
         }
     });
 

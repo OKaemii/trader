@@ -13,9 +13,17 @@ import { MongoOrderRepository } from "./modules/orders/infrastructure/MongoOrder
 import { AccountCache } from "./modules/orders/infrastructure/AccountCache.ts";
 import { OrderDispatcher } from "./modules/orders/infrastructure/OrderDispatcher.ts";
 import { FillsPoller } from "./modules/fills/application/FillsPoller.ts";
+import { FillsHistoryStore } from "./modules/reconciliation/infrastructure/FillsHistoryStore.ts";
+import { TcaWriter } from "./modules/tca/infrastructure/TcaWriter.ts";
+import { ReconciliationStore } from "./modules/reconciliation/infrastructure/ReconciliationStore.ts";
+import { T212HistoryWalker } from "./modules/reconciliation/infrastructure/T212HistoryWalker.ts";
+import { MongoSystemReader } from "./modules/reconciliation/infrastructure/MongoSystemReader.ts";
+import { MongoHealer } from "./modules/reconciliation/infrastructure/MongoHealer.ts";
+import { Reconciliation } from "./modules/reconciliation/application/Reconciliation.ts";
+import type { T212Position } from "./modules/t212/infrastructure/Trading212Client.ts";
 import { PriceLookup } from "./shared/PriceLookup.ts";
 import { TradingMode } from "./modules/orders/domain/Order.ts";
-import { invalidateSignalOrderType, configureLiveConfig, parseSignalOrderType } from "./modules/orders/infrastructure/live-config.ts";
+import { invalidateSignalOrderType, configureLiveConfig, parseSignalOrderType, getSignalOrderType } from "./modules/orders/infrastructure/live-config.ts";
 
 export async function wireDependencies(env: TradingEnv, logger: Logger) {
     configureLiveConfig({ logger, envDefault: parseSignalOrderType(env.SIGNAL_ORDER_TYPE) });
@@ -50,6 +58,10 @@ export async function wireDependencies(env: TradingEnv, logger: Logger) {
         mintToken:     mintInternalJwt,
     });
 
+    // Append-only fills ledger (Timescale fills_history) — written by FillsPoller, read by
+    // reconciliation. Safe to construct in any mode (lazy getPgPool); only used demo/live.
+    const fillsHistoryStore = new FillsHistoryStore();
+
     const fillsPoller = env.TRADING_MODE !== TradingMode.Paper
         ? new FillsPoller(
             new MongoOrderRepository(await getMongoDb()),
@@ -58,6 +70,8 @@ export async function wireDependencies(env: TradingEnv, logger: Logger) {
             env.FILL_POLL_INTERVAL_MS,
             logger,
             priceLookup,
+            fillsHistoryStore,
+            new TcaWriter(),
         )
         : null;
 
@@ -86,8 +100,62 @@ export async function wireDependencies(env: TradingEnv, logger: Logger) {
         minIntervalMs:       env.ORDER_MIN_INTERVAL_MS,
         maxAttempts:         env.ORDER_MAX_ATTEMPTS,
         queueTtlMs:          env.QUEUE_TTL_MS,
+        marketRetryWindowMs: env.MARKET_RETRY_WINDOW_MS,
+        getOrderType:        () => getSignalOrderType(),
         priceDriftTolerance: env.PRICE_DRIFT_TOLERANCE,
+        driftQuoteFreshnessMs: env.DRIFT_QUOTE_FRESHNESS_MS,
     });
+
+    // ── Reconciliation (demo/live only — paper has no broker truth to reconcile against) ──
+    // Observe-only by default (RECONCILE_AUTO_HEAL=false): findings + NAV are recorded, no
+    // Mongo mutations. NAV positions-value is FX-summed to GBP; an FX outage degrades it to
+    // cash-only rather than failing the cycle.
+    const reconcileStore = new ReconciliationStore();
+    let reconcile: {
+        run: (w: { startMs: number; endMs: number; trigger: 'manual' | 'scheduled_4h' | 'scheduled_nightly' | 'pod_catchup' }) => Promise<unknown>;
+        acknowledge: (findingId: number, by: string) => Promise<void>;
+        listFindings: (openOnly: boolean, limit: number) => Promise<Record<string, unknown>[]>;
+        listNav: (limit: number) => Promise<Record<string, unknown>[]>;
+    } | null = null;
+
+    if (env.TRADING_MODE !== TradingMode.Paper) {
+        const db = await getMongoDb();
+        const valuePositionsGbp = async (positions: T212Position[]): Promise<number> => {
+            try {
+                const fx = await getFxClient();
+                let sum = 0;
+                for (const p of positions) sum += await fx.toGBP(p.currentValue);
+                return sum;
+            } catch (err) {
+                logger.warn({ err }, "reconcile: FX unavailable — NAV positions-value degraded to 0 (cash-only)");
+                return 0;
+            }
+        };
+        const engine = new Reconciliation({
+            broker: sharedClient,
+            history: new T212HistoryWalker(sharedClient, env.RECONCILE_MAX_HISTORY_PAGES),
+            system: new MongoSystemReader(db, fillsHistoryStore),
+            store: reconcileStore,
+            healer: new MongoHealer(db),
+            alerter: {
+                notify: async ({ cycleId, count }) =>
+                    logger.warn({ cycleId, majorFindings: count }, "reconcile: open major findings — operator review needed"),
+            },
+            valuePositionsGbp,
+            thresholds: {
+                positionDriftSharesAuto:  env.RECONCILE_POSITION_AUTO_SHARES,
+                positionDriftSharesAlert: env.RECONCILE_POSITION_ALERT_SHARES,
+                cashDriftAlertAmount:     env.RECONCILE_CASH_ALERT_GBP,
+            },
+            autoHealEnabled: env.RECONCILE_AUTO_HEAL,
+        });
+        reconcile = {
+            run: (w) => engine.run(w),
+            acknowledge: (findingId, by) => reconcileStore.markResolution(findingId, 'operator_acknowledged', by),
+            listFindings: (openOnly, limit) => reconcileStore.listFindings(openOnly, limit),
+            listNav: (limit) => reconcileStore.listNav(limit),
+        };
+    }
 
     return {
         logger,
@@ -97,6 +165,7 @@ export async function wireDependencies(env: TradingEnv, logger: Logger) {
         signal,
         fillsPoller,
         dispatcher,
+        reconcile,
         getFxClient,
         subscribeConfigInvalidations: async () => {
             const redis = await getRedisClient();

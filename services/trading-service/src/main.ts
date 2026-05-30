@@ -21,6 +21,7 @@ async function main(): Promise<void> {
         signal:   deps.signal,
         logger,
         accountCache: deps.sharedAccountCache,
+        reconcile: deps.reconcile,
     };
     const app = buildApp(appDeps);
 
@@ -40,6 +41,24 @@ async function main(): Promise<void> {
 
     deps.dispatcher.start().catch((err: unknown) => logger.error({ err }, "dispatcher crashed"));
 
+    // In-process reconciliation loop (demo/live only). Runs a pod_catchup pass on boot, then
+    // every RECONCILE_INTERVAL_MS. Preferred over an external CronJob here: it reuses the wired
+    // engine and needs no JWT (a shell CronJob can't mint the internal/admin token), and the
+    // service is always-on. The portal "Run now" button hits the admin endpoint for ad-hoc runs.
+    let reconcileTimer: ReturnType<typeof setInterval> | undefined;
+    if (deps.reconcile && env.RECONCILE_INTERVAL_MS > 0) {
+        const runReconcile = (trigger: "pod_catchup" | "scheduled_4h") => {
+            const endMs = Date.now();
+            const startMs = endMs - env.RECONCILE_INTERVAL_MS;
+            deps.reconcile!.run({ startMs, endMs, trigger })
+                .then((summary) => logger.info({ summary, trigger }, "reconcile cycle complete"))
+                .catch((err: unknown) => logger.warn({ err, trigger }, "reconcile cycle failed"));
+        };
+        runReconcile("pod_catchup");
+        reconcileTimer = setInterval(() => runReconcile("scheduled_4h"), env.RECONCILE_INTERVAL_MS);
+        logger.info({ intervalMs: env.RECONCILE_INTERVAL_MS, autoHeal: env.RECONCILE_AUTO_HEAL }, "reconcile loop started");
+    }
+
     try {
         await deps.subscribeConfigInvalidations();
     } catch (err) {
@@ -53,6 +72,7 @@ async function main(): Promise<void> {
             await handle.close();
             await deps.dispatcher.stop?.();
             deps.fillsPoller?.stop();
+            if (reconcileTimer) clearInterval(reconcileTimer);
         },
     });
 }

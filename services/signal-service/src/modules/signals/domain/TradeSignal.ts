@@ -18,6 +18,11 @@ export class TradeSignal {
   public readonly entryPrice?: number | undefined;
   public readonly lifecycle: SignalLifecycle;
   public readonly approvedAt?: number | undefined;
+  // Wall-clock ms the signal entered the dispatch queue (lifecycle → Queued). The queue
+  // TTL is measured from THIS, not from emission `timestamp` — so approval latency (a
+  // slow auto-approve sweep, a backlog flush) can never by itself expire a signal; only
+  // genuine queue-sitting does. Price staleness is guarded separately by the drift gate.
+  public readonly queuedAt?: number | undefined;
   public readonly executedAt?: number | undefined;
   public readonly closedAt?: number | undefined;
   public readonly exitPrice?: number | undefined;
@@ -48,6 +53,7 @@ export class TradeSignal {
     entryPrice?: number;
     lifecycle?: SignalLifecycle;
     approvedAt?: number;
+    queuedAt?: number;
     executedAt?: number;
     closedAt?: number;
     exitPrice?: number;
@@ -84,6 +90,7 @@ export class TradeSignal {
         : (params.approved ?? false) ? SignalLifecycle.Approved
         : SignalLifecycle.Pending);
     this.approvedAt = params.approvedAt;
+    this.queuedAt = params.queuedAt;
     this.executedAt = params.executedAt;
     this.closedAt = params.closedAt;
     this.exitPrice = params.exitPrice;

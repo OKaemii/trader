@@ -11,6 +11,8 @@ const links = [
   { href: '/research', label: 'Research' },
   { href: '/universe', label: 'Universe' },
   { href: '/market-data', label: 'Market Data' },
+  { href: '/operations/reconciliation', label: 'Reconciliation' },
+  { href: '/operations/tca', label: 'TCA' },
 ]
 
 export function AppNav() {

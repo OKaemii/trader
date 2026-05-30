@@ -8,6 +8,7 @@ import type { Trading212Client } from '../../t212/infrastructure/Trading212Clien
 import type { InstrumentMetadataCache } from '../../t212/infrastructure/InstrumentMetadataCache.ts';
 import type { AccountCache } from './AccountCache.ts';
 import { MongoOrderRepository } from './MongoOrderRepository.ts';
+import { getMidQuote } from '@trader/shared-bars';
 import { PriceLookup } from '../../../shared/PriceLookup.ts';
 import { T212OrderExecutor } from '../../t212/infrastructure/T212OrderExecutor.ts';
 import { PlaceOrderUseCase } from '../application/PlaceOrderUseCase.ts';
@@ -47,6 +48,7 @@ export interface ClaimedSignal {
     confidence:   number;
     entryPrice?:  number;
     timestamp:    number;
+    queuedAt?:    number;
     attempts:     number;
 }
 
@@ -71,7 +73,19 @@ export interface OrderDispatcherDeps {
     idleSleepMs?:         number;
     maxAttempts?:         number;
     queueTtlMs?:          number;
+    // Freshness window for MARKET orders specifically: a market order that has sat in the
+    // queue longer than this is too stale to fill at-market (the trade is no longer the same
+    // trade) → fail, no more retries. LIMIT orders keep the longer queueTtlMs (a resting order
+    // at a price tolerates sitting). Default 5min.
+    marketRetryWindowMs?: number;
+    // Effective order type (live config). Injected so the dispatcher depends on an abstraction,
+    // not the module-global getSignalOrderType (which awaits Mongo and would hang in tests).
+    // Defaults to Limit (the conservative window) when not wired.
+    getOrderType?: () => Promise<OrderType>;
     priceDriftTolerance?: number;
+    // Max staleness for a mid-quote to be used by the drift gate; older → fall back to last
+    // close. 0 disables mid-quote (always last-close). Default 15min.
+    driftQuoteFreshnessMs?: number;
     now?:                 () => number;
 }
 
@@ -82,7 +96,10 @@ export class OrderDispatcher {
     private readonly idleSleepMs:   number;
     private readonly maxAttempts:   number;
     private readonly queueTtlMs:    number;
+    private readonly marketRetryWindowMs: number;
+    private readonly getOrderType: () => Promise<OrderType>;
     private readonly drift:         number;
+    private readonly driftQuoteFreshnessMs: number;
     private readonly now:           () => number;
     private stopped = false;
 
@@ -91,7 +108,10 @@ export class OrderDispatcher {
         this.idleSleepMs   = deps.idleSleepMs         ?? 5000;
         this.maxAttempts   = deps.maxAttempts         ?? 5;
         this.queueTtlMs    = deps.queueTtlMs          ?? 60 * 60_000;
+        this.marketRetryWindowMs = deps.marketRetryWindowMs ?? 5 * 60_000;
+        this.getOrderType  = deps.getOrderType        ?? (async () => OrderType.Limit);
         this.drift         = deps.priceDriftTolerance ?? 0.01;
+        this.driftQuoteFreshnessMs = deps.driftQuoteFreshnessMs ?? 15 * 60_000;
         this.now           = deps.now                 ?? (() => Date.now());
     }
 
@@ -131,7 +151,7 @@ export class OrderDispatcher {
                     confidence:   signal.confidence,
                     entryPrice:   signal.entryPrice,
                     attempts:     signal.attempts,
-                    ageMs:        this.now() - signal.timestamp,
+                    ageMs:        this.now() - (signal.queuedAt ?? signal.timestamp),
                 }, 'order-dispatcher: claimed signal');
                 const procStart = Date.now();
                 await this.processOne(signal);
@@ -163,12 +183,24 @@ export class OrderDispatcher {
             return;
         }
 
-        const ageMs = this.now() - signal.timestamp;
-        if (ageMs > this.queueTtlMs) {
-            this.deps.logger.warn({ signalId: signal.id, ageMs, ttl: this.queueTtlMs },
+        // Queue freshness — measured from when the signal entered the queue (queuedAt),
+        // NOT from emission. Approval latency (a slow auto-approve sweep, a backlog flush)
+        // therefore can't expire a still-fresh trade; only genuine queue-sitting does.
+        // Falls back to emission `timestamp` for signals queued before queuedAt existed.
+        // Price staleness is guarded independently by the drift gate below.
+        //
+        // Order-type-aware: a MARKET order older than marketRetryWindowMs (5min) is too stale
+        // to fill at-market and gets no further retries; LIMIT orders (resting at a price)
+        // keep the longer queueTtlMs. The gate runs at the start of every claim, so a market
+        // order that was requeued after a transient error also stops retrying once it ages out.
+        const orderType = await this.getOrderType();
+        const effectiveTtl = orderType === OrderType.Market ? this.marketRetryWindowMs : this.queueTtlMs;
+        const ageMs = this.now() - (signal.queuedAt ?? signal.timestamp);
+        if (ageMs > effectiveTtl) {
+            this.deps.logger.warn({ signalId: signal.id, ageMs, ttl: effectiveTtl, orderType: OrderType[orderType] },
                 'dispatcher: queue expired');
             await this.markFailed(signal.id, SignalFailureReason.QueueExpired,
-                `age=${ageMs}ms > ttl=${this.queueTtlMs}ms`);
+                `age=${ageMs}ms > ttl=${effectiveTtl}ms (orderType=${OrderType[orderType]})`);
             return;
         }
 
@@ -211,27 +243,35 @@ export class OrderDispatcher {
             }, 'dispatcher: current price loaded');
         }
 
-        // Drift gate: scalar comparison in the instrument's currency. Both currentPrice.amount
-        // and signal.entryPrice are recorded at emission in the instrument currency, so the
-        // comparison stays valid without any FX hop.
-        if (signal.entryPrice && currentPrice && signal.entryPrice > 0) {
-            const movement = Math.abs(currentPrice.amount - signal.entryPrice) / signal.entryPrice;
-            if (movement > this.drift) {
-                this.deps.logger.warn({
-                    signalId: signal.id, ticker: signal.ticker,
-                    entry: signal.entryPrice, current: currentPrice.amount,
-                    movement, tolerance: this.drift,
-                }, 'dispatcher: price drift exceeds tolerance — failing signal');
-                await this.markFailed(
-                    signal.id,
-                    SignalFailureReason.MarketDrift,
-                    `entry=${signal.entryPrice.toFixed(4)} current=${currentPrice.amount.toFixed(4)} delta=${(movement * 100).toFixed(2)}%`,
-                );
-                return;
+        // Drift gate: prefer a fresh mid-quote (truer than a ≤24h-old close — catches an
+        // intraday spread blow-out that the last close hides) and fall back to last close when
+        // no quote is fresh. Reference + entryPrice are both in the instrument currency, so the
+        // scalar comparison stays valid without an FX hop.
+        if (signal.entryPrice && signal.entryPrice > 0) {
+            const mq = this.driftQuoteFreshnessMs > 0
+                ? await getMidQuote(signal.ticker, { freshnessMs: this.driftQuoteFreshnessMs }).catch(() => null)
+                : null;
+            const referencePrice = mq ? mq.mid : currentPrice?.amount;
+            const referenceSource = mq ? `mid_quote:${mq.source}` : 'last_close';
+            if (referencePrice != null && Number.isFinite(referencePrice)) {
+                const movement = Math.abs(referencePrice - signal.entryPrice) / signal.entryPrice;
+                if (movement > this.drift) {
+                    this.deps.logger.warn({
+                        signalId: signal.id, ticker: signal.ticker,
+                        entry: signal.entryPrice, reference: referencePrice, referenceSource,
+                        movement, tolerance: this.drift,
+                    }, 'dispatcher: price drift exceeds tolerance — failing signal');
+                    await this.markFailed(
+                        signal.id,
+                        SignalFailureReason.MarketDrift,
+                        `entry=${signal.entryPrice.toFixed(4)} reference=${referencePrice.toFixed(4)} source=${referenceSource} delta=${(movement * 100).toFixed(2)}%`,
+                    );
+                    return;
+                }
+                this.deps.logger.info({
+                    signalId: signal.id, movement, tolerance: this.drift, referenceSource,
+                }, 'dispatcher: drift within tolerance');
             }
-            this.deps.logger.info({
-                signalId: signal.id, movement, tolerance: this.drift,
-            }, 'dispatcher: drift within tolerance');
         }
 
         const currentQuantity = snapshot.positions.find((p) => p.ticker === signal.ticker)?.quantity ?? 0;

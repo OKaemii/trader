@@ -84,7 +84,10 @@ export class MongoSignalRepository implements ISignalRepository {
   }
 
   async markQueued(id: string): Promise<void> {
-    await this.manager.update(id, { lifecycle: SignalLifecycle.Queued });
+    // Stamp queuedAt so the dispatcher measures TTL from queue entry, not emission. A
+    // requeue after a transient error (see `requeue`) deliberately does NOT reset this —
+    // the signal has genuinely been waiting — so retries still count toward the TTL.
+    await this.manager.update(id, { lifecycle: SignalLifecycle.Queued, queuedAt: new Date() });
     await this.invalidate(id);
   }
 
@@ -131,8 +134,11 @@ export class MongoSignalRepository implements ISignalRepository {
   }
 
   async retry(id: string): Promise<void> {
+    // Admin-driven retry — a fresh start. Reset queuedAt so the TTL clock restarts from
+    // now (the operator is explicitly re-validating the trade as current).
     await this.manager.update(id, {
       lifecycle: SignalLifecycle.Queued,
+      queuedAt: new Date(),
       attempts: 0,
       failureReason: null,
       failureDetail: null,

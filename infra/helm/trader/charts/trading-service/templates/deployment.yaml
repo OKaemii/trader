@@ -64,8 +64,25 @@ spec:
               value: {{ .Values.global.env.orderMaxAttempts | default "5" | quote }}
             - name: QUEUE_TTL_MS
               value: {{ .Values.global.env.queueTtlMs | default "3600000" | quote }}
+            - name: MARKET_RETRY_WINDOW_MS
+              value: {{ .Values.global.env.marketRetryWindowMs | default "300000" | quote }}
             - name: PRICE_DRIFT_TOLERANCE
               value: {{ .Values.global.env.priceDriftTolerance | default "0.01" | quote }}
+            # Drift gate mid-quote freshness (0 → always last-close). Needs the quote feed.
+            - name: DRIFT_QUOTE_FRESHNESS_MS
+              value: {{ .Values.global.env.driftQuoteFreshnessMs | default "900000" | quote }}
+            # Reconciliation. autoHeal OFF by default → observe-only (findings + NAV recorded,
+            # no Mongo mutations). Flip on once findings are trusted.
+            - name: RECONCILE_AUTO_HEAL
+              value: {{ .Values.global.env.reconcileAutoHeal | default "false" | quote }}
+            - name: RECONCILE_INTERVAL_MS
+              value: {{ .Values.global.env.reconcileIntervalMs | default "14400000" | quote }}
+            - name: RECONCILE_POSITION_AUTO_SHARES
+              value: {{ .Values.global.env.reconcilePositionAutoShares | default "1" | quote }}
+            - name: RECONCILE_POSITION_ALERT_SHARES
+              value: {{ .Values.global.env.reconcilePositionAlertShares | default "10" | quote }}
+            - name: RECONCILE_CASH_ALERT_GBP
+              value: {{ .Values.global.env.reconcileCashAlertGbp | default "10" | quote }}
             - name: SIGNAL_SERVICE_URL
               value: "http://signal-service:3003"
           livenessProbe:
