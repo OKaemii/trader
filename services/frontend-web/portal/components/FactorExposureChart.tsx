@@ -27,16 +27,35 @@ export function FactorExposureChart({ initial = null }: { initial?: StrategyOutp
     );
   }
 
-  // Aggregate portfolio-level factor exposures from all tickers
+  // Portfolio-level factor tilt — conviction-weighted over the HELD set, not the
+  // full universe. The per-ticker attributions are cross-sectional z-scores, whose
+  // universe-wide mean is ≈0 by construction; flat-averaging them across all ~190
+  // names cancels every factor to zero (the bug this replaced). Instead we restrict
+  // to the top-K names the strategy actually holds (by composite score) and weight
+  // each by its positive composite score — a proxy for the optimiser's conviction.
+  const scores = features.composite_scores ?? {};
+  const candidates = (features.ticker_universe ?? Object.keys(features.factor_attributions))
+    .filter((t) => features.factor_attributions[t])
+    .sort((a, b) => (scores[b] ?? 0) - (scores[a] ?? 0));
+  const topK = features.top_k && features.top_k > 0 ? features.top_k : candidates.length;
+  const held = candidates.slice(0, topK);
+
+  // Positive-clamped composite scores as weights; fall back to equal weight if the
+  // held set has no positive conviction (degenerate cycle).
+  const rawWeights = held.map((t) => Math.max(0, scores[t] ?? 0));
+  const weightSum = rawWeights.reduce((s, w) => s + w, 0);
+  const weights = weightSum > 1e-9
+    ? rawWeights.map((w) => w / weightSum)
+    : held.map(() => 1 / Math.max(held.length, 1));
+
   const aggregate: Record<string, number> = {};
-  const tickers = features.ticker_universe ?? Object.keys(features.factor_attributions);
-  for (const ticker of tickers) {
+  held.forEach((ticker, idx) => {
     const attrs = features.factor_attributions[ticker];
-    if (!attrs) continue;
+    if (!attrs) return;
     for (const [factor, value] of Object.entries(attrs)) {
-      aggregate[factor] = (aggregate[factor] ?? 0) + value / tickers.length;
+      aggregate[factor] = (aggregate[factor] ?? 0) + value * weights[idx];
     }
-  }
+  });
 
   const data = Object.entries(aggregate)
     .filter(([k]) => k in FACTOR_LABELS)
@@ -47,7 +66,7 @@ export function FactorExposureChart({ initial = null }: { initial?: StrategyOutp
     <div className="bg-gray-900 rounded-lg p-4">
       <h2 className="text-lg font-semibold text-white mb-1">Factor Exposures</h2>
       <p className="text-xs text-gray-400 mb-4">
-        Portfolio-average factor attributions from last strategy cycle
+        Conviction-weighted factor tilt of the held set (top-{held.length}) from last strategy cycle
       </p>
       <ResponsiveContainer width="100%" height={200}>
         <BarChart data={data} layout="vertical" margin={{ left: 16, right: 16 }}>

@@ -33,19 +33,25 @@ def validate_strategy(
     n_trials: int,
     regime_series: np.ndarray,
     covariance_matrix: np.ndarray | None = None,
+    pbo_returns_matrix: np.ndarray | None = None,
+    periods_per_year: int = 252,
 ) -> ValidationReport:
+    """`pbo_returns_matrix` is the (n_configs, n_periods) matrix of competing-configuration
+    OOS returns (the ablation family) used for the CSCV PBO estimate. When None — e.g. a
+    single-config caller — PBO degrades to the uninformative 0.5 rather than being computed
+    off one row (which the old code did and which always collapsed to 0.5 anyway)."""
     from scipy import stats
 
     mean_ic = float(ic_series.mean())
     _, ic_pvalue = stats.ttest_1samp(ic_series, 0)
     ic_hit_rate = float((ic_series > 0).mean())
-    oos_sharpe_v = sharpe_ratio(oos_returns)
+    oos_sharpe_v = sharpe_ratio(oos_returns, periods_per_year)
     mdd = max_drawdown(np.cumprod(1 + oos_returns))
     cvar = cvar_95(oos_returns)
     dsr = deflated_sharpe_ratio(oos_sharpe_v, oos_returns, n_trials)
-    pbo_v = compute_pbo(oos_returns.reshape(1, -1)) if oos_returns.ndim == 1 else compute_pbo(oos_returns)
+    pbo_v = compute_pbo(pbo_returns_matrix) if pbo_returns_matrix is not None else 0.5
     fdr_p = bh_corrected_pvalue(float(ic_pvalue), n_trials)
-    regime_bd = regime_breakdown(oos_returns, regime_series)
+    regime_bd = regime_breakdown(oos_returns, regime_series, periods_per_year)
 
     failures = []
     if fdr_p >= 0.05:

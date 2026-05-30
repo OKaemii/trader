@@ -1,5 +1,6 @@
-import { NextRequest, NextResponse } from 'next/server'
+import { NextRequest } from 'next/server'
 import { authedFetch } from '@/app/lib/auth-fetch'
+import { forwardJson } from '@/app/lib/proxy-json'
 
 export async function POST(req: NextRequest) {
   const body = await req.text()
@@ -8,6 +9,5 @@ export async function POST(req: NextRequest) {
     headers: { 'Content-Type': 'application/json' },
     body,
   })
-  const data = await upstream.json().catch(() => ({}))
-  return NextResponse.json(data, { status: upstream.status })
+  return forwardJson(upstream)
 }

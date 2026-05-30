@@ -41,6 +41,12 @@ spec:
               value: "postgresql://trader:$(TIMESCALEDB_PASSWORD)@timescaledb-postgresql:5432/trader_ts"
             - name: BARS_BACKEND
               value: {{ .Values.global.env.barsBackend | default "mongo" | quote }}
+            # Drives the replay validator's rolling-window sizing via quant-core's strategy
+            # factory (daily → ROLLING_WINDOW_BARS=20). The Phase-4 backtest reads multi-year
+            # adjusted daily direct from Yahoo (YahooDailyBarsReader), so it needs no
+            # MARKET_DATA_SERVICE_URL — the research data path is decoupled from the live one.
+            - name: BAR_FREQUENCY
+              value: {{ .Values.global.env.barFrequency | default "daily" | quote }}
           # Mount the research warehouse PV so the DuckDB reader
           # (src/infrastructure/duckdb_reader.py) can open the Parquet snapshots
           # written daily by the warehouse-snapshot CronJob. Read-only by
