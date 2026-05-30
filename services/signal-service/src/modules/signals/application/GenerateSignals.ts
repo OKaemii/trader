@@ -236,11 +236,22 @@ export class GenerateSignalsUseCase {
         if (inflightTickers.has(ticker)) return null;
         const w = weights[i] ?? 0;
         const currentW = currentWeights[ticker] ?? 0;
-        if (w < 0.01 && currentW < 0.01) return null;
+        // Asymmetric no-trade bands (intentional, not symmetric):
+        //   BUY needs target to clear current by >BUY_BAND (1%) — never open a sub-1% dust
+        //     position the broker can't size above minQuantity (the ZeroQuantity class).
+        //   SELL fires on a much smaller reduction (SELL_BAND, 0.2%) so a held position that
+        //     drops out of top-K is fully unwound even when it's a sub-1% holding. The old
+        //     symmetric 1% band silently stranded every demoted sub-1% name — which is how
+        //     the book bloated to 150+ tiny positions that could never be sold.
+        //   DUST (0.05%) is the floor below which a holding is untradeable noise — leave it.
+        const BUY_BAND  = 0.01;
+        const SELL_BAND = 0.002;
+        const DUST      = 0.0005;
+        if (w < BUY_BAND && currentW < DUST) return null;   // nothing meaningful to do
 
         const action: Action =
-          w > currentW + 0.01 ? 'BUY' :
-          w < currentW - 0.01 ? 'SELL' :   // SELL = reduce long, never short
+          w > currentW + BUY_BAND  ? 'BUY' :
+          w < currentW - SELL_BAND ? 'SELL' :   // SELL = reduce/exit a long, never short
           'HOLD';
 
         if (action === 'HOLD') return null;
