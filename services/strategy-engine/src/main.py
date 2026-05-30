@@ -6,20 +6,26 @@ from fastapi import FastAPI, Response
 from fastapi.responses import PlainTextResponse
 import redis.asyncio as aioredis
 from prometheus_client import Counter, Gauge, generate_latest, CONTENT_TYPE_LATEST
-from .application.topology_strategy import TopologyStrategy
-from .application.sector_momentum_strategy import SectorMomentumStrategy
-from .application.factor_rank_strategy import FactorRankStrategy
+# Strategy code is the single source of truth in the shared quant-core package — the live
+# host (here) and the backtest replay both import it, so they cannot drift. The host depends
+# only on the `Strategy` Protocol + `make_strategy` factory, never on a concrete strategy.
+from quant_core.strategy.factory import make_strategy, known_strategies
+from quant_core.strategy.contract import HistoryView, PortfolioState, StrategyParams
+from quant_core.wiring import build_feature_store
 from .domain.dataclasses import OHLCVBar
 from .infrastructure.market_data_client import MarketDataClient
 
-STRATEGY_REGISTRY = {
-    'topology_v1':        TopologyStrategy,
-    'sector_momentum_v1': SectorMomentumStrategy,
-    'factor_rank_v1':     FactorRankStrategy,
-}
+# Live decide() takes default params + an empty portfolio (none of the current strategies'
+# decide() reads portfolio — sizing happens in signal-service). Phase 1 wires a real
+# PortfolioProvider if/when a strategy needs portfolio-aware decisions.
+_LIVE_PARAMS = StrategyParams(values={})
+_EMPTY_PORTFOLIO = PortfolioState(current_weights={}, nav=0.0, cash=0.0)
 
 app = FastAPI()
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
+# Bi-temporal feature store (audit + backtest replay). Unset TIMESCALE_URL → NullFeatureStore
+# (no-op) so the engine still emits signals; persistence is never on the signal-correctness path.
+TIMESCALE_URL = os.getenv("TIMESCALE_URL", "")
 
 # Start with the simplest validated strategy. Enable topology only after
 # OOS ablation confirms it adds statistically significant IC (see PROGRESS.md).
@@ -72,6 +78,9 @@ CONSUMER_NAME  = f"{CONSUMER_GROUP}-{os.getenv('POD_NAME', 'local')}"
 _strategy = None          # type: ignore[var-annotated]
 _bars_client = None       # type: ignore[var-annotated]
 _redis = None             # type: ignore[var-annotated]
+_feature_store = None     # type: ignore[var-annotated]  # FeatureStore (Timescale or Null)
+_pg_pool = None           # type: ignore[var-annotated]  # asyncpg pool, or None
+_feature_persist_logged = False  # one-shot "first feature row written" log
 _history_interval: str = "daily"
 _history_range:    str = "30d"
 _needed:           int = 20
@@ -116,7 +125,23 @@ def strategy_health_aliased():
 
 @app.get("/admin/api/strategy/list")
 def list_strategies():
-    return {"available": list(STRATEGY_REGISTRY.keys()), "active": ACTIVE_STRATEGY}
+    return {"available": known_strategies(), "active": ACTIVE_STRATEGY}
+
+
+@app.get("/admin/api/strategy/features")
+async def feature_audit(strategy_id: str = "", as_of_ms: int = 0):
+    """As-of feature read for the portal 'Feature audit' panel.
+
+    Given a signal's strategy_id + timestamp, returns the exact FeatureVector the strategy
+    saw at that instant (latest live revision with observation_ts <= as_of_ms). 404 when the
+    feature store isn't wired (NullFeatureStore) or no row exists.
+    """
+    if _feature_store is None or not strategy_id or as_of_ms <= 0:
+        return {"found": False, "reason": "missing strategy_id/as_of_ms or store unavailable"}
+    fv = await _feature_store.read_at(strategy_id, as_of_ms, is_replay=False)
+    if fv is None:
+        return {"found": False, "strategy_id": strategy_id, "as_of_ms": as_of_ms}
+    return {"found": True, "feature_vector": dataclasses.asdict(fv)}
 
 
 @app.get("/admin/api/strategy/status")
@@ -167,6 +192,14 @@ def bars_from_json(data: list) -> list[OHLCVBar]:
     ]
 
 
+def _history_view(closes_of, tickers: list[str]) -> HistoryView:
+    """Build the pure HistoryView the strategy contract consumes from a per-ticker closes
+    lookup. Volumes/timestamps are left empty — the current strategies key off closes only;
+    the contract carries the other series for future factors without forcing a fetch now."""
+    closes = {t: list(closes_of(t)) for t in tickers}
+    return HistoryView(closes=closes, volumes={}, timestamps={})
+
+
 def _pick_prewarm_range(calendar_days: int) -> str:
     """Smallest RangeKey that covers `calendar_days`. Matches shared-bars enum."""
     if calendar_days <= 30:  return "30d"
@@ -193,9 +226,9 @@ async def historical_prewarm(
 
     No-op when strategy.prewarm_cycles == 0 (strategies without cross-cycle state).
     """
-    needed = getattr(strategy, "prewarm_cycles", 0)
+    needed = strategy.config.prewarm_cycles
     if needed <= 0:
-        print(f"[strategy-engine] prewarm: skipped (strategy.prewarm_cycles=0)", flush=True)
+        print(f"[strategy-engine] prewarm: skipped (strategy.config.prewarm_cycles=0)", flush=True)
         return
     if not active_tickers:
         print(f"[strategy-engine] prewarm: skipped (empty universe)", flush=True)
@@ -249,16 +282,18 @@ async def historical_prewarm(
     t1 = _t.time()
     skipped = 0
     for ts in replay:
-        bars_at_ts = by_ts[ts]
+        tickers_at_ts = sorted(set(b.ticker for b in by_ts[ts]))
 
         # Strategy lookup: closes oldest-first, up to and including this timestamp.
         # Replaces the live cycle's market-data-service round-trip with a slice
         # of the already-fetched history_map. No I/O.
-        def history_at_ts(t: str, _ts=ts, _hist=history_map) -> list[float]:
+        def closes_at_ts(t: str, _ts=ts, _hist=history_map) -> list[float]:
             return [b.close for b in _hist.get(t, []) if b.timestamp <= _ts]
 
         try:
-            strategy.update(bars_at_ts, history_at_ts)
+            # compute_features() warms the composed RegimeEngine / FeatureStabilityAnalyser
+            # state exactly as the old update() did; decide() is unnecessary for prewarm.
+            strategy.compute_features(_history_view(closes_at_ts, tickers_at_ts), ts, _LIVE_PARAMS)
         except Exception as exc:
             skipped += 1
             if skipped <= 3:
@@ -278,20 +313,38 @@ async def _init_engine_singletons() -> None:
     dependent config. Idempotent: safe to no-op if called twice.
     """
     global _strategy, _bars_client, _redis, _history_interval, _history_range, _needed
+    global _feature_store, _pg_pool
     if _strategy is not None:
         return
     _redis = await aioredis.from_url(REDIS_URL)
     await ensure_consumer_group(_redis, INPUT_STREAM, CONSUMER_GROUP)
 
-    strategy_cls = STRATEGY_REGISTRY.get(ACTIVE_STRATEGY)
-    if not strategy_cls:
-        raise RuntimeError(f"Unknown strategy: {ACTIVE_STRATEGY}")
-    _strategy = strategy_cls()
+    # Feature store. Best-effort: a Timescale outage must not stop signal emission, so a
+    # failed pool create degrades to the no-op NullFeatureStore (logged).
+    if TIMESCALE_URL:
+        try:
+            import asyncpg
+            _pg_pool = await asyncpg.create_pool(dsn=TIMESCALE_URL, min_size=1, max_size=4)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[strategy-engine] feature store pool create failed (features disabled): {exc!r}", flush=True)
+            _pg_pool = None
+    _feature_store = build_feature_store(_pg_pool)
+    # Loud state line so the operator can tell from logs alone whether features will persist.
+    if _pg_pool is not None:
+        print("[strategy-engine] feature store: ACTIVE (TimescaleFeatureStore) — features will persist per cycle", flush=True)
+    else:
+        _reason = "TIMESCALE_URL unset" if not TIMESCALE_URL else "pool create failed"
+        print(f"[strategy-engine] feature store: DISABLED ({_reason}) — features will NOT persist (NullFeatureStore)", flush=True)
+
+    try:
+        _strategy = make_strategy(ACTIVE_STRATEGY)
+    except ValueError as exc:
+        raise RuntimeError(f"Unknown strategy: {ACTIVE_STRATEGY}") from exc
 
     # Single client across the engine — its per-cycle cache clears on start_cycle.
     _bars_client = MarketDataClient()
 
-    _needed = getattr(_strategy, "rolling_window", ROLLING_WINDOW_BARS)
+    _needed = _strategy.config.rolling_window
     _history_interval = "daily" if BAR_FREQUENCY == "daily" else "15m"
     # Range key the HTTP endpoint accepts. shared-bars currently supports
     # 30d / 60d / 90d / 180d. 30d covers the 20-bar daily window; 60d covers the
@@ -300,7 +353,7 @@ async def _init_engine_singletons() -> None:
 
     print(f"[strategy-engine] singletons ready — strategy={ACTIVE_STRATEGY} bar_freq={BAR_FREQUENCY} "
           f"rolling_window={ROLLING_WINDOW_BARS} history_range={_history_range} history_interval={_history_interval} "
-          f"prewarm_cycles={getattr(_strategy, 'prewarm_cycles', 0)} "
+          f"prewarm_cycles={_strategy.config.prewarm_cycles} "
           f"input={INPUT_STREAM} output={OUTPUT_STREAM} consumer={CONSUMER_NAME} group={CONSUMER_GROUP}", flush=True)
 
 
@@ -391,15 +444,32 @@ async def process_cycle(
               flush=True)
 
         _update_start = _t.time()
-        output = _strategy.update(bars, _lookup)
+        # Split strategy contract: compute_features (pure features-as-of-now) then decide
+        # (features → emission). Same source of truth as the backtest replay.
+        as_of_ms = int(_update_start * 1000)
+        features = _strategy.compute_features(_history_view(_lookup, active_tickers), as_of_ms, _LIVE_PARAMS)
+        # Persist the feature vector bi-temporally (audit + replay parity). Best-effort:
+        # a store failure logs but never blocks signal emission.
+        if features is not None and _feature_store is not None:
+            try:
+                await _feature_store.write(features, is_replay=False)
+                global _feature_persist_logged
+                if not _feature_persist_logged:
+                    print(f"[strategy-engine] feature persist OK — first row written "
+                          f"(strategy={ACTIVE_STRATEGY} observation_ts={as_of_ms} "
+                          f"tickers={len(features.ticker_universe)})", flush=True)
+                    _feature_persist_logged = True
+            except Exception as exc:  # noqa: BLE001
+                print(f"[strategy-engine] cycle {cycle_n} feature persist failed: {exc!r}", flush=True)
+        output = _strategy.decide(features, _EMPTY_PORTFOLIO) if features is not None else None
         _update_ms = int((_t.time() - _update_start) * 1000)
 
         _bars_processed.labels(strategy_id=ACTIVE_STRATEGY).inc(len(bars))
 
         if output is None:
             reason = "unknown"
-            if _ready < _strategy.min_universe_size:
-                reason = f"ready={_ready} < min_universe_size={_strategy.min_universe_size}"
+            if _ready < _strategy.config.min_universe_size:
+                reason = f"ready={_ready} < min_universe_size={_strategy.config.min_universe_size}"
             elif _total == 0:
                 reason = "no bars on the stream"
             else:

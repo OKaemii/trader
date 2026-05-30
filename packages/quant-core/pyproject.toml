@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quant-core"
+version = "0.1.0"
+description = "Shared strategy contract, factors, feature store, replay driver, and optimiser used by strategy-engine (live) and backtest-engine (replay). One source of truth so live and replay cannot drift."
+requires-python = ">=3.11"
+dependencies = [
+  "numpy==1.26.4",
+  "scipy==1.13.1",
+  # sklearn pinned to 1.3.2 — the version proven to coexist with giotto-tda 0.6.2 in
+  # strategy-engine. backtest-engine is aligned DOWN to this (it was 1.5.0). LedoitWolf's
+  # API is stable across the range; do NOT bump without re-checking giotto-tda compatibility
+  # (giotto-tda 0.6.2 constrains the sklearn upper bound).
+  "scikit-learn==1.3.2",
+  "giotto-tda==0.6.2",
+  "cvxpy==1.5.3",
+  "asyncpg==0.29.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest==8.3.3", "pytest-asyncio==0.24.0"]
+# Only the WarehouseBarsReader needs DuckDB (backtest replay from the parquet warehouse).
+# Kept optional so the live host (strategy-engine) doesn't pull a heavy dep it never uses.
+warehouse = ["duckdb==1.1.3"]
+http = ["httpx==0.27.2"]
+
+[tool.setuptools.packages.find]
+include = ["quant_core*"]
