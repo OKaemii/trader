@@ -2,11 +2,41 @@ import type { Logger } from '@trader/core';
 import type { SignalServiceClient, OpenBuy } from '@trader/contracts';
 import { type Order, OrderSide, OrderStatus } from '../../orders/domain/Order.ts';
 import type { IOrderRepository } from '../../orders/domain/IOrderRepository.ts';
-import type { Trading212Client, T212HistoryItem } from '../../t212/infrastructure/Trading212Client.ts';
+import { type Trading212Client, type T212HistoryItem, currencyOfTicker } from '../../t212/infrastructure/Trading212Client.ts';
 import { scaleT212Quote, type PriceLookupForScaler } from '../../../shared/T212PriceScaler.ts';
 
 const MAX_HISTORY_PAGES = 5;    // 5 × 50 = 250 most-recent terminal orders — well beyond a 30s tick window
 const HISTORY_PAGE_SIZE = 50;
+
+// Append-only fills ledger sink (Timescale fills_history). FillsPoller writes one row per
+// observed fill; the reconciliation engine reads it back. Optional + best-effort — a ledger
+// failure logs but never blocks the fill → signal-service notification path.
+export interface FillLedgerRow {
+  fillId: string;
+  orderId: string;
+  signalId: string | null;
+  ticker: string;
+  side: 'BUY' | 'SELL';
+  quantity: number;
+  fillPrice: number;
+  currency: string;
+  filledAt: number;          // UTC ms
+  arrivalAt: number | null;  // order-send time (UTC ms); TCA input (Phase 3)
+  source?: 'fills_poller' | 'reconciliation_backfill';
+}
+
+export interface FillLedgerWriter {
+  recordFill(row: FillLedgerRow): Promise<void>;
+}
+
+// TCA fan-out from a fill (joins quotes at arrival + fill → tca_log). Optional + best-effort.
+export interface TcaRecorder {
+  record(input: {
+    fillId: string; orderId: string; signalId: string | null; ticker: string;
+    side: 'BUY' | 'SELL'; filledQty: number; fillPrice: number;
+    filledAtMs: number; arrivalAtMs: number | null;
+  }): Promise<void>;
+}
 
 // Reconciles Mongo `submitted` orders against T212 state every tick.
 //
@@ -41,6 +71,10 @@ export class FillsPoller {
         // stored bar close to detect pence-quoted LSE listings. Without it, fills for
         // tickers like SUPRl_EQ / SGLNl_EQ are written 100x inflated to Mongo.
         private readonly priceLookup: PriceLookupForScaler | null = null,
+        // Optional append-only fills ledger (Timescale). Best-effort; failure never blocks fills.
+        private readonly fillsLedger: FillLedgerWriter | null = null,
+        // Optional TCA fan-out (Timescale tca_log). Best-effort; failure never blocks fills.
+        private readonly tca: TcaRecorder | null = null,
     ) {}
 
     start(): void {
@@ -139,6 +173,45 @@ export class FillsPoller {
                 : rawFillPrice;
             const filledQuantity = item.fill.quantity;
             await this.orderRepo.save({ ...order, status: OrderStatus.Filled, filledAt, fillPrice, filledQuantity });
+
+            // Append to the fills ledger (best-effort; reconciliation reads this back).
+            if (this.fillsLedger) {
+                try {
+                    await this.fillsLedger.recordFill({
+                        fillId:    String(item.fill.id),
+                        orderId:   String(order.t212OrderId ?? order.id),
+                        signalId:  order.signalId ?? null,
+                        ticker:    order.ticker,
+                        side:      order.side === OrderSide.Buy ? 'BUY' : 'SELL',
+                        quantity:  filledQuantity,
+                        fillPrice,
+                        currency:  currencyOfTicker(order.ticker),
+                        filledAt,
+                        arrivalAt: Date.parse(item.order.createdAt) || null,
+                    });
+                } catch (err) {
+                    this.logger.warn({ err, t212OrderId: order.t212OrderId }, 'fills-ledger write failed (non-fatal)');
+                }
+            }
+
+            // TCA fan-out (best-effort; reads quotes at arrival + fill → tca_log).
+            if (this.tca) {
+                try {
+                    await this.tca.record({
+                        fillId:      String(item.fill.id),
+                        orderId:     String(order.t212OrderId ?? order.id),
+                        signalId:    order.signalId ?? null,
+                        ticker:      order.ticker,
+                        side:        order.side === OrderSide.Buy ? 'BUY' : 'SELL',
+                        filledQty:   filledQuantity,
+                        fillPrice,
+                        filledAtMs:  filledAt,
+                        arrivalAtMs: Date.parse(item.order.createdAt) || null,
+                    });
+                } catch (err) {
+                    this.logger.warn({ err, t212OrderId: order.t212OrderId }, 'tca write failed (non-fatal)');
+                }
+            }
 
             if (order.side === OrderSide.Buy) {
                 // Record the real fill quantity on the BUY signal so future SELLs can FIFO it.

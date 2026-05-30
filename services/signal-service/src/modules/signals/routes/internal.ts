@@ -90,6 +90,7 @@ export function createInternalRouter(deps: Deps): Hono {
             attempts:     signal.attempts,
         };
         if (signal.entryPrice !== undefined) out.entryPrice = signal.entryPrice;
+        if (signal.queuedAt   !== undefined) out.queuedAt   = signal.queuedAt;
         return { signal: out };
     });
 

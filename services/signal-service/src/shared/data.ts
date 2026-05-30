@@ -25,6 +25,7 @@ const toSignalDoc = (s: TradeSignal): any => ({
   entryPrice: s.entryPrice,
   lifecycle: s.lifecycle,
   approvedAt: s.approvedAt ? new Date(s.approvedAt) : undefined,
+  queuedAt:   s.queuedAt   ? new Date(s.queuedAt)   : undefined,
   executedAt: s.executedAt ? new Date(s.executedAt) : undefined,
   closedAt:   s.closedAt   ? new Date(s.closedAt)   : undefined,
   exitPrice:  s.exitPrice,
@@ -61,6 +62,7 @@ const fromSignalDoc = (doc: any): TradeSignal => {
   if (typeof doc.failureDetail === 'string')    params.failureDetail    = doc.failureDetail;
   if (doc.failureReason !== undefined)          params.failureReason    = doc.failureReason;
   const approvedAt = toMs(doc.approvedAt);   if (approvedAt   !== undefined) params.approvedAt    = approvedAt;
+  const queuedAt   = toMs(doc.queuedAt);     if (queuedAt     !== undefined) params.queuedAt      = queuedAt;
   const executedAt = toMs(doc.executedAt);   if (executedAt   !== undefined) params.executedAt    = executedAt;
   const closedAt   = toMs(doc.closedAt);     if (closedAt     !== undefined) params.closedAt      = closedAt;
   const lastAt     = toMs(doc.lastAttemptAt); if (lastAt      !== undefined) params.lastAttemptAt = lastAt;

@@ -119,6 +119,27 @@ describe('OrderDispatcher', () => {
         expect(calls.failed).toContainEqual(expect.objectContaining({ reason: SignalFailureReason.QueueExpired }));
     });
 
+    it('measures queue-TTL from queuedAt, not emission timestamp — a long-emitted but freshly-queued signal does NOT expire', async () => {
+        const now = 10_000_000;
+        const { deps, calls } = makeDeps({ now: () => now, queueTtlMs: 1000 });
+        const d = new OrderDispatcher(deps);
+        // Emitted 5s ago (would expire under the old emission-based TTL) but queued just now.
+        await (d as unknown as { processOne: (s: ClaimedSignal) => Promise<void> }).processOne(
+            makeSignal({ timestamp: now - 5000, queuedAt: now - 100 }),
+        );
+        expect(calls.failed).not.toContainEqual(expect.objectContaining({ reason: SignalFailureReason.QueueExpired }));
+    });
+
+    it('still expires when the signal has genuinely sat in the queue past the TTL (queuedAt old)', async () => {
+        const now = 10_000_000;
+        const { deps, calls } = makeDeps({ now: () => now, queueTtlMs: 1000 });
+        const d = new OrderDispatcher(deps);
+        await (d as unknown as { processOne: (s: ClaimedSignal) => Promise<void> }).processOne(
+            makeSignal({ timestamp: now - 5000, queuedAt: now - 5000 }),
+        );
+        expect(calls.failed).toContainEqual(expect.objectContaining({ reason: SignalFailureReason.QueueExpired }));
+    });
+
     it('fails with retries_exhausted when attempts > maxAttempts', async () => {
         const { deps, calls } = makeDeps({ maxAttempts: 5 });
         const d = new OrderDispatcher(deps);

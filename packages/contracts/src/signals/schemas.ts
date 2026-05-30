@@ -62,6 +62,10 @@ export const ClaimedSignalSchema = z.object({
     confidence: z.number(),
     entryPrice: z.number().optional(),
     timestamp: z.number().int().positive(),
+    // Wall-clock ms the signal entered the queue. The dispatcher measures the queue-TTL
+    // from this (falling back to `timestamp` for signals queued before the field existed),
+    // so approval latency never expires a signal — only genuine queue-sitting does.
+    queuedAt: z.number().int().positive().optional(),
     attempts: z.number().int().nonnegative(),
 });
 export type ClaimedSignal = z.infer<typeof ClaimedSignalSchema>;
