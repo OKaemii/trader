@@ -20,8 +20,17 @@ global:
     # deployment templates can read `.Values.global.env.*` directly. Bump these and redeploy —
     # no code change required for any of the toggles documented in CLAUDE.md.
     tradingMode: Demo                   # Paper (notify only) | Demo (demo.trading212) | Live (trading212; admin gate required)
-    signalOrderType: Market             # Limit (T212-friendly, weekly) | Market (immediate fill, daily). Risk-exits always Market. Paired with barFrequency=intraday — 15m signals can't sit on limit orders.
-    barFrequency: intraday                 # daily | intraday
+    # Market-data upstream for OHLCV bars + liquidity ranking. twelvedata (default; needs
+    # TWELVEDATA_API_KEY in trader-secrets) | yahoo (legacy free fallback, no key). FX rates
+    # and sector classification stay on Yahoo regardless. NOTE: the TwelveData free tier
+    # (8 credits/min, 800/day) only sustains a 24h poll cadence at this universe size — keep
+    # pollIntervalMs at 86400000 unless you upgrade the plan and raise the credit knobs.
+    marketDataProvider: twelvedata
+    # Daily cadence: TwelveData free tier is 24h-only, so market-data uses the per-market
+    # EOD close-anchored fetch (~183 credits/day, within the 800 budget). Limit orders rest at
+    # the last close (T212-friendly); flip to Market for immediate fills (crosses the spread).
+    signalOrderType: Limit              # Limit (rest at close) | Market (immediate fill)
+    barFrequency: daily                 # daily | intraday
     # Live bar-storage backend selector. `mongo` (default) keeps the existing path; `timescale`
     # flips the shared-bars dispatcher onto the new Timescale hypertable.
     #
@@ -120,20 +129,15 @@ global:
   # `primaryStrategy` picks which worker the legacy `strategy-engine` Service alias points
   # at — keeps the portal and any other in-cluster caller working without ingress rewrites.
   strategies:
-    - mode:         "5m"
-      barFrequency: "intraday"
-      strategyId:   "factor_rank_v1"
-      replicas:     1
+    # Daily-only. One always-on worker (replicas:1) so the portal's strategy alias stays live
+    # between the once-a-day emits; it idles waiting for the EOD daily bar on market:raw:daily,
+    # processes it at each market close, then idles again. (Dropped the 5m worker + KEDA
+    # scale-to-zero: TwelveData is 24h-only and the daily strategy emits at most twice a day.)
     - mode:         "daily"
       barFrequency: "daily"
       strategyId:   "factor_rank_v1"
-      # WP3: KEDA scale-to-zero. Worker idles at 0 replicas until a daily bar lands on
-      # `market:raw:daily`; KEDA spins it up, processes, scales back down after the
-      # cooldown. `replicas:` is omitted intentionally — KEDA owns the count when this
-      # flag is set. See charts/strategy-engine/templates/scaledobject.yaml.
-      scaleToZero:     true
-      cooldownSeconds: 300
-  primaryStrategy: "5m-factor_rank_v1"
+      replicas:     1
+  primaryStrategy: "daily-factor_rank_v1"
 
 redis:
   host: redis-master
