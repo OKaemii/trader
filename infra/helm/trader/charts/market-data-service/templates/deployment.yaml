@@ -57,12 +57,18 @@ spec:
               value: {{ .Values.global.env.dualWriteBars | default "false" | quote }}
             - name: TRADING_MODE
               value: {{ .Values.global.env.tradingMode | default "Paper" | quote }}
+            # Market-data upstream. twelvedata (default) | yahoo. TWELVEDATA_API_KEY itself
+            # arrives via the trader-secrets envFrom above (same as the T212 keys).
+            - name: MARKET_DATA_PROVIDER
+              value: {{ .Values.global.env.marketDataProvider | default "twelvedata" | quote }}
             - name: BAR_FREQUENCY
               value: {{ .Values.global.env.barFrequency | default "daily" | quote }}
             {{- with .Values.global.env.pollIntervalMs }}
             - name: POLL_INTERVAL_MS
               value: {{ . | quote }}
             {{- end }}
+            - name: QUOTE_POLL_INTERVAL_MS
+              value: {{ .Values.global.env.quotePollIntervalMs | default "3600000" | quote }}
             - name: SIGNAL_ORDER_TYPE
               value: {{ .Values.global.env.signalOrderType | default "Limit" | quote }}
             - name: ACTIVE_STRATEGY

@@ -51,6 +51,14 @@ variable "t212_api_key_id_demo" {
   default   = ""
 }
 
+// TwelveData market-data API key — powers market-data-service's OHLCV + liquidity feed
+// (MARKET_DATA_PROVIDER=twelvedata). Injected into trader-secrets as TWELVEDATA_API_KEY;
+// empty falls back to no data until set (or flip MARKET_DATA_PROVIDER=yahoo).
+variable "twelvedata_api_key" {
+  sensitive = true
+  default   = ""
+}
+
 variable "resend_api_key" {
   sensitive = true
   default   = ""

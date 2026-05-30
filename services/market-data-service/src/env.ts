@@ -10,6 +10,8 @@ const EnvSchema = z.object({
     BAR_FREQUENCY: z.enum(["daily", "intraday"]).default("daily"),
     POLL_INTERVAL_MS: z.coerce.number().int().positive().optional(),
     POLL_ANCHOR_OFFSET_MS: z.coerce.number().int().default(22 * 60 * 60_000),
+    // Bid/ask quote poll cadence (Yahoo v7/quote side-channel). Default 1h, matching bars.
+    QUOTE_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(60 * 60_000),
 
     UNIVERSE_REFRESH_MS: z.coerce.number().int().positive().default(30 * 24 * 60 * 60 * 1000),
     GAP_THRESHOLD: z.coerce.number().min(0).max(1).default(0.20),
@@ -32,6 +34,18 @@ const EnvSchema = z.object({
 
     // SIGNAL_ORDER_TYPE: surfaced in the admin /config response for portal symmetry.
     SIGNAL_ORDER_TYPE: z.string().default("Limit"),
+
+    // ── Market-data provider ──────────────────────────────────────────────────
+    // Active upstream for OHLCV bars + liquidity. Defaults to TwelveData; `yahoo` keeps
+    // the legacy free Yahoo Finance path as a fallback (no API key needed). FX rates and
+    // sector classification stay on Yahoo regardless — separate, free, low-volume calls.
+    MARKET_DATA_PROVIDER: z.enum(["twelvedata", "yahoo"]).default("twelvedata"),
+    // TwelveData free Basic plan: 8 credits/min, 800/day, 1 credit per symbol. The key is
+    // injected from trader-secrets (TWELVEDATA_API_KEY); bump the credit knobs to match a
+    // paid plan. Optional so the service still boots (provider returns no bars) without it.
+    TWELVEDATA_API_KEY:            z.string().optional(),
+    TWELVEDATA_CREDITS_PER_MIN:    z.coerce.number().int().positive().default(8),
+    TWELVEDATA_DAILY_CREDIT_LIMIT: z.coerce.number().int().positive().default(800),
 
     MONGODB_URL: z.string().url().default("mongodb://mongodb:27017"),
     REDIS_URL:   z.string().url().default("redis://redis:6379"),
