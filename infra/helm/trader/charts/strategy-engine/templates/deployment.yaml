@@ -63,6 +63,15 @@ spec:
                   key: MONGODB_PASSWORD
             - name: MONGODB_URL
               value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb-headless:27017/trader?authSource=trader&directConnection=true"
+            - name: TIMESCALEDB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: TIMESCALEDB_PASSWORD
+            # Feature store (bi-temporal audit + replay parity). Best-effort in the host —
+            # unset/unreachable → NullFeatureStore, signal emission unaffected.
+            - name: TIMESCALE_URL
+              value: "postgresql://trader:$(TIMESCALEDB_PASSWORD)@timescaledb-postgresql:5432/trader_ts"
             - name: BAR_FREQUENCY
               value: {{ .Values.global.env.barFrequency | default "daily" | quote }}
             - name: SIGNAL_ORDER_TYPE
@@ -148,6 +157,13 @@ spec:
                   key: MONGODB_PASSWORD
             - name: MONGODB_URL
               value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb-headless:27017/trader?authSource=trader&directConnection=true"
+            - name: TIMESCALEDB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: TIMESCALEDB_PASSWORD
+            - name: TIMESCALE_URL
+              value: "postgresql://trader:$(TIMESCALEDB_PASSWORD)@timescaledb-postgresql:5432/trader_ts"
             # ── Per-worker stream wiring ─────────────────────────────────────
             # INPUT_STREAM: market-data publishes here; the worker is the consumer.
             # OUTPUT_STREAM: signal-service multiplexes consumer groups across the

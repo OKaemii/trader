@@ -39,10 +39,14 @@ class RegimeEngine:
 
     Warm-up: the engine needs ≥ WINDOW_VOL cross-sectional return vectors before it
     produces a non-sentinel confidence. The strategy-engine host runs a historical
-    prewarm pass at boot (see main.py historical_prewarm()) that feeds 2× HISTORY_MIN
-    vectors from Mongo before the first live cycle — so steady state is reached on
-    cycle 1, not cycle 22. No Redis persistence needed: every boot recomputes
-    deterministically from the bar history.
+    prewarm pass at boot that feeds 2× HISTORY_MIN vectors before the first live cycle —
+    so steady state is reached on cycle 1, not cycle 22. No Redis persistence needed:
+    every boot recomputes deterministically from the bar history.
+
+    NOTE: In Phase 1 of the quant-grade-strategy-lifecycle plan this engine becomes
+    stateless — `assess(returns, prior_means, prior_vectors)` reading its window from the
+    FeatureStore instead of holding `_mean_history` / `_corr_window`. For now it preserves
+    the live behaviour so the Phase 0 parity gate holds.
     """
 
     WINDOW_TREND = 63   # trading days for trend estimation
@@ -50,23 +54,6 @@ class RegimeEngine:
     HISTORY_MIN  = 63   # minimum history required
 
     def __init__(self) -> None:
-        # Two parallel histories — both required because the regime metrics have
-        # different invariance properties under universe change:
-        #
-        # _mean_history  : scalar per cycle (cross-sectional mean of returns). Universe-
-        #                  invariant — a 7-ticker mean is comparable to a 10-ticker mean
-        #                  as long as both are equal-weighted. Used for trend + vol stats.
-        #
-        # _corr_window   : full cross-sectional vectors over the last WINDOW_VOL cycles.
-        #                  Required for the correlation matrix. Reset on any universe size
-        #                  change — comparing a 7×7 corr to an 8×8 corr is mathematically
-        #                  undefined, so we drop the window rather than crash.
-        #
-        # Pre-prewarm, storing the full vector worked because consecutive cycles usually
-        # shared the same universe. With historical prewarm replaying 126 days of bars,
-        # the universe legitimately changes across the window (different tickers ready on
-        # different dates) and `np.array(_returns_history)` becomes inhomogeneous → ValueError.
-        # Splitting the storage is the principled fix, not a workaround.
         self._mean_history: list[float] = []
         self._corr_window: list[np.ndarray] = []
         self._prev_corr: np.ndarray | None = None
@@ -126,10 +113,8 @@ class RegimeEngine:
             self._prev_corr = corr.copy()
 
         # Soft confidence: logistic centred on (vol_z=0, stability=0) → 1.0 in calm markets,
-        # decaying toward 0 as vol excess and correlation instability grow. Previous formula
-        # `raw = -(k_v * max(vol_z, 0) + k_s * stability)` capped at 0.5 because raw was
-        # always ≤ 0; that contradicted the docstring (1 = stable). Anchor offset 4.0 puts
-        # the calm-market sigmoid output near 0.98.
+        # decaying toward 0 as vol excess and correlation instability grow. Anchor offset 4.0
+        # puts the calm-market sigmoid output near 0.98.
         k_v, k_s = 2.0, 1.5
         raw = 4.0 - (k_v * max(vol_z, 0) + k_s * stability)
         confidence = float(1.0 / (1.0 + np.exp(-raw)))

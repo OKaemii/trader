@@ -5,7 +5,7 @@ Run at every rebalance cycle. If a feature's CV exceeds the threshold or it fail
 ADF stationarity test, it is flagged for review. Flagged features are down-weighted in
 the composite score (handled by the calling strategy).
 
-The report is attached to StrategyOutput and written to MongoDB on every cycle.
+The report is attached to StrategyOutput and written to the feature store on every cycle.
 """
 from dataclasses import dataclass, field
 import numpy as np

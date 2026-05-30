@@ -23,41 +23,19 @@ latency bounded.
 
 from __future__ import annotations
 
-import base64
-import hashlib
-import hmac
-import json
 import os
-import time
 from typing import Any
 
 import httpx
+
+# Single source of truth for internal-JWT minting (mirrors shared-auth/internal-jwt.ts).
+from quant_core.http.internal_jwt import mint_internal_jwt
 
 from ..domain.dataclasses import OHLCVBar
 
 
 CALLER = "strategy-engine"
-INTERNAL_TTL_SEC = 300        # match shared-auth/internal-jwt.ts
 DEFAULT_TIMEOUT_SECONDS = 10.0
-
-
-def _b64url(blob: bytes) -> str:
-    return base64.urlsafe_b64encode(blob).rstrip(b"=").decode("ascii")
-
-
-def mint_internal_jwt(caller: str, secret: str, ttl_sec: int = INTERNAL_TTL_SEC, now: float | None = None) -> str:
-    """
-    HS256 JWT compatible with packages/shared-auth/src/internal-jwt.ts.
-
-    `now` is overridable for tests; defaults to wall-clock seconds.
-    """
-    ts = int(now if now is not None else time.time())
-    header  = {"alg": "HS256", "typ": "JWT"}
-    payload = {"sub": caller, "aud": "internal", "iat": ts, "exp": ts + ttl_sec}
-    signing_input = f"{_b64url(json.dumps(header,  separators=(',', ':')).encode())}." \
-                    f"{_b64url(json.dumps(payload, separators=(',', ':')).encode())}"
-    sig = hmac.new(secret.encode(), signing_input.encode(), hashlib.sha256).digest()
-    return f"{signing_input}.{_b64url(sig)}"
 
 
 class MarketDataClient:

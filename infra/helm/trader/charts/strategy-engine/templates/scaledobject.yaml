@@ -1,19 +1,27 @@
 {{/*
 WP3: KEDA ScaledObject — emitted only for workers with `scaleToZero: true`. KEDA scales
-the Deployment from 0 → 1 when the consumer group has pending (unacked) entries, and
-back to 0 after the cooldown when the PEL drains. The daily worker is the prototype use
-case: idle from session close → next session close (~24h), then bursts to process one
-day's bars and exits.
+the Deployment from 0 → 1 when the consumer group is behind the stream tail (lag), and
+back to 0 after the cooldown once the worker has read + acked everything. The daily
+worker is the prototype use case: idle from session close → next session close (~24h),
+then bursts to process one day's bars and exits.
 
-Why pendingEntriesCount and not streamLength:
-- streamLength counts every entry ever xAdded; with no trim policy, it grows forever and
-  KEDA would never scale down.
-- pendingEntriesCount tracks the consumer group's unacknowledged-entries-list (PEL),
-  which drops to 0 the moment the worker acks. Correct scale-up + scale-down signal.
+Why lagCount and NOT pendingEntriesCount (this WAS the bug — the daily worker never
+spun up because of it; market:raw:daily showed lag=7, pending=0, ScaledObject ACTIVE=False):
+- pendingEntriesCount measures the consumer group's PEL (delivered-but-unacked entries).
+  At minReplicaCount=0 there is no consumer, so nothing is ever delivered, so the PEL is
+  permanently 0 — KEDA sees "no work", never scales 0→1, and the worker can never create
+  the PEL it's waiting on. Classic scale-from-zero deadlock.
+- lagCount measures entries added to the stream but not yet delivered to the group
+  (tail id − group last-delivered id). It is non-zero the instant market-data xAdds a
+  daily bar, with zero consumers running — exactly the scale-from-zero signal we need.
+  activationLagCount=1 is the 0→1 threshold; lag drops back to 0 once the worker drains
+  and acks, so the cooldown scales back to 0. (lagCount needs KEDA ≥2.9; cluster is 2.15.)
+- streamLength was rejected because it counts every entry ever xAdded; with no trim
+  policy it grows forever and KEDA would never scale down.
 
 Why a bootstrap Job (job-keda-bootstrap.yaml):
-- pendingEntriesCount needs the consumer group to exist before KEDA can query it. When
-  the worker is scaled to 0 on a fresh deploy, no pod has started, so the group hasn't
+- lagCount needs the consumer group to exist before KEDA can query its last-delivered id.
+  When the worker is scaled to 0 on a fresh deploy, no pod has started, so the group hasn't
   been created. The bootstrap Job runs once on helm install/upgrade and XGROUP CREATEs
   the group at the stream tail ("$") with MKSTREAM so the stream exists too.
 
@@ -71,7 +79,7 @@ spec:
         address:               "redis-master.{{ $.Release.Namespace }}.svc.cluster.local:6379"
         stream:                {{ printf "market:raw:%s" $s.mode | quote }}
         consumerGroup:         {{ $name | quote }}
-        pendingEntriesCount:   "1"
+        lagCount:              "1"
         activationLagCount:    "1"
         enableTLS:             "false"
       authenticationRef:
