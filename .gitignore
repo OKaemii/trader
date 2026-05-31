@@ -137,3 +137,4 @@ temp/
 mongo-backup-*/
 .turbo/
 .npmrc
+infra/scripts/setup-github-runner.sh

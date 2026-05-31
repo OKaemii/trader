@@ -15,8 +15,8 @@ spec:
     spec:
       containers:
         - name: auth-service
-          image: {{ .Values.image | default "trader/auth-service:latest" }}
-          imagePullPolicy: Never
+          image: {{ .Values.image | default (printf "%strader-auth-service:%s" (.Values.global.imageRegistry | default "") (.Values.global.imageTag | default "latest")) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy | default "IfNotPresent" }}
           ports:
             - containerPort: 3001
           envFrom:

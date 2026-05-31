@@ -15,8 +15,8 @@ spec:
     spec:
       containers:
         - name: backtest-engine
-          image: {{ .Values.image | default "trader/backtest-engine:latest" }}
-          imagePullPolicy: Never
+          image: {{ .Values.image | default (printf "%strader-backtest-engine:%s" (.Values.global.imageRegistry | default "") (.Values.global.imageTag | default "latest")) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy | default "IfNotPresent" }}
           ports:
             - containerPort: 8001
           envFrom:

@@ -145,9 +145,32 @@ resource "helm_release" "timescaledb" {
   })]
 }
 
-resource "helm_release" "trader_app" {
-  name      = "trader-app"
-  chart     = "../helm/trader"
-  namespace = var.namespace
-  depends_on = [helm_release.redis, helm_release.mongodb, helm_release.timescaledb]
+# trader-app release: owned by CI, not Terraform.
+#
+# The build-deploy workflow runs `helm upgrade --install trader-app … --set
+# global.imageTag=<sha>` on every push to master. Terraform must NOT also manage
+# this release — mixing `terraform apply` and `helm upgrade` on one release fights
+# over the rendered manifest. Concretely: a Terraform reconcile re-renders with
+# imageTag="" → `ghcr.io/okaemii/trader-<svc>:latest`, which don't exist until CI
+# pushes them, so (with imagePullPolicy: IfNotPresent) every pod ImagePullBackOffs.
+# An earlier attempt to neutralise this with `lifecycle { ignore_changes = all }`
+# backfired: it pinned the release `version` to the stale state value, which the
+# helm provider then rejected against the bumped chart ("Planned version is
+# different from configured version"). The clean separation is: Terraform
+# bootstraps infra (DBs, secrets, ghcr-pull, KEDA, nginx); CI owns the app release.
+#
+# This `removed` block drops the previously TF-managed release from state WITHOUT
+# uninstalling it (destroy = false), so the running pods (still on the old
+# side-loaded images) stay up until CI's first deploy rolls them onto GHCR images.
+# `helm upgrade --install` finds the release via Helm's own storage regardless of
+# TF state. On a fresh bootstrap the app is installed by the first CI deploy (or a
+# manual `helm upgrade --install trader-app ../helm/trader -n trader`).
+#
+# Safe to delete this block once the apply that processes it has run (state clean).
+# See agent-docs/plans/github-releases-ci-cd.md.
+removed {
+  from = helm_release.trader_app
+  lifecycle {
+    destroy = false
+  }
 }

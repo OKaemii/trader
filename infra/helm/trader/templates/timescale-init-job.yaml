@@ -39,8 +39,8 @@ spec:
       restartPolicy: Never
       containers:
         - name: migrate
-          image: {{ .Values.services.marketDataService.image | default "trader/market-data-service:latest" }}
-          imagePullPolicy: IfNotPresent
+          image: {{ printf "%strader-market-data-service:%s" (.Values.global.imageRegistry | default "") (.Values.global.imageTag | default "latest") }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy | default "IfNotPresent" }}
           command: ["node", "services/market-data-service/dist/migrate.js"]
           env:
             - name: TIMESCALEDB_PASSWORD

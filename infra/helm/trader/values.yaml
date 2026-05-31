@@ -1,6 +1,16 @@
 global:
   namespace: trader
-  imageRegistry: ""
+  # Image coordinates shared by every subchart + parent template. The full image
+  # ref is composed at render time as:  <imageRegistry><repo>:<imageTag | "latest">
+  # Primary path: images live in private GHCR (ghcr.io/<owner>/trader-<svc>), built
+  # and pushed by .github/workflows/build-deploy.yml. CI pins each deploy to the
+  # commit SHA via `helm upgrade --set global.imageTag=<sha>`. Leave imageTag empty
+  # here so a plain `helm template` / `helm lint` renders the floating :latest tag.
+  # The private-registry pull secret (`ghcr-pull`) is attached cluster-wide via the
+  # trader namespace default ServiceAccount (infra/terraform/modules/k8s-bootstrap),
+  # so individual pods don't declare imagePullSecrets.
+  imageRegistry: "ghcr.io/okaemii/"
+  imageTag: ""
   imagePullPolicy: IfNotPresent
   env:
     # ---- Observability ----
@@ -165,47 +175,9 @@ ingress:
   host: trader.local
   className: nginx
 
-services:
-  authService:
-    replicaCount: 1
-    image: trader/auth-service:latest
-    port: 3001
-  marketDataService:
-    replicaCount: 1
-    image: trader/market-data-service:latest
-    port: 3002
-  strategyEngine:
-    replicaCount: 1
-    image: trader/strategy-engine:latest
-    port: 8000
-  signalService:
-    replicaCount: 1
-    image: trader/signal-service:latest
-    port: 3003
-  notificationService:
-    replicaCount: 1
-    image: trader/notification-service:latest
-    port: 3004
-  tradingService:
-    replicaCount: 1
-    image: trader/trading-service:latest
-    port: 3005
-  portfolioService:
-    replicaCount: 1
-    image: trader/portfolio-service:latest
-    port: 3006
-  backtestEngine:
-    replicaCount: 1
-    image: trader/backtest-engine:latest
-    port: 8001
-  # Warehouse-snapshotter has no replicaCount/port — it runs only as the
-  # warehouse-snapshot CronJob (templates/warehouse-snapshot-cronjob.yaml).
-  # Image tag matches the convention of the other services so build-images.sh
-  # can produce it the same way.
-  warehouseSnapshotter:
-    image: trader/warehouse-snapshotter:latest
-  frontendWeb:
-    replicaCount: 1
-    image: trader/frontend-web:latest
-    port: 3007
+# NOTE: the per-service `services:` block was removed when images moved to the
+# composed global coordinates above. Replica counts default to 1 in each subchart
+# (`.Values.replicaCount | default 1`); the strategy-engine worker count comes from
+# `global.strategies`; service ports are fixed in each subchart's service.yaml. No
+# parent value feeds the subcharts' image any more — they read global.image*.
 
