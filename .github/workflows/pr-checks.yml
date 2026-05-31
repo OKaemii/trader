@@ -1,0 +1,58 @@
+name: PR Checks
+
+# Gate every PR into master on the same checks the monorepo runs locally:
+#   - Node 22 + pnpm workspace: typecheck / lint / test / build (Turborepo fans out)
+#   - Python: the canonical docker-build test gate (quant-core + backtest-engine pytest)
+#   - Helm: lint + template smoke of the umbrella chart
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node:
+    name: Node (typecheck / lint / test / build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # No `version:` — pnpm/action-setup reads the pinned `packageManager`
+      # (pnpm@9.12.0) from the root package.json, the single source of truth.
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm test
+      - run: pnpm build
+
+  python:
+    name: Python (quant-core + backtest-engine pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The authoring/CI sandbox has no numpy, so the real Python gate is a docker
+      # build that pip-installs the sci stack and RUNs both pytest suites during the
+      # build (a failing assertion fails the build).
+      # The workflow step here is just a smoke test to catch any egregious Python issues
+      - run: bash infra/scripts/run-python-tests.sh
+
+  helm:
+    name: Helm (lint + template smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: helm lint infra/helm/trader
+      # Render with a representative SHA tag so the composed image refs and every
+      # subchart template are exercised; discard the output (smoke test only).
+      - run: helm template trader infra/helm/trader --set global.imageTag="$GITHUB_SHA" > /dev/null
