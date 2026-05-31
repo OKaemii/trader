@@ -43,8 +43,8 @@ spec:
           restartPolicy: Never
           containers:
             - name: snapshotter
-              image: {{ .Values.services.warehouseSnapshotter.image | default "trader/warehouse-snapshotter:latest" }}
-              imagePullPolicy: IfNotPresent
+              image: {{ printf "%strader-warehouse-snapshotter:%s" (.Values.global.imageRegistry | default "") (.Values.global.imageTag | default "latest") }}
+              imagePullPolicy: {{ .Values.global.imagePullPolicy | default "IfNotPresent" }}
               # The Dockerfile's ENTRYPOINT is `python -m src.snapshot`; no
               # `--date` arg → defaults to yesterday UTC.
               env:

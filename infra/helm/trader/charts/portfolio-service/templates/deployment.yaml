@@ -15,8 +15,8 @@ spec:
     spec:
       containers:
         - name: portfolio-service
-          image: {{ .Values.image | default "trader/portfolio-service:latest" }}
-          imagePullPolicy: Never
+          image: {{ .Values.image | default (printf "%strader-portfolio-service:%s" (.Values.global.imageRegistry | default "") (.Values.global.imageTag | default "latest")) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy | default "IfNotPresent" }}
           ports:
             - containerPort: 3006
           envFrom:

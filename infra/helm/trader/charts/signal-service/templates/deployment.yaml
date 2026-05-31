@@ -15,8 +15,8 @@ spec:
     spec:
       containers:
         - name: signal-service
-          image: {{ .Values.image | default "trader/signal-service:latest" }}
-          imagePullPolicy: Never
+          image: {{ .Values.image | default (printf "%strader-signal-service:%s" (.Values.global.imageRegistry | default "") (.Values.global.imageTag | default "latest")) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy | default "IfNotPresent" }}
           ports:
             - containerPort: 3003
           envFrom:
