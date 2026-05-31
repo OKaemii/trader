@@ -17,6 +17,8 @@ module "k8s_bootstrap" {
   email_to            = var.email_to
   seed_admin_email    = var.seed_admin_email
   seed_admin_password = var.seed_admin_password
+  ghcr_username       = var.ghcr_username
+  ghcr_token          = var.ghcr_token
 }
 
 module "nginx_ingress" {

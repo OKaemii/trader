@@ -34,8 +34,8 @@ spec:
     spec:
       containers:
         - name: strategy-engine
-          image: {{ .Values.image | default "trader/strategy-engine:latest" }}
-          imagePullPolicy: Never
+          image: {{ .Values.image | default (printf "%strader-strategy-engine:%s" (.Values.global.imageRegistry | default "") (.Values.global.imageTag | default "latest")) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy | default "IfNotPresent" }}
           ports:
             - containerPort: 8000
           env:
@@ -124,8 +124,8 @@ spec:
     spec:
       containers:
         - name: strategy-engine
-          image: {{ $.Values.image | default "trader/strategy-engine:latest" }}
-          imagePullPolicy: Never
+          image: {{ $.Values.image | default (printf "%strader-strategy-engine:%s" ($.Values.global.imageRegistry | default "") ($.Values.global.imageTag | default "latest")) }}
+          imagePullPolicy: {{ $.Values.global.imagePullPolicy | default "IfNotPresent" }}
           ports:
             - containerPort: 8000
           env:

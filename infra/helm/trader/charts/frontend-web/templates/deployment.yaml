@@ -15,8 +15,8 @@ spec:
     spec:
       containers:
         - name: frontend-web
-          image: {{ .Values.image | default "trader/frontend-web:latest" }}
-          imagePullPolicy: Never
+          image: {{ .Values.image | default (printf "%strader-frontend-web:%s" (.Values.global.imageRegistry | default "") (.Values.global.imageTag | default "latest")) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy | default "IfNotPresent" }}
           ports:
             - containerPort: 3000
           env:

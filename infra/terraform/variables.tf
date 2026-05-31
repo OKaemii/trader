@@ -90,3 +90,16 @@ variable "seed_admin_password" {
 variable "homeserver_ip" {
   default = "192.168.50.2"
 }
+
+// GHCR image pull credentials for the private trader-* packages built by the
+// build-deploy GitHub Actions workflow. ghcr_username is the GitHub username/org;
+// ghcr_token is a PAT (or fine-grained token) with read:packages. Injected into the
+// `ghcr-pull` dockerconfigjson secret and attached to the namespace default SA.
+variable "ghcr_username" {
+  default = ""
+}
+
+variable "ghcr_token" {
+  sensitive = true
+  default   = ""
+}
