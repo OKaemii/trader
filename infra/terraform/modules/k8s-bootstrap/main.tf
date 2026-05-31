@@ -33,6 +33,17 @@ variable "seed_admin_password" {
   default   = ""
 }
 
+# GHCR credentials for pulling the private trader-* images that the build-deploy
+# workflow pushes. ghcr_username is the GitHub username/org; ghcr_token is a PAT
+# (or fine-grained token) with read:packages.
+variable "ghcr_username" {
+  default = ""
+}
+variable "ghcr_token" {
+  sensitive = true
+  default   = ""
+}
+
 resource "kubernetes_namespace" "trader" {
   metadata { name = var.namespace }
 }
@@ -60,4 +71,41 @@ resource "kubernetes_secret" "trader_secrets" {
     SEED_ADMIN_PASSWORD = var.seed_admin_password
   }
   depends_on = [kubernetes_namespace.trader]
+}
+
+# Private-GHCR image pull secret. The build-deploy workflow pushes images to
+# ghcr.io/<owner>/trader-*; k3s needs credentials to pull them. Attached to the
+# namespace default ServiceAccount below so every pod inherits it without each
+# Deployment having to declare imagePullSecrets.
+resource "kubernetes_secret" "ghcr_pull" {
+  metadata {
+    name      = "ghcr-pull"
+    namespace = var.namespace
+  }
+  type = "kubernetes.io/dockerconfigjson"
+  data = {
+    ".dockerconfigjson" = jsonencode({
+      auths = {
+        "ghcr.io" = {
+          username = var.ghcr_username
+          password = var.ghcr_token
+          auth     = base64encode("${var.ghcr_username}:${var.ghcr_token}")
+        }
+      }
+    })
+  }
+  depends_on = [kubernetes_namespace.trader]
+}
+
+# Attach ghcr-pull to the namespace default ServiceAccount so all trader pods can
+# pull private images. k3s auto-creates this SA with the namespace; this resource
+# adopts and patches it (Terraform owns it from here on).
+resource "kubernetes_default_service_account" "trader" {
+  metadata {
+    namespace = var.namespace
+  }
+  image_pull_secret {
+    name = kubernetes_secret.ghcr_pull.metadata[0].name
+  }
+  depends_on = [kubernetes_secret.ghcr_pull]
 }

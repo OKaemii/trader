@@ -15,8 +15,8 @@ spec:
     spec:
       containers:
         - name: market-data-service
-          image: {{ .Values.image | default "trader/market-data-service:latest" }}
-          imagePullPolicy: Never
+          image: {{ .Values.image | default (printf "%strader-market-data-service:%s" (.Values.global.imageRegistry | default "") (.Values.global.imageTag | default "latest")) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy | default "IfNotPresent" }}
           ports:
             - containerPort: 3002
           envFrom:

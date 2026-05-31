@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
-# Build all service Docker images and load them into the homeserver's k3s containerd.
+# BREAK-GLASS local image build. The normal build+deploy path is GitHub Actions
+# (.github/workflows/build-deploy.yml → GHCR → helm upgrade). Use this only when CI
+# is unavailable and you need to side-load an image straight into the homeserver's
+# k3s containerd.
+#
+# Images are tagged ghcr.io/okaemii/trader-<service>:latest to match the chart's
+# composed default ref. With imagePullPolicy=IfNotPresent, a locally-imported :latest
+# is used without hitting the registry. To roll the cluster onto these local images:
+#   helm upgrade --install trader-app infra/helm/trader -n trader   # renders :latest
 #
 # Usage:
 #   ./infra/scripts/build-images.sh              # build + load all images
@@ -37,7 +45,7 @@ TS_SERVICES=(
 
 build_and_load() {
   local service="$1"
-  local tag="trader/${service}:latest"
+  local tag="ghcr.io/okaemii/trader-${service}:latest"
   local tmpfile="/tmp/trader-${service}.tar"
 
   echo ""
@@ -104,7 +112,7 @@ verify_images() {
   echo ""
   echo "Verifying imported images on homeserver ..."
   ssh -i "${TMPKEY}" -p "${HOMESERVER_PORT}" "${HOMESERVER}" \
-    "sudo k3s ctr images list | grep 'trader/'"
+    "sudo k3s ctr images list | grep 'okaemii/trader-'"
 }
 
 cd "${REPO_ROOT}"
@@ -125,4 +133,6 @@ else
 fi
 
 echo ""
-echo "All images loaded. Next: cd infra/terraform && terraform apply -var-file=terraform.tfvars"
+echo "All images loaded into k3s containerd as ghcr.io/okaemii/trader-<svc>:latest."
+echo "Roll the cluster onto them (break-glass, renders the :latest tag):"
+echo "  helm upgrade --install trader-app infra/helm/trader -n trader"
