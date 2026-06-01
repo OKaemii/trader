@@ -9,6 +9,7 @@ const links = [
   { href: '/dashboard', label: 'Dashboard' },
   { href: '/signals', label: 'Signals' },
   { href: '/research', label: 'Research' },
+  { href: '/strategy-config', label: 'Strategy' },
   { href: '/universe', label: 'Universe' },
   { href: '/market-data', label: 'Market Data' },
   { href: '/operations/reconciliation', label: 'Reconciliation' },
