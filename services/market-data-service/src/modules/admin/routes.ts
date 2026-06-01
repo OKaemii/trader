@@ -15,6 +15,7 @@ import { MongoInstrumentMeta } from '../universe/infrastructure/MongoInstrumentM
 import type { MarketDataProvider } from '../bars/infrastructure/providers/market-data-provider.ts';
 import { aggregateBars, getBars, invalidateBars, type RangeKey } from '@trader/shared-bars';
 import { backfillTickers, CACHE_INVALIDATED_TOPIC } from '../bars/infrastructure/backfill.ts';
+import { backfillDailyHistory } from '../bars/infrastructure/daily-history.ts';
 import { REDIS_STREAMS, POLL_INTERVAL_OPTIONS, type BarInterval, type OHLCVBar, type PollIntervalKey } from '@trader/shared-types';
 import type { HolidayCache, ExchangeCalendar, Market } from '@trader/shared-calendar';
 import { scheduleBetween, marketStateOf } from '@trader/shared-calendar';
@@ -57,7 +58,31 @@ const MIN_POLL_MS = 5_000;
 const MAX_POLL_MS = 24 * 60 * 60_000;
 
 const VALID_INTERVALS: BarInterval[] = ['5m', '15m', '1h', 'daily'];
-const VALID_RANGES: RangeKey[]     = ['30d', '60d', '90d', '180d'];
+const VALID_RANGES: RangeKey[]     = ['30d', '60d', '90d', '180d', '1y', '2y', '5y', 'max'];
+
+// Read a downsampled OHLCV series for one ticker. `daily` reads the persisted
+// `interval:'daily'` series directly (long-range strategy lookbacks — aggregating 5m here
+// would cap at the 60d 5m retention); intraday views aggregate the stored 5m series.
+async function readBarsSeries(
+  redis: Awaited<ReturnType<typeof getRedisClient>>,
+  db: Awaited<ReturnType<typeof getMongoDb>>,
+  ticker: string,
+  interval: BarInterval,
+  range: RangeKey,
+  asOf: number | undefined,
+): Promise<OHLCVBar[]> {
+  const opts = asOf !== undefined ? { asOf } : {};
+  if (interval === 'daily') {
+    const daily = await getBars(redis as any, db, ticker, 'daily', range, opts);
+    if (daily.length > 0) return daily;
+    // Daily series not yet seeded for this ticker (pre-backfill window) — fall back to
+    // aggregating the recent 5m series so callers still get a short-range daily view.
+    const base5 = await getBars(redis as any, db, ticker, '5m', range, opts);
+    return aggregateBars(base5, 'daily');
+  }
+  const base = await getBars(redis as any, db, ticker, '5m', range, opts);
+  return aggregateBars(base, interval);
+}
 
 export interface CalendarDeps {
   holidayCache: () => HolidayCache;
@@ -263,6 +288,34 @@ export function createAdminRouter(
     },
   );
 
+  // ── Backfill long-range DAILY history (Yahoo, multi-year) ──────────────────
+  // POST /api/admin/market-data/backfill-daily
+  // body: { tickers?: string[], years?: number }  (tickers omitted → active universe)
+  // Seeds the persisted interval:'daily' series that strategy lookbacks read (12-1 momentum
+  // etc.). Yahoo-sourced + free, decoupled from the metered 5m provider.
+  r.post(
+    '/admin/api/market-data/backfill-daily',
+    zValidator('json', MarketDataContracts.BackfillDailyRequestSchema, (result, c) => {
+      if (!result.success) return c.json({ error: 'invalid body', issues: result.error.issues }, 400);
+    }),
+    async (c) => {
+      const body = c.req.valid('json');
+      const tickers = body.tickers && body.tickers.length > 0
+        ? body.tickers
+        : universeManager.activeTickers;
+      if (tickers.length === 0) return c.json({ error: 'no tickers (universe empty and no body.tickers)' }, 400);
+      const db = await getMongoDb();
+      const redis = await getRedisClient();
+      const results = await backfillDailyHistory(db, redis, tickers, body.years !== undefined ? { years: body.years } : {});
+      return c.json({
+        tickers: results.length,
+        bars:    results.reduce((acc, r) => acc + r.upserted, 0),
+        failures: results.filter((r) => r.error).length,
+        results,
+      });
+    },
+  );
+
   // ── Clear cached bars ──────────────────────────────────────────────────────
   // POST /api/admin/market-data/clear-cache
   // body: { interval?: BarInterval, beforeTimestamp?: number (ms), dryRun?: boolean }
@@ -377,13 +430,9 @@ export function createAdminRouter(
     }
     const db    = await getMongoDb();
     const redis = await getRedisClient();
-    // getBars currently keys cache by storedInterval — storage is always 5m, so we
-    // fetch the 5m series and downsample here. Returning the downsampled view keeps
-    // the cache compact (one entry per ticker/range), not bloated per requested-interval.
-    const base = asOf !== undefined
-      ? await getBars(redis as any, db, ticker, '5m', range, { asOf })
-      : await getBars(redis as any, db, ticker, '5m', range);
-    const out  = aggregateBars(base, interval);
+    // `daily` reads the persisted daily series directly (long-range); intraday intervals
+    // downsample the stored 5m series. See readBarsSeries.
+    const out = await readBarsSeries(redis, db, ticker, interval, range, asOf);
     return c.json({ ticker, interval, range, asOf: asOf ?? null, bars: out });
   });
 
@@ -488,10 +537,7 @@ export function createInternalBarsRouter(universeManager: UniverseManager): Hono
     }
     const db    = await getMongoDb();
     const redis = await getRedisClient();
-    const base = asOf !== undefined
-      ? await getBars(redis as any, db, ticker, '5m', range, { asOf })
-      : await getBars(redis as any, db, ticker, '5m', range);
-    const out  = aggregateBars(base, interval);
+    const out = await readBarsSeries(redis, db, ticker, interval, range, asOf);
     return c.json({ ticker, interval, range, asOf: asOf ?? null, bars: out });
   });
 
@@ -514,10 +560,7 @@ export function createInternalBarsRouter(universeManager: UniverseManager): Hono
       // call within a TTL window. We could parallelise with Promise.all if the cache
       // miss path proves slow in production; for now serial is simpler and predictable.
       for (const ticker of body.tickers) {
-        const base = asOf !== undefined
-          ? await getBars(redis as any, db, ticker, '5m', range, { asOf })
-          : await getBars(redis as any, db, ticker, '5m', range);
-        out[ticker] = aggregateBars(base, interval);
+        out[ticker] = await readBarsSeries(redis, db, ticker, interval, range, asOf);
       }
       return c.json({ interval, range, asOf: asOf ?? null, bars: out });
     },

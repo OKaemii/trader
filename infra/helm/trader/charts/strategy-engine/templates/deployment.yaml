@@ -78,6 +78,10 @@ spec:
               value: {{ .Values.global.env.signalOrderType | default "Limit" | quote }}
             - name: ACTIVE_STRATEGY
               value: {{ .Values.global.env.activeStrategy | default "factor_rank_v1" | quote }}
+            {{- if .Values.global.env.rollingWindowBars }}
+            - name: ROLLING_WINDOW_BARS
+              value: {{ .Values.global.env.rollingWindowBars | quote }}
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /healthz
@@ -178,6 +182,10 @@ spec:
               value: {{ $s.barFrequency | default "daily" | quote }}
             - name: ACTIVE_STRATEGY
               value: {{ $s.strategyId | quote }}
+            {{- if $.Values.global.env.rollingWindowBars }}
+            - name: ROLLING_WINDOW_BARS
+              value: {{ $.Values.global.env.rollingWindowBars | quote }}
+            {{- end }}
             - name: SIGNAL_ORDER_TYPE
               value: {{ $.Values.global.env.signalOrderType | default "Limit" | quote }}
           livenessProbe:

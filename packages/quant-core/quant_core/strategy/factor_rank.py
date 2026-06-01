@@ -20,6 +20,7 @@ from .collaborators.scorer import eligible_returns
 from .collaborators.covariance import shrunk_covariance
 from .collaborators.regime_engine import RegimeEngine
 from .collaborators.feature_stability import FeatureStabilityAnalyser
+from .collaborators.trend_filter import TrendFilter
 import dataclasses
 
 STABILITY_WINDOW = 30  # cycles to accumulate before running stability analysis
@@ -31,11 +32,13 @@ class FactorRankStrategy:
         factor,                              # CompositeFactor (a Factor)
         regime: RegimeEngine,
         stability: FeatureStabilityAnalyser,
+        trend: TrendFilter,
         config: StrategyConfig,
     ) -> None:
         self._factor = factor
         self._regime = regime
         self._stability = stability
+        self._trend = trend
         self.config = config
         self._sectors: dict[str, str] = {}
         # Cross-cycle state for stability tracking. Phase 1 makes this stateless (read the
@@ -45,10 +48,21 @@ class FactorRankStrategy:
         }
 
     def parameter_space(self) -> dict[str, list[float]]:
+        # Lean default sweep (≈12 points = legacy MCPT cost). The full knob set lives in
+        # parameter_defaults() for live tuning + the portal grid editor; widen deliberately
+        # there since MCPT cost scales with the cartesian-product size.
         return {
             'w_momentum': [0.5, 1.0, 1.5],
-            'w_reversal': [0.5, 1.0],
-            'w_low_vol': [0.5, 1.0],
+            'mom_lookback': [126.0, 252.0],
+            'trend_risk_off_mult': [0.0, 1.0],
+        }
+
+    def parameter_defaults(self) -> dict[str, float]:
+        return {
+            'w_momentum': 1.0, 'w_low_vol': 0.5, 'w_reversal': 0.0,
+            'mom_lookback': 252.0, 'mom_skip': 21.0,
+            'abs_lookback': 252.0, 'abs_threshold': 0.0,
+            'trend_risk_off_mult': 0.0, 'breadth_floor': 0.4,
         }
 
     def compute_features(
@@ -63,7 +77,18 @@ class FactorRankStrategy:
             return None
 
         bd = self._factor.breakdown(history, window, params)
-        composite_scores = {t: bd[t]['composite'] for t in tickers}
+        composite_all = {t: bd[t]['composite'] for t in tickers}
+
+        # Defensive overlay (composition): keep only uptrending names + a breadth-driven gross
+        # exposure scalar. Covariance / universe / scores are all realigned to the held set so
+        # the optimiser sees a consistent (scores, cov, universe) triple.
+        held_scores, trend_exposure, trend_tel = self._trend.apply(composite_all, history, params)
+        held_idx = [i for i, t in enumerate(tickers) if t in held_scores]
+        held_tickers = [tickers[i] for i in held_idx]
+        if len(held_tickers) < self.config.min_universe_size:
+            return None   # too few uptrending names — stay defensive, emit nothing this cycle
+
+        composite_scores = {t: held_scores[t] for t in held_tickers}
         per_ticker = {
             t: {
                 'momentum':       bd[t]['momentum'],
@@ -72,7 +97,7 @@ class FactorRankStrategy:
                 'topology':       0.0,
                 'residual_alpha': bd[t]['composite'],
             }
-            for t in tickers
+            for t in held_tickers
         }
 
         # Regime confidence + soft multipliers (from the last cross-sectional return vector).
@@ -92,19 +117,20 @@ class FactorRankStrategy:
         if len(self._feature_history['momentum']) >= STABILITY_WINDOW:
             feature_stability = dataclasses.asdict(self._stability.analyse(self._feature_history))
 
-        cov = shrunk_covariance(returns)
+        cov = shrunk_covariance(returns[held_idx])   # held subset — aligns with ticker_universe
 
         return FeatureVector(
             strategy_id=self.config.strategy_id,
             observation_ts=as_of_ms,
-            ticker_universe=tickers,
+            ticker_universe=held_tickers,
             composite_scores=composite_scores,
             per_ticker=per_ticker,
             cross_sectional_stats={
                 'momentum_mean': m_mean, 'reversal_mean': r_mean, 'low_vol_mean': l_mean,
+                'trend_breadth': trend_tel['breadth'], 'trend_held': trend_tel['n_qualifying'],
             },
             regime_confidence=regime.confidence,
-            position_size_multiplier=regime.position_size_multiplier,
+            position_size_multiplier=regime.position_size_multiplier * trend_exposure,
             signal_weights=regime.signal_weights,
             sectors=dict(self._sectors),
             covariance_matrix=cov.tolist(),

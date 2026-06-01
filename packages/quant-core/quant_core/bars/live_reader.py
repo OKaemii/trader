@@ -13,17 +13,23 @@ from ..http.internal_jwt import mint_internal_jwt
 from ..strategy.contract import HistoryView
 from ..types import OHLCVBar
 
-# Range keys the internal bars endpoint serves. Long-range daily keys (1y/2y/5y/max) are
-# added in Phase 3 (market-data-service fetchDailyHistory); until then daily history is
-# capped at 180d, which bounds how far back a replay can reach.
-_RANGE_LADDER = [(30, "30d"), (60, "60d"), (90, "90d"), (180, "180d")]
+# Range keys the internal bars endpoint serves, as (calendar-day cap, key). The long keys
+# (1y/2y/5y/max) read the persisted interval:'daily' series, so a strategy lookback can reach
+# as far back as daily history has been backfilled — no 180d cap.
+_RANGE_LADDER = [(30, "30d"), (60, "60d"), (90, "90d"), (180, "180d"),
+                 (365, "1y"), (730, "2y"), (1825, "5y")]
 
 
 def _range_for(lookback_bars: int) -> str:
+    # lookback_bars counts TRADING bars; convert to a calendar-day budget (~252 trading
+    # days/year ⇒ ×1.5 headroom for weekends + holidays) and pick the smallest range key
+    # whose window covers it. The old 1:1 bars→days mapping under-provisioned (180 calendar
+    # days ≈ 126 trading bars), which is exactly what capped momentum at ~6 months.
+    calendar_days = int(lookback_bars * 1.5) + 5
     for cap, key in _RANGE_LADDER:
-        if lookback_bars <= cap:
+        if calendar_days <= cap:
             return key
-    return "180d"
+    return "max"
 
 
 class LiveBarsReader:
@@ -78,10 +84,14 @@ class LiveBarsReader:
     ) -> list[OHLCVBar]:
         import httpx
 
-        # NOTE: bounded by the 180d ladder until Phase 3 adds long-range daily keys; a
-        # multi-year backtest needs that extension to reach `start_ms` fully.
+        # Pick the smallest range key whose calendar window reaches start_ms. The persisted
+        # daily series now serves 1y/2y/5y/max, so a multi-year reach is no longer capped.
+        import time as _time
+        end = end_ms if end_ms is not None else int(_time.time() * 1000)
+        days = max(1, int((end - start_ms) / 86_400_000))
+        range_key = next((key for cap, key in _RANGE_LADDER if days <= cap), "max")
         url = (f"{self._base_url}/internal/api/market-data/bars/{ticker}"
-               f"?interval=daily&range=180d")
+               f"?interval=daily&range={range_key}")
         if end_ms is not None:
             url += f"&asOf={end_ms}"
         async with httpx.AsyncClient(timeout=self._timeout) as client:

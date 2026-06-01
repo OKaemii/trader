@@ -20,6 +20,8 @@ import traceback
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
+from ..infrastructure.strategy_config import resolve_search_grid
+
 from pymongo import ReturnDocument
 
 POLL_INTERVAL_S = 30
@@ -95,6 +97,11 @@ class JobRunner:
             ignored = [k for k in req if k not in accepted]
             if ignored:
                 print(f"validation job {job.get('_id')}: ignoring request keys not on validator.run {ignored}")
+            # Portal searchGrid override (resolved on the event loop; the compute thread stays
+            # Mongo-free). None ⇒ validator falls back to the strategy's parameter_space().
+            grid_override = await resolve_search_grid(self._db, req.get('strategy_id', 'factor_rank_v1'))
+            if grid_override is not None:
+                run_kwargs['param_grid'] = grid_override
 
             def _entry():
                 return asyncio.run(validator.run(prices, bench_bars, constituents=constituents, **run_kwargs))

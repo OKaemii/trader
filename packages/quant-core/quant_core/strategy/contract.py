@@ -85,6 +85,12 @@ class Strategy(Protocol):
         """Discrete hyper-parameter grid for in-sample fit / MCPT. {} = no tunables."""
         ...
 
+    def parameter_defaults(self) -> dict[str, float]:
+        """Single live value per tunable knob — the defaults the live host runs with when no
+        portal override is set. A superset of parameter_space() keys (it may expose knobs that
+        aren't swept by default). {} = no tunables."""
+        ...
+
     def compute_features(
         self, history: HistoryView, as_of_ms: int, params: StrategyParams
     ) -> Optional[FeatureVector]:

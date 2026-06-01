@@ -42,8 +42,10 @@ spec:
             - name: BARS_BACKEND
               value: {{ .Values.global.env.barsBackend | default "mongo" | quote }}
             # Drives the replay validator's rolling-window sizing via quant-core's strategy
-            # factory (daily → ROLLING_WINDOW_BARS=20). The Phase-4 backtest reads multi-year
-            # adjusted daily direct from Yahoo (YahooDailyBarsReader), so it needs no
+            # factory (daily → ROLLING_WINDOW_BARS=300, the 12-1 momentum floor). The Phase-4
+            # backtest reads multi-year adjusted daily direct from Yahoo (YahooDailyBarsReader),
+            # so it needs multi-year history per fold; short windows return insufficient_history.
+            # It needs no
             # MARKET_DATA_SERVICE_URL — the research data path is decoupled from the live one.
             - name: BAR_FREQUENCY
               value: {{ .Values.global.env.barFrequency | default "daily" | quote }}

@@ -12,9 +12,10 @@
 process.env.JWT_SECRET = 'test-jwt-secret-min-16-chars';
 import { describe, it, expect, vi } from "vitest";
 
-// Stub Mongo: every collection.find returns three 5m bars for any ticker, sorted oldest-first.
-// We use this to verify that aggregation to 'daily' yields ONE bar per ticker (all three 5m
-// bars fold into the same UTC day) — proving the endpoint downsamples via aggregateBars.
+// Stub Mongo: the 5m series has three bars per ticker; the persisted daily series is empty
+// (interval-aware mock). A 'daily' request therefore reads the empty daily series and falls
+// back to aggregating the 5m series → ONE daily bar per ticker (all three 5m bars fold into
+// the same UTC day) — exercising readBarsSeries's pre-backfill fallback path.
 const fiveMin = 5 * 60_000;
 const dayStart = Date.UTC(2026, 4, 14, 0, 0, 0);
 const stubDocs = (ticker: string) => [
@@ -33,9 +34,11 @@ vi.mock('@trader/shared-mongo', () => ({
   },
   getMongoDb: async () => ({
     collection: () => ({
+      // Interval-aware: only the 5m series is populated. The daily series is empty, so the
+      // endpoint's daily read falls back to 5m aggregation.
       find: (q: any) => ({
         sort: () => ({
-          toArray: async () => stubDocs(q.ticker),
+          toArray: async () => (q.interval === '5m' ? stubDocs(q.ticker) : []),
         }),
       }),
       findOne: async () => null,
