@@ -61,6 +61,10 @@ spec:
             # arrives via the trader-secrets envFrom above (same as the T212 keys).
             - name: MARKET_DATA_PROVIDER
               value: {{ .Values.global.env.marketDataProvider | default "twelvedata" | quote }}
+            - name: DAILY_HISTORY_PROVIDER
+              value: {{ .Values.global.env.dailyHistoryProvider | default "yahoo" | quote }}
+            - name: DAILY_BACKFILL_YEARS
+              value: {{ .Values.global.env.dailyBackfillYears | default "5" | quote }}
             - name: BAR_FREQUENCY
               value: {{ .Values.global.env.barFrequency | default "daily" | quote }}
             {{- with .Values.global.env.pollIntervalMs }}
