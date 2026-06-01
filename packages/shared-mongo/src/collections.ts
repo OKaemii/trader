@@ -34,6 +34,9 @@ export const COLLECTIONS = {
   RISK_STATE:            'risk_state',
   PORTAL_UNIVERSE_OVERRIDES: 'portal_universe_overrides',
   PORTAL_MARKET_CONFIG:      'portal_market_config',
+  // Per-strategy tunable overrides set from the portal: { _id: strategy_id, liveParams,
+  // searchGrid }. liveParams hot-applied by strategy-engine; searchGrid swept by the validator.
+  PORTAL_STRATEGY_CONFIG:    'portal_strategy_config',
   MARKET_CALENDAR:           'market_calendar',
   COMPANY_PROFILES:          'company_profiles',
   // Per-ticker GICS metadata sourced from Yahoo `quoteSummary(assetProfile)`. Owned by
