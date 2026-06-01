@@ -17,11 +17,13 @@ from quant_core.strategy.factory import make_strategy
 class _FakeBars:
     """Deterministic, as-of-independent history (constant across steps)."""
 
-    def __init__(self, n_tickers=12, n_closes=30):
+    def __init__(self, n_tickers=12, n_closes=400):
+        # ≥ factor_rank's 300-bar window, all-uptrending (dispersed positive drift) so the
+        # TrendFilter retains the universe and the replay produces non-empty steps.
         rng = np.random.default_rng(1234)
         self._closes = {}
         for i in range(n_tickers):
-            steps = rng.normal(0.0006 * (i - n_tickers / 2), 0.011, size=n_closes)
+            steps = rng.normal(0.0008 + 0.0004 * i, 0.011, size=n_closes)
             self._closes[f"T{i}"] = [float(x) for x in 100.0 * np.exp(np.cumsum(steps))]
 
     async def history_as_of(self, tickers, as_of_ms, lookback_bars):

@@ -32,6 +32,22 @@ def _trending_history(n_tickers: int, n_closes: int) -> HistoryView:
     )
 
 
+def _uptrend_history(n_tickers: int, n_closes: int) -> HistoryView:
+    """All tickers trend up (dispersed positive drift) so the TrendFilter keeps every name —
+    used where we need a populated FeatureVector, not to exercise the defensive filter."""
+    rng = np.random.default_rng(7)
+    closes = {}
+    for i in range(n_tickers):
+        drift = 0.001 + 0.0005 * i
+        steps = rng.normal(drift, 0.008, size=n_closes)
+        closes[f"T{i}"] = list(100.0 * np.exp(np.cumsum(steps)))
+    return HistoryView(
+        closes=closes,
+        volumes={t: [1.0] * len(c) for t, c in closes.items()},
+        timestamps={t: list(range(len(c))) for t, c in closes.items()},
+    )
+
+
 def test_factory_known_ids():
     assert known_strategies() == ['factor_rank_v1', 'sector_momentum_v1', 'topology_v1']
 
@@ -55,22 +71,36 @@ def test_strategies_satisfy_protocol(sid):
     assert isinstance(s, Strategy)
     assert s.config.strategy_id == sid
     assert isinstance(s.parameter_space(), dict)
+    assert isinstance(s.parameter_defaults(), dict)
+
+
+def test_factor_rank_parameter_surface():
+    s = make_strategy('factor_rank_v1')
+    space = s.parameter_space()
+    assert set(space) == {'w_momentum', 'mom_lookback', 'trend_risk_off_mult'}
+    defaults = s.parameter_defaults()
+    assert set(space).issubset(set(defaults))   # defaults cover every swept knob
+    assert defaults['w_reversal'] == 0.0         # reversal off by default (kept tunable)
+    assert defaults['mom_lookback'] == 252.0
 
 
 def test_factor_rank_emits_and_decides():
     s = make_strategy('factor_rank_v1')
-    hist = _trending_history(12, 25)
+    # ≥ rolling_window (300) closes, all uptrending so the TrendFilter keeps the universe.
+    hist = _uptrend_history(12, 320)
     fv = s.compute_features(hist, as_of_ms=1_700_000_000_000, params=NO_PARAMS)
     assert isinstance(fv, FeatureVector)
     assert set(fv.composite_scores) == set(fv.ticker_universe)
+    # covariance is realigned to the held universe (no dimension drift after filtering)
+    assert len(fv.covariance_matrix) == len(fv.ticker_universe)
     out = s.decide(fv, EMPTY_PORTFOLIO)
     assert isinstance(out, StrategyOutput)
     assert out.strategy_id == 'factor_rank_v1'
     assert out.top_k == 20
-    # composite == mean of the three z-scored leaves (CompositeFactor equal weight)
+    # weighted composite with the new defaults: w_momentum=1.0, w_low_vol=0.5, w_reversal=0.0
     for t in fv.ticker_universe:
         a = fv.per_ticker[t]
-        assert abs(fv.composite_scores[t] - (a['momentum'] + a['reversal'] + a['low_vol']) / 3.0) < 1e-9
+        assert abs(fv.composite_scores[t] - (1.0 * a['momentum'] + 0.5 * a['low_vol'])) < 1e-9
 
 
 def test_thin_universe_returns_none():

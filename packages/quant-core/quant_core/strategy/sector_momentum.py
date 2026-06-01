@@ -26,6 +26,9 @@ class SectorMomentumStrategy:
     def parameter_space(self) -> dict[str, list[float]]:
         return {}  # no tunables for v1
 
+    def parameter_defaults(self) -> dict[str, float]:
+        return {}
+
     def compute_features(
         self, history: HistoryView, as_of_ms: int, params: StrategyParams
     ) -> Optional[FeatureVector]:
