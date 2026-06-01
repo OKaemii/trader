@@ -42,6 +42,7 @@ from .application.objectives import make_sharpe
 from .application.regime import classify_regime, regime_label
 from .application.replay_pnl import PriceSeries, series_period_returns
 from .application.validator import DEFAULT_BENCHMARK_TICKERS, Validator
+from .infrastructure.strategy_config import resolve_search_grid
 from .application.walk_forward import WalkForwardValidator
 
 MONGODB_URL = os.getenv('MONGODB_URL', 'mongodb://localhost:27017')
@@ -232,7 +233,7 @@ def _regime_series(bench: PriceSeries, bounds: list[tuple[int, int]], window_day
     return np.array(labels)
 
 
-async def _walk_forward(strategy_id, reader, prices, bench, benchmark_name, folds, step, universe, round_trip_bps, ppy):
+async def _walk_forward(strategy_id, reader, prices, bench, benchmark_name, folds, step, universe, round_trip_bps, ppy, param_grid=None):
     """The CPU-bound core (driven by asyncio.run inside a worker thread). Returns a plain dict
     of everything the response + persisted doc need — no FastAPI/Mongo objects cross back. On a
     too-thin realised path it returns {'insufficient': reason} rather than running stats on
@@ -240,7 +241,7 @@ async def _walk_forward(strategy_id, reader, prices, bench, benchmark_name, fold
     from quant_core.strategy.factory import make_strategy
 
     universe_at = lambda _t: universe  # static universe (survivorship caveat stamped upstream)
-    grid = expand_grid(make_strategy(strategy_id).parameter_space())
+    grid = expand_grid(param_grid if param_grid is not None else make_strategy(strategy_id).parameter_space())
     ablations = _ablation_param_sets(strategy_id)
     sharpe_obj = make_sharpe(ppy)   # the walk-forward IS fit selects on annualised Sharpe
 
@@ -395,10 +396,13 @@ async def run_backtest(req: BacktestRequest):
     # Round-trip cost per unit one-way turnover ≈ 2·(half-spread 5bps + commission 1bps).
     round_trip_bps = float(os.getenv('BACKTEST_ROUND_TRIP_BPS', '12'))
 
+    # Portal searchGrid override (resolved on the event loop; the compute thread stays Mongo-free).
+    grid_override = await resolve_search_grid(_db, req.strategy_id)
+
     def _thread_entry():
         return asyncio.run(_walk_forward(
             req.strategy_id, reader, prices, bench, benchmark, folds, step,
-            list(prices.keys()), round_trip_bps, ppy,
+            list(prices.keys()), round_trip_bps, ppy, grid_override,
         ))
 
     out = await asyncio.to_thread(_thread_entry)
