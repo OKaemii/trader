@@ -12,6 +12,7 @@ from .contract import Strategy, StrategyConfig
 from .factors import CompositeFactor, LowVolFactor, MomentumFactor, ReversalFactor
 from .collaborators.regime_engine import RegimeEngine
 from .collaborators.feature_stability import FeatureStabilityAnalyser
+from .collaborators.trend_filter import TrendFilter
 from .factor_rank import FactorRankStrategy
 from .sector_momentum import SectorMomentumStrategy
 from .topology import TopologyStrategy
@@ -27,13 +28,21 @@ def _report_cadence() -> str:
 
 
 def _factor_rank_window() -> int:
-    # BAR_FREQUENCY=daily → 20 trading days; intraday → 60 bars (shorter horizon).
-    default = '20' if _bar_frequency() == 'daily' else '60'
+    # BAR_FREQUENCY=daily → 300 trading days: a floor that covers 12-1 momentum (252 lookback +
+    # 21 skip) with headroom, fed by the persisted long-range daily series. Intraday → 60 bars
+    # (shorter horizon; the momentum lookback clamps to what's available).
+    default = '300' if _bar_frequency() == 'daily' else '60'
     return int(os.getenv('ROLLING_WINDOW_BARS', default))
 
 
 def _build_factor_rank() -> Strategy:
-    factor = CompositeFactor([MomentumFactor(), ReversalFactor(), LowVolFactor()])
+    # Momentum-led blend; reversal kept at weight 0 (tunable — it was part of the original
+    # research) so it no longer cancels the re-horizoned momentum. TrendFilter adds the
+    # absolute-momentum / breadth defensive overlay.
+    factor = CompositeFactor(
+        [MomentumFactor(), LowVolFactor(), ReversalFactor()],
+        weights={'momentum': 1.0, 'low_vol': 0.5, 'reversal': 0.0},
+    )
     config = StrategyConfig(
         strategy_id='factor_rank_v1',
         rolling_window=_factor_rank_window(),
@@ -44,7 +53,7 @@ def _build_factor_rank() -> Strategy:
         # cycle 1 (preserves the legacy factor_rank prewarm depth of 126).
         prewarm_cycles=RegimeEngine.HISTORY_MIN * 2,
     )
-    return FactorRankStrategy(factor, RegimeEngine(), FeatureStabilityAnalyser(), config)
+    return FactorRankStrategy(factor, RegimeEngine(), FeatureStabilityAnalyser(), TrendFilter(), config)
 
 
 def _build_sector_momentum() -> Strategy:

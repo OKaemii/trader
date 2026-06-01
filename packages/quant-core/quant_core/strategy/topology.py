@@ -34,6 +34,9 @@ class TopologyStrategy:
     def parameter_space(self) -> dict[str, list[float]]:
         return {}
 
+    def parameter_defaults(self) -> dict[str, float]:
+        return {}
+
     def compute_features(
         self, history: HistoryView, as_of_ms: int, params: StrategyParams
     ) -> Optional[FeatureVector]:
