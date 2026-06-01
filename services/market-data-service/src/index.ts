@@ -26,6 +26,7 @@ import {
   type Market, type MarketState, type ExchangeCalendar,
 } from '@trader/shared-calendar';
 import { backfillTickers, tickersMissingHistory, healMissingHistory } from './modules/bars/infrastructure/backfill.ts';
+import { backfillDailyHistory, tickersMissingDailyHistory } from './modules/bars/infrastructure/daily-history.ts';
 import { writeBarRevisions, ensureBiTemporalIndexes, fetchFirstPrintCloses } from './modules/bars/infrastructure/persist-bars.ts';
 import { msUntilNextTick } from './modules/bars/application/poll-scheduling.ts';
 import { log } from './logger.ts';
@@ -204,6 +205,8 @@ async function maybeEmitDailyAtClose(
         continue;
       }
       await persistBars(dailyBars, 'daily');
+      // Drop the daily read-cache so the next getBars('daily', …) reflects today's close.
+      await invalidateBarsBulk(redis as any, dailyBars.map((b) => ({ ticker: b.ticker, interval: 'daily' as BarInterval })));
       await xAdd(redis, REDIS_STREAMS.MARKET_RAW_DAILY, dailyBars);
       log.info(`[market-data] daily-emit ${market} ${utcDate} cycle=${cycleCounter}: ${dailyBars.length} bars → market:raw:daily`);
     } catch (err) {
@@ -690,6 +693,29 @@ async function bootstrap(): Promise<void> {
       log.warn('[market-data] bootstrap backfill failed:', err);
     }
   }
+
+  // Long-range DAILY history bootstrap — runs in the background (multi-year × full-universe
+  // Yahoo fetches take minutes; blocking pollLoop/health probes on it is worse than a brief
+  // window of thin daily coverage). Idempotent: subsequent boots see coverage and skip.
+  void (async () => {
+    if (universe.length === 0) return;
+    try {
+      const db = await getMongoDb();
+      const missingDaily = await tickersMissingDailyHistory(db, universe);
+      if (missingDaily.length === 0) {
+        log.info(`[market-data] bootstrap: all ${universe.length} tickers have sufficient daily history`);
+        return;
+      }
+      log.info(`[market-data] bootstrap: ${missingDaily.length}/${universe.length} tickers missing long-range daily history — backfilling from Yahoo (background)`);
+      const redis = await getRedisClient();
+      const results = await backfillDailyHistory(db, redis, missingDaily);
+      const ok    = results.filter((r) => !r.error).length;
+      const total = results.reduce((acc, r) => acc + r.upserted, 0);
+      log.info(`[market-data] bootstrap daily backfill done: ${ok}/${results.length} tickers OK, ${total} daily rows`);
+    } catch (err) {
+      log.warn('[market-data] bootstrap daily backfill failed:', err);
+    }
+  })();
 
   pollLoop().catch((err) => {
     log.error('[fatal]', err);

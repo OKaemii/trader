@@ -37,6 +37,23 @@ from ..domain.dataclasses import OHLCVBar
 CALLER = "strategy-engine"
 DEFAULT_TIMEOUT_SECONDS = 10.0
 
+# Range keys the internal bars endpoint serves, as (calendar-day cap, key). Mirrors
+# quant_core.bars.live_reader._RANGE_LADDER — the long keys read the persisted daily series,
+# so a deep lookback (e.g. 12-1 momentum) is no longer capped at 180d.
+_RANGE_LADDER = [(30, "30d"), (60, "60d"), (90, "90d"), (180, "180d"),
+                 (365, "1y"), (730, "2y"), (1825, "5y")]
+
+
+def range_for_bars(lookback_bars: int) -> str:
+    """Smallest range key whose calendar window covers `lookback_bars` TRADING bars
+    (~252/yr ⇒ ×1.5 headroom for weekends + holidays). Used by the live host to size the
+    daily fetch to the configured momentum lookback."""
+    calendar_days = int(max(1, lookback_bars) * 1.5) + 5
+    for cap, key in _RANGE_LADDER:
+        if calendar_days <= cap:
+            return key
+    return "max"
+
 
 class MarketDataClient:
     def __init__(

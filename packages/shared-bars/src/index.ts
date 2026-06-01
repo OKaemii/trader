@@ -33,13 +33,20 @@ import { getBarsFromPg, pgCacheKey } from './pg-bar-reader.ts';
 export { hashBarContent } from './content-hash.ts';
 export { getBarsFromPg, getLastClosePg, pgCacheKey } from './pg-bar-reader.ts';
 
-export type RangeKey = '30d' | '60d' | '90d' | '180d';
+// Short keys (30d–180d) bound 5m-derived reads; the long keys (1y–max) exist for the
+// persisted `interval:'daily'` series that backs strategy lookbacks (e.g. 12-1 momentum
+// needs ~273 trading days). `max` is a sentinel that predates any stored row.
+export type RangeKey = '30d' | '60d' | '90d' | '180d' | '1y' | '2y' | '5y' | 'max';
 
 const RANGE_DAYS: Record<RangeKey, number> = {
   '30d': 30,
   '60d': 60,
   '90d': 90,
   '180d': 180,
+  '1y': 365,
+  '2y': 730,
+  '5y': 1825,
+  'max': 36500,
 };
 
 // Bucket size in ms for each interval the consumer might request. Storage is always
@@ -322,7 +329,7 @@ export async function invalidateBars(
   ticker: string,
   interval: BarInterval,
 ): Promise<number> {
-  const ranges: RangeKey[] = ['30d', '60d', '90d', '180d'];
+  const ranges = Object.keys(RANGE_DAYS) as RangeKey[];
   // Clear both namespaces unconditionally — during the dual-write window both
   // caches may be populated, and after cutover the inactive one is just absent
   // (the DEL is a cheap no-op). Sidesteps the alternative of having to know

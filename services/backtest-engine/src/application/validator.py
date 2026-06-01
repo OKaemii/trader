@@ -156,6 +156,7 @@ class Validator:
         n_folds: int = 5,
         embargo_days: int = 21,
         data_source: str = '',
+        param_grid: Optional[dict] = None,   # portal searchGrid override; None ⇒ parameter_space()
     ) -> dict:
         step = max(1, rebalance_days) * DAY_MS
         ppy = max(1, round(365.0 / max(1, rebalance_days)))
@@ -176,7 +177,7 @@ class Validator:
         real_bars = panel_to_bars(panel)
         real_reader, real_prices = _reader_and_prices(real_bars)
         bench_map = {bt: PriceSeries.from_bars(b) for bt, b in (benchmark_bars or {}).items() if b}
-        grid = expand_grid(make_strategy(strategy_id).parameter_space())
+        grid = expand_grid(param_grid if param_grid is not None else make_strategy(strategy_id).parameter_space())
         panel_set = set(panel.tickers)
 
         if constituents:

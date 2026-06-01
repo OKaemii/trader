@@ -33,10 +33,18 @@ class MomentumFactor:
     name = "momentum"
 
     def score(self, history, window, params) -> FactorScores:
-        tickers, rets = eligible_returns(history, window)
+        tickers, rets = eligible_returns(history, window)          # rets: (n_tickers, T)
         if not tickers:
             return {}
-        z = zscore(rets.sum(axis=1))  # cumulative window return
+        # Cross-sectional momentum over a real horizon: cumulative return over the `lookback`
+        # window ending `skip` bars ago. Default 12-1 (252 lookback, 21 skip) — skipping the
+        # most recent month avoids the short-term-reversal contamination that made the legacy
+        # full-`window` momentum (≈20d) anti-correlate with itself. Empty/flat slice → zeros.
+        lookback = int(params.get("mom_lookback", 252))
+        skip = int(params.get("mom_skip", 21))
+        end = max(0, rets.shape[1] - max(0, skip))
+        start = max(0, end - max(1, lookback))
+        z = zscore(rets[:, start:end].sum(axis=1))
         return {t: float(z[i]) for i, t in enumerate(tickers)}
 
 

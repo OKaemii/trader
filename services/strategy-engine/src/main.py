@@ -2,8 +2,8 @@ import os
 import json
 import asyncio
 import dataclasses
-from fastapi import FastAPI, Response
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, Response, Request
+from fastapi.responses import PlainTextResponse, JSONResponse
 import redis.asyncio as aioredis
 from prometheus_client import Counter, Gauge, generate_latest, CONTENT_TYPE_LATEST
 # Strategy code is the single source of truth in the shared quant-core package — the live
@@ -13,7 +13,8 @@ from quant_core.strategy.factory import make_strategy, known_strategies
 from quant_core.strategy.contract import HistoryView, PortfolioState, StrategyParams
 from quant_core.wiring import build_feature_store
 from .domain.dataclasses import OHLCVBar
-from .infrastructure.market_data_client import MarketDataClient
+from .infrastructure.market_data_client import MarketDataClient, range_for_bars
+from .infrastructure import strategy_config
 
 # Live decide() takes default params + an empty portfolio (none of the current strategies'
 # decide() reads portfolio — sizing happens in signal-service). Phase 1 wires a real
@@ -32,9 +33,10 @@ TIMESCALE_URL = os.getenv("TIMESCALE_URL", "")
 ACTIVE_STRATEGY = os.getenv("ACTIVE_STRATEGY", "factor_rank_v1")
 BAR_FREQUENCY   = os.getenv("BAR_FREQUENCY", "daily")   # daily | intraday
 
-# Rolling window in bars: 20 daily bars = 20 days; 20 intraday bars = 20 * bar_size minutes
+# Rolling window in bars. Daily: 300 trading days — a floor covering 12-1 momentum (252+21)
+# with headroom, fed by the persisted long-range daily series. Intraday: 60 bars.
 # Strategy classes read ROLLING_WINDOW_BARS from this module so the env var flows through.
-ROLLING_WINDOW_BARS = 20 if BAR_FREQUENCY == "daily" else 60
+ROLLING_WINDOW_BARS = 300 if BAR_FREQUENCY == "daily" else 60
 
 # ── Prometheus metrics ──────────────────────────────────────────────────────
 _signals_published = Counter(
@@ -162,6 +164,71 @@ def status():
         "warming_up":      len(warming),
         "warming_detail":  warming,
     }
+
+
+@app.get("/admin/api/strategy/config")
+async def get_strategy_config():
+    """Per-strategy tunable surface for the portal editor: the grid schema (parameter_space),
+    the single-value live defaults (parameter_defaults), and any portal overrides."""
+    out = []
+    for sid in known_strategies():
+        s = make_strategy(sid)
+        doc = await strategy_config.get_strategy_config_doc(sid)
+        updated_at = (doc or {}).get("updatedAt")
+        out.append({
+            "strategy_id": sid,
+            "schema":      s.parameter_space(),
+            "defaults":    s.parameter_defaults(),
+            "liveParams":  (doc or {}).get("liveParams"),
+            "searchGrid":  (doc or {}).get("searchGrid"),
+            "updatedAt":   updated_at.isoformat() if hasattr(updated_at, "isoformat") else None,
+        })
+    return {"strategies": out, "active": ACTIVE_STRATEGY}
+
+
+@app.put("/admin/api/strategy/config")
+async def put_strategy_config(req: Request):
+    body = await req.json()
+    sid = body.get("strategy_id")
+    if sid not in known_strategies():
+        return JSONResponse({"error": f"unknown strategy_id: {sid!r}"}, status_code=400)
+    s = make_strategy(sid)
+    allowed = set(s.parameter_space()) | set(s.parameter_defaults())   # defence-in-depth allowlist
+
+    live: dict[str, float] = {}
+    for k, v in (body.get("liveParams") or {}).items():
+        if k not in allowed:
+            continue
+        try:
+            live[k] = float(v)
+        except (TypeError, ValueError):
+            return JSONResponse({"error": f"liveParams[{k}] not numeric"}, status_code=400)
+
+    grid: dict[str, list[float]] = {}
+    product = 1
+    for k, v in (body.get("searchGrid") or {}).items():
+        if k not in allowed or not isinstance(v, list) or not v:
+            continue
+        try:
+            vals = [float(x) for x in v]
+        except (TypeError, ValueError):
+            return JSONResponse({"error": f"searchGrid[{k}] not numeric"}, status_code=400)
+        grid[k] = vals
+        product *= len(vals)
+    if product > 256:
+        return JSONResponse(
+            {"error": f"search grid too large ({product} points > 256) — MCPT cost is product × ~2000 replays"},
+            status_code=400,
+        )
+
+    await strategy_config.upsert_strategy_config(sid, live or None, grid or None, str(body.get("userId", "unknown")))
+    # upsert already invalidated this pod's cache; publish for any other subscribers.
+    try:
+        if _redis is not None:
+            await _redis.publish("config:invalidated", sid)
+    except Exception:   # noqa: BLE001 — pubsub is best-effort; the 15s TTL is the backstop
+        pass
+    return {"ok": True, "strategy_id": sid, "liveParams": live or None, "searchGrid": grid or None}
 
 
 @app.get("/metrics", response_class=PlainTextResponse)
@@ -345,11 +412,15 @@ async def _init_engine_singletons() -> None:
     _bars_client = MarketDataClient()
 
     _needed = _strategy.config.rolling_window
-    _history_interval = "daily" if BAR_FREQUENCY == "daily" else "15m"
-    # Range key the HTTP endpoint accepts. shared-bars currently supports
-    # 30d / 60d / 90d / 180d. 30d covers the 20-bar daily window; 60d covers the
-    # 60-bar 15m intraday window. Prewarm asks for a longer range separately.
-    _history_range = "30d" if _needed <= 25 else "60d"
+    if BAR_FREQUENCY == "daily":
+        _history_interval = "daily"
+        # _needed counts DAILY bars; map to the smallest range key that covers it. The persisted
+        # daily series serves the long keys (1y/2y/5y/max), so a 300-bar window reaches ~2y back
+        # instead of the old 60d cap — this is what lets 12-1 momentum actually have its history.
+        _history_range = range_for_bars(_needed)
+    else:
+        _history_interval = "15m"
+        _history_range = "60d"   # 60d of 15m bars comfortably covers the 60-bar intraday window
 
     print(f"[strategy-engine] singletons ready — strategy={ACTIVE_STRATEGY} bar_freq={BAR_FREQUENCY} "
           f"rolling_window={ROLLING_WINDOW_BARS} history_range={_history_range} history_interval={_history_interval} "
@@ -447,7 +518,12 @@ async def process_cycle(
         # Split strategy contract: compute_features (pure features-as-of-now) then decide
         # (features → emission). Same source of truth as the backtest replay.
         as_of_ms = int(_update_start * 1000)
-        features = _strategy.compute_features(_history_view(_lookup, active_tickers), as_of_ms, _LIVE_PARAMS)
+        # Per-cycle live params (portal override, 15s cache) — hot-applied, no restart. Empty ⇒
+        # the strategy's code defaults via StrategyParams.get.
+        _live_params = await strategy_config.get_live_params(ACTIVE_STRATEGY)
+        features = _strategy.compute_features(
+            _history_view(_lookup, active_tickers), as_of_ms, StrategyParams(values=_live_params)
+        )
         # Persist the feature vector bi-temporally (audit + replay parity). Best-effort:
         # a store failure logs but never blocks signal emission.
         if features is not None and _feature_store is not None:

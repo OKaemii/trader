@@ -523,3 +523,77 @@ export async function fetchYahooPrices(
 
   return bars;
 }
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Multi-year DAILY history from Yahoo (`/chart?interval=1d&period1&period2`). This is the
+ * long-horizon series that strategy lookbacks (e.g. 12-1 momentum, ~273 trading days) read —
+ * decoupled from the metered 5m provider exactly like the FX / sector Yahoo clients. Returns
+ * bars tagged `interval:'daily'`, oldest-first, with `observation_ts` snapped to 00:00:00Z of
+ * the trading day so they share the partial-unique key with the EOD-emitted daily bars.
+ */
+async function fetchYahooDailyChart(
+  yahooSymbol: string, period1Sec: number, period2Sec: number,
+): Promise<YahooResponse> {
+  const url =
+    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}` +
+    `?interval=1d&period1=${period1Sec}&period2=${period2Sec}`;
+  const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0', Accept: 'application/json' } });
+  if (!res.ok) throw new Error(`Yahoo ${yahooSymbol}: HTTP ${res.status}`);
+  return (await res.json()) as YahooResponse;
+}
+
+function extractDailySeries(ticker: string, data: YahooResponse): OHLCVBar[] {
+  const result = data.chart?.result?.[0];
+  if (!result?.timestamp?.length) return [];
+  const quote = result.indicators.quote?.[0];
+  if (!quote) return [];
+  const { currency, priceScale } = normaliseYahooCurrency(result.meta?.currency);
+
+  const byDay = new Map<number, OHLCVBar>();
+  for (let i = 0; i < result.timestamp.length; i++) {
+    const c = quote.close[i];
+    if (c == null || c <= 0) continue;                                 // holidays / null prints
+    const obsMs = Math.floor((result.timestamp[i]! * 1000) / DAY_MS) * DAY_MS;
+    byDay.set(obsMs, {                                                 // last write per day wins
+      ticker,
+      observation_ts: obsMs,
+      timestamp:      obsMs,
+      interval:       'daily',
+      ...(currency ? { currency } : {}),
+      open:   (quote.open[i]  ?? c) * priceScale,
+      high:   (quote.high[i]  ?? c) * priceScale,
+      low:    (quote.low[i]   ?? c) * priceScale,
+      close:  c * priceScale,
+      volume: quote.volume[i] ?? 0,
+    });
+  }
+  return Array.from(byDay.values()).sort((a, b) => a.observation_ts - b.observation_ts);
+}
+
+export async function fetchYahooDailyHistory(
+  t212Ticker: string, startMs: number, endMs: number,
+): Promise<OHLCVBar[]> {
+  const period1 = Math.floor(startMs / 1000);
+  const period2 = Math.floor(endMs / 1000);
+  const primary = toYahooSymbol(t212Ticker);
+  if (UNSUPPORTED_SYMBOLS.has(primary)) return [];
+
+  const { symbol, exchange } = parseT212Ticker(t212Ticker);
+  const candidates = [primary, ...(!exchange ? FALLBACK_SUFFIXES.map((s) => `${symbol}${s}`) : [])];
+  const attempted = new Set<string>();
+  for (const sym of candidates) {
+    if (attempted.has(sym)) continue;
+    attempted.add(sym);
+    try {
+      const series = extractDailySeries(t212Ticker, await fetchYahooDailyChart(sym, period1, period2));
+      if (series.length) { yahooSymbolCache.set(t212Ticker, sym); return series; }
+    } catch (err) {
+      const m = err instanceof Error ? err.message : String(err);
+      if (m.includes('404') || m.includes('no chart result')) continue;
+      throw err;
+    }
+  }
+  return [];
+}
