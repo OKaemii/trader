@@ -29,6 +29,10 @@ const RANGE_DAYS: Record<RangeKey, number> = {
   '60d': 60,
   '90d': 90,
   '180d': 180,
+  '1y': 365,
+  '2y': 730,
+  '5y': 1825,
+  'max': 36500,
 };
 
 const CACHE_TTL_SECONDS = 3600;

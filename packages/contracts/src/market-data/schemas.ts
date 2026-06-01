@@ -3,7 +3,7 @@ import { z } from "zod";
 export const BarIntervalSchema = z.enum(["5m", "15m", "1h", "daily"]);
 export type BarInterval = z.infer<typeof BarIntervalSchema>;
 
-export const RangeKeySchema = z.enum(["30d", "60d", "90d", "180d"]);
+export const RangeKeySchema = z.enum(["30d", "60d", "90d", "180d", "1y", "2y", "5y", "max"]);
 export type RangeKey = z.infer<typeof RangeKeySchema>;
 
 export const UniverseOverridesRequestSchema = z.object({
@@ -18,6 +18,15 @@ export const BackfillRequestSchema = z.object({
     days: z.number().int().min(1).max(60).optional(),
 });
 export type BackfillRequest = z.infer<typeof BackfillRequestSchema>;
+
+// Long-range daily backfill (Yahoo-sourced, multi-year) — seeds the persisted
+// `interval:'daily'` series that strategy lookbacks read. Distinct from BackfillRequest,
+// whose `days` is bounded by the 60d 5m provider cap.
+export const BackfillDailyRequestSchema = z.object({
+    tickers: z.array(z.string()).optional(),
+    years: z.number().int().min(1).max(30).optional(),
+});
+export type BackfillDailyRequest = z.infer<typeof BackfillDailyRequestSchema>;
 
 export const ClearCacheRequestSchema = z.object({
     interval: BarIntervalSchema.optional(),
