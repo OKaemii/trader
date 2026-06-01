@@ -95,6 +95,16 @@ global:
     queueTtlMs:           "3600000"       # signal age cap (1h daily); past this → queue_expired
     priceDriftTolerance:  "0.01"          # 1% absolute price drift → market_drift (terminal)
     activeStrategy: factor_rank_v1      # factor_rank_v1 | sector_momentum_v1 | topology_v1
+    # Strategy rolling window in bars (ROLLING_WINDOW_BARS). Empty ⇒ code default, which is
+    # bar-frequency-aware (300 daily — a floor covering 12-1 momentum's 252+21; 60 intraday).
+    # Set a number to override (e.g. "600" for a longer live momentum horizon — ensure the
+    # persisted daily series is backfilled deep enough; see dailyBackfillYears).
+    rollingWindowBars: ""
+    # Long-range daily history source for the persisted interval:'daily' series that strategy
+    # lookbacks read (12-1 momentum etc.). Yahoo is free, multi-year, and decoupled from the
+    # metered 5m provider — same "stays on Yahoo regardless" split as FX/sectors.
+    dailyHistoryProvider: yahoo         # yahoo (free) | (paid feed via the provider abstraction)
+    dailyBackfillYears: "5"             # one-shot seed depth for the daily series on bootstrap
     volTarget: "0.10"                   # portfolio vol target (signal-service)
     minActionableConfidence: "0.50"     # min confidence to emit a BUY TradeSignal. Raised from 0.30 to cut low-conviction noise and concentrate on stronger picks. SELLs that reduce/exit a held position bypass this floor — exits are portfolio-driven, not conviction-driven.
     # Confidence-math calibration. See services/signal-service/src/modules/signals/application/GenerateSignals.ts.
