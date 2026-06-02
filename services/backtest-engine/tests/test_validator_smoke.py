@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from quant_core.types import OHLCVBar
-from src.application.validator import Validator, _quasi_p
+from src.application.validator import Validator, _decision_locked, _quasi_p
 
 
 def test_quasi_p_mechanism():
@@ -22,6 +22,18 @@ def test_quasi_p_mechanism():
     # Ties count toward the null (≥). 2 of {1,2,3} are ≥ 2 ⇒ (1+2)/(1+3).
     assert _quasi_p(2.0, [1.0, 2.0, 3.0]) == pytest.approx(0.75)
     assert _quasi_p(1.0, []) == 1.0
+
+
+def test_decision_locked_bounds():
+    # n=1000, threshold=0.01. FAIL locks once (1+count)/(1+n) ≥ 0.01 ⇒ 1+count ≥ 10.01 ⇒ count ≥ 10.
+    assert _decision_locked(count_ge=10, done=20, n=1000, threshold=0.01) is False   # fail certain
+    assert _decision_locked(count_ge=9, done=20, n=1000, threshold=0.01) is None      # just shy ⇒ undetermined
+    assert _decision_locked(count_ge=0, done=20, n=1000, threshold=0.01) is None
+    # PASS locks only when even all-remaining-exceed stays < threshold ⇒ needs done ≈ n.
+    assert _decision_locked(count_ge=0, done=992, n=1000, threshold=0.01) is True      # pass certain (hi=9/1001)
+    assert _decision_locked(count_ge=0, done=500, n=1000, threshold=0.01) is None
+    # A tiny N can never reach p<0.01 (min p = 1/(1+n) = 1/7), so FAIL locks on the first permutation.
+    assert _decision_locked(count_ge=0, done=1, n=6, threshold=0.01) is False
 
 
 def _panel(n_tickers=6, n_bars=520, seed=11):
@@ -70,19 +82,92 @@ async def test_validator_end_to_end_smoke():
         strategy_id='factor_rank_v1', start_ms=start_ms, end_ms=end_ms,
         train_years=0.5, n_folds=3, mcpt_n_in_sample=6, mcpt_n_wf=4,
         objective_name='profit_factor', benchmark_tickers=['^GSPC'], rebalance_days=7,
+        mcpt_early_stop=False,                   # run the full tiny loop so the smoke exercises every step
     )
     # Well-formed: four steps + gates present, and no insufficient_history on a 2y panel.
     for key in ('step1_in_sample_fit', 'step2_in_sample_mcpt', 'step3_walk_forward',
-                'step4_walk_forward_mcpt', 'legacy_gates', 'benchmark_overlays', 'data_quality'):
+                'step4_walk_forward_mcpt', 'legacy_gates', 'benchmark_overlays', 'data_quality',
+                'permutation_seed'):
         assert key in report
     assert len(report['benchmark_overlays']) == 1 and report['benchmark_overlays'][0]['benchmark'] == '^GSPC'
     assert report['engine'] == 'replay_mcpt'
     assert report['universe_size_at_run'] == 6
     assert isinstance(report['passed'], bool)
+    assert report['permutation_seed'] == {'engine': 'MT19937', 'base': 0, 'wf_offset': 10000,
+                                          'n_in_sample': 6, 'n_wf': 4}
 
-    for step in ('step2_in_sample_mcpt', 'step4_walk_forward_mcpt'):
+    for step, n in (('step2_in_sample_mcpt', 6), ('step4_walk_forward_mcpt', 4)):
         q = report[step]['quasi_p']
         assert 0.0 < q <= 1.0                    # a valid Monte-Carlo p-value
-        assert report[step]['n_permutations'] >= 1
+        assert report[step]['n_permutations'] == n          # full loop ran (early-stop off)
+        assert report[step]['early_stopped'] is False
+        assert report[step]['n_planned'] == n
 
     assert _all_floats_finite(report)            # JSON-safe (no NaN/Inf leaks into the doc)
+
+
+async def _run(prices, bench, start_ms, end_ms, **kw):
+    base = dict(strategy_id='factor_rank_v1', start_ms=start_ms, end_ms=end_ms, train_years=0.5,
+                n_folds=3, objective_name='profit_factor', benchmark_tickers=['^GSPC'], rebalance_days=7)
+    base.update(kw)
+    return await Validator().run(prices, {'^GSPC': bench}, **base)
+
+
+@pytest.mark.asyncio
+async def test_seed_reproducible():
+    prices, bench, s, e = _panel()
+    a = await _run(prices, bench, s, e, mcpt_n_in_sample=6, mcpt_n_wf=4, seed=0, mcpt_early_stop=False)
+    b = await _run(prices, bench, s, e, mcpt_n_in_sample=6, mcpt_n_wf=4, seed=0, mcpt_early_stop=False)
+    # Same seed ⇒ byte-identical permutation objectives (the "rerun with the same seed" guarantee).
+    assert a['step2_in_sample_mcpt']['permutation_objectives'] == \
+        b['step2_in_sample_mcpt']['permutation_objectives']
+    assert a['step4_walk_forward_mcpt']['permutation_objectives'] == \
+        b['step4_walk_forward_mcpt']['permutation_objectives']
+    assert a['permutation_seed'] == {'engine': 'MT19937', 'base': 0, 'wf_offset': 10000,
+                                     'n_in_sample': 6, 'n_wf': 4}
+
+
+def test_seed_changes_the_permutation():
+    # The seed actually drives the draw — proven at the permutation level (warmup-independent; a
+    # tiny-panel objective collapses to 0 because factor_rank's 12-1 momentum needs 273 bars). Same
+    # seed ⇒ identical bars; a different seed reshuffles the path.
+    from src.application.permutation import align_panel, panel_to_bars, permute_panel
+    prices, _b, _s, _e = _panel()
+    panel = align_panel(prices)
+    t = panel.tickers[0]
+
+    def closes(seed):
+        return [bar.close for bar in panel_to_bars(permute_panel(panel, start_index=0, seed=seed))[t]]
+
+    assert closes(0) == closes(0)        # deterministic per seed
+    assert closes(0) != closes(7)        # a different seed reshuffles the path
+
+
+@pytest.mark.asyncio
+async def test_early_stop_matches_full_verdict():
+    prices, bench, s, e = _panel()
+    full = await _run(prices, bench, s, e, mcpt_n_in_sample=6, mcpt_n_wf=4, mcpt_early_stop=False)
+    early = await _run(prices, bench, s, e, mcpt_n_in_sample=6, mcpt_n_wf=4, mcpt_early_stop=True)
+    # Synthetic noise can't beat its own permutation null ⇒ both FAIL, identical verdict; the
+    # early run stops sooner (p<0.01 is unreachable at N=6, so it fails after one permutation).
+    for step in ('step2_in_sample_mcpt', 'step4_walk_forward_mcpt'):
+        assert full[step]['passed'] == early[step]['passed']
+        assert early[step]['n_permutations'] <= full[step]['n_permutations']
+    assert early['step2_in_sample_mcpt']['early_stopped'] is True
+
+
+@pytest.mark.asyncio
+async def test_parallel_matches_serial(monkeypatch):
+    """The load-bearing determinism guarantee: the process pool returns the *same* permutation
+    objectives (in seed order) as the serial path, so the quasi-p is identical."""
+    prices, bench, s, e = _panel()
+    monkeypatch.setenv('BACKTEST_MIN_PARALLEL', '4')
+    monkeypatch.setenv('BACKTEST_MAX_WORKERS', '1')      # ⇒ SerialMap
+    serial = await _run(prices, bench, s, e, mcpt_n_in_sample=8, mcpt_n_wf=2, mcpt_early_stop=False)
+    monkeypatch.setenv('BACKTEST_MAX_WORKERS', '2')      # ⇒ ProcessPoolMap (8 ≥ 4)
+    par = await _run(prices, bench, s, e, mcpt_n_in_sample=8, mcpt_n_wf=2, mcpt_early_stop=False)
+    # The pool reassembles by submission index, so the per-seed objectives match the serial path
+    # exactly (in order) — the determinism guarantee that keeps the quasi-p identical.
+    assert par['step2_in_sample_mcpt']['permutation_objectives'] == \
+        pytest.approx(serial['step2_in_sample_mcpt']['permutation_objectives'])
+    assert par['step2_in_sample_mcpt']['quasi_p'] == pytest.approx(serial['step2_in_sample_mcpt']['quasi_p'])

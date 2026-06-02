@@ -16,6 +16,11 @@ Everything runs on one aligned in-memory panel so the real objective and its per
 share an identical basis. The whole thing is pure compute (no Mongo); the job runner loads the
 history and drives this off the event loop. Real runs are ~hours — that is why it is a queued
 job, not a request handler.
+
+Steps 2 and 4 (the dominant loops) are fanned across a process pool via `ParallelMap`, and each
+stops early once the remaining permutations cannot change the pass/fail verdict at the gate
+threshold (`_decision_locked`) — verdict-identical to the full N. Progress + cancellation flow
+through an injected `ProgressSink`.
 """
 from __future__ import annotations
 
@@ -32,13 +37,16 @@ from .benchmark import benchmark_overlay
 from .grid_search import expand_grid, grid_search, replay_path, walk_forward_oos, _equity
 from .hypothesis_testing import validate_strategy
 from .objectives import make_objective
+from .parallel import drive_coro, make_parallel_map
 from .permutation import AlignedPanel, align_panel, panel_to_bars, permute_panel
+from .progress import NullProgress, ProgressSink
 from .replay_pnl import OosPath, PriceSeries, series_period_returns
 from .walk_forward import forward_test_folds
 
 DAY_MS = 86_400_000
 MIN_PANEL_TICKERS = 5
 MIN_OOS_PERIODS = 8
+WF_SEED_OFFSET = 10_000   # keeps the IS and WF MT19937 streams disjoint (UI caps N below this)
 
 # Benchmark suite (Phase 6): SPY + the 11 sector SPDRs — all tradeable total-return ETFs, so a
 # CAPM overlay is well-defined. ^IRX (T-bill yield) is intentionally NOT here: it's a *yield
@@ -64,6 +72,8 @@ class StepMcpt:
     n_permutations: int
     threshold: float
     passed: bool
+    early_stopped: bool = False     # stopped once the verdict was decision-locked (see _decision_locked)
+    n_planned: int = 0              # the requested N (n_permutations is what actually ran)
 
 
 @dataclass
@@ -93,6 +103,7 @@ class ValidationReportV2:
     legacy_gates: dict
     data_quality: str                         # universe construction + coverage stamp
     passed: bool
+    permutation_seed: dict = field(default_factory=dict)   # {engine, base, wf_offset, n_in_sample, n_wf}
     failures: list[str] = field(default_factory=list)
     context_notes: list[str] = field(default_factory=list)
 
@@ -105,6 +116,20 @@ def _quasi_p(real: float, perms: list[float]) -> float:
         return 1.0
     count = sum(1 for p in perms if p >= real)
     return (1 + count) / (1 + n)
+
+
+def _decision_locked(count_ge: int, done: int, n: int, threshold: float):
+    """Return the final pass/fail verdict iff the remaining (n - done) permutations cannot change
+    it, else None. The full-run quasi-p = (1 + total)/(1 + n) with total ∈ [count_ge, count_ge +
+    (n - done)], so its interval is [(1+count)/(1+n), (1+count+(n-done))/(1+n)]:
+      lower ≥ threshold  ⇒ FAIL certain;  upper < threshold ⇒ PASS certain."""
+    lo = (1 + count_ge) / (1 + n)
+    hi = (1 + count_ge + (n - done)) / (1 + n)
+    if lo >= threshold:
+        return False
+    if hi < threshold:
+        return True
+    return None
 
 
 def _sanitize(obj):
@@ -134,6 +159,56 @@ def _slice_panel(panel: AlignedPanel, end_index: int) -> AlignedPanel:
     )
 
 
+def _build_universe_at(spec: dict, panel_set: set):
+    """Reconstruct the (non-picklable) `universe_at` closure inside a worker from a plain spec —
+    so only data crosses the process boundary, never a live closure."""
+    if spec.get('kind') == 'pit':
+        cons = spec['constituents']
+        return lambda t: [tk for tk in load_constituents(cons, t) if tk in panel_set]
+    tickers = spec['tickers']
+    return lambda _t: tickers
+
+
+# ── module-level MCPT workers (picklable for `spawn`; read a worker-global ctx) ───────
+_WORKER_CTX: Optional[dict] = None
+
+
+def _init_mcpt_worker(ctx: dict) -> None:
+    global _WORKER_CTX
+    _WORKER_CTX = ctx
+
+
+def _is_mcpt_worker(seed: int) -> float:
+    """One IS-MCPT permutation → best in-sample objective. Permutes strictly within the IS
+    sub-panel so the OOS region never leaks into the null."""
+    ctx = _WORKER_CTX
+    panel = ctx['panel']
+    is_panel = _slice_panel(panel, ctx['train_index'])
+    pbars = panel_to_bars(permute_panel(is_panel, start_index=0, seed=seed))
+    reader, prices = _reader_and_prices(pbars)
+    objective = make_objective(ctx['objective_name'], ctx['ppy'])
+    universe_at = _build_universe_at(ctx['universe_spec'], set(panel.tickers))
+    gs = drive_coro(lambda: grid_search(ctx['strategy_id'], reader, prices, ctx['grid'],
+                                        ctx['start_ms'], ctx['train_ms'], ctx['step'],
+                                        universe_at, objective, ctx['round_trip_bps']))
+    return float(gs.best_objective)
+
+
+def _wf_mcpt_worker(seed: int) -> float:
+    """One WF-MCPT permutation → walk-forward OOS objective. Permutes the post-training tail only,
+    leaving the fitted region intact."""
+    ctx = _WORKER_CTX
+    panel = ctx['panel']
+    pbars = panel_to_bars(permute_panel(panel, start_index=ctx['train_index'], seed=seed))
+    reader, prices = _reader_and_prices(pbars)
+    objective = make_objective(ctx['objective_name'], ctx['ppy'])
+    universe_at = _build_universe_at(ctx['universe_spec'], set(panel.tickers))
+    pwf = drive_coro(lambda: walk_forward_oos(ctx['strategy_id'], reader, prices, ctx['grid'],
+                                              ctx['folds'], ctx['step'], universe_at, objective,
+                                              ctx['round_trip_bps']))
+    return float(objective(OosPath(net_returns=pwf.net_returns, ic_series=pwf.ic_series)))
+
+
 class Validator:
     def __init__(self, *, round_trip_bps: float = 12.0) -> None:
         self._rt = round_trip_bps
@@ -157,6 +232,9 @@ class Validator:
         embargo_days: int = 21,
         data_source: str = '',
         param_grid: Optional[dict] = None,   # portal searchGrid override; None ⇒ parameter_space()
+        seed: int = 0,                       # MT19937 base; 0 reproduces the original 0.. / 10000.. streams
+        mcpt_early_stop: bool = True,        # decision-bounded sequential stop (verdict-identical to full N)
+        progress: ProgressSink = NullProgress(),
     ) -> dict:
         step = max(1, rebalance_days) * DAY_MS
         ppy = max(1, round(365.0 / max(1, rebalance_days)))
@@ -174,6 +252,16 @@ class Validator:
         train_ms = min(max(train_ms, start_ms + 1), end_ms - 1)
         train_index = int(np.searchsorted(panel.timestamps, train_ms, side='right'))
 
+        # Fold geometry up front — needed for the progress total AND the WF worker ctx; fail fast.
+        folds = forward_test_folds(
+            train_start=start_ms, oos_start=train_ms, oos_end=end_ms,
+            n_folds=n_folds, embargo_days=embargo_days,
+            min_oos_ms=MIN_OOS_PERIODS * step, min_train_ms=MIN_OOS_PERIODS * step)
+        if len(folds) < 2:
+            return self._insufficient(strategy_id, objective_name, start_ms, end_ms, data_source,
+                                      f'window yields {len(folds)} valid folds (need ≥2)')
+        n_eff_folds = len(folds)
+
         real_bars = panel_to_bars(panel)
         real_reader, real_prices = _reader_and_prices(real_bars)
         bench_map = {bt: PriceSeries.from_bars(b) for bt, b in (benchmark_bars or {}).items() if b}
@@ -184,13 +272,12 @@ class Validator:
             # Point-in-time membership: rank only names in the index at instant t, intersected with
             # the aligned (full-coverage) panel. Delisted names whose Yahoo history is too partial
             # already fell out of the panel — the free-data survivorship gap, stamped below.
-            def universe_at(t):
-                return [tk for tk in load_constituents(constituents, t) if tk in panel_set]
+            universe_spec = {'kind': 'pit', 'constituents': constituents}
             universe_kind = 'point_in_time_sp500'
         else:
-            universe = panel.tickers
-            universe_at = lambda _t: universe
+            universe_spec = {'kind': 'static', 'tickers': list(panel.tickers)}
             universe_kind = 'static'
+        universe_at = _build_universe_at(universe_spec, panel_set)
 
         data_quality = (
             f"yahoo_daily; universe={universe_kind}; panel {len(panel.tickers)}/{len(prices)} "
@@ -199,58 +286,74 @@ class Validator:
                "needs a paid feed)" if constituents else "current-membership ⇒ survivorship bias")
         )
 
+        # Shared, fully-picklable worker ctx for the parallel MCPT stages (steps 2 & 4).
+        ctx = {
+            'panel': panel, 'grid': grid, 'strategy_id': strategy_id,
+            'objective_name': objective_name, 'ppy': ppy, 'step': step,
+            'round_trip_bps': self._rt, 'universe_spec': universe_spec,
+            'start_ms': start_ms, 'train_ms': train_ms, 'train_index': train_index, 'folds': folds,
+        }
+
+        # Uniform fit-units: step1 (1) + IS-MCPT (N) + walk-forward (folds) + WF-MCPT (M·folds).
+        progress.set_total(1 + mcpt_n_in_sample + n_eff_folds + mcpt_n_wf * n_eff_folds)
+
+        def _run_mcpt_stage(stage, worker, seeds, real, n, *, threshold, tick_units):
+            progress.set_stage(stage)
+
+            def _stop(objs):
+                if not mcpt_early_stop:
+                    return False
+                count = sum(1 for o in objs if o >= real)
+                return _decision_locked(count, len(objs), n, threshold) is not None
+
+            objs = make_parallel_map(n).run(
+                worker, seeds, initializer=_init_mcpt_worker, initargs=(ctx,),
+                on_result=lambda _o: progress.tick(tick_units),
+                cancel=progress.raise_if_cancelled, should_stop=_stop)
+            done = len(objs)
+            count = sum(1 for o in objs if o >= real)
+            progress.tick(tick_units * (n - done))   # close the stage's bar if it stopped early
+            if done < n:
+                verdict = _decision_locked(count, done, n, threshold) is True
+            else:
+                verdict = (1 + count) / (1 + n) < threshold
+            return StepMcpt(
+                real_objective=real, permutation_objectives=objs, n_permutations=done,
+                quasi_p=(1 + count) / (1 + n),   # a lower bound when early-stopped (≥ threshold on a fail)
+                threshold=threshold, passed=verdict, early_stopped=done < n, n_planned=n)
+
         # ── Step 1: in-sample fit ──────────────────────────────────────────────────
+        progress.set_stage('in_sample_fit')
         is_gs = await grid_search(strategy_id, real_reader, real_prices, grid,
                                   start_ms, train_ms, step, universe_at, objective, self._rt)
         is_path = await replay_path(strategy_id, real_reader, real_prices, is_gs.best_params,
                                     start_ms, train_ms, step, universe_at, self._rt)
         step1 = StepFit(best_params=is_gs.best_params, objective=is_gs.best_objective,
                         equity=_equity(is_path.net_returns), grid_results=is_gs.all_results)
+        progress.tick(1)
 
-        # ── Step 2: in-sample MCPT (permute strictly within the IS sub-panel) ──────
-        is_panel = _slice_panel(panel, train_index)
-        is_perms: list[float] = []
-        for seed in range(mcpt_n_in_sample):
-            pbars = panel_to_bars(permute_panel(is_panel, start_index=0, seed=seed))
-            preader, pprices = _reader_and_prices(pbars)
-            pgs = await grid_search(strategy_id, preader, pprices, grid,
-                                    start_ms, train_ms, step, universe_at, objective, self._rt)
-            is_perms.append(pgs.best_objective)
-        q2 = _quasi_p(step1.objective, is_perms)
-        step2 = StepMcpt(real_objective=step1.objective, permutation_objectives=is_perms,
-                         quasi_p=q2, n_permutations=len(is_perms), threshold=0.01, passed=q2 < 0.01)
+        # ── Step 2: in-sample MCPT (parallel; permute strictly within the IS sub-panel) ──
+        step2 = _run_mcpt_stage('in_sample_mcpt', _is_mcpt_worker,
+                                [seed + i for i in range(mcpt_n_in_sample)], step1.objective,
+                                mcpt_n_in_sample, threshold=0.01, tick_units=1)
 
         # ── Step 3: walk-forward — test windows roll through the OOS half [train_ms, end_ms],
         # training anchored at start_ms. This is what makes step 4's post-train permutation hit
-        # every fold's OOS (and later folds' training tails).
-        folds = forward_test_folds(
-            train_start=start_ms, oos_start=train_ms, oos_end=end_ms,
-            n_folds=n_folds, embargo_days=embargo_days,
-            min_oos_ms=MIN_OOS_PERIODS * step, min_train_ms=MIN_OOS_PERIODS * step)
-        if len(folds) < 2:
-            return self._insufficient(strategy_id, objective_name, start_ms, end_ms, data_source,
-                                      f'window yields {len(folds)} valid folds (need ≥2)')
+        # every fold's OOS (and later folds' training tails). Serial; per-fold progress.
+        progress.set_stage('walk_forward')
         wf = await walk_forward_oos(strategy_id, real_reader, real_prices, grid, folds, step,
-                                    universe_at, objective, self._rt)
+                                    universe_at, objective, self._rt, progress=progress)
         real_oos_obj = objective(OosPath(net_returns=wf.net_returns, ic_series=wf.ic_series))
         step3 = StepWalkForward(folds=wf.per_fold, oos_objective=real_oos_obj,
                                 oos_equity=_equity(wf.net_returns), oos_periods=len(wf.net_returns),
                                 embargo_days=embargo_days)
 
-        # ── Step 4: walk-forward MCPT (permute post-training, re-run the walk-forward) ──
-        wf_perms: list[float] = []
-        for seed in range(mcpt_n_wf):
-            pbars = panel_to_bars(permute_panel(panel, start_index=train_index, seed=10_000 + seed))
-            preader, pprices = _reader_and_prices(pbars)
-            pwf = await walk_forward_oos(strategy_id, preader, pprices, grid, folds, step,
-                                         universe_at, objective, self._rt)
-            wf_perms.append(objective(OosPath(net_returns=pwf.net_returns, ic_series=pwf.ic_series)))
+        # ── Step 4: walk-forward MCPT (parallel; permute post-training, re-run the walk-forward) ──
         oos_years = (end_ms - train_ms) / (365 * DAY_MS)
         wf_threshold = 0.01 if oos_years >= 2 else 0.05
-        q4 = _quasi_p(real_oos_obj, wf_perms)
-        step4 = StepMcpt(real_objective=real_oos_obj, permutation_objectives=wf_perms,
-                         quasi_p=q4, n_permutations=len(wf_perms), threshold=wf_threshold,
-                         passed=q4 < wf_threshold)
+        step4 = _run_mcpt_stage('walk_forward_mcpt', _wf_mcpt_worker,
+                                [seed + WF_SEED_OFFSET + i for i in range(mcpt_n_wf)], real_oos_obj,
+                                mcpt_n_wf, threshold=wf_threshold, tick_units=n_eff_folds)
 
         # ── Benchmark overlays (one per benchmark) + legacy gates on the real WF arrays ──
         strat_returns = np.asarray(wf.net_returns, dtype=float)
@@ -276,9 +379,11 @@ class Validator:
 
         failures = list(legacy.failures)
         if not step2.passed:
-            failures.append(f'In-sample MCPT quasi-p {q2:.3f} ≥ 0.01')
+            failures.append(f'In-sample MCPT quasi-p {step2.quasi_p:.3f} ≥ 0.01'
+                            + (' (early-stopped — decision locked)' if step2.early_stopped else ''))
         if not step4.passed:
-            failures.append(f'Walk-forward MCPT quasi-p {q4:.3f} ≥ {wf_threshold} (OOS {oos_years:.1f}y)')
+            failures.append(f'Walk-forward MCPT quasi-p {step4.quasi_p:.3f} ≥ {wf_threshold} (OOS {oos_years:.1f}y)'
+                            + (' (early-stopped — decision locked)' if step4.early_stopped else ''))
 
         report = ValidationReportV2(
             strategy_id=strategy_id, objective_name=objective_name, engine='replay_mcpt',
@@ -289,6 +394,8 @@ class Validator:
             step1_in_sample_fit=asdict(step1), step2_in_sample_mcpt=asdict(step2),
             step3_walk_forward=asdict(step3), step4_walk_forward_mcpt=asdict(step4),
             benchmark_overlays=overlays, legacy_gates=_legacy_dict(legacy), data_quality=data_quality,
+            permutation_seed={'engine': 'MT19937', 'base': seed, 'wf_offset': WF_SEED_OFFSET,
+                              'n_in_sample': mcpt_n_in_sample, 'n_wf': mcpt_n_wf},
             passed=len(failures) == 0, failures=failures,
             context_notes=[
                 'MCPT is the primary overfitting gate; legacy PBO is left uninformative (0.5).',

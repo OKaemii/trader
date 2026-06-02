@@ -49,6 +49,15 @@ spec:
             # MARKET_DATA_SERVICE_URL — the research data path is decoupled from the live one.
             - name: BAR_FREQUENCY
               value: {{ .Values.global.env.barFrequency | default "daily" | quote }}
+            # Validation/backtest job parallelism — the MCPT validator + walk-forward backtest fan
+            # their independent permutation/fold work across a process pool. See
+            # agent-docs/plans/queued-validation-jobs-progress-tracking.md.
+            - name: BACKTEST_MAX_WORKERS
+              value: {{ .Values.global.env.backtestMaxWorkers | default "" | quote }}
+            - name: BACKTEST_MIN_PARALLEL
+              value: {{ .Values.global.env.backtestMinParallel | default "16" | quote }}
+            - name: BACKTEST_BLAS_THREADS
+              value: {{ .Values.global.env.backtestBlasThreads | default "1" | quote }}
           # Mount the research warehouse PV so the DuckDB reader
           # (src/infrastructure/duckdb_reader.py) can open the Parquet snapshots
           # written daily by the warehouse-snapshot CronJob. Read-only by
@@ -59,6 +68,9 @@ spec:
               readOnly: true
           resources:
             requests:
+              # No CPU *limit* by design — a limit CFS-throttles the validation/backtest process
+              # pool and defeats the parallelism. The request is a scheduling floor for the burst.
+              cpu: "2"
               ephemeral-storage: "256Mi"
             limits:
               ephemeral-storage: "512Mi"
