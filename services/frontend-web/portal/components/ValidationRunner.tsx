@@ -1,5 +1,5 @@
 'use client'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 
 const STRATEGIES = ['factor_rank_v1', 'sector_momentum_v1', 'topology_v1'] as const
 const OBJECTIVES = ['profit_factor', 'sharpe', 'cum_return', 'ic_mean'] as const
@@ -8,11 +8,17 @@ function isoToMs(d: string): number {
   return new Date(d + 'T00:00:00Z').getTime()
 }
 
+function msToIso(ms: unknown): string | null {
+  return typeof ms === 'number' ? new Date(ms).toISOString().slice(0, 10) : null
+}
+
 function defaultDates(): { start: string; end: string } {
   return { start: '2016-01-01', end: new Date().toISOString().slice(0, 10) }
 }
 
-export function ValidationRunner({ onSubmitted }: { onSubmitted?: (jobId: string) => void }) {
+export function ValidationRunner({
+  onSubmitted, initial,
+}: { onSubmitted?: (jobId: string) => void; initial?: Record<string, unknown> | null }) {
   const init = defaultDates()
   const [strategy, setStrategy] = useState<typeof STRATEGIES[number]>('factor_rank_v1')
   const [start, setStart] = useState(init.start)
@@ -21,10 +27,29 @@ export function ValidationRunner({ onSubmitted }: { onSubmitted?: (jobId: string
   const [objective, setObjective] = useState<typeof OBJECTIVES[number]>('profit_factor')
   const [nIs, setNIs] = useState(200)
   const [nWf, setNWf] = useState(50)
+  const [seed, setSeed] = useState(0)
+  const [earlyStop, setEarlyStop] = useState(true)
   const [survivorshipFree, setSurvivorshipFree] = useState(false)
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState<string | null>(null)
   const [err, setErr] = useState<string | null>(null)
+
+  // Clone-to-form: prefill from a routed-in job request.
+  useEffect(() => {
+    if (!initial) return
+    if (typeof initial.strategy_id === 'string' && (STRATEGIES as readonly string[]).includes(initial.strategy_id))
+      setStrategy(initial.strategy_id as typeof STRATEGIES[number])
+    const s = msToIso(initial.start_ms); if (s) setStart(s)
+    const e = msToIso(initial.end_ms); if (e) setEnd(e)
+    if (typeof initial.train_years === 'number') setTrainYears(initial.train_years)
+    if (typeof initial.objective_name === 'string' && (OBJECTIVES as readonly string[]).includes(initial.objective_name))
+      setObjective(initial.objective_name as typeof OBJECTIVES[number])
+    if (typeof initial.mcpt_n_in_sample === 'number') setNIs(initial.mcpt_n_in_sample)
+    if (typeof initial.mcpt_n_wf === 'number') setNWf(initial.mcpt_n_wf)
+    if (typeof initial.seed === 'number') setSeed(initial.seed)
+    if (typeof initial.mcpt_early_stop === 'boolean') setEarlyStop(initial.mcpt_early_stop)
+    if (typeof initial.survivorship_free === 'boolean') setSurvivorshipFree(initial.survivorship_free)
+  }, [initial])
 
   async function submit() {
     setBusy(true); setErr(null); setMsg(null)
@@ -33,14 +58,9 @@ export function ValidationRunner({ onSubmitted }: { onSubmitted?: (jobId: string
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          strategy_id: strategy,
-          start_ms: isoToMs(start),
-          end_ms: isoToMs(end),
-          train_years: trainYears,
-          objective_name: objective,
-          mcpt_n_in_sample: nIs,
-          mcpt_n_wf: nWf,
-          survivorship_free: survivorshipFree,
+          strategy_id: strategy, start_ms: isoToMs(start), end_ms: isoToMs(end), train_years: trainYears,
+          objective_name: objective, mcpt_n_in_sample: nIs, mcpt_n_wf: nWf, mcpt_early_stop: earlyStop,
+          seed, survivorship_free: survivorshipFree,
         }),
       })
       const data = await res.json()
@@ -57,9 +77,9 @@ export function ValidationRunner({ onSubmitted }: { onSubmitted?: (jobId: string
     <div className="rounded border border-gray-800 bg-gray-900 p-4">
       <h2 className="mb-1 text-sm font-medium text-gray-300">Run permutation validation (MCPT)</h2>
       <p className="mb-3 text-[11px] text-gray-500">
-        Four-step Monte-Carlo permutation test (IS fit → IS-MCPT → walk-forward → WF-MCPT). A full
-        1000/200 run is <span className="text-amber-300">hours</span> — it queues and runs in the
-        background; start small to iterate.
+        Four-step Monte-Carlo permutation test (IS fit → IS-MCPT → walk-forward → WF-MCPT), fanned
+        across cores. Early-stop ends the run once the pass/fail verdict is locked — a clear fail
+        finishes in <span className="text-amber-300">tens</span> of permutations instead of 1000.
       </p>
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         <label className="block text-xs">
@@ -103,6 +123,16 @@ export function ValidationRunner({ onSubmitted }: { onSubmitted?: (jobId: string
           <input type="number" min={1} max={500} value={nWf}
             onChange={(e) => setNWf(parseInt(e.target.value, 10) || 1)}
             className="mt-1 w-full rounded bg-gray-950 px-2 py-1.5 text-gray-200" />
+        </label>
+        <label className="block text-xs">
+          <span className="text-gray-400">Seed</span>
+          <input type="number" min={0} value={seed} onChange={(e) => setSeed(parseInt(e.target.value, 10) || 0)}
+            className="mt-1 w-full rounded bg-gray-950 px-2 py-1.5 text-gray-200" />
+        </label>
+        <label className="flex items-end gap-2 text-xs">
+          <input type="checkbox" checked={earlyStop} onChange={(e) => setEarlyStop(e.target.checked)}
+            className="mb-2 h-4 w-4 rounded bg-gray-950" />
+          <span className="mb-1.5 text-gray-400">Early-stop (verdict-locked)</span>
         </label>
         <label className="flex items-end gap-2 text-xs">
           <input type="checkbox" checked={survivorshipFree} onChange={(e) => setSurvivorshipFree(e.target.checked)}
