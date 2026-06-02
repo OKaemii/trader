@@ -2,4 +2,4 @@ apiVersion: v2
 name: frontend-web
 description: Frontend — Next.js dashboard
 type: application
-version: 0.1.2
+version: 0.2.0
