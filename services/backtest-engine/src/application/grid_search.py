@@ -11,6 +11,7 @@ import itertools
 from dataclasses import dataclass, field
 from typing import Callable
 
+from .progress import NullProgress, ProgressSink
 from .replay_pnl import OosPath, realise
 
 Objective = Callable[[OosPath], float]
@@ -91,10 +92,14 @@ class WalkForwardOos:
 
 async def walk_forward_oos(
     strategy_id, reader, prices, grid, folds, step, universe_at, objective: Objective, round_trip_bps,
+    progress: ProgressSink = NullProgress(),
 ) -> WalkForwardOos:
     """Anchored walk-forward: per fold, grid-search IS on `objective` → best params → OOS replay;
     concatenate the OOS legs. Used for the real walk-forward (step 3) and, run on each permuted
-    panel, for WF-MCPT (step 4) — so the surrogate sees the identical fit→evaluate process."""
+    panel, for WF-MCPT (step 4) — so the surrogate sees the identical fit→evaluate process.
+
+    `progress.tick(1)` fires per fold so the real step-3 pass advances the bar; the per-permutation
+    WF-MCPT runs pass the default NullProgress (the validator ticks once per whole permutation)."""
     out = WalkForwardOos()
     for f in folds:
         gs = await grid_search(
@@ -115,4 +120,5 @@ async def walk_forward_oos(
             'oos_objective': objective(oos),
             'oos_equity': _equity(oos.net_returns),
         })
+        progress.tick(1)
     return out
