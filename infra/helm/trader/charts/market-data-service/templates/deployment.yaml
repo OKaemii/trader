@@ -65,6 +65,18 @@ spec:
               value: {{ .Values.global.env.dailyHistoryProvider | default "yahoo" | quote }}
             - name: DAILY_BACKFILL_YEARS
               value: {{ .Values.global.env.dailyBackfillYears | default "5" | quote }}
+            # EODHD single universe source + fundamentals. EODHD_API_KEY arrives via the
+            # trader-secrets envFrom above (same as TWELVEDATA_API_KEY / the T212 keys).
+            - name: UNIVERSE_SOURCE
+              value: {{ .Values.global.env.universeSource | default "curated" | quote }}
+            - name: MIN_MARKET_CAP_GBP
+              value: {{ .Values.global.env.minMarketCapGbp | default "5000000000" | quote }}
+            - name: EODHD_CALLS_PER_MIN
+              value: {{ .Values.global.env.eodhdCallsPerMin | default "1000" | quote }}
+            - name: EODHD_DAILY_CALL_LIMIT
+              value: {{ .Values.global.env.eodhdDailyCallLimit | default "90000" | quote }}
+            - name: FUNDAMENTALS_PROVIDER
+              value: {{ .Values.global.env.fundamentalsProvider | default "yahoo" | quote }}
             - name: BAR_FREQUENCY
               value: {{ .Values.global.env.barFrequency | default "daily" | quote }}
             {{- with .Values.global.env.pollIntervalMs }}

@@ -11,7 +11,12 @@ const links = [
   { href: '/research', label: 'Research' },
   { href: '/strategy-config', label: 'Strategy' },
   { href: '/universe', label: 'Universe' },
+  { href: '/scanner', label: 'Scanner' },
   { href: '/market-data', label: 'Market Data' },
+  { href: '/operations/console', label: 'Console' },
+  { href: '/operations/performance', label: 'Performance' },
+  { href: '/operations/trade-audit', label: 'Trade Audit' },
+  { href: '/operations/risk-limits', label: 'Risk Limits' },
   { href: '/operations/reconciliation', label: 'Reconciliation' },
   { href: '/operations/tca', label: 'TCA' },
 ]

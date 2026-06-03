@@ -3,11 +3,14 @@ import { serve } from "@hono/node-server";
 import { createNodeWebSocket } from "@hono/node-ws";
 import { createLogger, registerGracefulShutdown, errorHandler } from "@trader/core";
 import { startTracer, traceMixin } from "@trader/telemetry";
+import { publish, subscribe } from "@trader/shared-redis";
+import type { RedisClientType } from "redis";
 
 import { loadSignalEnv } from "./env.ts";
 import { wireDependencies } from "./wiring.ts";
 import { createRouter } from "./modules/signals/routes/public.ts";
 import { createInternalRouter } from "./modules/signals/routes/internal.ts";
+import { createPieRouter } from "./modules/pie/routes/pie-routes.ts";
 import { registerTopologyWebSocket, registerSystemReset } from "./modules/signals/routes/system.ts";
 
 async function main(): Promise<void> {
@@ -37,6 +40,10 @@ async function main(): Promise<void> {
         signalRepo:       deps.signalRepo,
         riskEngine:       deps.riskEngine,
         tripRecorder:     deps.tripRecorder,
+        publishConfigInvalidated: async () => {
+            await publish(deps.redis as unknown as RedisClientType, "config:invalidated",
+                { source: "signal-service", kind: "risk_limits", ts: Date.now() });
+        },
     }));
     app.route("/", createInternalRouter({
         signalRepo:        deps.signalRepo,
@@ -44,6 +51,7 @@ async function main(): Promise<void> {
         logger:            deps.logger,
         telemetrySnapshot: deps.telemetrySnapshot,
     }));
+    app.route("/", createPieRouter(deps.pieRepo));
 
     // WebSocket + system-reset moved here from the (deleted) api-gateway. Both belong
     // with the service that already owns the strategy:* pubsub channels and the bulk of
@@ -91,6 +99,11 @@ async function main(): Promise<void> {
         void sub.subscribe(async (features) => { await deps.generateSignals.execute(features); });
     }
     await deps.bus.subscribe("market", async () => { await deps.cache.invalidatePattern("*"); });
+
+    // Cross-pod risk-limit cache refresh: any config:invalidated broadcast (our own risk-limits
+    // PUT or a market-data config save) drops the RiskLimitsProvider cache so every pod re-reads.
+    await subscribe(deps.redis as unknown as RedisClientType, "config:invalidated",
+        () => deps.riskEngine.invalidateRiskLimits());
 
     // Self-heal stuck Pending signals. See AutoApprovalGate.startSweeper for the rationale.
     const stopSweeper = deps.autoApprovalGate.startSweeper(env.AUTO_APPROVE_SWEEP_INTERVAL_MS);

@@ -32,6 +32,8 @@ import numpy as np
 from quant_core.bars.in_memory_reader import InMemoryBarsReader
 from quant_core.strategy.factory import make_strategy
 from quant_core.universe import load_constituents
+from quant_core.wiring import set_replay_fundamentals
+from ..infrastructure.fundamentals_loader import load_fundamentals_snapshot
 
 from .benchmark import benchmark_overlay
 from .grid_search import expand_grid, grid_search, replay_path, walk_forward_oos, _equity
@@ -176,6 +178,7 @@ _WORKER_CTX: Optional[dict] = None
 def _init_mcpt_worker(ctx: dict) -> None:
     global _WORKER_CTX
     _WORKER_CTX = ctx
+    set_replay_fundamentals(ctx.get('fundamentals'))   # point-in-time-approx QMJ snapshot (spawn-safe)
 
 
 def _is_mcpt_worker(seed: int) -> float:
@@ -286,12 +289,23 @@ class Validator:
                "needs a paid feed)" if constituents else "current-membership ⇒ survivorship bias")
         )
 
+        # Point-in-time-approximate fundamentals for quality-screening strategies (high_velocity).
+        # Loaded once; applied at every replay step (main process here + MCPT workers via ctx). The
+        # fail-closed QMJ screen yields an empty backtest if no snapshot exists — honest, not faked.
+        fundamentals_snapshot: dict = {}
+        if strategy_id == 'high_velocity_v1':
+            fundamentals_snapshot = await load_fundamentals_snapshot(list(panel.tickers))
+            data_quality += ("; fundamentals=point_in_time_approximate "
+                             "(current company_fundamentals applied historically — Yahoo has no as-of fundamentals)")
+        set_replay_fundamentals(fundamentals_snapshot)   # main process: step-1 fit + step-3 walk-forward
+
         # Shared, fully-picklable worker ctx for the parallel MCPT stages (steps 2 & 4).
         ctx = {
             'panel': panel, 'grid': grid, 'strategy_id': strategy_id,
             'objective_name': objective_name, 'ppy': ppy, 'step': step,
             'round_trip_bps': self._rt, 'universe_spec': universe_spec,
             'start_ms': start_ms, 'train_ms': train_ms, 'train_index': train_index, 'folds': folds,
+            'fundamentals': fundamentals_snapshot,
         }
 
         # Uniform fit-units: step1 (1) + IS-MCPT (N) + walk-forward (folds) + WF-MCPT (M·folds).

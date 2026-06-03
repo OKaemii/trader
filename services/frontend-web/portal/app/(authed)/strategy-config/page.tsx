@@ -1,5 +1,6 @@
 import { authedFetch } from '@/app/lib/auth-fetch'
 import { StrategyConfigEditor, type StrategyConfig } from './StrategyConfigEditor'
+import { ActiveStrategySelector } from './ActiveStrategySelector'
 
 // SSR-seed the per-strategy tunable surface, then hand to the client editor (SSR-seed +
 // client-mutate, the portal's no-flicker pattern). Reads strategy-engine /admin/api/strategy/config.
@@ -22,6 +23,7 @@ export default async function StrategyConfigPage() {
 
   return (
     <div className="space-y-6 p-6">
+      <ActiveStrategySelector strategies={(data.strategies ?? []).map((s) => s.strategy_id)} active={data.active ?? ''} />
       <StrategyConfigEditor initial={data.strategies ?? []} active={data.active ?? ''} />
     </div>
   )
