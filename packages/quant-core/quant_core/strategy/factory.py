@@ -16,6 +16,8 @@ from .collaborators.trend_filter import TrendFilter
 from .factor_rank import FactorRankStrategy
 from .sector_momentum import SectorMomentumStrategy
 from .topology import TopologyStrategy
+from .high_velocity import HighVelocityStrategy
+from .collaborators.rebalance_clock import RebalanceClock
 
 
 def _bar_frequency() -> str:
@@ -78,10 +80,39 @@ def _build_topology() -> Strategy:
     return TopologyStrategy(RegimeEngine(), config)
 
 
+def _build_high_velocity() -> Strategy:
+    # Concentrated monthly momentum + quality: screen (cap ≥ £5B + fail-closed QMJ) → 12-1
+    # momentum top-N → drop the highest-vol → inverse-vol weights. Reads the single EODHD-fed
+    # universe + the fundamentals the host attaches; the RebalanceClock gates emission to the
+    # first session of each calendar month (else it holds).
+    top_n  = int(os.getenv('HIGH_VELOCITY_TOP_N_MOMENTUM', '30'))
+    drop_n = int(os.getenv('HIGH_VELOCITY_DROP_N_VOL', '10'))
+    held_k = max(1, top_n - drop_n)
+    config = StrategyConfig(
+        strategy_id='high_velocity_v1',
+        rolling_window=int(os.getenv('HIGH_VELOCITY_WINDOW', '300')),   # floor: 12-1 needs 252+21
+        min_universe_size=5,
+        report_cadence=_report_cadence(),
+        top_k=int(os.getenv('HIGH_VELOCITY_TOP_K', str(held_k))),
+        wants_fundamentals=True,
+    )
+    return HighVelocityStrategy(
+        RebalanceClock(),
+        config,
+        top_n_momentum=top_n,
+        drop_n_vol=drop_n,
+        vol_lookback=int(os.getenv('HIGH_VELOCITY_VOL_LOOKBACK', '90')),
+        mom_lookback=int(os.getenv('HIGH_VELOCITY_MOM_LOOKBACK', '252')),
+        mom_skip=int(os.getenv('HIGH_VELOCITY_MOM_SKIP', '21')),
+        min_cap_gbp=float(os.getenv('MIN_MARKET_CAP_GBP', '5000000000')),
+    )
+
+
 _BUILDERS = {
     'factor_rank_v1': _build_factor_rank,
     'sector_momentum_v1': _build_sector_momentum,
     'topology_v1': _build_topology,
+    'high_velocity_v1': _build_high_velocity,
 }
 
 

@@ -7,7 +7,7 @@ composed in (factors, regime engine, stability analyser, covariance estimator); 
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Protocol, runtime_checkable
 
 from ..types import StrategyOutput
@@ -19,6 +19,10 @@ class HistoryView:
     closes: dict[str, list[float]]
     volumes: dict[str, list[float]]
     timestamps: dict[str, list[int]]
+    # Optional per-ticker fundamentals (snake_case: market_cap_gbp, net_income, total_equity,
+    # total_debt, current_assets, current_liabilities) the host attaches for quality-screening
+    # strategies (high_velocity_v1). Empty for bars-only strategies — additive, default {}.
+    fundamentals: dict[str, dict[str, float]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -75,6 +79,8 @@ class StrategyConfig:
     # collaborator state (RegimeEngine / FeatureStabilityAnalyser). Phase 1 makes those
     # stateless (window read from the FeatureStore) and this drops to 0 everywhere.
     prewarm_cycles: int = 0
+    # When True the live host attaches a per-ticker fundamentals map to HistoryView (QMJ screen).
+    wants_fundamentals: bool = False
 
 
 @runtime_checkable

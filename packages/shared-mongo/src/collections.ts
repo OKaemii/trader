@@ -39,6 +39,19 @@ export const COLLECTIONS = {
   PORTAL_STRATEGY_CONFIG:    'portal_strategy_config',
   MARKET_CALENDAR:           'market_calendar',
   COMPANY_PROFILES:          'company_profiles',
+  // Per-ticker fundamentals (raw balance-sheet + income line items + market cap in GBP) for the
+  // QMJ quality screen. Written by market-data-service's FundamentalsCache (Yahoo quoteSummary,
+  // monthly refresh); read by the high-velocity strategy host + the Scanner/Feeds page. Doc:
+  // { _id: ticker, asOf, raw, ratios, qualityPass, source, updatedAt }.
+  COMPANY_FUNDAMENTALS:      'company_fundamentals',
+  // Reusable holdings "pie" — one active doc per strategy (keyed by pieId uuid): target
+  // weights + rebalance history. Written by signal-service's PieManager on each rebalance;
+  // signals/orders carry the pieId for attribution. { pieId, strategyId, name, status, targets,
+  // rebalanceHistory, ... }.
+  PIES:                      'pies',
+  // Portal-driven runtime singletons not covered by the market/strategy config docs — e.g. the
+  // active-strategy selection ({ _id:'active_strategy', strategyId }). One doc per concern.
+  PORTAL_RUNTIME_CONFIG:     'portal_runtime_config',
   // Per-ticker GICS metadata sourced from Yahoo `quoteSummary(assetProfile)`. Owned by
   // market-data-service's UniverseManager: looked up + refreshed (>30d stale) on every
   // universe rebuild. Replaces the no-op T212-derived `sector='Unknown'` path so

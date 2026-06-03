@@ -40,6 +40,7 @@ const toSignalDoc = (s: TradeSignal): any => ({
   // — typical doc ~300 bytes. Old signals without this field round-trip as undefined
   // and renderers fall back to defaults.
   features_snapshot: s.features_snapshot,
+  pieId: s.pieId,
 });
 
 const fromSignalDoc = (doc: any): TradeSignal => {
@@ -69,6 +70,7 @@ const fromSignalDoc = (doc: any): TradeSignal => {
   if (doc.features_snapshot && typeof doc.features_snapshot === 'object') {
     params.features_snapshot = doc.features_snapshot;
   }
+  if (typeof doc.pieId === 'string') params.pieId = doc.pieId;
   return new TradeSignal(params);
 };
 

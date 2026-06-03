@@ -1,4 +1,5 @@
 import { solveLongOnly, type RankingInput } from './LongOnlyOptimiser.ts';
+import { solveInverseVol } from './InverseVolOptimiser.ts';
 
 export interface PortfolioResult {
   weights: number[];
@@ -24,7 +25,11 @@ export class PortfolioConstructor {
     input: RankingInput,
     factorAttributions: Record<string, Record<string, number>>,
   ): PortfolioResult {
-    const weights = solveLongOnly(input);
+    // Inverse-vol strategies (high_velocity_v1) size by 1/σ over the emitted held set — no
+    // sector cap, no re-selection. Everything else uses the score-proportional solver.
+    const weights = input.weighting === 'inverse_vol' && input.volatilities
+      ? solveInverseVol({ volatilities: input.volatilities, tickers: input.tickers, currentWeights: input.currentWeights })
+      : solveLongOnly(input);
     const { tickers, covariance } = input;
     const warnings: string[] = [];
 

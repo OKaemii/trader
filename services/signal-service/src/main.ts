@@ -8,6 +8,7 @@ import { loadSignalEnv } from "./env.ts";
 import { wireDependencies } from "./wiring.ts";
 import { createRouter } from "./modules/signals/routes/public.ts";
 import { createInternalRouter } from "./modules/signals/routes/internal.ts";
+import { createPieRouter } from "./modules/pie/routes/pie-routes.ts";
 import { registerTopologyWebSocket, registerSystemReset } from "./modules/signals/routes/system.ts";
 
 async function main(): Promise<void> {
@@ -44,6 +45,7 @@ async function main(): Promise<void> {
         logger:            deps.logger,
         telemetrySnapshot: deps.telemetrySnapshot,
     }));
+    app.route("/", createPieRouter(deps.pieRepo));
 
     // WebSocket + system-reset moved here from the (deleted) api-gateway. Both belong
     // with the service that already owns the strategy:* pubsub channels and the bulk of

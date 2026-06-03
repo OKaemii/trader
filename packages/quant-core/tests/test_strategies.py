@@ -49,7 +49,7 @@ def _uptrend_history(n_tickers: int, n_closes: int) -> HistoryView:
 
 
 def test_factory_known_ids():
-    assert known_strategies() == ['factor_rank_v1', 'sector_momentum_v1', 'topology_v1']
+    assert known_strategies() == ['factor_rank_v1', 'high_velocity_v1', 'sector_momentum_v1', 'topology_v1']
 
 
 def test_factory_unknown_raises():
@@ -65,7 +65,7 @@ def test_report_cadence_follows_bar_frequency(monkeypatch):
     assert make_strategy('factor_rank_v1').config.report_cadence == 'hourly'
 
 
-@pytest.mark.parametrize('sid', ['factor_rank_v1', 'sector_momentum_v1', 'topology_v1'])
+@pytest.mark.parametrize('sid', ['factor_rank_v1', 'high_velocity_v1', 'sector_momentum_v1', 'topology_v1'])
 def test_strategies_satisfy_protocol(sid):
     s = make_strategy(sid)
     assert isinstance(s, Strategy)
