@@ -10,6 +10,8 @@ import { fetchT212Instruments } from '../infrastructure/t212-client.ts';
 import { fetchYahooLiquidity } from '../../bars/infrastructure/providers/yahoo-client.ts';
 import { MongoInstrumentMeta } from '../infrastructure/MongoInstrumentMeta.ts';
 import { YahooSectorClient } from '../infrastructure/yahoo-sector-client.ts';
+import { fetchEodhdCapScan } from '../infrastructure/eodhd-scan.ts';
+import { mapEodhdToT212 } from '../infrastructure/eodhd-symbol-map.ts';
 import { log } from '../../../logger.ts';
 
 // Rows older than this are re-fetched from Yahoo on the next refresh. Sectors are
@@ -35,6 +37,11 @@ export interface UniverseConfig {
   // Current T212 integration sets volume=0 — filter is a no-op until a real feed is wired.
   // Spread (≤ 30bps) cannot be filtered here: T212 API does not expose bid-ask spread.
   minAdvGbp: number;
+  // Candidate source: 'curated' (UNIVERSE_INCLUDE_* lists) or 'eodhd_scan' (EODHD market-cap
+  // screener >= minCapGbp). Either way the result is the ONE active universe (instrument_registry).
+  source: 'curated' | 'eodhd_scan';
+  // Market-cap floor (GBP) for the eodhd_scan source.
+  minCapGbp: number;
 }
 
 const DEFAULT_CONFIG: UniverseConfig = {
@@ -43,6 +50,8 @@ const DEFAULT_CONFIG: UniverseConfig = {
   includeLse: [],
   minPriceGbp: 1.0,
   minAdvGbp: 2_000_000,
+  source:     'curated',
+  minCapGbp:  5_000_000_000,
 };
 
 const ADV_LOOKBACK_DAYS   = 20;
@@ -263,6 +272,41 @@ async function selectCurated(
   return selected;
 }
 
+/**
+ * EODHD-scan universe source. Scans every US+LSE name >= minCapGbp via the EODHD screener,
+ * maps to tradeable T212 tickers, dedupes by ticker, and ranks by market cap (a sound liquidity
+ * proxy at the >=£5B floor — avoids N per-name ADV calls). Returns at most maxSize. Sector
+ * enrichment, portal overrides, and the registry diff happen in refresh() exactly as for the
+ * curated source — this only swaps the candidate source. ONE active universe, no parallel pool.
+ */
+async function selectFromEodhdScan(
+  rawInstruments: Awaited<ReturnType<typeof fetchT212Instruments>>,
+  fxToGBP: FxToGBP,
+  config: UniverseConfig,
+): Promise<InstrumentMeta[]> {
+  const candidates = await fetchEodhdCapScan({ minCapGbp: config.minCapGbp, exchanges: ['US', 'LSE'], fxToGBP });
+  const { mapped, dropped } = mapEodhdToT212(candidates, rawInstruments);
+
+  // Dedup by T212 ticker (a cross-listing could resolve twice); keep the larger cap.
+  const byTicker = new Map<string, (typeof mapped)[number]>();
+  for (const m of mapped) {
+    const prev = byTicker.get(m.ticker);
+    if (!prev || m.marketCapGbp > prev.marketCapGbp) byTicker.set(m.ticker, m);
+  }
+  const ranked = [...byTicker.values()]
+    .sort((a, b) => b.marketCapGbp - a.marketCapGbp)
+    .slice(0, config.maxSize);
+
+  log.info(`[universe] eodhd_scan: ${candidates.length} >= £${(config.minCapGbp / 1e9).toFixed(1)}B, ${mapped.length} tradeable (${dropped} dropped), ${ranked.length} selected (cap ${config.maxSize})`);
+  return ranked.map((m) => ({
+    ticker:       m.ticker,
+    name:         m.name,
+    sector:       'Unknown',     // enriched later in refresh() step 4c
+    t212Tradable: true,
+    market:       m.market,
+  }));
+}
+
 export interface UniverseManagerOptions {
   // Optional injected sector client — defaults to the real Yahoo HTTP client. Tests
   // pass a stub. When set to `null`, sector enrichment is skipped entirely (useful
@@ -323,7 +367,11 @@ export class UniverseManager {
 
     let selected: InstrumentMeta[];
 
-    if (this.config.includeUs.length > 0 || this.config.includeLse.length > 0) {
+    if (this.config.source === 'eodhd_scan') {
+      // ── EODHD market-cap scan: the single universe source (US+LSE >= minCapGbp). ──
+      // Feeds the same instrument_registry diff below — no parallel pool.
+      selected = await selectFromEodhdScan(rawInstruments, this.fxToGBP, this.config);
+    } else if (this.config.includeUs.length > 0 || this.config.includeLse.length > 0) {
       // ── 2/3/4 (curated): resolve include lists → ADV rank → top N ────────────
       // Each include-list symbol is matched against T212's `shortName` (the bare symbol,
       // e.g. "AAPL", "SHEL") and the best T212 ticker is picked per the market preference:

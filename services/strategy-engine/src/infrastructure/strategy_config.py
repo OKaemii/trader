@@ -90,3 +90,30 @@ async def upsert_strategy_config(
 
 def invalidate() -> None:
     _cache.clear()
+
+
+# ── Active-strategy selection (portal dropdown) ──────────────────────────────────
+# Stored in PORTAL_RUNTIME_CONFIG ({_id:'active_strategy', strategyId}). Read once at host
+# startup to override the ACTIVE_STRATEGY env default; the PUT persists the operator's choice.
+# Applies on the next strategy-engine restart (selection is structural — it changes the universe
+# source, rolling window, and cross-cycle state).
+RUNTIME_COLLECTION = "portal_runtime_config"
+ACTIVE_STRATEGY_ID = "active_strategy"
+
+
+async def get_active_strategy() -> Optional[str]:
+    try:
+        doc = await _db()[RUNTIME_COLLECTION].find_one({"_id": ACTIVE_STRATEGY_ID})
+        sid = (doc or {}).get("strategyId")
+        return str(sid) if sid else None
+    except Exception as exc:   # noqa: BLE001 — fall back to the env default on any miss/blip
+        print(f"[strategy-engine:strategy-config] active-strategy read failed: {exc!r}")
+        return None
+
+
+async def set_active_strategy(strategy_id: str, updated_by: str) -> None:
+    await _db()[RUNTIME_COLLECTION].update_one(
+        {"_id": ACTIVE_STRATEGY_ID},
+        {"$set": {"strategyId": strategy_id, "updatedBy": updated_by, "updatedAt": datetime.now(timezone.utc)}},
+        upsert=True,
+    )

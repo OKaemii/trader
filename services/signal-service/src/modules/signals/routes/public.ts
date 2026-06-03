@@ -123,6 +123,25 @@ export function createRouter(deps: Deps): Hono {
     return c.json({ reset: true, ts: Date.now() });
   });
 
+  // Operator controls — kill switch (halts new emission AND the dispatcher drain) + pause
+  // (halts emission only; the dispatcher keeps draining in-flight orders). Distinct from the
+  // automatic NAV circuit breaker.
+  router.get('/admin/api/signals/risk/controls', async (c) => {
+    return c.json(await deps.riskEngine.operatorState());
+  });
+  router.post('/admin/api/signals/risk/kill-switch', async (c) => {
+    const { on } = await c.req.json().catch(() => ({ on: undefined }));
+    if (typeof on !== 'boolean') return c.json({ error: 'body { on: boolean } required' }, 400);
+    await deps.riskEngine.setKillSwitch(on);
+    return c.json({ killSwitch: on, ts: Date.now() });
+  });
+  router.post('/admin/api/signals/strategy/pause', async (c) => {
+    const { on } = await c.req.json().catch(() => ({ on: undefined }));
+    if (typeof on !== 'boolean') return c.json({ error: 'body { on: boolean } required' }, 400);
+    await deps.riskEngine.setPaused(on);
+    return c.json({ paused: on, ts: Date.now() });
+  });
+
   // Post-mortem list — one row per historical trip. Lean projection (no positions,
   // no signals array) so the portal table renders fast. Detail view fetches the
   // full doc separately.

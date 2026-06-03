@@ -13,6 +13,10 @@ export interface RankingInput {
   // outside top-K go to weight=0 — produces clean SELLs for demoted holdings and
   // skips emission for new noise. 0 / undefined disables (legacy full-universe).
   topK?: number;
+  // Inverse-vol sizing (when weighting='inverse_vol'): per-ticker annualised σ aligned to
+  // `tickers`. PortfolioConstructor routes to solveInverseVol instead of solveLongOnly.
+  volatilities?: number[];
+  weighting?: 'score_proportional' | 'inverse_vol';
 }
 
 export const RISK_LIMITS = {

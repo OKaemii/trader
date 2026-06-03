@@ -33,6 +33,10 @@ export class TradeSignal {
   public readonly failureReason?: SignalFailureReason | undefined;
   public readonly failureDetail?: string | undefined;
 
+  // Pie attribution — the internal Pie (holdings basket) this signal belongs to. Stamped by
+  // GenerateSignals for pie-managed strategies (high_velocity_v1); absent for others.
+  public readonly pieId?: string | undefined;
+
   // Trimmed StrategyOutput snapshot — populated by GenerateSignals with just enough
   // context (sector + score for THIS ticker, regime, position multiplier, strategy id)
   // for downstream notification enrichment. covariance_matrix + ticker_universe are
@@ -63,6 +67,7 @@ export class TradeSignal {
     failureReason?: SignalFailureReason;
     failureDetail?: string;
     features_snapshot?: StrategyOutput;
+    pieId?: string;
   }) {
     if (params.confidence < 0 || params.confidence > 1)
       throw new Error('confidence must be in [0, 1]');
@@ -100,6 +105,7 @@ export class TradeSignal {
     this.failureReason = params.failureReason;
     this.failureDetail = params.failureDetail;
     this.features_snapshot = params.features_snapshot;
+    this.pieId = params.pieId;
   }
 
   // minConfidence is strategy policy — not a domain invariant.

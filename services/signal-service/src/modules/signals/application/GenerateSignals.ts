@@ -10,6 +10,7 @@ import { PortfolioConstructor } from './PortfolioConstructor.ts';
 import type { RiskEngine } from '../../risk/application/RiskEngine.ts';
 import type { StrategyDecayMonitor } from '../../approval/application/StrategyDecayMonitor.ts';
 import type { AutoApprovalGate } from '../../approval/application/AutoApprovalGate.ts';
+import type { PieManager } from '../../pie/application/PieManager.ts';
 import { randomUUID } from 'node:crypto';
 
 export interface GenerateSignalsConfig {
@@ -78,6 +79,7 @@ export class GenerateSignalsUseCase {
     private readonly decayMonitor?: StrategyDecayMonitor,
     private readonly priceLookup?: IPriceLookup,
     private readonly autoApprovalGate?: AutoApprovalGate,
+    private readonly pieManager?: PieManager,
   ) {}
 
   async execute(features: StrategyOutput): Promise<TradeSignal[]> {
@@ -120,8 +122,13 @@ export class GenerateSignalsUseCase {
     // operational NAV context and expands the held-position count upward as the
     // portfolio grows, so that a £50k account isn't forced to hold the same 20
     // names a £5k account does. Capped at the paper's §6.1 n=60 upper bound.
+    // Inverse-vol strategies (high_velocity_v1) emit a precomputed held set sized by 1/σ — hold
+    // exactly `top_k` (no NAV-adaptive expansion) and treat the basket as deterministic
+    // (BUYs bypass the conviction gate, like SELLs) since it's portfolio-driven, not score-driven.
+    const weighting = features.weighting ?? 'score_proportional';
+    const isInverseVol = weighting === 'inverse_vol';
     let effectiveTopK = features.top_k ?? 0;
-    if (effectiveTopK > 0) {
+    if (effectiveTopK > 0 && !isInverseVol) {
       // Defensive: older RiskEngine instances (test mocks, alternate impls) may not
       // have currentNavGBP; treat absence the same as a degraded read (skip adaptation).
       const nav = typeof this.riskEngine.currentNavGBP === 'function'
@@ -153,6 +160,10 @@ export class GenerateSignalsUseCase {
           targetVol: this.config.volTarget,
           covariance: features.covariance_matrix,
           ...(effectiveTopK > 0 ? { topK: effectiveTopK } : {}),
+          ...(isInverseVol ? {
+            weighting,
+            volatilities: features.ticker_universe.map((t) => features.factor_attributions?.[t]?.volatility ?? 0),
+          } : {}),
         },
         features.factor_attributions ?? {},
       );
@@ -167,6 +178,21 @@ export class GenerateSignalsUseCase {
     );
 
     const decayFactor = this.riskEngine.confidenceDecayFactor();
+
+    // Pie sync — for pie-managed (inverse-vol) strategies, record the resolved target book as the
+    // strategy's active Pie and stamp the pieId on emitted signals for attribution. Best-effort:
+    // a pie write must never block signal emission.
+    let pieId: string | undefined;
+    if (this.pieManager && isInverseVol) {
+      const pieTargets = features.ticker_universe
+        .map((t, i) => ({ ticker: t, targetWeight: weights[i] ?? 0 }))
+        .filter((x) => x.targetWeight > 0);
+      try {
+        pieId = await this.pieManager.syncFromWeights(features.strategy_id, pieTargets, features.timestamp, 'rebalance');
+      } catch (err) {
+        this.logger.warn({ err }, 'pie sync failed (continuing without pie attribution)');
+      }
+    }
 
     // Confidence normalisation: sign-aware, cross-sectional, scale-free. We compute p95
     // separately over positive and negative composite scores and pick the divisor matching
@@ -324,6 +350,7 @@ export class GenerateSignalsUseCase {
             ...(entry && entry > 0 ? { entryPrice: entry } : {}),
             lifecycle: SignalLifecycle.Pending,
             features_snapshot: analysisContext,
+            ...(pieId ? { pieId } : {}),
           });
         } catch { return null; }
       })
@@ -337,6 +364,7 @@ export class GenerateSignalsUseCase {
       .filter((s): s is TradeSignal =>
         s !== null && (
           s.action === 'SELL' ||
+          isInverseVol ||   // deterministic inverse-vol basket — portfolio-driven, not conviction-gated
           s.isActionable(this.config.minActionableConfidence)
         ));
 
