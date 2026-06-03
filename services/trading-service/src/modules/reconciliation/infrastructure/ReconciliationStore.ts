@@ -67,12 +67,16 @@ export class ReconciliationStore {
     );
   }
 
+  // Prior-snapshot baseline for the cash-drift check (cashCheck compares the broker `total` against
+  // this). Reads the `nav` column — which holds the broker total — not `cash`, because `cash` now
+  // records FREE cash; comparing total-against-free would flag a spurious drift every cycle once
+  // positions are held.
   async readPriorCash(): Promise<number | null> {
     const pool = getPgPool();
-    const { rows } = await pool.query<{ cash: number }>(
-      `SELECT cash FROM nav_history ORDER BY snapshot_at DESC LIMIT 1`,
+    const { rows } = await pool.query<{ nav: number }>(
+      `SELECT nav FROM nav_history ORDER BY snapshot_at DESC LIMIT 1`,
     );
-    return rows.length ? Number(rows[0]!.cash) : null;
+    return rows.length ? Number(rows[0]!.nav) : null;
   }
 
   // ── Reads for the operator portal ───────────────────────────────────────────
