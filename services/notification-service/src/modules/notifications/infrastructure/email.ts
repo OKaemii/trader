@@ -42,4 +42,15 @@ export class EmailSender {
 
         if (error) throw new Error(`Resend error: ${JSON.stringify(error)}`);
     }
+
+    // Generic send for non-signal emails (operational alerts). `to` overrides the default recipient.
+    async sendRaw(subject: string, html: string, to?: string): Promise<void> {
+        const { error } = await this.resend.emails.send({
+            from: 'trader@resend.dev',
+            to: to ?? this.to,
+            subject,
+            html,
+        });
+        if (error) throw new Error(`Resend error: ${JSON.stringify(error)}`);
+    }
 }
