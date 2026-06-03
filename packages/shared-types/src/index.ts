@@ -132,6 +132,10 @@ export interface StrategyOutput {
   // below T212 per-instrument minQuantity → ZeroQuantity / min-quantity-exceeded failures.
   // Set per strategy; omitted/0 means "no truncation" (legacy behaviour).
   top_k?: number;
+  // Sizing intent: 'inverse_vol' (w ∝ 1/σ over the emitted held set; high_velocity_v1) skips
+  // score-proportional sizing, the sector cap, and NAV-adaptive top-K. Per-ticker σ rides in
+  // factor_attributions[t].volatility. Omitted ⇒ 'score_proportional' (default).
+  weighting?: 'score_proportional' | 'inverse_vol';
 }
 
 // TopologyFeatures — retained for backward-compatible dashboard reads only.

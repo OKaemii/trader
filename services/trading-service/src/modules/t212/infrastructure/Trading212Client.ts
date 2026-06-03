@@ -109,6 +109,13 @@ export class Trading212Client {
     return (data ?? []).map((o) => ({ id: String(o.id ?? o.orderId ?? '') }));
   }
 
+  // Cancel a resting order (DELETE /equity/orders/{id}). 404 = already gone (filled/cancelled) —
+  // tolerated so the flatten path is idempotent. Used by FlattenAllUseCase.
+  async cancelOrder(orderId: string): Promise<void> {
+    const res = await fetch(`${this.baseUrl}/equity/orders/${orderId}`, { method: 'DELETE', headers: this.headers });
+    if (!res.ok && res.status !== 404) throw new Error(`T212 cancel order ${orderId}: ${res.status}`);
+  }
+
   // Instrument metadata — per-ticker quantity rules. T212 returns a large array (typ.
   // 5k+ instruments, several MB). Fetch once on boot and cache; the metadata changes only
   // when T212 adds/removes tickers, which is rare. minTradeQuantity also implicitly defines

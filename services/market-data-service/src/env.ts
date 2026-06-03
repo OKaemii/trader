@@ -47,6 +47,22 @@ const EnvSchema = z.object({
     TWELVEDATA_CREDITS_PER_MIN:    z.coerce.number().int().positive().default(8),
     TWELVEDATA_DAILY_CREDIT_LIMIT: z.coerce.number().int().positive().default(800),
 
+    // ── EODHD (daily/EOD + market scanner) ────────────────────────────────────
+    // EODHD is the single universe SOURCE (screener) + the long-range daily feed; intraday
+    // stays on TwelveData. Key from trader-secrets (EODHD_API_KEY <- tfvars eodhd_api_key).
+    // Call budgets are conservative ceilings under the 100k/month plan (with headroom).
+    EODHD_API_KEY:          z.string().optional(),
+    EODHD_CALLS_PER_MIN:    z.coerce.number().int().positive().default(1000),
+    EODHD_DAILY_CALL_LIMIT: z.coerce.number().int().positive().default(90_000),
+    // Universe candidate source. 'curated' = UNIVERSE_INCLUDE_* lists; 'eodhd_scan' = the EODHD
+    // market-cap screener (>= MIN_MARKET_CAP_GBP, US+LSE). One active universe either way.
+    UNIVERSE_SOURCE:    z.enum(["curated", "eodhd_scan"]).default("curated"),
+    MIN_MARKET_CAP_GBP: z.coerce.number().nonnegative().default(5_000_000_000),
+    // Long-range daily history source (decoupled from the metered intraday provider).
+    DAILY_HISTORY_PROVIDER: z.enum(["yahoo", "eodhd"]).default("yahoo"),
+    // Fundamentals (QMJ) source. 'yahoo' (free quoteSummary, default) or 'eodhd' (paid add-on).
+    FUNDAMENTALS_PROVIDER:  z.enum(["yahoo", "eodhd"]).default("yahoo"),
+
     MONGODB_URL: z.string().url().default("mongodb://mongodb:27017"),
     REDIS_URL:   z.string().url().default("redis://redis:6379"),
 

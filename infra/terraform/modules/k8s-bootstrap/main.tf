@@ -21,6 +21,10 @@ variable "twelvedata_api_key" {
   sensitive = true
   default   = ""
 }
+variable "eodhd_api_key" {
+  sensitive = true
+  default   = ""
+}
 variable "resend_api_key" { sensitive = true }
 variable "deepseek_api_key" {
   sensitive = true
@@ -64,6 +68,7 @@ resource "kubernetes_secret" "trader_secrets" {
     T212_API_KEY_DEMO    = var.t212_api_key_demo
     T212_API_KEY_ID_DEMO = var.t212_api_key_id_demo
     TWELVEDATA_API_KEY   = var.twelvedata_api_key
+    EODHD_API_KEY        = var.eodhd_api_key
     RESEND_API_KEY       = var.resend_api_key
     DEEPSEEK_API_KEY     = var.deepseek_api_key
     EMAIL_TO            = var.email_to

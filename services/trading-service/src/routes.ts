@@ -16,6 +16,7 @@ import { PlaceOrderUseCase } from "./modules/orders/application/PlaceOrderUseCas
 import { AccountCache } from "./modules/orders/infrastructure/AccountCache.ts";
 import { getSignalOrderType } from "./modules/orders/infrastructure/live-config.ts";
 import { TradingMode, type OrderType } from "./modules/orders/domain/Order.ts";
+import { FlattenAllUseCase } from "./modules/orders/application/FlattenAllUseCase.ts";
 
 // Live-trading admin approval gate. Stored in Redis so it survives restarts.
 const LIVE_GATE_KEY = "trading:live_approved";
@@ -121,6 +122,18 @@ export function buildApp(deps: AppDeps): Hono {
         const redis = await deps.getRedis();
         const approved = !!(await redis.get(LIVE_GATE_KEY));
         return c.json({ trading_mode: modeName(tradingMode), live_gate_approved: approved });
+    });
+
+    // Flatten — cancel every resting order + market-sell every open position. The hard
+    // "get me out now" panic action. Demo/live only (no broker positions in Paper).
+    app.post("/admin/api/trading/flatten", async (c) => {
+        if (tradingMode === TradingMode.Paper) {
+            return c.json({ error: "flatten is a no-op in Paper mode (no broker positions)" }, 400);
+        }
+        const flatten = new FlattenAllUseCase(deps.client(), deps.logger ?? ({ warn() {} } as unknown as Logger));
+        const result = await flatten.execute();
+        deps.logger?.warn({ result }, "flatten endpoint invoked by admin");
+        return c.json({ ok: true, ...result });
     });
 
     // Admin manual order placement. Schema comes from @trader/contracts so the producer

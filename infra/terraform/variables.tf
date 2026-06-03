@@ -59,6 +59,14 @@ variable "twelvedata_api_key" {
   default   = ""
 }
 
+// EODHD daily/EOD + market-scanner API key — powers the single universe source (screener),
+// the bulk-EOD daily feed, and long-range daily history (DAILY_HISTORY_PROVIDER=eodhd).
+// Injected into trader-secrets as EODHD_API_KEY; empty falls back to no EODHD data.
+variable "eodhd_api_key" {
+  sensitive = true
+  default   = ""
+}
+
 variable "resend_api_key" {
   sensitive = true
   default   = ""
