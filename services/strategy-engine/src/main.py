@@ -231,6 +231,20 @@ async def put_strategy_config(req: Request):
     return {"ok": True, "strategy_id": sid, "liveParams": live or None, "searchGrid": grid or None}
 
 
+@app.put("/admin/api/strategy/active")
+async def put_active_strategy(req: Request):
+    """Portal dropdown — persist the active strategy. Applies on the next strategy-engine restart
+    (selection is structural: universe source, rolling window, cross-cycle state)."""
+    body = await req.json()
+    sid = body.get("strategy_id")
+    if sid not in known_strategies():
+        return JSONResponse({"error": f"unknown strategy_id: {sid!r}"}, status_code=400)
+    await strategy_config.set_active_strategy(sid, str(body.get("userId", "unknown")))
+    return {"ok": True, "selected": sid, "applied": ACTIVE_STRATEGY,
+            "restartRequired": sid != ACTIVE_STRATEGY,
+            "note": "applies on the next strategy-engine restart"}
+
+
 @app.get("/metrics", response_class=PlainTextResponse)
 def metrics():
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
@@ -259,12 +273,13 @@ def bars_from_json(data: list) -> list[OHLCVBar]:
     ]
 
 
-def _history_view(closes_of, tickers: list[str]) -> HistoryView:
-    """Build the pure HistoryView the strategy contract consumes from a per-ticker closes
-    lookup. Volumes/timestamps are left empty — the current strategies key off closes only;
-    the contract carries the other series for future factors without forcing a fetch now."""
+def _history_view(closes_of, tickers: list[str], ts_of=None, fundamentals=None) -> HistoryView:
+    """Build the pure HistoryView the strategy contract consumes. closes always; timestamps when
+    `ts_of` is given (the RebalanceClock needs them for monthly strategies); fundamentals when the
+    host attaches them (quality-screening strategies). Bars-only strategies pass neither."""
     closes = {t: list(closes_of(t)) for t in tickers}
-    return HistoryView(closes=closes, volumes={}, timestamps={})
+    timestamps = {t: list(ts_of(t)) for t in tickers} if ts_of is not None else {}
+    return HistoryView(closes=closes, volumes={}, timestamps=timestamps, fundamentals=fundamentals or {})
 
 
 def _pick_prewarm_range(calendar_days: int) -> str:
@@ -380,7 +395,7 @@ async def _init_engine_singletons() -> None:
     dependent config. Idempotent: safe to no-op if called twice.
     """
     global _strategy, _bars_client, _redis, _history_interval, _history_range, _needed
-    global _feature_store, _pg_pool
+    global _feature_store, _pg_pool, ACTIVE_STRATEGY
     if _strategy is not None:
         return
     _redis = await aioredis.from_url(REDIS_URL)
@@ -403,6 +418,11 @@ async def _init_engine_singletons() -> None:
         _reason = "TIMESCALE_URL unset" if not TIMESCALE_URL else "pool create failed"
         print(f"[strategy-engine] feature store: DISABLED ({_reason}) — features will NOT persist (NullFeatureStore)", flush=True)
 
+    # Portal-selected active strategy (PORTAL_RUNTIME_CONFIG) overrides the env default. Read at
+    # startup — strategy selection is structural (universe source, rolling window, cross-cycle state).
+    _configured = await strategy_config.get_active_strategy()
+    if _configured and _configured in known_strategies():
+        ACTIVE_STRATEGY = _configured
     try:
         _strategy = make_strategy(ACTIVE_STRATEGY)
     except ValueError as exc:
@@ -521,8 +541,19 @@ async def process_cycle(
         # Per-cycle live params (portal override, 15s cache) — hot-applied, no restart. Empty ⇒
         # the strategy's code defaults via StrategyParams.get.
         _live_params = await strategy_config.get_live_params(ACTIVE_STRATEGY)
+        def _ts_lookup(t: str, _m=history_map) -> list[int]:
+            return [b.timestamp for b in _m.get(t, [])]
+        # Fundamentals (QMJ) for quality-screening strategies (high_velocity_v1). Best-effort:
+        # a fetch failure leaves the map empty → the fail-closed screen emits nothing this cycle.
+        fundamentals_map: dict[str, dict[str, float]] = {}
+        if getattr(_strategy.config, "wants_fundamentals", False):
+            try:
+                fundamentals_map = await _bars_client.fetch_fundamentals(active_tickers)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[strategy-engine] cycle {cycle_n} fundamentals fetch failed (continuing): {exc!r}", flush=True)
         features = _strategy.compute_features(
-            _history_view(_lookup, active_tickers), as_of_ms, StrategyParams(values=_live_params)
+            _history_view(_lookup, active_tickers, _ts_lookup, fundamentals_map),
+            as_of_ms, StrategyParams(values=_live_params),
         )
         # Persist the feature vector bi-temporally (audit + replay parity). Best-effort:
         # a store failure logs but never blocks signal emission.

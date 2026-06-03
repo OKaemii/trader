@@ -12,8 +12,10 @@ import type { Db } from 'mongodb';
 import type { RedisClientType } from 'redis';
 import { COLLECTIONS } from '@trader/shared-mongo';
 import { invalidateBars } from '@trader/shared-bars';
+import type { OHLCVBar } from '@trader/shared-types';
 import { writeBarRevisions } from './persist-bars.ts';
 import { fetchYahooDailyHistory } from './providers/yahoo-client.ts';
+import { fetchEodhdDailyHistory } from './providers/eodhd-client.ts';
 import { CACHE_INVALIDATED_TOPIC } from './backfill.ts';
 import { log } from '../../../logger.ts';
 
@@ -66,6 +68,16 @@ export async function backfillDailyHistory(
   return results;
 }
 
+// Long-range daily source dispatch. DAILY_HISTORY_PROVIDER selects 'yahoo' (free, default) or
+// 'eodhd' (paid bulk-EOD). Both return oldest-first daily OHLCVBar[] tagged interval:'daily';
+// writeBarRevisions persists them identically (bi-temporal, idempotent).
+function fetchDailyHistory(ticker: string, startMs: number, endMs: number): Promise<OHLCVBar[]> {
+  const src = (process.env.DAILY_HISTORY_PROVIDER ?? 'yahoo').toLowerCase();
+  return src === 'eodhd'
+    ? fetchEodhdDailyHistory(ticker, startMs, endMs)
+    : fetchYahooDailyHistory(ticker, startMs, endMs);
+}
+
 async function backfillDailyOne(
   db: Db,
   redis: RedisClientType,
@@ -73,7 +85,7 @@ async function backfillDailyOne(
   startMs: number,
   endMs: number,
 ): Promise<DailyBackfillResult> {
-  const bars = await fetchYahooDailyHistory(ticker, startMs, endMs);
+  const bars = await fetchDailyHistory(ticker, startMs, endMs);
   if (bars.length === 0) {
     log.warn(`[daily-history] ${ticker}: Yahoo returned no daily history`);
     return { ticker, fetched: 0, upserted: 0 };

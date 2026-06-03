@@ -16,6 +16,7 @@ import { getLiveConfig } from './shared/live-config.ts';
 import { createAdminRouter, createInternalBarsRouter } from './modules/admin/routes.ts';
 import { YahooProvider } from './modules/bars/infrastructure/providers/yahoo-provider.ts';
 import { TwelveDataProvider } from './modules/bars/infrastructure/providers/twelvedata-provider.ts';
+import { configureEodhdClient } from './modules/bars/infrastructure/providers/eodhd-client.ts';
 import type { MarketDataProvider } from './modules/bars/infrastructure/providers/market-data-provider.ts';
 import { FxClient, YahooFxProvider } from '@trader/shared-fx';
 import { aggregateBars, invalidateBarsBulk } from '@trader/shared-bars';
@@ -27,6 +28,10 @@ import {
 } from '@trader/shared-calendar';
 import { backfillTickers, tickersMissingHistory, healMissingHistory } from './modules/bars/infrastructure/backfill.ts';
 import { backfillDailyHistory, tickersMissingDailyHistory } from './modules/bars/infrastructure/daily-history.ts';
+import { runEodhdDailyFeed } from './modules/bars/infrastructure/eodhd-daily-feed.ts';
+import { buildFundamentalsCache } from './modules/fundamentals/wiring.ts';
+import { createFundamentalsRouter } from './modules/fundamentals/routes.ts';
+import { createScannerRouter } from './modules/scanner/routes.ts';
 import { writeBarRevisions, ensureBiTemporalIndexes, fetchFirstPrintCloses } from './modules/bars/infrastructure/persist-bars.ts';
 import { msUntilNextTick } from './modules/bars/application/poll-scheduling.ts';
 import { log } from './logger.ts';
@@ -83,6 +88,8 @@ const universeManager = new UniverseManager(
     includeLse:  parseSymbolList(env.UNIVERSE_INCLUDE_LSE),
     minPriceGbp: env.UNIVERSE_MIN_PRICE,
     minAdvGbp:   env.UNIVERSE_MIN_ADV,
+    source:      env.UNIVERSE_SOURCE,
+    minCapGbp:   env.MIN_MARKET_CAP_GBP,
   },
 );
 
@@ -277,6 +284,18 @@ function buildProvider(): MarketDataProvider {
 }
 const provider: MarketDataProvider = buildProvider();
 
+// EODHD client (daily/EOD + screener) — configured once at boot so the daily-history dispatch
+// (DAILY_HISTORY_PROVIDER=eodhd) and the universe scanner share one budgeted client. Intraday
+// OHLCV stays on `provider` (TwelveData); EODHD is a separate daily/universe upstream.
+configureEodhdClient({
+  apiKey:         env.EODHD_API_KEY ?? '',
+  callsPerMinute: env.EODHD_CALLS_PER_MIN,
+  dailyCallLimit: env.EODHD_DAILY_CALL_LIMIT,
+});
+if (env.DAILY_HISTORY_PROVIDER === 'eodhd' && !env.EODHD_API_KEY) {
+  log.warn('[market-data] DAILY_HISTORY_PROVIDER=eodhd but EODHD_API_KEY is unset — daily history will be empty until the secret is wired');
+}
+
 // Calendar wiring: one HolidayCache per process, shared by both ExchangeCalendars.
 // Hydrated in bootstrap() before pollLoop starts. The cache walks
 // mem → Mongo → live providers (NYSE iCal, gov.uk JSON) → static fallback;
@@ -330,6 +349,17 @@ async function pollLoop(): Promise<void> {
       activeTickers = await universeManager.refresh();
       lastUniverseRefresh = Date.now();
       log.info(`[market-data] universe refreshed: ${activeTickers.length} tickers`);
+    }
+
+    // EODHD bulk daily feed — refresh the persisted daily series for the active universe.
+    // Self-gated per (exchange, UTC date) so it costs ~2 EODHD calls/day; only runs when EODHD
+    // is the daily source (the EODHD-scanned universe is too large for TwelveData intraday).
+    if (env.DAILY_HISTORY_PROVIDER === 'eodhd' && cfg.barFrequency === 'daily') {
+      try {
+        await runEodhdDailyFeed(await getMongoDb(), redis, activeTickers);
+      } catch (err) {
+        log.warn('[market-data] EODHD daily feed failed (continuing):', err);
+      }
     }
 
     // Session gate. Partition the universe by exchange and decide, per-market,
@@ -625,6 +655,15 @@ app.route('/', createAdminRouter(universeManager, provider, adminLogger, {
   calendarFor,
 }));
 app.route('/', createInternalBarsRouter(universeManager));
+
+// Fundamentals (QMJ) — read-through company_fundamentals cache + internal/admin routes.
+// Provider selected by FUNDAMENTALS_PROVIDER (yahoo default; eodhd dormant until the add-on).
+const fundamentalsCache = buildFundamentalsCache(
+  async (amount, currency) => (await getFxClient()).toGBP({ amount, currency }),
+  env.FUNDAMENTALS_PROVIDER,
+);
+app.route('/', createFundamentalsRouter(fundamentalsCache, universeManager));
+app.route('/', createScannerRouter(universeManager, fundamentalsCache));
 
 app.get('/latest/:ticker', async (c) => {
   const redis = await getRedisClient();

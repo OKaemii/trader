@@ -130,6 +130,12 @@ export class OrderDispatcher {
         let cycleCounter = 0;
         while (!this.stopped) {
             try {
+                // Operator kill switch — halt the queue drain entirely while engaged (a hard stop
+                // on order placement, independent of the automatic NAV circuit breaker).
+                if ((await (await this.deps.getRedis()).get('trading:kill_switch')) === '1') {
+                    await this.sleep(this.idleSleepMs);
+                    continue;
+                }
                 const signal = await this.claim();
                 if (!signal) {
                     idleTicks++;

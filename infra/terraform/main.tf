@@ -12,6 +12,7 @@ module "k8s_bootstrap" {
   t212_api_key_demo    = var.t212_api_key_demo
   t212_api_key_id_demo = var.t212_api_key_id_demo
   twelvedata_api_key   = var.twelvedata_api_key
+  eodhd_api_key        = var.eodhd_api_key
   resend_api_key       = var.resend_api_key
   deepseek_api_key     = var.deepseek_api_key
   email_to            = var.email_to

@@ -4,6 +4,7 @@ import type { Logger } from '@trader/core';
 import type { TradingServiceClient } from '@trader/contracts';
 import { sumPositionsGBP, type FxConverter, type PositionDoc } from '@trader/shared-portfolio';
 import { CircuitBreakerRedis } from '../infrastructure/CircuitBreakerRedis.ts';
+import { OperatorControls } from '../infrastructure/OperatorControls.ts';
 import { RISK_LIMITS } from '../../signals/application/LongOnlyOptimiser.ts';
 import type { TripRecorder, TripContext } from './TripRecorder.ts';
 import type { ISignalRepository } from '../../signals/domain/ISignalRepository.ts';
@@ -57,6 +58,7 @@ export class RiskEngine {
   private readonly riskState: Collection<RiskState>;
   private readonly positions: Collection;
   private readonly cb: CircuitBreakerRedis;
+  private readonly ops: OperatorControls;
 
   private _state: RiskState = {
     _id: 'singleton',
@@ -87,6 +89,7 @@ export class RiskEngine {
     this.riskState  = db.collection<RiskState>('risk_state');
     this.positions  = db.collection('positions');
     this.cb         = new CircuitBreakerRedis(redis);
+    this.ops        = new OperatorControls(redis);
   }
 
   // Wired post-construction because TripRecorder needs the signal repo, and the repo
@@ -155,7 +158,11 @@ export class RiskEngine {
   }
 
   async canTrade(): Promise<{ allowed: boolean; reason: string | null }> {
-    // Redis-backed circuit breaker check first
+    // Operator halts first — distinct from (and independent of) the automatic NAV breaker.
+    const ops = await this.ops.state();
+    if (ops.killSwitch) return { allowed: false, reason: 'kill_switch engaged' };
+    if (ops.paused)     return { allowed: false, reason: 'strategy paused' };
+    // Redis-backed circuit breaker check
     const { open, reason: cbReason } = await this.cb.isOpen();
     if (open) return { allowed: false, reason: cbReason ?? 'Circuit breaker tripped' };
 
@@ -222,6 +229,21 @@ export class RiskEngine {
 
   async resetCircuitBreaker(): Promise<void> {
     await this.cb.reset();
+  }
+
+  // ── Operator controls (kill switch + pause) — see OperatorControls ────────────────
+  async operatorState(): Promise<{ killSwitch: boolean; paused: boolean }> {
+    return this.ops.state();
+  }
+
+  async setKillSwitch(on: boolean): Promise<void> {
+    await this.ops.setKillSwitch(on);
+    this.logger.warn({ on }, on ? 'KILL SWITCH ENGAGED — halting new emission + dispatcher drain' : 'kill switch released');
+  }
+
+  async setPaused(on: boolean): Promise<void> {
+    await this.ops.setPaused(on);
+    this.logger.warn({ on }, on ? 'strategy emission PAUSED' : 'strategy emission resumed');
   }
 
   // Public NAV accessor — used by GenerateSignals to scale `top_k` with portfolio size.
