@@ -52,6 +52,12 @@ export const COLLECTIONS = {
   // Portal-driven runtime singletons not covered by the market/strategy config docs — e.g. the
   // active-strategy selection ({ _id:'active_strategy', strategyId }). One doc per concern.
   PORTAL_RUNTIME_CONFIG:     'portal_runtime_config',
+  // Operator-tunable risk limits overlaid on the RISK_LIMITS compile-time defaults: singleton
+  // { _id:'singleton', overrides, updatedAt } where `overrides` holds only the tunable subset
+  // (maxDailyLoss/maxDrawdownHalt/maxSingleName/maxSectorConcentration/maxWeeklyTurnover). Read hot
+  // by signal-service's RiskLimitsProvider (15s cache + config:invalidated). Each absent field
+  // falls back to the compile-time default; structural/env-backed fields are not overridable here.
+  PORTAL_RISK_CONFIG:        'portal_risk_config',
   // Per-ticker GICS metadata sourced from Yahoo `quoteSummary(assetProfile)`. Owned by
   // market-data-service's UniverseManager: looked up + refreshed (>30d stale) on every
   // universe rebuild. Replaces the no-op T212-derived `sector='Unknown'` path so

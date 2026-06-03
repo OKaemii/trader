@@ -162,4 +162,44 @@ describe('solveLongOnly', () => {
       expect(avg).toBeGreaterThan(0.015);
     });
   });
+
+  describe('operator-tunable caps (RankingInput overrides — G6 portal_risk_config)', () => {
+    it('respects an overridden maxSingleName (tighter cap → smaller dominant-name share)', () => {
+      const base = baseInput({
+        scores: [0.9, 0.1, 0.1, 0.1],
+        tickers: ['A', 'B', 'C', 'D'],
+        sectors: ['s0', 's1', 's2', 's3'],   // distinct → the sector cap never binds
+        currentWeights: [0, 0, 0, 0],
+        maxWeeklyTurnover: 5.0,               // disable turnover blending to isolate the name cap
+      });
+      const dflt  = solveLongOnly(base);                              // default cap 0.15
+      const tight = solveLongOnly({ ...base, maxSingleName: 0.05 });  // tightened to 0.05
+      expect(tight[0]!).toBeLessThan(dflt[0]!);
+    });
+
+    it('respects an overridden maxWeeklyTurnover (looser cap → less blending toward current)', () => {
+      const input = baseInput({
+        scores: [1, 0.01, 0.01, 0.01],
+        sectors: ['s0', 's1', 's2', 's3'],
+        currentWeights: [0.25, 0.25, 0.25, 0.25],
+      });
+      const turnoverOf = (w: number[]) =>
+        w.reduce((a, x, i) => a + Math.abs(x - input.currentWeights[i]!), 0) / 2;
+      const tight = solveLongOnly(input);                                 // default budget 0.20
+      const loose = solveLongOnly({ ...input, maxWeeklyTurnover: 5.0 });  // loosened to 5.0
+      expect(turnoverOf(loose)).toBeGreaterThan(turnoverOf(tight));
+    });
+
+    it('absent caps fall back to the RISK_LIMITS defaults (no behavioural change)', () => {
+      const input = baseInput();
+      const withDefaults = solveLongOnly(input);
+      const withExplicit = solveLongOnly({
+        ...input,
+        maxSingleName: RISK_LIMITS.maxSingleName,
+        maxSectorConcentration: RISK_LIMITS.maxSectorConcentration,
+        maxWeeklyTurnover: RISK_LIMITS.maxWeeklyTurnover,
+      });
+      expect(withExplicit).toEqual(withDefaults);
+    });
+  });
 });
