@@ -17,6 +17,7 @@ import { AccountCache } from "./modules/orders/infrastructure/AccountCache.ts";
 import { getSignalOrderType } from "./modules/orders/infrastructure/live-config.ts";
 import { TradingMode, type OrderType } from "./modules/orders/domain/Order.ts";
 import { FlattenAllUseCase } from "./modules/orders/application/FlattenAllUseCase.ts";
+import { computeEquityKpis } from "./modules/reconciliation/application/equity-kpis.ts";
 
 // Live-trading admin approval gate. Stored in Redis so it survives restarts.
 const LIVE_GATE_KEY = "trading:live_approved";
@@ -264,6 +265,24 @@ export function buildApp(deps: AppDeps): Hono {
         if (!r) return c.res;
         const limit = Math.min(Number(c.req.query("limit") ?? "200"), 1000);
         return c.json({ nav: await r.listNav(limit) });
+    });
+
+    // Equity curve + performance KPIs over nav_history (demo/live only — paper has no NAV history).
+    // Honest realised return + drawdown only; annualised Sharpe/vol live in the backtest validator.
+    app.get("/admin/api/trading/equity", async (c) => {
+        const r = needReconcile(c);
+        if (!r) return c.res;
+        const days = Math.min(Math.max(Number(c.req.query("days") ?? "90"), 1), 365);
+        const rows = await r.listNav(Math.min(days * 8, 2000));   // ~6 snapshots/day; pull generously
+        const cutoff = Date.now() - days * 86_400_000;
+        const series = rows
+            .map((row) => ({
+                t: new Date(row.snapshot_at as string).getTime(),
+                nav: Number(row.nav), cash: Number(row.cash), positionsValue: Number(row.positions_value),
+            }))
+            .filter((p) => Number.isFinite(p.t) && p.t >= cutoff)
+            .sort((a, b) => a.t - b.t);                            // listNav is DESC → re-order ASC
+        return c.json({ ...computeEquityKpis(series), days });
     });
 
     // ── TCA (transaction-cost analysis) ─────────────────────────────────────────
