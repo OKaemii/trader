@@ -5,6 +5,7 @@ import type { TradingServiceClient } from '@trader/contracts';
 import { sumPositionsGBP, type FxConverter, type PositionDoc } from '@trader/shared-portfolio';
 import { CircuitBreakerRedis } from '../infrastructure/CircuitBreakerRedis.ts';
 import { OperatorControls } from '../infrastructure/OperatorControls.ts';
+import { RiskLimitsProvider, type RiskLimits, type RiskLimitsOverride } from '../infrastructure/RiskLimitsProvider.ts';
 import { RISK_LIMITS } from '../../signals/application/LongOnlyOptimiser.ts';
 import type { TripRecorder, TripContext } from './TripRecorder.ts';
 import type { ISignalRepository } from '../../signals/domain/ISignalRepository.ts';
@@ -19,7 +20,7 @@ export interface RiskStatus {
   drawdown_from_hwm_pct: number;
   rejections_today: number;
   confidence_decay_factor: number;  // 1.0 = fresh model, 0.0 = stale (>120 days)
-  limits: typeof RISK_LIMITS;
+  limits: RiskLimits;               // effective (overrides overlaid on RISK_LIMITS defaults)
   checked_at: number;
 }
 
@@ -59,6 +60,7 @@ export class RiskEngine {
   private readonly positions: Collection;
   private readonly cb: CircuitBreakerRedis;
   private readonly ops: OperatorControls;
+  private readonly riskLimits: RiskLimitsProvider;
 
   private _state: RiskState = {
     _id: 'singleton',
@@ -90,6 +92,7 @@ export class RiskEngine {
     this.positions  = db.collection('positions');
     this.cb         = new CircuitBreakerRedis(redis);
     this.ops        = new OperatorControls(redis);
+    this.riskLimits = new RiskLimitsProvider(db, logger);
   }
 
   // Wired post-construction because TripRecorder needs the signal repo, and the repo
@@ -204,8 +207,11 @@ export class RiskEngine {
       ? (this._state.hwm - nav) / this._state.hwm
       : 0;
 
-    if (dailyLossPct > RISK_LIMITS.maxDailyLoss) {
-      const reasonText = `Daily loss ${(dailyLossPct * 100).toFixed(2)}% exceeds ${(RISK_LIMITS.maxDailyLoss * 100).toFixed(0)}% limit`;
+    // Operator-tunable halt thresholds (portal_risk_config); 15s-cached overlay on RISK_LIMITS.
+    const limits = await this.riskLimits.effective();
+
+    if (dailyLossPct > limits.maxDailyLoss) {
+      const reasonText = `Daily loss ${(dailyLossPct * 100).toFixed(2)}% exceeds ${(limits.maxDailyLoss * 100).toFixed(0)}% limit`;
       await this._onTrip({
         reason: 'DAILY_LOSS_HALT', reasonText,
         nav, hwm: this._state.hwm, dayOpenNav: this._state.day_open_nav,
@@ -214,8 +220,8 @@ export class RiskEngine {
       return { allowed: false, reason: reasonText };
     }
 
-    if (drawdownPct > RISK_LIMITS.maxDrawdownHalt) {
-      const reasonText = `Drawdown ${(drawdownPct * 100).toFixed(2)}% exceeds ${(RISK_LIMITS.maxDrawdownHalt * 100).toFixed(0)}% HWM limit`;
+    if (drawdownPct > limits.maxDrawdownHalt) {
+      const reasonText = `Drawdown ${(drawdownPct * 100).toFixed(2)}% exceeds ${(limits.maxDrawdownHalt * 100).toFixed(0)}% HWM limit`;
       await this._onTrip({
         reason: 'DRAWDOWN_HALT', reasonText,
         nav, hwm: this._state.hwm, dayOpenNav: this._state.day_open_nav,
@@ -246,6 +252,33 @@ export class RiskEngine {
     this.logger.warn({ on }, on ? 'strategy emission PAUSED' : 'strategy emission resumed');
   }
 
+  // ── Risk limits (operator-tunable, hot via portal_risk_config) ────────────────────
+  /** Effective limits used by the optimiser caps + circuit-breaker thresholds (15s-cached). */
+  async effectiveLimits(): Promise<RiskLimits> {
+    return this.riskLimits.effective();
+  }
+
+  /** Admin read: effective + raw overrides + compile-time defaults + tunable field list + bounds. */
+  async riskLimitsView() {
+    const [effective, overrides] = await Promise.all([
+      this.riskLimits.effective(),
+      this.riskLimits.overrides(),
+    ]);
+    return { effective, overrides, ...this.riskLimits.defaults() };
+  }
+
+  /** Admin write: validate + persist overrides, drop cache, return the new effective limits. */
+  async setRiskLimits(next: RiskLimitsOverride): Promise<{ effective: RiskLimits; overrides: RiskLimitsOverride }> {
+    const result = await this.riskLimits.setOverrides(next);
+    this.logger.warn({ overrides: result.overrides }, 'risk limits updated from portal');
+    return result;
+  }
+
+  /** Drop the local cache — called from the config:invalidated subscription (cross-pod refresh). */
+  invalidateRiskLimits(): void {
+    this.riskLimits.invalidate();
+  }
+
   // Public NAV accessor — used by GenerateSignals to scale `top_k` with portfolio size.
   // Returns 0 when the underlying read is incomplete (cash fetch failed, FX unavailable);
   // callers must treat that as "no signal" and fall back to the strategy-emitted top_k.
@@ -271,6 +304,7 @@ export class RiskEngine {
       : 0;
 
     const { open, reason } = await this.cb.isOpen();
+    const limits = await this.riskLimits.effective();
 
     return {
       circuit_open:            open,
@@ -281,7 +315,7 @@ export class RiskEngine {
       drawdown_from_hwm_pct:   drawdownPct,
       rejections_today:        this._rejectionsToday,
       confidence_decay_factor: this.confidenceDecayFactor(),
-      limits:                  RISK_LIMITS,
+      limits,
       checked_at:              Date.now(),
     };
   }

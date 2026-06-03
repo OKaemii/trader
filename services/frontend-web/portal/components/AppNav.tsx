@@ -14,6 +14,7 @@ const links = [
   { href: '/scanner', label: 'Scanner' },
   { href: '/market-data', label: 'Market Data' },
   { href: '/operations/console', label: 'Console' },
+  { href: '/operations/risk-limits', label: 'Risk Limits' },
   { href: '/operations/reconciliation', label: 'Reconciliation' },
   { href: '/operations/tca', label: 'TCA' },
 ]

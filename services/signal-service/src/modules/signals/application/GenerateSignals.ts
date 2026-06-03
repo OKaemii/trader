@@ -150,6 +150,12 @@ export class GenerateSignalsUseCase {
       }
     }
 
+    // Operator-tunable optimiser caps (portal_risk_config, hot). Absent/mock ⇒ solveLongOnly uses
+    // the RISK_LIMITS defaults. Defensive typeof guard keeps existing RiskEngine test mocks working.
+    const limits = typeof this.riskEngine.effectiveLimits === 'function'
+      ? await this.riskEngine.effectiveLimits().catch(() => null)
+      : null;
+
     const { weights: rawWeights, stabilityWarnings, uncertainty } =
       this.portfolioConstructor.construct(
         {
@@ -159,6 +165,11 @@ export class GenerateSignalsUseCase {
           currentWeights: features.ticker_universe.map((t) => currentWeights[t] ?? 0),
           targetVol: this.config.volTarget,
           covariance: features.covariance_matrix,
+          ...(limits ? {
+            maxSingleName: limits.maxSingleName,
+            maxSectorConcentration: limits.maxSectorConcentration,
+            maxWeeklyTurnover: limits.maxWeeklyTurnover,
+          } : {}),
           ...(effectiveTopK > 0 ? { topK: effectiveTopK } : {}),
           ...(isInverseVol ? {
             weighting,
