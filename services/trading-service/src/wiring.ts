@@ -13,7 +13,7 @@ import { MongoOrderRepository } from "./modules/orders/infrastructure/MongoOrder
 import { AccountCache } from "./modules/orders/infrastructure/AccountCache.ts";
 import { OrderDispatcher } from "./modules/orders/infrastructure/OrderDispatcher.ts";
 import { FillsPoller } from "./modules/fills/application/FillsPoller.ts";
-import { FillsHistoryStore } from "./modules/reconciliation/infrastructure/FillsHistoryStore.ts";
+import { FillsHistoryStore, type FillFilter, type FillRow } from "./modules/reconciliation/infrastructure/FillsHistoryStore.ts";
 import { TcaWriter } from "./modules/tca/infrastructure/TcaWriter.ts";
 import { ReconciliationStore } from "./modules/reconciliation/infrastructure/ReconciliationStore.ts";
 import { T212HistoryWalker } from "./modules/reconciliation/infrastructure/T212HistoryWalker.ts";
@@ -116,6 +116,7 @@ export async function wireDependencies(env: TradingEnv, logger: Logger) {
         acknowledge: (findingId: number, by: string) => Promise<void>;
         listFindings: (openOnly: boolean, limit: number) => Promise<Record<string, unknown>[]>;
         listNav: (limit: number) => Promise<Record<string, unknown>[]>;
+        listFills: (f: FillFilter) => Promise<FillRow[]>;
     } | null = null;
 
     if (env.TRADING_MODE !== TradingMode.Paper) {
@@ -154,6 +155,7 @@ export async function wireDependencies(env: TradingEnv, logger: Logger) {
             acknowledge: (findingId, by) => reconcileStore.markResolution(findingId, 'operator_acknowledged', by),
             listFindings: (openOnly, limit) => reconcileStore.listFindings(openOnly, limit),
             listNav: (limit) => reconcileStore.listNav(limit),
+            listFills: (f) => fillsHistoryStore.listFills(f),
         };
     }
 

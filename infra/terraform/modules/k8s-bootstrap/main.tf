@@ -31,6 +31,11 @@ variable "deepseek_api_key" {
   default   = ""
 }
 variable "email_to" {}
+variable "alert_webhook_url" {
+  sensitive = true
+  default   = ""
+}
+variable "alert_email_to" { default = "" }
 variable "seed_admin_email" { default = "" }
 variable "seed_admin_password" {
   sensitive = true
@@ -58,10 +63,10 @@ resource "kubernetes_secret" "trader_secrets" {
     namespace = var.namespace
   }
   data = {
-    JWT_SECRET          = var.jwt_secret
-    INTERNAL_SECRET     = var.internal_secret
-    REDIS_PASSWORD      = var.redis_password
-    MONGODB_PASSWORD    = var.mongodb_password
+    JWT_SECRET           = var.jwt_secret
+    INTERNAL_SECRET      = var.internal_secret
+    REDIS_PASSWORD       = var.redis_password
+    MONGODB_PASSWORD     = var.mongodb_password
     TIMESCALEDB_PASSWORD = var.timescaledb_password
     T212_API_KEY         = var.t212_api_key
     T212_API_KEY_ID      = var.t212_api_key_id
@@ -71,9 +76,11 @@ resource "kubernetes_secret" "trader_secrets" {
     EODHD_API_KEY        = var.eodhd_api_key
     RESEND_API_KEY       = var.resend_api_key
     DEEPSEEK_API_KEY     = var.deepseek_api_key
-    EMAIL_TO            = var.email_to
-    SEED_ADMIN_EMAIL    = var.seed_admin_email
-    SEED_ADMIN_PASSWORD = var.seed_admin_password
+    EMAIL_TO             = var.email_to
+    ALERT_WEBHOOK_URL    = var.alert_webhook_url
+    ALERT_EMAIL_TO       = var.alert_email_to
+    SEED_ADMIN_EMAIL     = var.seed_admin_email
+    SEED_ADMIN_PASSWORD  = var.seed_admin_password
   }
   depends_on = [kubernetes_namespace.trader]
 }
