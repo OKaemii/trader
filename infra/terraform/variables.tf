@@ -59,6 +59,14 @@ variable "twelvedata_api_key" {
   default   = ""
 }
 
+// EODHD daily/EOD + market-scanner API key — powers the single universe source (screener),
+// the bulk-EOD daily feed, and long-range daily history (DAILY_HISTORY_PROVIDER=eodhd).
+// Injected into trader-secrets as EODHD_API_KEY; empty falls back to no EODHD data.
+variable "eodhd_api_key" {
+  sensitive = true
+  default   = ""
+}
+
 variable "resend_api_key" {
   sensitive = true
   default   = ""
@@ -74,6 +82,18 @@ variable "deepseek_api_key" {
 
 variable "email_to" {
   default = "panxiaqi@gmail.com"
+}
+
+// Operational alerting (G4). alert_webhook_url: a generic incoming-webhook URL (Slack/Discord/
+// custom) that receives `critical` alerts (circuit-breaker trip, kill-switch). Empty disables the
+// webhook channel. alert_email_to: recipient for warning+critical alert emails; empty ⇒ email_to.
+variable "alert_webhook_url" {
+  sensitive = true
+  default   = ""
+}
+
+variable "alert_email_to" {
+  default = ""
 }
 
 variable "seed_admin_email" {

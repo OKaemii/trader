@@ -82,6 +82,16 @@ spec:
             - name: ROLLING_WINDOW_BARS
               value: {{ .Values.global.env.rollingWindowBars | quote }}
             {{- end }}
+            # high_velocity_v1 tuning (code defaults apply when unset). MIN_MARKET_CAP_GBP also
+            # gates the eodhd_scan universe in market-data-service.
+            - name: MIN_MARKET_CAP_GBP
+              value: {{ .Values.global.env.minMarketCapGbp | default "5000000000" | quote }}
+            - name: HIGH_VELOCITY_TOP_N_MOMENTUM
+              value: {{ .Values.global.env.highVelocityTopN | default "30" | quote }}
+            - name: HIGH_VELOCITY_DROP_N_VOL
+              value: {{ .Values.global.env.highVelocityDropN | default "10" | quote }}
+            - name: HIGH_VELOCITY_VOL_LOOKBACK
+              value: {{ .Values.global.env.highVelocityVolLookback | default "90" | quote }}
           livenessProbe:
             httpGet:
               path: /healthz
@@ -186,6 +196,14 @@ spec:
             - name: ROLLING_WINDOW_BARS
               value: {{ $.Values.global.env.rollingWindowBars | quote }}
             {{- end }}
+            - name: MIN_MARKET_CAP_GBP
+              value: {{ $.Values.global.env.minMarketCapGbp | default "5000000000" | quote }}
+            - name: HIGH_VELOCITY_TOP_N_MOMENTUM
+              value: {{ $.Values.global.env.highVelocityTopN | default "30" | quote }}
+            - name: HIGH_VELOCITY_DROP_N_VOL
+              value: {{ $.Values.global.env.highVelocityDropN | default "10" | quote }}
+            - name: HIGH_VELOCITY_VOL_LOOKBACK
+              value: {{ $.Values.global.env.highVelocityVolLookback | default "90" | quote }}
             - name: SIGNAL_ORDER_TYPE
               value: {{ $.Values.global.env.signalOrderType | default "Limit" | quote }}
           livenessProbe:

@@ -132,6 +132,10 @@ export interface StrategyOutput {
   // below T212 per-instrument minQuantity → ZeroQuantity / min-quantity-exceeded failures.
   // Set per strategy; omitted/0 means "no truncation" (legacy behaviour).
   top_k?: number;
+  // Sizing intent: 'inverse_vol' (w ∝ 1/σ over the emitted held set; high_velocity_v1) skips
+  // score-proportional sizing, the sector cap, and NAV-adaptive top-K. Per-ticker σ rides in
+  // factor_attributions[t].volatility. Omitted ⇒ 'score_proportional' (default).
+  weighting?: 'score_proportional' | 'inverse_vol';
 }
 
 // TopologyFeatures — retained for backward-compatible dashboard reads only.
@@ -245,6 +249,26 @@ export const REDIS_STREAMS = {
   STRATEGY_OUTPUT:   'signals:strategy',     // strategy-engine → signal-service (shared, legacy)
   TRADE_SIGNALS:     'signals:trade',        // signal-service → notification-service
 } as const;
+
+// ── Operational alerts (G4) ──────────────────────────────────────────────────────────────
+// Best-effort pub/sub (deliberately NOT a durable stream): the authoritative record of an
+// alert-worthy event lives in its own store (circuit_breaker_trips, risk_rejections, …). This
+// topic only fans the event out to the operator's notification channels (webhook / email) for
+// "tell me now" delivery — a missed alert during a notification-service restart loses a ping, not
+// state. notification-service's AlertConsumer subscribes; any service can publish.
+export const ALERTS_TOPIC = 'alerts';
+
+export type AlertTier = 'info' | 'warning' | 'critical';
+
+export interface Alert {
+  tier: AlertTier;
+  kind: string;        // machine tag, e.g. 'circuit_breaker' | 'kill_switch' | 'strategy_decay'
+  title: string;       // one-line human summary
+  detail: string;      // longer human detail
+  source: string;      // emitting service, e.g. 'signal-service'
+  ts: number;          // epoch ms
+  meta?: Record<string, unknown> | undefined;
+}
 
 // Per-worker strategy output stream — `signals:strategy:{mode}:{strategyId}`. Each
 // strategy-engine worker writes here; signal-service multiplexes consumer groups across

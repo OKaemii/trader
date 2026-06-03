@@ -7,6 +7,7 @@ import { mintInternalJwt } from "@trader/shared-auth";
 import type { NotificationEnv } from "./env.ts";
 import { EmailSender } from "./modules/notifications/infrastructure/email.ts";
 import { PushSender } from "./modules/notifications/infrastructure/push.ts";
+import { WebhookSender } from "./modules/notifications/infrastructure/webhook.ts";
 import { DeepSeekClient } from "./modules/analysis/infrastructure/DeepSeekClient.ts";
 import { CompanyProfileService } from "./modules/analysis/application/CompanyProfileService.ts";
 import {
@@ -31,6 +32,7 @@ export interface NotificationDeps {
     readonly redis: Awaited<ReturnType<typeof getRedisClient>>;
     readonly email: EmailSender | null;
     readonly push: PushSender;
+    readonly webhook: WebhookSender | null;
     // Per-cycle analysis path. Both fields are nullable so the service still boots when
     // DEEPSEEK_API_KEY (or RESEND/EMAIL_TO) is missing — quick emails alone keep working.
     readonly analysisEmail: AnalysisEmailSender | null;
@@ -48,6 +50,10 @@ export async function wireDependencies(env: NotificationEnv, logger: Logger): Pr
     if (!email) logger.warn("RESEND_API_KEY or EMAIL_TO not set — email notifications disabled");
 
     const push = new PushSender(redis as never);
+
+    // Operational-alert webhook (G4) — optional; null disables the loud channel (email/log only).
+    const webhook = env.ALERT_WEBHOOK_URL ? new WebhookSender(env.ALERT_WEBHOOK_URL, logger) : null;
+    if (!webhook) logger.info("ALERT_WEBHOOK_URL not set — alert webhook channel disabled");
 
     // Per-cycle analysis path: needs DeepSeek (for company profiles + cycle narrative)
     // AND Resend (the email transport). If either is missing, we degrade to per-signal
@@ -131,5 +137,5 @@ export async function wireDependencies(env: NotificationEnv, logger: Logger): Pr
         }, "analysis email path disabled — missing one of DEEPSEEK_API_KEY/RESEND_API_KEY/EMAIL_TO");
     }
 
-    return { logger, env, redis, email, push, analysisEmail, analysisBatcher };
+    return { logger, env, redis, email, push, webhook, analysisEmail, analysisBatcher };
 }

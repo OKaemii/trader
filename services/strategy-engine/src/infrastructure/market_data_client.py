@@ -199,3 +199,27 @@ class MarketDataClient:
         # and we don't want a downstream mutation of the dict to leak back into the
         # next call's response.
         return dict(sectors)
+
+    async def fetch_fundamentals(self, tickers: list[str]) -> dict[str, dict[str, float]]:
+        """Per-ticker QMJ line items from market-data /internal/api/fundamentals, mapped to the
+        quant-core HistoryView.fundamentals shape (snake_case). The host attaches this for
+        quality-screening strategies (high_velocity_v1); fail-closed downstream on missing names."""
+        if not tickers:
+            return {}
+        url = f"{self._base_url}/internal/api/fundamentals?tickers={','.join(tickers)}"
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            r = await client.get(url, headers=self._auth_header())
+            r.raise_for_status()
+            payload = r.json()
+        out: dict[str, dict[str, float]] = {}
+        for t, d in (payload.get("fundamentals") or {}).items():
+            raw = d.get("raw") or {}
+            out[t] = {
+                "market_cap_gbp":      float(d.get("marketCapGbp") or 0.0),
+                "net_income":          float(raw.get("netIncome") or 0.0),
+                "total_equity":        float(raw.get("totalEquity") or 0.0),
+                "total_debt":          float(raw.get("totalDebt") or 0.0),
+                "current_assets":      float(raw.get("currentAssets") or 0.0),
+                "current_liabilities": float(raw.get("currentLiabilities") or 0.0),
+            }
+        return out

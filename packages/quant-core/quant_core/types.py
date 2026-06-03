@@ -42,3 +42,6 @@ class StrategyOutput:
     report_cadence: str = 'per_cycle'
     # Top-K positions the optimiser is allowed to hold (0 = no truncation).
     top_k: int = 0
+    # Sizing intent honoured by the optimiser: 'score_proportional' (default — solve_long_only)
+    # or 'inverse_vol' (w_i ∝ 1/σ_i over the emitted held set; high_velocity_v1).
+    weighting: str = 'score_proportional'

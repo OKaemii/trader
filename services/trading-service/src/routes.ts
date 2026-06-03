@@ -16,6 +16,9 @@ import { PlaceOrderUseCase } from "./modules/orders/application/PlaceOrderUseCas
 import { AccountCache } from "./modules/orders/infrastructure/AccountCache.ts";
 import { getSignalOrderType } from "./modules/orders/infrastructure/live-config.ts";
 import { TradingMode, type OrderType } from "./modules/orders/domain/Order.ts";
+import { FlattenAllUseCase } from "./modules/orders/application/FlattenAllUseCase.ts";
+import { computeEquityKpis } from "./modules/reconciliation/application/equity-kpis.ts";
+import type { FillFilter, FillRow } from "./modules/reconciliation/infrastructure/FillsHistoryStore.ts";
 
 // Live-trading admin approval gate. Stored in Redis so it survives restarts.
 const LIVE_GATE_KEY = "trading:live_approved";
@@ -27,6 +30,7 @@ export interface ReconcileRunner {
     acknowledge: (findingId: number, by: string) => Promise<void>;
     listFindings: (openOnly: boolean, limit: number) => Promise<Record<string, unknown>[]>;
     listNav: (limit: number) => Promise<Record<string, unknown>[]>;
+    listFills: (f: FillFilter) => Promise<FillRow[]>;
 }
 
 export interface AppDeps {
@@ -121,6 +125,18 @@ export function buildApp(deps: AppDeps): Hono {
         const redis = await deps.getRedis();
         const approved = !!(await redis.get(LIVE_GATE_KEY));
         return c.json({ trading_mode: modeName(tradingMode), live_gate_approved: approved });
+    });
+
+    // Flatten — cancel every resting order + market-sell every open position. The hard
+    // "get me out now" panic action. Demo/live only (no broker positions in Paper).
+    app.post("/admin/api/trading/flatten", async (c) => {
+        if (tradingMode === TradingMode.Paper) {
+            return c.json({ error: "flatten is a no-op in Paper mode (no broker positions)" }, 400);
+        }
+        const flatten = new FlattenAllUseCase(deps.client(), deps.logger ?? ({ warn() {} } as unknown as Logger));
+        const result = await flatten.execute();
+        deps.logger?.warn({ result }, "flatten endpoint invoked by admin");
+        return c.json({ ok: true, ...result });
     });
 
     // Admin manual order placement. Schema comes from @trader/contracts so the producer
@@ -251,6 +267,37 @@ export function buildApp(deps: AppDeps): Hono {
         if (!r) return c.res;
         const limit = Math.min(Number(c.req.query("limit") ?? "200"), 1000);
         return c.json({ nav: await r.listNav(limit) });
+    });
+
+    // Equity curve + performance KPIs over nav_history (demo/live only — paper has no NAV history).
+    // Honest realised return + drawdown only; annualised Sharpe/vol live in the backtest validator.
+    app.get("/admin/api/trading/equity", async (c) => {
+        const r = needReconcile(c);
+        if (!r) return c.res;
+        const days = Math.min(Math.max(Number(c.req.query("days") ?? "90"), 1), 365);
+        const rows = await r.listNav(Math.min(days * 8, 2000));   // ~6 snapshots/day; pull generously
+        const cutoff = Date.now() - days * 86_400_000;
+        const series = rows
+            .map((row) => ({
+                t: new Date(row.snapshot_at as string).getTime(),
+                nav: Number(row.nav), cash: Number(row.cash), positionsValue: Number(row.positions_value),
+            }))
+            .filter((p) => Number.isFinite(p.t) && p.t >= cutoff)
+            .sort((a, b) => a.t - b.t);                            // listNav is DESC → re-order ASC
+        return c.json({ ...computeEquityKpis(series), days });
+    });
+
+    // Trade audit — filterable fills ledger (demo/live; fills_history is FillsPoller-populated).
+    app.get("/admin/api/trading/fills", async (c) => {
+        const r = needReconcile(c);
+        if (!r) return c.res;
+        const ticker = c.req.query("ticker")?.trim().toUpperCase() || undefined;
+        const sideRaw = c.req.query("side");
+        const side = sideRaw === "BUY" || sideRaw === "SELL" ? sideRaw : undefined;
+        const days = Math.min(Math.max(Number(c.req.query("days") ?? "30"), 1), 365);
+        const limit = Math.min(Number(c.req.query("limit") ?? "200"), 1000);
+        const fills = await r.listFills({ ticker, side, sinceMs: Date.now() - days * 86_400_000, limit });
+        return c.json({ fills, days });
     });
 
     // ── TCA (transaction-cost analysis) ─────────────────────────────────────────

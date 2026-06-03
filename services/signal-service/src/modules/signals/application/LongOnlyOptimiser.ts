@@ -13,6 +13,16 @@ export interface RankingInput {
   // outside top-K go to weight=0 — produces clean SELLs for demoted holdings and
   // skips emission for new noise. 0 / undefined disables (legacy full-universe).
   topK?: number;
+  // Inverse-vol sizing (when weighting='inverse_vol'): per-ticker annualised σ aligned to
+  // `tickers`. PortfolioConstructor routes to solveInverseVol instead of solveLongOnly.
+  volatilities?: number[];
+  weighting?: 'score_proportional' | 'inverse_vol';
+  // Operator-tunable risk caps (signal-service RiskLimitsProvider → portal_risk_config). Absent ⇒
+  // the RISK_LIMITS compile-time defaults. Threaded in by GenerateSignals so the pure solver stays
+  // pure (no module-global mutation) while the caps stay hot-overridable from the portal.
+  maxSingleName?: number;
+  maxSectorConcentration?: number;
+  maxWeeklyTurnover?: number;
 }
 
 export const RISK_LIMITS = {
@@ -29,6 +39,10 @@ export const RISK_LIMITS = {
 export function solveLongOnly(input: RankingInput): number[] {
   const { scores, tickers, sectors, currentWeights, topK } = input;
   const n = tickers.length;
+  // Operator-tunable caps (portal_risk_config via RiskLimitsProvider); absent ⇒ RISK_LIMITS default.
+  const maxSingleName = input.maxSingleName ?? RISK_LIMITS.maxSingleName;
+  const maxSectorConcentration = input.maxSectorConcentration ?? RISK_LIMITS.maxSectorConcentration;
+  const maxWeeklyTurnover = input.maxWeeklyTurnover ?? RISK_LIMITS.maxWeeklyTurnover;
 
   // Step 1: Select names with positive composite scores (no synthetic shorts)
   let eligible = scores.map((s, i) => ({ score: s, i })).filter((x) => x.score > 0);
@@ -56,7 +70,7 @@ export function solveLongOnly(input: RankingInput): number[] {
   const rawWeights = new Array(n).fill(0);
   const posScoreSum = eligible.reduce((a, x) => a + x.score, 0);
   for (const { score, i } of eligible) {
-    rawWeights[i] = Math.min(score / posScoreSum, RISK_LIMITS.maxSingleName);
+    rawWeights[i] = Math.min(score / posScoreSum, maxSingleName);
   }
 
   // Step 3: Sector neutrality — cap each GICS sector at maxSectorConcentration
@@ -68,8 +82,8 @@ export function solveLongOnly(input: RankingInput): number[] {
   for (let i = 0; i < n; i++) {
     const sector = sectors[i] ?? 'UNKNOWN';
     const sectorTotal = sectorTotals[sector] ?? 0;
-    if (sectorTotal > RISK_LIMITS.maxSectorConcentration) {
-      rawWeights[i] = (rawWeights[i] ?? 0) * (RISK_LIMITS.maxSectorConcentration / sectorTotal);
+    if (sectorTotal > maxSectorConcentration) {
+      rawWeights[i] = (rawWeights[i] ?? 0) * (maxSectorConcentration / sectorTotal);
     }
   }
 
@@ -79,8 +93,8 @@ export function solveLongOnly(input: RankingInput): number[] {
 
   // Step 5: Turnover guard — blend toward current weights if turnover exceeds budget
   const turnover = normalised.reduce((a: number, w: number, i: number) => a + Math.abs(w - (currentWeights[i] ?? 0)), 0) / 2;
-  if (turnover > RISK_LIMITS.maxWeeklyTurnover) {
-    const blendFactor = RISK_LIMITS.maxWeeklyTurnover / turnover;
+  if (turnover > maxWeeklyTurnover) {
+    const blendFactor = maxWeeklyTurnover / turnover;
     return normalised.map((w: number, i: number) => blendFactor * w + (1 - blendFactor) * (currentWeights[i] ?? 0));
   }
 
