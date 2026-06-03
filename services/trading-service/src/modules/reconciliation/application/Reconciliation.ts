@@ -135,8 +135,13 @@ export class Reconciliation {
     }
 
     const positionsValue = await this.deps.valuePositionsGbp(t212Positions);
+    // NAV is the broker's authoritative `total`, which ALREADY includes the market value of open
+    // positions (free + invested + ppl). Adding positionsValue on top double-counts holdings — the
+    // bug that inflated nav_history the moment positions existed. Mirror RiskEngine._computeNav,
+    // which uses cash.total alone. `cash` records FREE cash so the portal's free/positions breakdown
+    // reconciles (free + positions ≈ total = nav) instead of contradicting the NAV.
     await this.deps.store.writeNav(occurredAt, {
-      cash: brokerCash.total, positionsValue, nav: brokerCash.total + positionsValue,
+      cash: brokerCash.free, positionsValue, nav: brokerCash.total,
     });
 
     let healed = 0;
