@@ -84,6 +84,18 @@ variable "email_to" {
   default = "panxiaqi@gmail.com"
 }
 
+// Operational alerting (G4). alert_webhook_url: a generic incoming-webhook URL (Slack/Discord/
+// custom) that receives `critical` alerts (circuit-breaker trip, kill-switch). Empty disables the
+// webhook channel. alert_email_to: recipient for warning+critical alert emails; empty ⇒ email_to.
+variable "alert_webhook_url" {
+  sensitive = true
+  default   = ""
+}
+
+variable "alert_email_to" {
+  default = ""
+}
+
 variable "seed_admin_email" {
   description = "Email of the admin account seeded on first auth-service startup. Leave empty to skip seeding."
   default     = ""
