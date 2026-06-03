@@ -20,6 +20,7 @@ function makeDeps(over: Partial<ReconciliationDeps> & {
   const alerts: number[] = [];
   const findingsWritten: Finding[] = [];
   let navWrites = 0;
+  let lastNav: { cash: number; positionsValue: number; nav: number } | null = null;
 
   const deps: ReconciliationDeps = {
     broker: {
@@ -37,7 +38,7 @@ function makeDeps(over: Partial<ReconciliationDeps> & {
     },
     store: {
       writeFinding: async (_c, _o, _e, f) => { findingsWritten.push(f); },
-      writeNav: async () => { navWrites += 1; },
+      writeNav: async (_at, n) => { navWrites += 1; lastNav = n; },
       readPriorCash: async () => (over.priorCash === undefined ? 1000 : over.priorCash),
     },
     healer: {
@@ -48,7 +49,7 @@ function makeDeps(over: Partial<ReconciliationDeps> & {
     valuePositionsGbp: async () => 110,
     autoHealEnabled: over.autoHealEnabled,
   };
-  return { deps, healCalls, orderHealCalls, alerts, findingsWritten, navWrites: () => navWrites };
+  return { deps, healCalls, orderHealCalls, alerts, findingsWritten, navWrites: () => navWrites, lastNav: () => lastNav };
 }
 
 describe('Reconciliation engine', () => {
@@ -95,5 +96,17 @@ describe('Reconciliation engine', () => {
     const summary = await new Reconciliation(h.deps).run(WINDOW);
     expect(summary.healed).toBe(0);
     expect(h.findingsWritten.every((f) => f.isClean || f.driftType === null)).toBe(true);
+  });
+
+  it('NAV snapshot uses broker total (no position double-count); cash records free', async () => {
+    // CASH = free 500 / total 1000 — total already includes positions; valuePositionsGbp → 110.
+    const h = makeDeps();
+    await new Reconciliation(h.deps).run(WINDOW);
+    const n = h.lastNav();
+    expect(n).not.toBeNull();
+    expect(n!.nav).toBe(1000);            // broker total — positions already included
+    expect(n!.nav).not.toBe(1110);        // regression: NOT total + positionsValue (old double-count)
+    expect(n!.cash).toBe(500);            // FREE cash, so free + positions reconciles to nav in the portal
+    expect(n!.positionsValue).toBe(110);
   });
 });
