@@ -9,7 +9,8 @@ import { RiskLimitsProvider, type RiskLimits, type RiskLimitsOverride } from '..
 import { RISK_LIMITS } from '../../signals/application/LongOnlyOptimiser.ts';
 import type { TripRecorder, TripContext } from './TripRecorder.ts';
 import type { ISignalRepository } from '../../signals/domain/ISignalRepository.ts';
-import { SignalFailureReason } from '@trader/shared-types';
+import { SignalFailureReason, ALERTS_TOPIC, type Alert } from '@trader/shared-types';
+import { publish } from '@trader/shared-redis';
 
 export interface RiskStatus {
   circuit_open: boolean;
@@ -82,7 +83,7 @@ export class RiskEngine {
 
   constructor(
     db: Db,
-    redis: RedisClientType,
+    private readonly redis: RedisClientType,
     private readonly fx: FxConverter,
     private readonly trading: TradingServiceClient,
     private readonly logger: Logger,
@@ -245,6 +246,7 @@ export class RiskEngine {
   async setKillSwitch(on: boolean): Promise<void> {
     await this.ops.setKillSwitch(on);
     this.logger.warn({ on }, on ? 'KILL SWITCH ENGAGED — halting new emission + dispatcher drain' : 'kill switch released');
+    if (on) this._emitAlert('critical', 'kill_switch', 'Kill switch engaged', 'Operator halted new emission AND the dispatcher drain.');
   }
 
   async setPaused(on: boolean): Promise<void> {
@@ -393,6 +395,11 @@ export class RiskEngine {
   private async _onTrip(ctx: TripContext): Promise<void> {
     await this.cb.trip(ctx.reasonText);
 
+    // Loud operational alert — the operator wants to know the moment the breaker fires.
+    this._emitAlert('critical', 'circuit_breaker', `Circuit breaker tripped: ${ctx.reason}`, ctx.reasonText, {
+      nav: ctx.nav, hwm: ctx.hwm, dailyLossPct: ctx.dailyLossPct, drawdownPct: ctx.drawdownPct,
+    });
+
     let cancelledIds: string[] = [];
     if (this.signalRepo) {
       try {
@@ -425,6 +432,15 @@ export class RiskEngine {
   private async _logRejection(reason: string, detail: Record<string, unknown>): Promise<void> {
     this._rejectionsToday++;
     await this.rejections.insertOne({ timestamp: Date.now(), reason, detail });
+  }
+
+  // Best-effort operational alert (G4) → `alerts` pub/sub topic, routed to channels by
+  // notification-service. Fire-and-forget: a publish failure must never affect the trip /
+  // kill-switch path that called it.
+  private _emitAlert(tier: Alert['tier'], kind: string, title: string, detail: string, meta?: Record<string, unknown>): void {
+    void publish(this.redis, ALERTS_TOPIC, {
+      tier, kind, title, detail, source: 'signal-service', ts: Date.now(), meta,
+    } satisfies Alert).catch((err) => this.logger.warn({ err, kind }, 'alert publish failed'));
   }
 
   private async _persistState(): Promise<void> {

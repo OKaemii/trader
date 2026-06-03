@@ -23,6 +23,12 @@ const EnvSchema = z.object({
     EMAIL_FROM:     z.string().email().optional(),
     EMAIL_TO:       z.string().email().optional(),
 
+    // Operational alerting (G4). ALERT_WEBHOOK_URL: a generic incoming-webhook URL (Slack/Discord/
+    // custom) that receives `critical` alerts. Empty disables the webhook channel. ALERT_EMAIL_TO:
+    // recipient for `warning`+`critical` alert emails; falls back to EMAIL_TO when unset.
+    ALERT_WEBHOOK_URL: z.string().url().optional(),
+    ALERT_EMAIL_TO:    z.string().email().optional(),
+
     // DeepSeek API key. When set, notification-service runs a per-cycle batcher that
     // sends ONE enriched analysis email per strategy cycle (covering all picks together
     // with company profiles + sector-relative reasoning). Empty disables the analysis
