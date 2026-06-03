@@ -121,6 +121,8 @@ def _init_backtest_worker(ctx: dict) -> None:
     reader = InMemoryBarsReader(ctx['bars'])
     prices = {t: PriceSeries.from_bars(b) for t, b in ctx['bars'].items()}
     _BT_CTX = {**ctx, '_reader': reader, '_prices': prices}
+    from quant_core.wiring import set_replay_fundamentals
+    set_replay_fundamentals(ctx.get('fundamentals'))   # point-in-time-approx QMJ snapshot (spawn-safe)
 
 
 def _backtest_isfit_worker(task):
@@ -191,8 +193,17 @@ async def _load_backtest_history(db, req: dict) -> dict:
             bars[t] = b
     bench_bars = await reader.daily_bars(benchmark, start, end)
 
+    # Point-in-time-approximate fundamentals for high_velocity's QMJ screen (Yahoo has no as-of
+    # fundamentals → current snapshot applied historically; stamped in data_source).
+    fundamentals_snapshot: dict = {}
+    if strategy_id == 'high_velocity_v1':
+        from ..infrastructure.fundamentals_loader import load_fundamentals_snapshot
+        fundamentals_snapshot = await load_fundamentals_snapshot(list(bars.keys()))
+        data_source += "; fundamentals=point_in_time_approximate (current company_fundamentals applied historically)"
+
     return {
         'bars': bars, 'bench_bars': bench_bars or [], 'folds': folds, 'grid': grid,
+        'fundamentals': fundamentals_snapshot,
         'ablations': _ablation_param_sets(strategy_id), 'strategy_id': strategy_id,
         'ppy': ppy, 'step': step, 'rt': float(os.getenv('BACKTEST_ROUND_TRIP_BPS', '12')),
         'universe': list(bars.keys()), 'benchmark': benchmark, 'data_source': data_source,
