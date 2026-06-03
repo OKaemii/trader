@@ -18,6 +18,9 @@ interface Deps {
   signalRepo: ISignalRepository;
   riskEngine: RiskEngine;
   tripRecorder: TripRecorder;
+  // Broadcasts config:invalidated on a risk-limits PUT (cross-pod cache refresh). Optional so
+  // unit tests that build a partial Deps don't have to stub the pubsub bus.
+  publishConfigInvalidated?: () => Promise<void>;
 }
 
 /**
@@ -140,6 +143,26 @@ export function createRouter(deps: Deps): Hono {
     if (typeof on !== 'boolean') return c.json({ error: 'body { on: boolean } required' }, 400);
     await deps.riskEngine.setPaused(on);
     return c.json({ paused: on, ts: Date.now() });
+  });
+
+  // Operator-tunable risk limits (portal_risk_config). GET → effective + raw overrides + defaults +
+  // tunable field list + bounds for the editor. PUT { overrides:{field:number} } validates +
+  // bounds-checks + persists, drops the local cache, and broadcasts config:invalidated so other
+  // pods refresh before the 15s TTL. Invalid/out-of-range fields are dropped (prior value stands).
+  router.get('/admin/api/signals/risk/limits', async (c) => {
+    return c.json(await deps.riskEngine.riskLimitsView());
+  });
+  router.put('/admin/api/signals/risk/limits', async (c) => {
+    const body = await c.req.json().catch(() => null) as Record<string, unknown> | null;
+    const overrides = body && typeof body === 'object'
+      ? ((body.overrides ?? body) as Record<string, number>)
+      : null;
+    if (!overrides || typeof overrides !== 'object') {
+      return c.json({ error: 'body { overrides: { field: number } } required' }, 400);
+    }
+    const result = await deps.riskEngine.setRiskLimits(overrides);
+    await deps.publishConfigInvalidated?.();
+    return c.json({ ...result, ts: Date.now() });
   });
 
   // Post-mortem list — one row per historical trip. Lean projection (no positions,

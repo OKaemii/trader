@@ -250,6 +250,26 @@ export const REDIS_STREAMS = {
   TRADE_SIGNALS:     'signals:trade',        // signal-service → notification-service
 } as const;
 
+// ── Operational alerts (G4) ──────────────────────────────────────────────────────────────
+// Best-effort pub/sub (deliberately NOT a durable stream): the authoritative record of an
+// alert-worthy event lives in its own store (circuit_breaker_trips, risk_rejections, …). This
+// topic only fans the event out to the operator's notification channels (webhook / email) for
+// "tell me now" delivery — a missed alert during a notification-service restart loses a ping, not
+// state. notification-service's AlertConsumer subscribes; any service can publish.
+export const ALERTS_TOPIC = 'alerts';
+
+export type AlertTier = 'info' | 'warning' | 'critical';
+
+export interface Alert {
+  tier: AlertTier;
+  kind: string;        // machine tag, e.g. 'circuit_breaker' | 'kill_switch' | 'strategy_decay'
+  title: string;       // one-line human summary
+  detail: string;      // longer human detail
+  source: string;      // emitting service, e.g. 'signal-service'
+  ts: number;          // epoch ms
+  meta?: Record<string, unknown> | undefined;
+}
+
 // Per-worker strategy output stream — `signals:strategy:{mode}:{strategyId}`. Each
 // strategy-engine worker writes here; signal-service multiplexes consumer groups across
 // the active set. Producers should resolve the topic via `strategyOutputStream(mode, id)`
