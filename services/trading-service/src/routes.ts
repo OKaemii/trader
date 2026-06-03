@@ -18,6 +18,7 @@ import { getSignalOrderType } from "./modules/orders/infrastructure/live-config.
 import { TradingMode, type OrderType } from "./modules/orders/domain/Order.ts";
 import { FlattenAllUseCase } from "./modules/orders/application/FlattenAllUseCase.ts";
 import { computeEquityKpis } from "./modules/reconciliation/application/equity-kpis.ts";
+import type { FillFilter, FillRow } from "./modules/reconciliation/infrastructure/FillsHistoryStore.ts";
 
 // Live-trading admin approval gate. Stored in Redis so it survives restarts.
 const LIVE_GATE_KEY = "trading:live_approved";
@@ -29,6 +30,7 @@ export interface ReconcileRunner {
     acknowledge: (findingId: number, by: string) => Promise<void>;
     listFindings: (openOnly: boolean, limit: number) => Promise<Record<string, unknown>[]>;
     listNav: (limit: number) => Promise<Record<string, unknown>[]>;
+    listFills: (f: FillFilter) => Promise<FillRow[]>;
 }
 
 export interface AppDeps {
@@ -283,6 +285,19 @@ export function buildApp(deps: AppDeps): Hono {
             .filter((p) => Number.isFinite(p.t) && p.t >= cutoff)
             .sort((a, b) => a.t - b.t);                            // listNav is DESC → re-order ASC
         return c.json({ ...computeEquityKpis(series), days });
+    });
+
+    // Trade audit — filterable fills ledger (demo/live; fills_history is FillsPoller-populated).
+    app.get("/admin/api/trading/fills", async (c) => {
+        const r = needReconcile(c);
+        if (!r) return c.res;
+        const ticker = c.req.query("ticker")?.trim().toUpperCase() || undefined;
+        const sideRaw = c.req.query("side");
+        const side = sideRaw === "BUY" || sideRaw === "SELL" ? sideRaw : undefined;
+        const days = Math.min(Math.max(Number(c.req.query("days") ?? "30"), 1), 365);
+        const limit = Math.min(Number(c.req.query("limit") ?? "200"), 1000);
+        const fills = await r.listFills({ ticker, side, sinceMs: Date.now() - days * 86_400_000, limit });
+        return c.json({ fills, days });
     });
 
     // ── TCA (transaction-cost analysis) ─────────────────────────────────────────
