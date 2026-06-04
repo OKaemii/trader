@@ -10,6 +10,7 @@ This module is deliberately thin — the backtest orchestration lives in `applic
 and the validator in `application/validator.py`, so the process-pool workers import those
 side-effect-free modules rather than this FastAPI app.
 """
+import asyncio
 import inspect
 import os
 from contextlib import asynccontextmanager
@@ -20,6 +21,8 @@ import motor.motor_asyncio
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+
+from .infrastructure.deepseek_explainer import explain_report, is_available as deepseek_available
 
 from .application.backtest_run import (
     DEFAULT_SP100, _backtest_summary_row, _load_backtest_history, run_backtest_job,
@@ -115,7 +118,16 @@ def _summary_row(report: dict) -> dict:
 
 
 async def _mcpt_summarize(db, report: dict) -> None:
-    await db['backtest_results'].insert_one(_summary_row(report))
+    row = _summary_row(report)
+    # Best-effort plain-English interpretation, cached on the row so the portal never re-queries
+    # the LLM. A DeepSeek hiccup must never block the report from being recorded.
+    try:
+        explanation = await asyncio.to_thread(explain_report, row)
+        if explanation:
+            row['ai_explanation'] = explanation
+    except Exception as exc:   # noqa: BLE001
+        print(f"[backtest-engine] ai explanation skipped: {exc!r}", flush=True)
+    await db['backtest_results'].insert_one(row)
 
 
 @asynccontextmanager
@@ -274,7 +286,31 @@ async def get_results(strategy_id: str = '', limit: int = 10):
         r.pop('_id', None)
         if 'run_at' in r and hasattr(r['run_at'], 'isoformat'):
             r['run_at'] = r['run_at'].isoformat()
+        expl = r.get('ai_explanation')
+        if isinstance(expl, dict) and hasattr(expl.get('generated_at'), 'isoformat'):
+            expl['generated_at'] = expl['generated_at'].isoformat()
     return {'results': results}
+
+
+@app.post('/admin/api/backtest/results/explain')
+async def explain_results(limit: int = 10):
+    """Generate + cache a DeepSeek plain-English explanation for the most recent reports that don't
+    have one yet. On-demand backfill: the portal calls this once and every report gains a 'What this
+    means' write-up stored on its row (so we never re-query the LLM). No-op without DEEPSEEK_API_KEY."""
+    if not deepseek_available():
+        return {'explained': 0, 'available': False,
+                'detail': 'DEEPSEEK_API_KEY not set on backtest-engine'}
+    rows = await _db['backtest_results'].find(
+        {'ai_explanation': {'$exists': False}},
+    ).sort('run_at', -1).limit(max(1, min(limit, 25))).to_list(length=limit)
+    explained = 0
+    for r in rows:
+        explanation = await asyncio.to_thread(explain_report, r)
+        if not explanation:
+            continue
+        await _db['backtest_results'].update_one({'_id': r['_id']}, {'$set': {'ai_explanation': explanation}})
+        explained += 1
+    return {'explained': explained, 'available': True, 'scanned': len(rows)}
 
 
 def _health():
