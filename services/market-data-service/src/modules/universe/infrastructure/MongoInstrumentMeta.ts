@@ -17,7 +17,7 @@
 import { Db, Collection } from 'mongodb';
 import { COLLECTIONS } from '@trader/shared-mongo';
 
-export type InstrumentMetaSource = 'yahoo' | 'manual';
+export type InstrumentMetaSource = 'yahoo' | 'manual' | 'eodhd';
 
 export interface InstrumentMetaDoc {
   _id:       string;          // ticker

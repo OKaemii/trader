@@ -43,13 +43,13 @@ describe('eodhd-client', () => {
 
   it('screener parses rows, drops codeless rows, attaches api_token/fmt', async () => {
     spy = installFetch(() => ({ data: [
-      { code: 'AAPL', name: 'Apple', exchange: 'US', market_capitalization: 3.2e12, currency_symbol: 'USD' },
+      { code: 'AAPL', name: 'Apple', exchange: 'US', market_capitalization: 3.2e12, currency_symbol: 'USD', sector: 'Technology' },
       { code: '', name: 'junk' },
     ] }));
     const c = new EodhdClient({ apiKey: 'k', callsPerMinute: 1000, dailyCallLimit: 1000 });
     const rows = await c.screener([['market_capitalization', '>', 6e9]], 'market_capitalization.desc', 100, 0);
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ code: 'AAPL', exchange: 'US', marketCap: 3.2e12, currency: 'USD' });
+    expect(rows[0]).toMatchObject({ code: 'AAPL', exchange: 'US', marketCap: 3.2e12, currency: 'USD', sector: 'Technology' });
     const q = paramsOf(spy!.calls[0]!.url);
     expect(q.get('api_token')).toBe('k');
     expect(q.get('fmt')).toBe('json');

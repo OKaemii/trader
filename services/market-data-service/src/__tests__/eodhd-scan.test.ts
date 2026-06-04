@@ -25,13 +25,14 @@ const T212: T212Instrument[] = [
 describe('mapEodhdToT212', () => {
   it('maps US/LSE candidates to tradeable T212 tickers and drops untradeable / unknown', () => {
     const { mapped, dropped } = mapEodhdToT212([
-      { code: 'AAPL', name: 'Apple',  exchange: 'US',  marketCapGbp: 3e12 },
+      { code: 'AAPL', name: 'Apple',  exchange: 'US',  marketCapGbp: 3e12, sector: 'Technology' },
       { code: 'HSBA', name: 'HSBC',   exchange: 'LSE', marketCapGbp: 1e11 },
       { code: 'NOPE', name: 'Ghost',  exchange: 'US',  marketCapGbp: 9e9 },   // not on T212
       { code: 'BRK',  name: 'Berk',   exchange: 'XETRA', marketCapGbp: 9e11 }, // unknown exchange
     ], T212);
     expect(mapped.map((m) => m.ticker)).toEqual(['AAPL_US_EQ', 'HSBAl_EQ']);
     expect(mapped[0]!.eodhdSymbol).toBe('AAPL.US');
+    expect(mapped[0]!.sector).toBe('Technology');   // sector threaded from the screener candidate
     expect(mapped[1]!.eodhdSymbol).toBe('HSBA.LSE');
     expect(dropped).toBe(2);
   });
@@ -49,7 +50,7 @@ describe('fetchEodhdCapScan', () => {
 
   it('FX-normalises cap to GBP and keeps only names >= minCapGbp', async () => {
     spy = installFetch({ data: [
-      { code: 'BIG',   name: 'Big',   exchange: 'US', market_capitalization: 1e10, currency_symbol: 'USD' }, // £8e9 → keep
+      { code: 'BIG',   name: 'Big',   exchange: 'US', market_capitalization: 1e10, currency_symbol: 'USD', sector: 'Technology' }, // £8e9 → keep
       { code: 'SMALL', name: 'Small', exchange: 'US', market_capitalization: 4e9,  currency_symbol: 'USD' }, // £3.2e9 → drop
     ] });
     configureEodhdClient({ apiKey: 'k', callsPerMinute: 1000, dailyCallLimit: 1000 });
@@ -57,6 +58,7 @@ describe('fetchEodhdCapScan', () => {
     const out = await fetchEodhdCapScan({ minCapGbp: 5e9, exchanges: ['US'], fxToGBP: fx });
     expect(out.map((c) => c.code)).toEqual(['BIG']);
     expect(out[0]!.marketCapGbp).toBeCloseTo(8e9, 0);
+    expect(out[0]!.sector).toBe('Technology');   // sector carried from the EODHD screener row
     expect(spy!.calls).toHaveLength(1);   // one page (2 rows < 100) → no further pagination
   });
 });
