@@ -74,6 +74,7 @@ export interface EodhdScreenerRow {
   exchange: string;        // e.g. 'US' | 'LSE'
   marketCap: number;       // in the listing currency (FX-normalised by the caller)
   currency?: string;       // currency_symbol, when present
+  sector?: string;         // GICS-ish sector from the screener — sourced for free (no Yahoo)
 }
 
 export interface EodhdClientOptions {
@@ -143,6 +144,7 @@ export class EodhdClient {
         exchange:  String(d.exchange ?? ''),
         marketCap: numOr(d.market_capitalization, 0),
         ...(typeof d.currency_symbol === 'string' ? { currency: d.currency_symbol } : {}),
+        ...(typeof d.sector === 'string' && d.sector ? { sector: d.sector } : {}),
       }))
       .filter((r) => r.code !== '');
   }
