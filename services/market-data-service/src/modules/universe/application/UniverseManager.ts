@@ -273,11 +273,40 @@ async function selectCurated(
 }
 
 /**
+ * Balance an eodhd_scan selection evenly across US and LSE. A naive global market-cap sort yields
+ * a ~95% US universe (US caps dwarf UK — even the smallest S&P name outweighs most of the FTSE),
+ * which defeats the point of holding a UK book. We instead target `maxSize/2` names per market by
+ * descending cap, then backfill the deficit from whichever market has names to spare when the
+ * other is short of its half (e.g. fewer than `maxSize/2` UK names clear the £5B floor). The
+ * result is capped at `maxSize`, US-block first then LSE-block. Pure + exported for unit testing.
+ */
+export function balanceByMarket<T extends { market: 'US' | 'LSE'; marketCapGbp: number }>(
+  items: T[],
+  maxSize: number,
+): T[] {
+  if (maxSize <= 0) return [];
+  const byCap = (a: T, b: T) => b.marketCapGbp - a.marketCapGbp;
+  const us  = items.filter((i) => i.market === 'US').sort(byCap);
+  const lse = items.filter((i) => i.market === 'LSE').sort(byCap);
+  const perMarket = Math.floor(maxSize / 2);
+  const usPick  = us.slice(0, perMarket);
+  const lsePick = lse.slice(0, perMarket);
+  const result = [...usPick, ...lsePick];
+  if (result.length < maxSize) {
+    // One market was short of its half — backfill from the other market's overflow, highest cap first.
+    const overflow = [...us.slice(usPick.length), ...lse.slice(lsePick.length)].sort(byCap);
+    result.push(...overflow.slice(0, maxSize - result.length));
+  }
+  return result;
+}
+
+/**
  * EODHD-scan universe source. Scans every US+LSE name >= minCapGbp via the EODHD screener,
- * maps to tradeable T212 tickers, dedupes by ticker, and ranks by market cap (a sound liquidity
- * proxy at the >=£5B floor — avoids N per-name ADV calls). Returns at most maxSize. Sector
- * enrichment, portal overrides, and the registry diff happen in refresh() exactly as for the
- * curated source — this only swaps the candidate source. ONE active universe, no parallel pool.
+ * maps to tradeable T212 tickers, dedupes by ticker, and selects a market-balanced top set
+ * (100 US / 100 LSE at maxSize=200, via balanceByMarket — market cap is a sound liquidity proxy
+ * at the >=£5B floor, avoiding N per-name ADV calls). Sector enrichment, portal overrides, and the
+ * registry diff happen in refresh() exactly as for the curated source — this only swaps the
+ * candidate source. ONE active universe, no parallel pool.
  */
 async function selectFromEodhdScan(
   rawInstruments: Awaited<ReturnType<typeof fetchT212Instruments>>,
@@ -293,12 +322,12 @@ async function selectFromEodhdScan(
     const prev = byTicker.get(m.ticker);
     if (!prev || m.marketCapGbp > prev.marketCapGbp) byTicker.set(m.ticker, m);
   }
-  const ranked = [...byTicker.values()]
-    .sort((a, b) => b.marketCapGbp - a.marketCapGbp)
-    .slice(0, config.maxSize);
+  const balanced = balanceByMarket([...byTicker.values()], config.maxSize);
+  const usCount  = balanced.filter((m) => m.market === 'US').length;
+  const lseCount = balanced.length - usCount;
 
-  log.info(`[universe] eodhd_scan: ${candidates.length} >= £${(config.minCapGbp / 1e9).toFixed(1)}B, ${mapped.length} tradeable (${dropped} dropped), ${ranked.length} selected (cap ${config.maxSize})`);
-  return ranked.map((m) => ({
+  log.info(`[universe] eodhd_scan: ${candidates.length} >= £${(config.minCapGbp / 1e9).toFixed(1)}B, ${mapped.length} tradeable (${dropped} dropped), ${balanced.length} selected (${usCount} US / ${lseCount} LSE, cap ${config.maxSize})`);
+  return balanced.map((m) => ({
     ticker:       m.ticker,
     name:         m.name,
     // Sector comes straight from the EODHD screener row (no Yahoo). refresh() step 4c
@@ -573,9 +602,12 @@ export class UniverseManager {
       log.info(`[universe] added ${added.length} instruments: ${added.map((i) => i.ticker).join(', ')}`);
     }
 
-    // Refresh ADV + market on every surviving entry so the portal table doesn't show
-    // stale liquidity. Skip when fields are undefined (legacy path) so we don't blow
-    // away a known value with an empty one.
+    // Refresh ADV + market + sector on every surviving entry so the portal table doesn't show
+    // stale liquidity or a stale sector. Skip when fields are undefined (legacy path) so we don't
+    // blow away a known value with an empty one. The sector backfill matters because the EODHD
+    // screener source (PR #8) only stamped sectors on *newly inserted* rows — rows already active
+    // when the fix landed kept the 'Unknown' placeholder. Only write a *resolved* sector so a
+    // transient screener/Yahoo miss never wipes a previously-good label.
     const refreshUpdates = selected.filter((i) => i.adv != null || i.market != null);
     for (const i of refreshUpdates) {
       await db.collection(COLLECTIONS.INSTRUMENT_REGISTRY).updateOne(
@@ -583,6 +615,7 @@ export class UniverseManager {
         { $set: {
           ...(i.market != null ? { market: i.market } : {}),
           ...(i.adv != null    ? { adv: i.adv }       : {}),
+          ...(i.sector && i.sector !== 'Unknown' ? { sector: i.sector } : {}),
           updatedAt: now,
         }},
       );
