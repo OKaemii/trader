@@ -1,10 +1,20 @@
 import { getUniverseOverrides } from '@/app/actions/admin'
+import { authedFetch } from '@/app/lib/auth-fetch'
 import { UniverseEditor } from './UniverseEditor'
+import { ScannerPanel } from './ScannerPanel'
 import { UniverseOverview } from '@/components/UniverseOverview'
 import { BarHistoryExplorer } from '@/components/BarHistoryExplorer'
 
+// Universe = the single EODHD-fed scan. The market scanner (cap → QMJ funnel, per-name table, the
+// strategy's selected basket) was previously a separate /scanner page — consolidated here so there
+// is one place to see what the universe is and why each name is in it. SSR-seed everything.
 export default async function UniversePage() {
-  const result = await getUniverseOverrides()
+  const [result, snapRes, healthRes, pieRes] = await Promise.all([
+    getUniverseOverrides(),
+    authedFetch('/admin/api/market-data/scanner/snapshot'),
+    authedFetch('/admin/api/market-data/scanner/feed-health'),
+    authedFetch('/admin/api/signals/pies/strategy/high_velocity_v1'),   // selected basket (best-effort)
+  ])
 
   if (!result.ok) {
     return (
@@ -21,9 +31,12 @@ export default async function UniversePage() {
     )
   }
 
-  // Detailed list may be absent on legacy pods that haven't shipped the enriched endpoint
-  // yet. Synthesise a minimal record so the overview still renders during the rolling
-  // deploy window — market is inferred from the T212 suffix, ADV defaults to 0.
+  const snapshot = snapRes.ok ? await snapRes.json().catch(() => null) : null
+  const health = healthRes.ok ? await healthRes.json().catch(() => null) : null
+  const pie = pieRes.ok ? await pieRes.json().catch(() => null) : null
+
+  // Fallback for the universe overview when the scanner snapshot is unavailable (market-data down /
+  // legacy pod). Market is inferred from the T212 suffix, ADV defaults to 0.
   const detailed = result.data.activeUniverseDetailed ?? result.data.activeUniverse.map((ticker) => ({
     ticker,
     name: ticker,
@@ -33,17 +46,22 @@ export default async function UniversePage() {
   }))
 
   return (
-    <div className="space-y-6 p-6">
+    <div className="space-y-8 p-6">
       <div>
         <h1 className="text-2xl font-bold text-white">Universe</h1>
         <p className="mt-1 text-sm text-gray-400">
-          Curated S&amp;P 100 + FTSE 100 candidate pool, ranked by 5-day average dollar volume.
-          Forced adds bypass the cap; forced removes win over T212 inclusion.
+          The single active universe is the EODHD ≥£5B US+UK market-cap scan — market-balanced to ~100 US / 100 UK
+          and ranked by market cap. The QMJ quality screen and the strategy&apos;s selected basket are shown below.
+          Forced adds bypass the cap; forced removes win over the scan.
         </p>
       </div>
-      <UniverseOverview instruments={detailed} updatedAt={result.data.updatedAt} />
-      <BarHistoryExplorer tickers={result.data.activeUniverse} />
+
+      {snapshot
+        ? <ScannerPanel initialSnapshot={snapshot} initialHealth={health} initialPie={pie} />
+        : <UniverseOverview instruments={detailed} updatedAt={result.data.updatedAt} />}
+
       <UniverseEditor initial={result.data} />
+      <BarHistoryExplorer tickers={result.data.activeUniverse} />
     </div>
   )
 }
