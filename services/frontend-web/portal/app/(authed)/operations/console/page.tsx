@@ -10,7 +10,7 @@ const HUB_LINKS: ReadonlyArray<{ href: string; title: string; desc: string }> = 
   { href: '/risk/trips',                title: 'Circuit Trips',   desc: 'Circuit-breaker trip post-mortems.' },
   { href: '/operations/reconciliation', title: 'Reconciliation',  desc: 'System ↔ broker drift findings.' },
   { href: '/operations/tca',            title: 'TCA',             desc: 'Transaction-cost analysis.' },
-  { href: '/scanner',                   title: 'Scanner / Feeds', desc: 'Universe funnel + QMJ + feed health.' },
+  { href: '/universe',                  title: 'Universe / Scanner', desc: 'Active universe, cap→QMJ funnel, selected basket, feed health.' },
   { href: '/strategy-config',           title: 'Strategy',        desc: 'Active strategy + live params.' },
 ]
 
