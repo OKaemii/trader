@@ -1,5 +1,6 @@
 export { createServer, type ServerConfig } from "./server.ts";
 export { listen, type ServerHandle, type ListenConfig } from "./serve.ts";
+export { metricsRegistry, mountMetrics, startDefaultMetrics } from "./metrics.ts";
 export { AppError, errorHandler, type AppErrorStatus } from "./errors.ts";
 export { loadEnv, type LoadEnvOptions } from "./env.ts";
 export { createLogger, ALL_LEVELS, type Logger, type LoggerConfig, type LogLevel } from "./logger.ts";

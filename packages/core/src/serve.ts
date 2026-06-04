@@ -1,6 +1,7 @@
 import { serve as honoServe, type ServerType } from "@hono/node-server";
 import type { Hono } from "hono";
 import type { Logger } from "./logger.ts";
+import { mountMetrics } from "./metrics.ts";
 
 export interface ListenConfig {
     app: Hono;
@@ -14,6 +15,7 @@ export interface ServerHandle {
 }
 
 export function listen(cfg: ListenConfig): ServerHandle {
+    mountMetrics(cfg.app);   // GET /metrics on every service that uses the shared server entry
     const server = honoServe({ fetch: cfg.app.fetch, port: cfg.port }, (info) => {
         cfg.logger.info({ port: info.port }, "listening");
     });
