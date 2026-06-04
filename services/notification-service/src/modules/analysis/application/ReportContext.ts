@@ -32,6 +32,15 @@ export interface TelemetryBlock {
         bestPick:      PickPnl | null;
         worstPick:     PickPnl | null;
     };
+    // Open (unrealised) P&L on currently-held positions — the "how are my holdings doing right
+    // now" figure. Non-zero whenever positions have moved, unlike realisedSinceLast which is 0
+    // until a round-trip closes. `coveredCount`/`totalCount` flag partial cost-basis coverage.
+    openPnl: {
+        unrealisedGbp: number;
+        costBasisGbp:  number;
+        coveredCount:  number;
+        totalCount:    number;
+    };
     openExposure: {
         navGbp:          number;
         cashFractionApprox: number | null;     // 1 - (open MTM / NAV); null when NAV is 0
