@@ -200,6 +200,10 @@ export function renderTelemetryHtml(t: TelemetryBlock): string {
                 <td><b>Signals</b></td>
                 <td>buys=${t.signals.buys} sells=${t.signals.sells} holds=${t.signals.holds} (total ${t.signals.total})</td>
             </tr>
+            <tr style="background:#f0f9f0">
+                <td><b>Open P&amp;L</b></td>
+                <td>${fmtMoney(t.openPnl.unrealisedGbp)}${t.openPnl.costBasisGbp > 0 ? ` (${fmtPct(t.openPnl.unrealisedGbp / t.openPnl.costBasisGbp)})` : ''} unrealised on ${t.openPnl.coveredCount}/${t.openPnl.totalCount} positions · cost basis ${fmtMoney(t.openPnl.costBasisGbp)}</td>
+            </tr>
             <tr>
                 <td><b>Realised since last</b></td>
                 <td>closed=${t.realisedSinceLast.closedSignals} · P&amp;L ${fmtMoney(t.realisedSinceLast.pnlGbp)}${best ? ` · best ${escapeHtml(best.ticker)} ${(best.pnlPct*100).toFixed(2)}%` : ''}${worst ? ` · worst ${escapeHtml(worst.ticker)} ${(worst.pnlPct*100).toFixed(2)}%` : ''}</td>
