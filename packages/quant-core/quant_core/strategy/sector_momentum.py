@@ -24,10 +24,18 @@ class SectorMomentumStrategy:
         self._sectors: dict[str, str] = {}
 
     def parameter_space(self) -> dict[str, list[float]]:
-        return {}  # no tunables for v1
+        # Tunables sweep within the strategy's history budget (rolling_window=20 — a short-horizon
+        # sector rotation). lookback+skip are clamped to what's available, so no grid point fails.
+        return {
+            'lookback':      [10.0, 15.0, 20.0],   # momentum window (days)
+            'skip':          [0.0, 2.0, 5.0],      # skip most-recent days (reversal avoidance)
+            'sector_adjust': [0.0, 0.5, 1.0],      # how much of the sector mean to neutralise
+        }
 
     def parameter_defaults(self) -> dict[str, float]:
-        return {}
+        # Defaults reproduce the pre-tunable behaviour exactly: full 20-day window, no skip,
+        # full sector neutralisation.
+        return {'lookback': 20.0, 'skip': 0.0, 'sector_adjust': 1.0}
 
     def compute_features(
         self, history: HistoryView, as_of_ms: int, params: StrategyParams
@@ -43,7 +51,15 @@ class SectorMomentumStrategy:
         if returns.shape[1] < window:
             return None
 
-        cum_returns = returns[:, -window:].sum(axis=1)
+        # Tunable momentum window: total log-return over `lookback` days, ending `skip` days ago
+        # (skip avoids the short-term reversal in the most recent days). Both clamped to the data,
+        # so any portal/grid value stays valid. Defaults (lookback=window, skip=0) == legacy.
+        avail    = returns.shape[1]
+        skip     = min(max(0, int(params.get('skip', 0.0))), max(0, avail - 2))
+        lookback = min(max(2, int(params.get('lookback', float(window)))), avail - skip)
+        sector_adjust = params.get('sector_adjust', 1.0)
+        end = avail - skip
+        cum_returns = returns[:, end - lookback:end].sum(axis=1)
 
         sectors = [self._sectors.get(t, 'Unknown') for t in tickers]
         sector_means: dict[str, float] = {}
@@ -52,7 +68,7 @@ class SectorMomentumStrategy:
             sector_means[sec] = float(cum_returns[idxs].mean())
 
         sector_adj = np.array([
-            cum_returns[i] - sector_means[sectors[i]] for i in range(len(tickers))
+            cum_returns[i] - sector_adjust * sector_means[sectors[i]] for i in range(len(tickers))
         ])
         composite = zscore(sector_adj)
 
