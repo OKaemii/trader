@@ -32,10 +32,19 @@ class TopologyStrategy:
         self._sectors: dict[str, str] = {}
 
     def parameter_space(self) -> dict[str, list[float]]:
-        return {}
+        # Sweep the diffusion kernel + the momentum sub-window + the topology blend weight. Lean
+        # grid (2·3·3 = 18 points); `diffusion_j` is live-tunable via parameter_defaults but kept
+        # out of the sweep to bound MCPT cost.
+        return {
+            'mom_window':      [10.0, 20.0],        # momentum / low-vol sub-window
+            'diffusion_alpha': [0.05, 0.1, 0.2],    # Laplacian diffusion rate
+            'w_topology':      [0.5, 1.0, 1.5],     # weight on the topology residual in the blend
+        }
 
     def parameter_defaults(self) -> dict[str, float]:
-        return {}
+        # Defaults reproduce the pre-tunable behaviour: 20-bar sub-window, alpha=0.1, J=5, and an
+        # equal-weight 4-factor blend (w_topology=1.0 ⇒ /4).
+        return {'mom_window': 20.0, 'diffusion_alpha': 0.1, 'diffusion_j': 5.0, 'w_topology': 1.0}
 
     def compute_features(
         self, history: HistoryView, as_of_ms: int, params: StrategyParams
@@ -49,16 +58,22 @@ class TopologyStrategy:
         if returns.shape[1] < ROLLING_WINDOW:
             return None
 
-        residuals = laplacian_diffusion(returns, alpha=0.1, J=5)
+        # Tunable kernel + sub-window (clamped to the data) + blend weight. Defaults == legacy.
+        mw     = min(max(2, int(params.get('mom_window', float(ROLLING_WINDOW)))), returns.shape[1])
+        alpha  = float(params.get('diffusion_alpha', 0.1))
+        j      = max(1, int(params.get('diffusion_j', 5.0)))
+        w_topo = max(0.0, params.get('w_topology', 1.0))
+
+        residuals = laplacian_diffusion(returns, alpha=alpha, J=j)
         betti_curves, epsilon_range = compute_betti_curves(returns, n_bins=100)
         pairs = compute_persistence_pairs(returns)
 
-        cum_returns = returns[:, -ROLLING_WINDOW:].sum(axis=1)
+        cum_returns = returns[:, -mw:].sum(axis=1)
         momentum    = zscore(cum_returns)
         reversal    = zscore(-returns[:, -1])
-        low_vol     = zscore(-returns[:, -ROLLING_WINDOW:].std(axis=1))
+        low_vol     = zscore(-returns[:, -mw:].std(axis=1))
         topo_signal = zscore(-residuals)
-        composite   = (momentum + reversal + low_vol + topo_signal) / 4.0
+        composite   = (momentum + reversal + low_vol + w_topo * topo_signal) / (3.0 + w_topo)
 
         per_ticker = {
             t: {

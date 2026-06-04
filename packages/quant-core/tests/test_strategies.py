@@ -118,3 +118,55 @@ def test_topology_carries_extras():
     out = s.decide(fv, EMPTY_PORTFOLIO)
     assert out.betti_curves is not None
     assert out.laplacian_residuals is not None
+
+
+# ── Tunable parameters: sector_momentum_v1 + topology_v1 ──────────────────────────
+def _scores(strategy, hist, **params) -> dict:
+    fv = strategy.compute_features(hist, as_of_ms=1, params=StrategyParams(values=params))
+    assert fv is not None
+    return fv.composite_scores
+
+
+def test_sector_momentum_exposes_tunables():
+    s = make_strategy('sector_momentum_v1')
+    assert set(s.parameter_space()) == {'lookback', 'skip', 'sector_adjust'}
+    assert set(s.parameter_defaults()) == {'lookback', 'skip', 'sector_adjust'}
+
+
+def test_sector_momentum_defaults_match_no_params():
+    # The defaults must reproduce the pre-tunable behaviour exactly (no surprise on deploy).
+    s = make_strategy('sector_momentum_v1')
+    hist = _trending_history(8, 40)
+    base = _scores(s, hist)                              # NO_PARAMS → code defaults
+    same = _scores(s, hist, **s.parameter_defaults())   # defaults passed explicitly
+    assert all(abs(base[t] - same[t]) < 1e-9 for t in base)
+
+
+def test_sector_momentum_skip_shifts_window():
+    s = make_strategy('sector_momentum_v1')
+    hist = _trending_history(8, 40)
+    a = _scores(s, hist, lookback=10.0, skip=0.0)
+    b = _scores(s, hist, lookback=10.0, skip=5.0)
+    assert any(abs(a[t] - b[t]) > 1e-6 for t in a)       # different window ⇒ different ranking
+
+
+def test_sector_momentum_sector_adjust_zero_is_plain_momentum():
+    s = make_strategy('sector_momentum_v1')
+    s._sectors = {f'T{i}': ('A' if i % 2 == 0 else 'B') for i in range(8)}
+    hist = _trending_history(8, 40)
+    assert any(abs(_scores(s, hist, sector_adjust=1.0)[t] - _scores(s, hist, sector_adjust=0.0)[t]) > 1e-6
+               for t in _scores(s, hist, sector_adjust=0.0))
+
+
+def test_topology_exposes_tunables():
+    s = make_strategy('topology_v1')
+    assert set(s.parameter_space()) == {'mom_window', 'diffusion_alpha', 'w_topology'}
+    assert {'mom_window', 'diffusion_alpha', 'diffusion_j', 'w_topology'} <= set(s.parameter_defaults())
+
+
+def test_topology_w_topology_changes_blend():
+    s = make_strategy('topology_v1')
+    hist = _trending_history(12, 40)
+    low  = _scores(s, hist, w_topology=0.25)
+    high = _scores(s, hist, w_topology=2.0)
+    assert any(abs(low[t] - high[t]) > 1e-6 for t in low)
