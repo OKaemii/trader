@@ -301,7 +301,9 @@ async function selectFromEodhdScan(
   return ranked.map((m) => ({
     ticker:       m.ticker,
     name:         m.name,
-    sector:       'Unknown',     // enriched later in refresh() step 4c
+    // Sector comes straight from the EODHD screener row (no Yahoo). refresh() step 4c
+    // persists it to the meta cache; 'Unknown' only when the screener omitted it.
+    sector:       m.sector && m.sector.trim() ? m.sector : 'Unknown',
     t212Tradable: true,
     market:       m.market,
   }));
@@ -466,44 +468,53 @@ export class UniverseManager {
       log.info(`[universe] overrides applied: +${overrideResult.added} -${overrideResult.removed}`);
     }
 
-    // ── 4c. Sector enrichment — Mongo cache (read-through) + Yahoo refresh ─────
-    // Replaces the T212-derived `sector='Unknown'` placeholder with a real GICS label.
-    // - Pulled at the END of selection so we only spend Yahoo budget on universe members.
-    // - Cache lives in `instrument_metadata` collection; rows older than `sectorStaleMs`
-    //   (default 30d) get re-fetched; manual overrides (source='manual') are never
-    //   touched by auto-refresh.
-    // - Failures (Yahoo down, ticker unresolvable) keep the existing entry as-is and
-    //   the strategy continues to see 'Unknown' for that ticker — never blocks refresh.
+    // ── 4c. Sector enrichment — Mongo cache (read-through), sourced per universe source ─
+    // Replaces the placeholder sector with a real label and persists it to the
+    // `instrument_metadata` cache (read by the internal /sectors route + the registry diff).
+    // - eodhd_scan: the sector arrives FREE on each selected row from the EODHD screener — NO
+    //   Yahoo. Per-ticker quoteSummary melts at the ~500-name scanned universe (rate-limited),
+    //   so we persist the screener sectors (source 'eodhd') and never call Yahoo here.
+    // - curated/legacy: the low-volume, 30d-cached Yahoo enrichment (sectorClient) still runs.
+    // - Operator overrides (source='manual') always win; failures keep the existing entry.
     const metaRepo = new MongoInstrumentMeta(db);
     const universeTickers = selected.map((i) => i.ticker);
     if (universeTickers.length > 0) {
       try {
         const existingMeta = await metaRepo.findMany(universeTickers);
-        const needFetch = this.sectorClient
-          ? await metaRepo.needsRefresh(universeTickers, this.sectorStaleMs)
-          : [];
 
-        if (needFetch.length > 0 && this.sectorClient) {
-          log.info(`[universe] sector enrichment: ${needFetch.length}/${universeTickers.length} tickers need Yahoo lookup`);
-          const fetched = await withTimeout(
-            this.sectorClient.fetchSectors(needFetch),
-            SECTOR_FETCH_TIMEOUT_MS, {}, 'sector enrichment',
-          );
-          for (const ticker of needFetch) {
-            const hit = fetched[ticker];
-            if (!hit) continue;   // Yahoo didn't resolve it — leave existing value (or absence)
-            await metaRepo.upsert({
-              ticker,
-              sector:   hit.sector,
-              source:   'yahoo',
-              ...(hit.industry !== undefined ? { industry: hit.industry } : {}),
-            });
+        if (this.config.source === 'eodhd_scan') {
+          let persisted = 0;
+          for (const inst of selected) {
+            if (existingMeta[inst.ticker]?.source === 'manual') continue;   // operator pin wins
+            if (!inst.sector || inst.sector === 'Unknown') continue;        // screener had no sector
+            await metaRepo.upsert({ ticker: inst.ticker, sector: inst.sector, source: 'eodhd' });
+            persisted++;
+          }
+          log.info(`[universe] sector enrichment: ${persisted}/${universeTickers.length} from EODHD screener (no Yahoo)`);
+        } else if (this.sectorClient) {
+          const needFetch = await metaRepo.needsRefresh(universeTickers, this.sectorStaleMs);
+          if (needFetch.length > 0) {
+            log.info(`[universe] sector enrichment: ${needFetch.length}/${universeTickers.length} tickers need Yahoo lookup`);
+            const fetched = await withTimeout(
+              this.sectorClient.fetchSectors(needFetch),
+              SECTOR_FETCH_TIMEOUT_MS, {}, 'sector enrichment',
+            );
+            for (const ticker of needFetch) {
+              const hit = fetched[ticker];
+              if (!hit) continue;   // Yahoo didn't resolve it — leave existing value (or absence)
+              await metaRepo.upsert({
+                ticker,
+                sector:   hit.sector,
+                source:   'yahoo',
+                ...(hit.industry !== undefined ? { industry: hit.industry } : {}),
+              });
+            }
           }
         }
 
-        // Build the in-memory sector map. Order of precedence: just-fetched > existing
-        // cache (incl. manual overrides) > 'Unknown'. Falls back to the T212 placeholder
-        // only when Yahoo returns nothing AND no historical row exists.
+        // Build the in-memory sector map. Precedence: manual override > just-persisted
+        // (eodhd/yahoo) > existing cache > the scan placeholder. Only falls to 'Unknown'
+        // when no source ever resolved the ticker.
         const refreshed = await metaRepo.findMany(universeTickers);
         for (const inst of selected) {
           const row = refreshed[inst.ticker] ?? existingMeta[inst.ticker];

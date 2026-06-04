@@ -15,6 +15,7 @@ export interface ScanCandidate {
   name:         string;
   exchange:     string;     // 'US' | 'LSE'
   marketCapGbp: number;
+  sector?:      string;     // from the EODHD screener row — threaded through to sector enrichment
 }
 
 export interface EodhdScanOpts {
@@ -56,7 +57,7 @@ export async function fetchEodhdCapScan(opts: EodhdScanOpts): Promise<ScanCandid
       for (const r of rows) {
         const capGbp = await fx(r.marketCap, capCurrency(r.exchange || ex, r.currency));
         if (capGbp >= opts.minCapGbp) {
-          out.push({ code: r.code, name: r.name, exchange: r.exchange || ex, marketCapGbp: capGbp });
+          out.push({ code: r.code, name: r.name, exchange: r.exchange || ex, marketCapGbp: capGbp, ...(r.sector ? { sector: r.sector } : {}) });
           added++;
         }
       }

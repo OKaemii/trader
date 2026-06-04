@@ -13,6 +13,7 @@ export interface ScannedInstrument {
   name:         string;
   marketCapGbp: number;
   market:       'US' | 'LSE';
+  sector?:      string;     // carried from the EODHD screener candidate
 }
 
 function indexByMarket(rawInstruments: T212Instrument[]): {
@@ -57,6 +58,7 @@ export function mapEodhdToT212(
       name:         c.name || inst.name,
       marketCapGbp: c.marketCapGbp,
       market,
+      ...(c.sector ? { sector: c.sector } : {}),
     });
   }
   if (dropped) log.info(`[scanner] EODHD->T212 map: ${mapped.length} tradeable, ${dropped} dropped (not on T212 / unknown exchange)`);
