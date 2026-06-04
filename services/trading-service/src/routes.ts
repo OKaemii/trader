@@ -17,7 +17,7 @@ import { AccountCache } from "./modules/orders/infrastructure/AccountCache.ts";
 import { getSignalOrderType } from "./modules/orders/infrastructure/live-config.ts";
 import { TradingMode, type OrderType } from "./modules/orders/domain/Order.ts";
 import { FlattenAllUseCase } from "./modules/orders/application/FlattenAllUseCase.ts";
-import { computeEquityKpis } from "./modules/reconciliation/application/equity-kpis.ts";
+import { computeEquityKpis, repairLegacyNavPoint } from "./modules/reconciliation/application/equity-kpis.ts";
 import type { FillFilter, FillRow } from "./modules/reconciliation/infrastructure/FillsHistoryStore.ts";
 
 // Live-trading admin approval gate. Stored in Redis so it survives restarts.
@@ -278,7 +278,7 @@ export function buildApp(deps: AppDeps): Hono {
         const rows = await r.listNav(Math.min(days * 8, 2000));   // ~6 snapshots/day; pull generously
         const cutoff = Date.now() - days * 86_400_000;
         const series = rows
-            .map((row) => ({
+            .map((row) => repairLegacyNavPoint({   // correct pre-2026-06-03 double-counted NAV at read time
                 t: new Date(row.snapshot_at as string).getTime(),
                 nav: Number(row.nav), cash: Number(row.cash), positionsValue: Number(row.positions_value),
             }))
