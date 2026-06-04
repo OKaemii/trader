@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
     CycleAnalysisBatcher,
     resolveEffectiveCadence,
+    summariseCycleBatch,
     type CycleBatch,
     type Cadence,
 } from '../modules/analysis/application/CycleAnalysisBatcher.ts';
@@ -39,6 +40,37 @@ function makeSignal(args: {
         ...(features ? { features_snapshot: features as never } : {}),
     } as unknown as TradeSignalDTO;
 }
+
+describe('summariseCycleBatch (aggregated push payload)', () => {
+    const sig = (action: string, ticker: string) => ({ action, ticker } as unknown as TradeSignalDTO);
+
+    it('counts actions and lists the traded tickers', () => {
+        const out = summariseCycleBatch({
+            strategyId: 'high_velocity_v1', cadence: 'eod', cycleKey: 'k',
+            signals: [sig('BUY', 'A_US_EQ'), sig('BUY', 'B_US_EQ'), sig('SELL', 'C_US_EQ'), sig('HOLD', 'D_US_EQ')],
+        });
+        expect(out.title).toContain('high_velocity_v1');
+        expect(out.title).toContain('2 BUY / 1 SELL');
+        expect(out.body).toContain('A_US_EQ');
+        expect(out.body).toContain('1 hold');
+        expect(out.data).toMatchObject({ buys: 2, sells: 1, holds: 1 });
+    });
+
+    it('truncates the ticker list past 6 and notes the remainder', () => {
+        const signals = Array.from({ length: 9 }, (_, i) => sig('BUY', `T${i}_US_EQ`));
+        const out = summariseCycleBatch({ strategyId: 's', cadence: 'per_cycle', cycleKey: 'k', signals });
+        expect(out.body).toContain('+3 more');
+    });
+
+    it('reports no trades for an all-HOLD cycle', () => {
+        const out = summariseCycleBatch({
+            strategyId: 's', cadence: 'hourly', cycleKey: 'k',
+            signals: [sig('HOLD', 'A'), sig('HOLD', 'B')],
+        });
+        expect(out.title).toContain('0 BUY / 0 SELL');
+        expect(out.body).toContain('no trades');
+    });
+});
 
 describe('CycleAnalysisBatcher — per_cycle (legacy behaviour preserved)', () => {
     let flushed: CycleBatch[];

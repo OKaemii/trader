@@ -14,7 +14,7 @@ import {
     AnalysisEmailSender,
     type AnalysisEmailTransport,
 } from "./modules/analysis/infrastructure/AnalysisEmailSender.ts";
-import { CycleAnalysisBatcher, nyseCalendar, lseCalendar } from "./modules/analysis/application/CycleAnalysisBatcher.ts";
+import { CycleAnalysisBatcher, summariseCycleBatch, nyseCalendar, lseCalendar } from "./modules/analysis/application/CycleAnalysisBatcher.ts";
 import { TelemetryBuilder, type ISectorsFetcher } from "./modules/analysis/application/TelemetryBuilder.ts";
 import { SanityChecker } from "./modules/analysis/application/SanityChecker.ts";
 import type { StrategyRenderer } from "./modules/analysis/application/ReportContext.ts";
@@ -123,9 +123,14 @@ export async function wireDependencies(env: NotificationEnv, logger: Logger): Pr
             calendars,
             intradayOverride: env.REPORT_INTRADAY_CADENCE,
             onFlush: async (batch) => {
-                if (!analysisEmail) return;
-                try { await analysisEmail.send(batch); }
-                catch (err) { logger.warn({ err, cycleKey: batch.cycleKey }, "analysis email send failed"); }
+                // Aggregated email (rich) + one aggregated push (concise) per cycle — the single
+                // notification for the whole rebalance, replacing the per-signal taps.
+                if (analysisEmail) {
+                    try { await analysisEmail.send(batch); }
+                    catch (err) { logger.warn({ err, cycleKey: batch.cycleKey }, "analysis email send failed"); }
+                }
+                try { await push.sendDigest(summariseCycleBatch(batch)); }
+                catch (err) { logger.warn({ err, cycleKey: batch.cycleKey }, "aggregated push failed"); }
             },
         });
         logger.info("analysis email path enabled (DeepSeek + Resend)");
