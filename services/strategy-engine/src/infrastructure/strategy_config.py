@@ -21,6 +21,7 @@ CACHE_TTL_SEC = 15.0
 COLLECTION = "portal_strategy_config"
 
 _cache: dict[str, tuple[dict, float]] = {}
+_active_cache: Optional[tuple[Optional[str], float]] = None   # (strategyId|None, monotonic stamp)
 _lock = asyncio.Lock()
 _client: Optional[motor.motor_asyncio.AsyncIOMotorClient] = None
 
@@ -89,7 +90,9 @@ async def upsert_strategy_config(
 
 
 def invalidate() -> None:
+    global _active_cache
     _cache.clear()
+    _active_cache = None
 
 
 # ── Active-strategy selection (portal dropdown) ──────────────────────────────────
@@ -101,14 +104,22 @@ RUNTIME_COLLECTION = "portal_runtime_config"
 ACTIVE_STRATEGY_ID = "active_strategy"
 
 
-async def get_active_strategy() -> Optional[str]:
+async def get_active_strategy(use_cache: bool = False) -> Optional[str]:
+    """Portal-selected active strategy. `use_cache=True` returns the 15s-cached value — used by the
+    live host's per-cycle hot-swap check so it doesn't hit Mongo every cycle; the startup read and
+    the PUT path call it fresh."""
+    global _active_cache
+    if use_cache and _active_cache is not None and time.monotonic() - _active_cache[1] < CACHE_TTL_SEC:
+        return _active_cache[0]
     try:
         doc = await _db()[RUNTIME_COLLECTION].find_one({"_id": ACTIVE_STRATEGY_ID})
         sid = (doc or {}).get("strategyId")
-        return str(sid) if sid else None
-    except Exception as exc:   # noqa: BLE001 — fall back to the env default on any miss/blip
+        val = str(sid) if sid else None
+    except Exception as exc:   # noqa: BLE001 — fall back to the last good / env default on any miss/blip
         print(f"[strategy-engine:strategy-config] active-strategy read failed: {exc!r}")
-        return None
+        return _active_cache[0] if _active_cache is not None else None
+    _active_cache = (val, time.monotonic())
+    return val
 
 
 async def set_active_strategy(strategy_id: str, updated_by: str) -> None:
@@ -117,3 +128,4 @@ async def set_active_strategy(strategy_id: str, updated_by: str) -> None:
         {"$set": {"strategyId": strategy_id, "updatedBy": updated_by, "updatedAt": datetime.now(timezone.utc)}},
         upsert=True,
     )
+    invalidate()   # drop the cached active-strategy so the per-cycle check sees the new value at once
