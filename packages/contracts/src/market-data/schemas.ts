@@ -76,6 +76,17 @@ export const InternalBarsResponseSchema = z.object({
 });
 export type InternalBarsResponse = z.infer<typeof InternalBarsResponseSchema>;
 
+// One swing-screener candidate: the technical signals it fired + a score (see screen.ts).
+export const SwingScreenRowSchema = z.object({
+    ticker: z.string(),
+    close: z.number(),
+    pctFrom52wHigh: z.number(),
+    volSurge: z.number(),
+    signals: z.array(z.string()),
+    score: z.number(),
+});
+export type SwingScreenRow = z.infer<typeof SwingScreenRowSchema>;
+
 // Next earnings + dividend dates for a ticker (UTC ms). null = unknown coverage (never fabricated).
 export const EarningsEventSchema = z.object({
     ticker: z.string(),
