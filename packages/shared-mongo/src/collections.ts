@@ -39,6 +39,11 @@ export const COLLECTIONS = {
   // source, asOf, updatedAt }. Written by market-data-service's EarningsStore (Yahoo calendarEvents,
   // weekly refresh); unknown coverage is omitted (never a fabricated date).
   EARNINGS_CALENDAR:     'earnings_calendar',
+  // Price alert rules (manual + auto-derived from trade-plan stop/target). The AlertWatcher reads
+  // enabled rules each cycle and fires on a bar-range cross. { _id: id, ticker, kind, direction,
+  // level: Money, enabled, cooldownH, lastFiredAt?, source, updatedAt }. Derived rules use a
+  // deterministic id `${ticker}:${kind}` so re-saving a plan updates rather than duplicates.
+  ALERT_RULES:           'alert_rules',
   BAD_TICKS:             'bad_ticks',
   PUSH_TOKENS:           'push_tokens',
   RISK_REJECTIONS:       'risk_rejections',

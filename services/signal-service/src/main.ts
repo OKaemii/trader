@@ -12,6 +12,7 @@ import { createRouter } from "./modules/signals/routes/public.ts";
 import { createInternalRouter } from "./modules/signals/routes/internal.ts";
 import { createPieRouter } from "./modules/pie/routes/pie-routes.ts";
 import { createTradePlanRouter } from "./modules/tradeplans/routes/tradeplan-routes.ts";
+import { createAlertRouter } from "./modules/alerts/routes/alert-routes.ts";
 import { registerTopologyWebSocket, registerSystemReset } from "./modules/signals/routes/system.ts";
 
 async function main(): Promise<void> {
@@ -57,7 +58,9 @@ async function main(): Promise<void> {
         tradePlanRepo:  deps.tradePlanRepo,
         signalRepo:     deps.signalRepo,
         tradingClient:  deps.tradingClient,
+        alertRules:     deps.alertRuleRepo,
     }));
+    app.route("/", createAlertRouter(deps.alertRuleRepo));
 
     // WebSocket + system-reset moved here from the (deleted) api-gateway. Both belong
     // with the service that already owns the strategy:* pubsub channels and the bulk of
@@ -114,6 +117,9 @@ async function main(): Promise<void> {
     // Self-heal stuck Pending signals. See AutoApprovalGate.startSweeper for the rationale.
     const stopSweeper = deps.autoApprovalGate.startSweeper(env.AUTO_APPROVE_SWEEP_INTERVAL_MS);
 
+    // Price-alert watcher: evaluate enabled rules each tick, publish price_alert on a level cross.
+    deps.alertWatcher.start();
+
     const server = serve({ fetch: app.fetch, port: env.PORT }, (info) => {
         logger.info({ port: info.port }, "signal-service listening");
     });
@@ -122,6 +128,7 @@ async function main(): Promise<void> {
     registerGracefulShutdown(logger, {
         onSignal: async () => {
             stopSweeper();
+            deps.alertWatcher.stop();
             await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
             await deps.redis.quit();
         },
