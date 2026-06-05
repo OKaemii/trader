@@ -105,6 +105,12 @@ export class TelemetryBuilder {
                 bestPick:      snapshot?.realisedSinceLast.bestPick      ?? null,
                 worstPick:     snapshot?.realisedSinceLast.worstPick     ?? null,
             },
+            openPnl: {
+                unrealisedGbp: snapshot?.openPositions.unrealisedPnlGbp ?? 0,
+                costBasisGbp:  snapshot?.openPositions.costBasisGbp     ?? 0,
+                coveredCount:  snapshot?.openPositions.pnlCoveredCount  ?? 0,
+                totalCount:    snapshot?.openPositions.count            ?? 0,
+            },
             openExposure: {
                 navGbp,
                 cashFractionApprox,

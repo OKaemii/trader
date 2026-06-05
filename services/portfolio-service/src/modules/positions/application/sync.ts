@@ -7,13 +7,14 @@ import type { Currency, Money } from '@trader/shared-types';
 //   - currentPrice and currentValue are Money-shaped (instrument currency)
 export interface PositionUpdate {
   $set: {
-    ticker:       string;
-    quantity:     number;
-    currency:     Currency;
-    currentPrice: Money;
-    currentValue: Money;
-    weight:       number;
-    updatedAt:    Date;
+    ticker:        string;
+    quantity:      number;
+    currency:      Currency;
+    currentPrice:  Money;
+    currentValue:  Money;
+    weight:        number;
+    updatedAt:     Date;
+    averagePrice?: Money;   // cost basis per share (instrument currency) — drives open P&L
   };
   $unset: {
     currentValueGBP: '';
@@ -21,13 +22,14 @@ export interface PositionUpdate {
 }
 
 export function buildPositionUpdate(args: {
-  ticker:       string;
-  quantity:     number;
-  currency:     Currency;
-  priceNative:  number;
-  valueNative:  number;
-  weight:       number;
-  now?:         () => Date;
+  ticker:        string;
+  quantity:      number;
+  currency:      Currency;
+  priceNative:   number;
+  valueNative:   number;
+  weight:        number;
+  avgPriceNative?: number | undefined;   // omitted when T212 doesn't report a cost basis
+  now?:          () => Date;
 }): PositionUpdate {
   const now = (args.now ?? (() => new Date()))();
   return {
@@ -39,6 +41,9 @@ export function buildPositionUpdate(args: {
       currentValue: { amount: args.valueNative, currency: args.currency },
       weight:       args.weight,
       updatedAt:    now,
+      ...(args.avgPriceNative != null && args.avgPriceNative > 0
+        ? { averagePrice: { amount: args.avgPriceNative, currency: args.currency } }
+        : {}),
     },
     $unset: {
       currentValueGBP: '',
