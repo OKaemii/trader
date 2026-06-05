@@ -1,5 +1,6 @@
 import { authedFetch } from '@/app/lib/auth-fetch'
 import { PortfolioHero } from '@/components/PortfolioHero'
+import { EarningsWarning } from '@/components/EarningsWarning'
 import { HoldingsPanel, type HoldingsInitial } from '@/components/HoldingsPanel'
 import { AutoApproveToggle } from '@/components/AutoApproveToggle'
 import { CircuitBreakerCard } from '@/components/CircuitBreakerCard'
@@ -125,6 +126,9 @@ export default async function DashboardPage() {
           </div>
         )}
       </div>
+
+      {/* Surfaces any open position reporting earnings within 10 days — the swing-trade landmine. */}
+      <EarningsWarning />
 
       {/* Portfolio first (Trading212-style): lead with value + holdings, not ops controls. */}
       <PortfolioHero initial={cash as never} />
