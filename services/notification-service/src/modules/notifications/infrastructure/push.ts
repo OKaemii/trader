@@ -29,4 +29,23 @@ export class PushSender {
         const chunks = this.expo.chunkPushNotifications(messages);
         await Promise.all(chunks.map((chunk: ExpoPushMessage[]) => this.expo.sendPushNotificationsAsync(chunk)));
     }
+
+    /**
+     * One aggregated push per digest cycle — the real-time counterpart to the aggregated email,
+     * so the operator gets a single tap summarising the whole rebalance instead of one per signal.
+     */
+    async sendDigest(args: { title: string; body: string; data?: Record<string, unknown> }): Promise<void> {
+        const tokens = await this.redis.sMembers('push:tokens');
+        if (tokens.length === 0) return;
+        const validTokens: string[] = tokens.filter((t: string): t is string => Expo.isExpoPushToken(t));
+        const messages: ExpoPushMessage[] = validTokens.map((to: string) => ({
+            to,
+            sound: 'default' as const,
+            title: args.title,
+            body:  args.body,
+            ...(args.data ? { data: args.data } : {}),
+        }));
+        const chunks = this.expo.chunkPushNotifications(messages);
+        await Promise.all(chunks.map((chunk: ExpoPushMessage[]) => this.expo.sendPushNotificationsAsync(chunk)));
+    }
 }
