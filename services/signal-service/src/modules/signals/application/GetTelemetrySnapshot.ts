@@ -3,7 +3,7 @@ import type { Logger } from '@trader/core';
 import type { PriorAppearance, TelemetrySnapshotResponse } from '@trader/contracts';
 import { COLLECTIONS } from '@trader/shared-mongo';
 import { SignalLifecycle } from '@trader/shared-types';
-import { sumPositionsGBP, type FxConverter, type PositionDoc } from '@trader/shared-portfolio';
+import { sumPositionsGBP, sumOpenPnlGBP, type FxConverter, type PositionDoc } from '@trader/shared-portfolio';
 import type { StrategyDecayMonitor } from '../../approval/application/StrategyDecayMonitor.ts';
 import type { RiskEngine } from '../../risk/application/RiskEngine.ts';
 
@@ -115,11 +115,16 @@ export class GetTelemetrySnapshotUseCase {
     // (the email still wants to render with whatever telemetry IS available).
     const posDocs = await positions.find({}).toArray() as unknown as PositionDoc[];
     let mtmGbp = 0;
+    let openPnl = { pnlGbp: 0, costBasisGbp: 0, marketValueGbp: 0, covered: 0, total: posDocs.length };
     let fxDegraded = false;
     try {
       mtmGbp = await sumPositionsGBP(posDocs, this.fx);
+      // Open (unrealised) P&L: market value − cost basis over positions with a known averagePrice.
+      // This is the number operators actually want ("how are my holdings doing"), since realised
+      // P&L stays 0 until a round-trip closes.
+      openPnl = await sumOpenPnlGBP(posDocs, this.fx);
     } catch (err) {
-      this.logger.warn({ err }, 'fx unavailable for open-mtm; reporting 0 with fxDegraded=true');
+      this.logger.warn({ err }, 'fx unavailable for open-mtm/pnl; reporting 0 with fxDegraded=true');
       fxDegraded = true;
     }
 
@@ -207,6 +212,9 @@ export class GetTelemetrySnapshotUseCase {
         count: posDocs.length,
         mtmGbp,
         fxDegraded,
+        unrealisedPnlGbp: openPnl.pnlGbp,
+        costBasisGbp:     openPnl.costBasisGbp,
+        pnlCoveredCount:  openPnl.covered,
       },
       risk: {
         navGbp:       risk?.nav                   ?? 0,

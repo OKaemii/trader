@@ -175,6 +175,11 @@ export const TelemetrySnapshotResponseSchema = z.object({
         count: z.number().int().nonnegative(),
         mtmGbp: z.number(),
         fxDegraded: z.boolean(),
+        // Open (unrealised) P&L = market value − cost basis, over positions with a known cost
+        // basis. Distinct from realisedSinceLast (closed round-trips, ~0 until something sells).
+        unrealisedPnlGbp: z.number(),
+        costBasisGbp: z.number(),
+        pnlCoveredCount: z.number().int().nonnegative(),   // positions with a cost basis (≤ count)
     }),
     risk: z.object({
         navGbp:        z.number(),

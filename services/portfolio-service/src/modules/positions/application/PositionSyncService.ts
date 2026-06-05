@@ -88,6 +88,7 @@ export class PositionSyncService {
                     priceNative,
                     valueNative,
                     weight,
+                    avgPriceNative: p.averagePrice?.amount,
                 });
                 await this.deps.db.collection(COLLECTIONS.POSITIONS).updateOne(
                     { ticker: p.ticker },

@@ -6,6 +6,7 @@ export const PositionSchema = z.object({
     quantity: z.number(),
     currentPrice: MoneySchema.optional(),
     currentValue: MoneySchema.optional(),
+    averagePrice: MoneySchema.optional(),   // T212 cost basis per share — drives open (unrealised) P&L
 });
 export type Position = z.infer<typeof PositionSchema>;
 
