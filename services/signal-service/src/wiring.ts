@@ -22,6 +22,7 @@ import { AutoApprovalGate } from "./modules/approval/application/AutoApprovalGat
 import { StrategyDecayMonitor } from "./modules/approval/application/StrategyDecayMonitor.ts";
 import { MongoPieRepository } from "./modules/pie/infrastructure/MongoPieRepository.ts";
 import { PieManager } from "./modules/pie/application/PieManager.ts";
+import { MongoTradePlanRepository } from "./modules/tradeplans/infrastructure/MongoTradePlanRepository.ts";
 
 export async function wireDependencies(env: SignalEnv, logger: Logger) {
     const redis = await getRedisClient();
@@ -55,6 +56,7 @@ export async function wireDependencies(env: SignalEnv, logger: Logger) {
     const autoApprovalGate = new AutoApprovalGate(redis, signalRepo, approveSignal, tradingClient, logger);
     const pieRepo         = new MongoPieRepository(db);
     const pieManager      = new PieManager(pieRepo, logger);
+    const tradePlanRepo   = new MongoTradePlanRepository(db);
     const publisher       = new RedisSignalPublisher(redis, logger);
     const generateSignals = new GenerateSignalsUseCase(
         signalRepo, publisher, portfolioState, riskEngine,
@@ -90,7 +92,7 @@ export async function wireDependencies(env: SignalEnv, logger: Logger) {
     return {
         logger, env, redis, db, fx, tradingClient,
         signalRepo, riskEngine, tripRecorder, decayMonitor, portfolioState, priceLookup,
-        approveSignal, autoApprovalGate, publisher, generateSignals, pieRepo,
+        approveSignal, autoApprovalGate, publisher, generateSignals, pieRepo, tradePlanRepo,
         findRecent, getProgress, telemetrySnapshot, subscribers, cache, bus,
     } as const;
 }
