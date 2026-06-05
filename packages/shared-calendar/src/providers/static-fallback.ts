@@ -1,7 +1,8 @@
 // Tiny baked-in safety net used when both live providers AND the Mongo cache are
-// unavailable. Current-year tables only — older years are unlikely to be queried
-// (the cache walks back at most 7 days), and forward-year safety is the responsibility
-// of the live providers, not this file.
+// unavailable. Carries the current year plus the next — the NYSE iCal provider is dead,
+// so US closures have no other runtime source. Older years are unlikely to be queried
+// (the cache walks back at most 7 days). Operators must extend this before year-end (see
+// CLAUDE.md); a missing year degrades to an empty-closures stub, not an error.
 //
 // When this provider is read, log loudly: `source: 'static-fallback'` shows up on
 // the portal in red, and operators see a console warn.
@@ -34,6 +35,30 @@ export const STATIC_FALLBACK: Record<Market, Record<number, HolidayTable>> = {
       fetchedAt: 0,
       source: 'static-fallback',
     },
+    2027: {
+      market: 'US',
+      year: 2027,
+      fullClosures: [
+        '2027-01-01',   // New Year's Day
+        '2027-01-18',   // MLK Day
+        '2027-02-15',   // Presidents Day
+        '2027-03-26',   // Good Friday
+        '2027-05-31',   // Memorial Day
+        '2027-06-18',   // Juneteenth observed (19th is Saturday)
+        '2027-07-05',   // Independence Day observed (4th is Sunday)
+        '2027-09-06',   // Labor Day
+        '2027-11-25',   // Thanksgiving
+        '2027-12-24',   // Christmas observed (25th is Saturday)
+      ],
+      halfDays: [
+        { date: '2027-11-26', closeLocal: '13:00' },  // day after Thanksgiving
+        // No July-3 or Dec-24 early close in 2027: July 4 is a Sunday (full closure moves to
+        // Mon Jul 5), and Dec 24 is itself the observed Christmas full closure (Dec 25 is a
+        // Saturday). The single half-day above is intentional — do not "fill the gap".
+      ],
+      fetchedAt: 0,
+      source: 'static-fallback',
+    },
   },
   LSE: {
     2026: {
@@ -52,6 +77,26 @@ export const STATIC_FALLBACK: Record<Market, Record<number, HolidayTable>> = {
       halfDays: [
         { date: '2026-12-24', closeLocal: '12:30' },  // Christmas Eve (Thursday in 2026)
         { date: '2026-12-31', closeLocal: '12:30' },  // NYE (Thursday in 2026)
+      ],
+      fetchedAt: 0,
+      source: 'static-fallback',
+    },
+    2027: {
+      market: 'LSE',
+      year: 2027,
+      fullClosures: [
+        '2027-01-01',   // New Year's Day
+        '2027-03-26',   // Good Friday
+        '2027-03-29',   // Easter Monday
+        '2027-05-03',   // Early May bank holiday
+        '2027-05-31',   // Spring bank holiday
+        '2027-08-30',   // Summer bank holiday
+        '2027-12-27',   // Christmas Day (substitute, 25th is Saturday)
+        '2027-12-28',   // Boxing Day (substitute, 26th is Sunday)
+      ],
+      halfDays: [
+        { date: '2027-12-24', closeLocal: '12:30' },  // Christmas Eve (Friday in 2027)
+        { date: '2027-12-31', closeLocal: '12:30' },  // NYE (Friday in 2027)
       ],
       fetchedAt: 0,
       source: 'static-fallback',
