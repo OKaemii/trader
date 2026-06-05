@@ -1,6 +1,7 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
+import { mountMetrics } from '@trader/core';
 import { getRedisClient, xAdd, ensureConsumerGroup } from '@trader/shared-redis';
 import { getMongoDb } from '@trader/shared-mongo';
 import { COLLECTIONS } from '@trader/shared-mongo';
@@ -792,6 +793,7 @@ async function bootstrap(): Promise<void> {
 bootstrap();
 
 const port = env.PORT;
+mountMetrics(app);   // GET /metrics (Prometheus) — market-data uses its own serve, not core's listen()
 serve({ fetch: app.fetch, port }, (info) => {
   log.info(`[market-data-service] listening on :${info.port}`);
 });
