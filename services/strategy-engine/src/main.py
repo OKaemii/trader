@@ -109,6 +109,37 @@ def _health():
     return {"status": "ok", "active_strategy": ACTIVE_STRATEGY, "bar_frequency": BAR_FREQUENCY, "rolling_window_bars": ROLLING_WINDOW_BARS}
 
 
+def _recompute_history_window() -> None:
+    """Derive the per-cycle read window (_needed / _history_interval / _history_range) from the
+    current _strategy + BAR_FREQUENCY. Shared by startup AND the live hot-swap so both compute the
+    window identically (DRY — a switch to a strategy with a different rolling_window stays correct)."""
+    global _needed, _history_interval, _history_range
+    _needed = _strategy.config.rolling_window
+    if BAR_FREQUENCY == "daily":
+        _history_interval = "daily"
+        # _needed counts DAILY bars; map to the smallest range key that covers it (the persisted
+        # daily series serves the long keys), so e.g. a 300-bar window reaches ~2y back.
+        _history_range = range_for_bars(_needed)
+    else:
+        _history_interval = "15m"
+        _history_range = "60d"   # 60d of 15m bars comfortably covers the 60-bar intraday window
+
+
+def _apply_active_strategy(sid: str) -> None:
+    """Build `sid` as the in-process strategy and re-derive its read window + cross-cycle state.
+    Used at startup and on a LIVE switch (portal selection) — selecting a strategy in the portal
+    therefore needs no restart. Cheap because history is re-fetched per cycle from market-data, so
+    there is no in-engine warming buffer to lose; RegimeEngine/FeatureStability state is rebuilt by
+    forcing a re-prewarm (`_prewarmed=False`) on the next cycle. Raises ValueError for an unknown id."""
+    global _strategy, ACTIVE_STRATEGY, _prewarmed
+    _strategy = make_strategy(sid)
+    ACTIVE_STRATEGY = sid
+    _engine_state["strategy"] = sid
+    _engine_state["rolling_window"] = _strategy.config.rolling_window
+    _recompute_history_window()
+    _prewarmed = False
+
+
 @app.get("/health")
 def health():
     return _health()
@@ -233,16 +264,30 @@ async def put_strategy_config(req: Request):
 
 @app.put("/admin/api/strategy/active")
 async def put_active_strategy(req: Request):
-    """Portal dropdown — persist the active strategy. Applies on the next strategy-engine restart
-    (selection is structural: universe source, rolling window, cross-cycle state)."""
+    """Portal dropdown — persist the active strategy AND apply it live (no restart). The choice is
+    persisted to PORTAL_RUNTIME_CONFIG (so it also survives a restart), then the in-process strategy
+    is rebuilt under the cycle lock so the very next cycle emits from the new strategy."""
     body = await req.json()
     sid = body.get("strategy_id")
     if sid not in known_strategies():
         return JSONResponse({"error": f"unknown strategy_id: {sid!r}"}, status_code=400)
     await strategy_config.set_active_strategy(sid, str(body.get("userId", "unknown")))
+
+    # Apply live on the serving pod. Hold the cycle lock so we never swap _strategy mid-compute.
+    applied_live = False
+    if _strategy is not None:
+        try:
+            async with _cycle_lock:
+                _apply_active_strategy(sid)
+            applied_live = True
+            if _redis is not None:
+                await _redis.publish("config:invalidated", sid)   # nudge any other replica's cache
+        except Exception as exc:   # noqa: BLE001 — fall back to the per-cycle check on any hiccup
+            print(f"[strategy-engine] live strategy apply failed (will apply on next cycle): {exc!r}", flush=True)
+
     return {"ok": True, "selected": sid, "applied": ACTIVE_STRATEGY,
-            "restartRequired": sid != ACTIVE_STRATEGY,
-            "note": "applies on the next strategy-engine restart"}
+            "restartRequired": False, "appliedLive": applied_live,
+            "note": "applied live — no restart required"}
 
 
 @app.get("/metrics", response_class=PlainTextResponse)
@@ -424,23 +469,12 @@ async def _init_engine_singletons() -> None:
     if _configured and _configured in known_strategies():
         ACTIVE_STRATEGY = _configured
     try:
-        _strategy = make_strategy(ACTIVE_STRATEGY)
+        _apply_active_strategy(ACTIVE_STRATEGY)   # builds _strategy + derives _needed/_history_* + _engine_state
     except ValueError as exc:
         raise RuntimeError(f"Unknown strategy: {ACTIVE_STRATEGY}") from exc
 
     # Single client across the engine — its per-cycle cache clears on start_cycle.
     _bars_client = MarketDataClient()
-
-    _needed = _strategy.config.rolling_window
-    if BAR_FREQUENCY == "daily":
-        _history_interval = "daily"
-        # _needed counts DAILY bars; map to the smallest range key that covers it. The persisted
-        # daily series serves the long keys (1y/2y/5y/max), so a 300-bar window reaches ~2y back
-        # instead of the old 60d cap — this is what lets 12-1 momentum actually have its history.
-        _history_range = range_for_bars(_needed)
-    else:
-        _history_interval = "15m"
-        _history_range = "60d"   # 60d of 15m bars comfortably covers the 60-bar intraday window
 
     print(f"[strategy-engine] singletons ready — strategy={ACTIVE_STRATEGY} bar_freq={BAR_FREQUENCY} "
           f"rolling_window={ROLLING_WINDOW_BARS} history_range={_history_range} history_interval={_history_interval} "
@@ -475,6 +509,20 @@ async def process_cycle(
 
     async with _cycle_lock:
         global _prewarmed
+
+        # Hot strategy switch — a portal selection applies live, no restart. The check is cheap
+        # (15s-cached) and the swap is essentially free: history is re-fetched per cycle from
+        # market-data, so there's no in-engine warming buffer to lose. Other replicas (KEDA keeps
+        # ≤1) converge within the cache TTL; the PUT path applies it instantly on the serving pod.
+        try:
+            _desired = await strategy_config.get_active_strategy(use_cache=True)
+            if _desired and _desired != ACTIVE_STRATEGY and _desired in known_strategies():
+                _prev = ACTIVE_STRATEGY
+                _apply_active_strategy(_desired)
+                print(f"[strategy-engine] HOT SWITCH active strategy {_prev} → {_desired} "
+                      f"(portal selection, no restart) rolling_window={_needed} range={_history_range}", flush=True)
+        except Exception as _swap_exc:  # noqa: BLE001 — never break the cycle on a swap hiccup
+            print(f"[strategy-engine] active-strategy swap check failed (continuing): {_swap_exc!r}", flush=True)
 
         import time as _t
         _engine_state["cycles"] += 1
