@@ -43,7 +43,11 @@ export function pollIntervalKeyForMs(ms: number): PollIntervalKey | null {
 // (ticker, timestamp, interval) compound index dedups within an interval while letting
 // the cache serve different cadences. Older rows that pre-date this field default to
 // 'daily' in the Mongo reader since that's what market-data-service was emitting.
-export type BarInterval = 'daily' | '5m' | '15m' | '1h';
+//
+// '4h' and 'weekly' are read-time aggregation targets only — never stored or polled.
+// aggregateBars (packages/shared-bars) derives them on read: '4h' from the 5m series,
+// 'weekly' from the persisted daily series. Storage stays 5m (intraday) + daily (long).
+export type BarInterval = 'daily' | '5m' | '15m' | '1h' | '4h' | 'weekly';
 
 // ── Currency / Money ─────────────────────────────────────────────────────────
 // Two-currency system today (US + LSE listings). `BASE_CURRENCY` is what NAV, HWM,
