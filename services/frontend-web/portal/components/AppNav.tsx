@@ -12,6 +12,7 @@ const links = [
   { href: '/research', label: 'Research' },
   { href: '/strategy-config', label: 'Strategy' },
   { href: '/universe', label: 'Universe' },
+  { href: '/screener', label: 'Screener' },
   { href: '/sectors', label: 'Sectors' },
   { href: '/market-data', label: 'Market Data' },
   { href: '/operations/console', label: 'Console' },
