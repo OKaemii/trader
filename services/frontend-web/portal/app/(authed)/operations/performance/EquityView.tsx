@@ -49,6 +49,11 @@ export function EquityView({ initial }: { initial: EquityPayload }) {
   }
 
   const k = data.kpis
+  // Honest coverage: the NAV ledger fills ~every 4h, so live history is short early on. When the
+  // recorded span is shorter than the selected window, every range renders the same data — say so
+  // rather than letting it look like a broken toggle.
+  const spanDays = k.firstAt && k.lastAt ? Math.max(1, Math.round((k.lastAt - k.firstAt) / 86_400_000)) : 0
+  const shortHistory = k.nSnapshots > 0 && spanDays < days
   const cards: Array<[string, string, string?]> = [
     ['Total return', fmtPct(k.totalReturnPct), k.totalReturnPct >= 0 ? 'text-emerald-400' : 'text-red-400'],
     ['Current NAV', fmtGbp(k.current)],
@@ -73,7 +78,12 @@ export function EquityView({ initial }: { initial: EquityPayload }) {
             {d}d
           </button>
         ))}
-        <span className="text-xs text-gray-500">{fmtDate(k.firstAt)} → {fmtDate(k.lastAt)}</span>
+        <span className="text-xs text-gray-500">{fmtDate(k.firstAt)} → {fmtDate(k.lastAt)} · {k.nSnapshots} snapshots</span>
+        {shortHistory && (
+          <span className="text-xs text-amber-300/80">
+            Live NAV history spans ~{spanDays}d — longer ranges show the same data until more accrues.
+          </span>
+        )}
       </div>
 
       <div className="rounded border border-gray-800 bg-gray-950 p-4">
