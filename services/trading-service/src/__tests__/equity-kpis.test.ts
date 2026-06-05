@@ -1,7 +1,44 @@
 import { describe, it, expect } from 'vitest';
-import { computeEquityKpis, type NavPoint } from '../modules/reconciliation/application/equity-kpis.ts';
+import { computeEquityKpis, repairLegacyNavPoint, type NavPoint } from '../modules/reconciliation/application/equity-kpis.ts';
 
 const pt = (t: number, nav: number, cash = 0, positionsValue = nav): NavPoint => ({ t, nav, cash, positionsValue });
+
+describe('repairLegacyNavPoint', () => {
+  it('repairs a legacy double-counted row (nav == cash + positions, cash == total)', () => {
+    // Legacy writer: cash=total=900, positions=900, nav=total+positions=1800 (the inflated print).
+    const out = repairLegacyNavPoint({ t: 1, nav: 1800, cash: 900, positionsValue: 900 });
+    expect(out.nav).toBe(900);              // correct nav = broker total (the stored cash)
+    expect(out.cash).toBe(0);               // reconstructed free = total - positions
+    expect(out.positionsValue).toBe(900);
+  });
+
+  it('leaves a heavily-invested post-fix row untouched (free < positions)', () => {
+    // free=120, positions=880, total=1000. The identity nav==cash+positions holds, but free (120) is
+    // BELOW the position value — impossible for a legacy row where cash held the broker total.
+    const p = { t: 2, nav: 1000, cash: 120, positionsValue: 880 };
+    expect(repairLegacyNavPoint(p)).toBe(p);  // cash (120) < positions (880) → structural guard rejects
+  });
+
+  it('leaves a typical post-fix row untouched (residual from invested≠ourPV)', () => {
+    const p = { t: 3, nav: 1000, cash: 500, positionsValue: 110 };  // |1000-500-110| = 390 ≫ 0.01
+    expect(repairLegacyNavPoint(p)).toBe(p);
+  });
+
+  it('does not touch zero-position rows (no double-count possible)', () => {
+    const p = { t: 4, nav: 1000, cash: 1000, positionsValue: 0 };
+    expect(repairLegacyNavPoint(p)).toBe(p);
+  });
+
+  it('a repaired series no longer reports the inflated period high', () => {
+    const raw: NavPoint[] = [
+      { t: 1, nav: 1000, cash: 1000, positionsValue: 0 },     // pre-investment, fine
+      { t: 2, nav: 1900, cash: 950, positionsValue: 950 },    // legacy: true nav 950
+      { t: 3, nav: 980, cash: 70, positionsValue: 910 },      // post-fix: nav 980 (total)
+    ];
+    const { kpis } = computeEquityKpis(raw.map(repairLegacyNavPoint));
+    expect(kpis.high).toBe(1000);   // not 1900
+  });
+});
 
 describe('computeEquityKpis', () => {
   it('returns a zeroed result for an empty series', () => {

@@ -33,6 +33,36 @@ const EMPTY: EquityKpis = {
   start: 0, totalReturnPct: 0, high: 0, low: 0, maxDrawdownPct: 0, currentDrawdownPct: 0,
 };
 
+/**
+ * Repair the legacy NAV double-count for a single ledger point (pure; returns a new point or the
+ * input unchanged). Exported for unit testing + applied at the equity read path.
+ *
+ * Before the 2026-06-03 fix (commit 8d6a8f8) the reconciliation writer stored
+ *   cash = broker.total,  positionsValue = pv,  nav = broker.total + pv
+ * — adding position value on top of the broker `total`, which ALREADY includes open positions.
+ * That inflated nav by `pv` (≈2× once fully invested: the "£6,631" period-high that never
+ * happened). The post-fix writer stores cash = broker.FREE, nav = broker.total.
+ *
+ * A legacy row is identified by the exact arithmetic identity the bug produced —
+ * `nav === cash + positionsValue` — together with `cash >= positionsValue`: the legacy `cash` was
+ * the broker *total*, which necessarily covers the position value, whereas a meaningfully-invested
+ * post-fix row stores `free` cash that is *below* its position value. That structural guard rejects
+ * genuine post-fix rows (where `free < positions`) while still catching a fully-invested legacy row
+ * (`cash == positionsValue`, the most-inflated ~2× case). For a legacy row the correct nav is
+ * exactly the stored `cash` (= broker.total); we also reconstruct an approximate free cash
+ * (`cash - positionsValue`) so the split still reconciles. nav_history is an append-only ledger, so
+ * the correction lives here at read time — stored rows are never mutated, but KPIs see the honest
+ * series.
+ */
+export function repairLegacyNavPoint(p: NavPoint): NavPoint {
+  const looksDoubleCounted =
+    p.positionsValue > 0.01 &&                              // a double-count only exists once positions are held
+    p.cash + 0.01 >= p.positionsValue &&                   // legacy cash = broker total ⇒ ≥ position value
+    Math.abs(p.nav - (p.cash + p.positionsValue)) < 0.01;  // the exact identity the bug wrote (nav = total + pv)
+  if (!looksDoubleCounted) return p;
+  return { t: p.t, nav: p.cash, cash: p.cash - p.positionsValue, positionsValue: p.positionsValue };
+}
+
 /** `series` MUST be time-ordered ascending (oldest first). Returns the series + derived KPIs. */
 export function computeEquityKpis(series: NavPoint[]): { series: NavPoint[]; kpis: EquityKpis } {
   if (series.length === 0) return { series, kpis: { ...EMPTY } };
