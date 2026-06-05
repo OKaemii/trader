@@ -1,4 +1,5 @@
 import type { Db } from 'mongodb';
+import { getPgPool } from '@trader/shared-pg';
 import { COLLECTIONS } from '@trader/shared-mongo';
 import type { BarHLC } from '../application/detect.ts';
 
@@ -6,13 +7,23 @@ function num(v: unknown): number | null {
     return typeof v === 'number' && Number.isFinite(v) ? v : null;
 }
 
+function activeBackend(): 'mongo' | 'timescale' {
+    return (process.env.BARS_BACKEND ?? 'mongo') === 'timescale' ? 'timescale' : 'mongo';
+}
+
 // Latest unsuperseded bar for a ticker (high/low/close), used by the AlertWatcher to detect a
-// level cross. Reads OHLCV_BARS directly the same way PriceLookup does — on the daily-default
-// platform the most-recent bar is the day's bar, whose high/low bracket the session's range.
+// level cross. Dispatches on BARS_BACKEND exactly like PriceLookup — the live cluster runs
+// timescale, so a Mongo-only reader would read an empty store and the watcher would never fire.
+// On the daily-default platform the most-recent bar is the day's bar, whose high/low bracket the
+// session range.
 export class LatestBarReader {
     constructor(private readonly db: Db) {}
 
     async latest(ticker: string): Promise<BarHLC | null> {
+        return activeBackend() === 'timescale' ? this.latestPg(ticker) : this.latestMongo(ticker);
+    }
+
+    private async latestMongo(ticker: string): Promise<BarHLC | null> {
         const doc = await this.db.collection(COLLECTIONS.OHLCV_BARS)
             .find({ ticker, is_superseded: false })
             .sort({ observation_ts: -1 })
@@ -20,6 +31,20 @@ export class LatestBarReader {
             .next();
         if (!doc) return null;
         const high = num(doc.high), low = num(doc.low), close = num(doc.close);
+        return high != null && low != null && close != null ? { high, low, close } : null;
+    }
+
+    private async latestPg(ticker: string): Promise<BarHLC | null> {
+        // Live path — partial-unique-index fast lane, same as PriceLookup._lastClosePg.
+        const { rows } = await getPgPool().query<{ high: string; low: string; close: string }>(
+            `SELECT high, low, close FROM bars
+              WHERE ticker = $1 AND is_superseded = FALSE
+              ORDER BY observation_ts DESC LIMIT 1`,
+            [ticker],
+        );
+        const r = rows[0];
+        if (!r) return null;
+        const high = num(Number(r.high)), low = num(Number(r.low)), close = num(Number(r.close));
         return high != null && low != null && close != null ? { high, low, close } : null;
     }
 }
