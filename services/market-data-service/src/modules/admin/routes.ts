@@ -69,9 +69,11 @@ const MAX_UNIVERSE_SIZE = 500;
 const VALID_INTERVALS: BarInterval[] = ['5m', '15m', '1h', '4h', 'daily', 'weekly'];
 const VALID_RANGES: RangeKey[]     = ['30d', '60d', '90d', '180d', '1y', '2y', '5y', 'max'];
 
-// Read a downsampled OHLCV series for one ticker. `daily` reads the persisted
-// `interval:'daily'` series directly (long-range strategy lookbacks — aggregating 5m here
-// would cap at the 60d 5m retention); intraday views aggregate the stored 5m series.
+// Read a downsampled OHLCV series for one ticker. Long-horizon views (`daily`, `weekly`)
+// read the persisted `interval:'daily'` series directly — aggregating 5m would cap at the
+// 60d 5m retention, which is far too short for a weekly chart. `weekly` is then ISO-week
+// aggregated off that daily series. Intraday views (`5m`/`15m`/`1h`/`4h`) aggregate the
+// stored 5m series (so `4h` is best-effort — only as fresh as the 5m series).
 async function readBarsSeries(
   redis: Awaited<ReturnType<typeof getRedisClient>>,
   db: Awaited<ReturnType<typeof getMongoDb>>,
@@ -81,13 +83,15 @@ async function readBarsSeries(
   asOf: number | undefined,
 ): Promise<OHLCVBar[]> {
   const opts = asOf !== undefined ? { asOf } : {};
-  if (interval === 'daily') {
-    const daily = await getBars(redis as any, db, ticker, 'daily', range, opts);
-    if (daily.length > 0) return daily;
-    // Daily series not yet seeded for this ticker (pre-backfill window) — fall back to
-    // aggregating the recent 5m series so callers still get a short-range daily view.
-    const base5 = await getBars(redis as any, db, ticker, '5m', range, opts);
-    return aggregateBars(base5, 'daily');
+  if (interval === 'daily' || interval === 'weekly') {
+    let source = await getBars(redis as any, db, ticker, 'daily', range, opts);
+    if (source.length === 0) {
+      // Daily series not yet seeded for this ticker (pre-backfill window) — fall back to
+      // aggregating the recent 5m series so callers still get a short-range view.
+      const base5 = await getBars(redis as any, db, ticker, '5m', range, opts);
+      source = aggregateBars(base5, 'daily');
+    }
+    return interval === 'weekly' ? aggregateBars(source, 'weekly') : source;
   }
   const base = await getBars(redis as any, db, ticker, '5m', range, opts);
   return aggregateBars(base, interval);
