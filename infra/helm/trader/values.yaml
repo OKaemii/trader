@@ -119,6 +119,10 @@ global:
     eodhdDailyCallLimit: "90000"
     # Fundamentals (QMJ: ROE / D-E / current ratio) source. yahoo (free quoteSummary) | eodhd (paid add-on).
     fundamentalsProvider: yahoo
+    # Real-quote source for the bid/ask poll. eodhd (real-time last-trade — needs the EODHD real-time
+    # add-on; degrades to the synthetic proxy if unavailable) | none (synthetic-only). Flip to `none`
+    # if EODHD real-time isn't on the plan, to avoid spending credits on calls that return nothing.
+    quoteProvider: eodhd
     # high_velocity_v1 tuning (strategy-engine factory; code defaults apply when unset). Pipeline:
     # QMJ screen → 12-1 momentum top-N → drop the N highest-vol → inverse-vol weights. Select it
     # via the portal Strategy dropdown (or activeStrategy=high_velocity_v1) — one strategy at a time.
