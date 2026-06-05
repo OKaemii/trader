@@ -33,6 +33,9 @@ import { runEodhdDailyFeed } from './modules/bars/infrastructure/eodhd-daily-fee
 import { buildFundamentalsCache } from './modules/fundamentals/wiring.ts';
 import { FundamentalsRefreshScheduler } from './modules/fundamentals/application/FundamentalsRefreshScheduler.ts';
 import { createFundamentalsRouter } from './modules/fundamentals/routes.ts';
+import { buildEarningsStore } from './modules/earnings/wiring.ts';
+import { EarningsRefreshScheduler } from './modules/earnings/application/EarningsRefreshScheduler.ts';
+import { createEarningsRouter } from './modules/earnings/routes.ts';
 import { createScannerRouter } from './modules/scanner/routes.ts';
 import { writeBarRevisions, ensureBiTemporalIndexes, fetchFirstPrintCloses } from './modules/bars/infrastructure/persist-bars.ts';
 import { msUntilNextTick } from './modules/bars/application/poll-scheduling.ts';
@@ -686,6 +689,17 @@ const fundamentalsRefresher = new FundamentalsRefreshScheduler(
 app.route('/', createFundamentalsRouter(fundamentalsCache, universeManager, fundamentalsRefresher));
 app.route('/', createScannerRouter(universeManager, fundamentalsCache));
 
+// Earnings/dividend calendar — earnings_calendar store (Yahoo calendarEvents, weekly refresh) +
+// the upcoming/overlap admin routes backing the portal /calendar page and the dashboard
+// "holding reports within 10 days" red flag. Refresher started in bootstrap() with the universe.
+const earningsStore = buildEarningsStore(env.EARNINGS_PROVIDER, { requestSpacingMs: env.EARNINGS_REQUEST_SPACING_MS });
+const earningsRefresher = new EarningsRefreshScheduler(
+  earningsStore,
+  () => universeManager.activeTickers,
+  { idleMs: env.EARNINGS_REFRESH_IDLE_MS },
+);
+app.route('/', createEarningsRouter(earningsStore, earningsRefresher));
+
 app.get('/latest/:ticker', async (c) => {
   const redis = await getRedisClient();
   const raw = await redis.get(`market:latest:${c.req.param('ticker')}`);
@@ -780,6 +794,7 @@ async function bootstrap(): Promise<void> {
   // Universe is resolved by now — start the background QMJ refresher (first pass runs immediately,
   // populating any missing fundamentals, then self-paces). Independent of the bar poll cadence.
   fundamentalsRefresher.start();
+  earningsRefresher.start();
 
   // Centralized FX: market-data is the single platform writer of GBP/USD. Refresh on a fixed
   // interval so consumers (RedisGbpUsdProvider) always read a fresh fx:GBPUSD. Best-effort — a

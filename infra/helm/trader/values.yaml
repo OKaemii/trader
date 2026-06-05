@@ -119,6 +119,8 @@ global:
     eodhdDailyCallLimit: "90000"
     # Fundamentals (QMJ: ROE / D-E / current ratio) source. yahoo (free quoteSummary) | eodhd (paid add-on).
     fundamentalsProvider: yahoo
+    # Earnings/dividend calendar source. yahoo (free calendarEvents) | eodhd (dormant — falls back to yahoo).
+    earningsProvider: yahoo
     # Real-quote source for the bid/ask poll. eodhd (real-time last-trade — needs the EODHD real-time
     # add-on; degrades to the synthetic proxy if unavailable) | none (synthetic-only). Flip to `none`
     # if EODHD real-time isn't on the plan, to avoid spending credits on calls that return nothing.
