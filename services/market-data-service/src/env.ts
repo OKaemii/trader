@@ -62,6 +62,17 @@ const EnvSchema = z.object({
     DAILY_HISTORY_PROVIDER: z.enum(["yahoo", "eodhd"]).default("yahoo"),
     // Fundamentals (QMJ) source. 'yahoo' (free quoteSummary, default) or 'eodhd' (paid add-on).
     FUNDAMENTALS_PROVIDER:  z.enum(["yahoo", "eodhd"]).default("yahoo"),
+    // Fundamentals refresh pacing. The QMJ refresh walks the universe one name at a time; a
+    // burst trips Yahoo's per-IP rate limiter (which arms a multi-minute session cooldown that
+    // zeroes the whole run). These knobs keep the background refresher gentle + resumable.
+    //   _SPACING_MS — sleep between successive per-ticker provider calls (gentleness).
+    //   _IDLE_MS    — sleep once coverage is complete (re-checks staleness ~twice/day).
+    //   _RETRY_MS   — sleep after a no-progress pass (provider throttled); > the 15m cooldown.
+    //   _PROGRESS_MS— sleep after a partial pass, to keep accreting without hammering.
+    FUNDAMENTALS_REQUEST_SPACING_MS: z.coerce.number().int().nonnegative().default(500),
+    FUNDAMENTALS_REFRESH_IDLE_MS:     z.coerce.number().int().positive().default(12 * 60 * 60_000),
+    FUNDAMENTALS_REFRESH_RETRY_MS:    z.coerce.number().int().positive().default(20 * 60_000),
+    FUNDAMENTALS_REFRESH_PROGRESS_MS: z.coerce.number().int().positive().default(2 * 60_000),
 
     MONGODB_URL: z.string().url().default("mongodb://mongodb:27017"),
     REDIS_URL:   z.string().url().default("redis://redis:6379"),

@@ -46,6 +46,23 @@ export class FundamentalsCache {
     return Object.fromEntries(fresh.map((d) => [d._id, d]));
   }
 
+  /**
+   * Refresh only the missing/stale subset of `tickers` (the same freshness filter `get` applies),
+   * without the trailing read. Returns counts so the background refresher can decide its backoff:
+   * `stale` is how many needed work, `refreshed` how many the provider actually returned (a gap
+   * means the provider was throttled / omitted unknown symbols).
+   */
+  async refreshStale(tickers: string[]): Promise<{ stale: number; refreshed: number }> {
+    if (tickers.length === 0) return { stale: 0, refreshed: 0 };
+    const coll = await this.coll();
+    const existing = await coll.find({ _id: { $in: tickers } }, { projection: { asOf: 1 } }).toArray();
+    const asOfByTicker = new Map(existing.map((d) => [d._id, d.asOf]));
+    const now = Date.now();
+    const stale = tickers.filter((t) => { const a = asOfByTicker.get(t); return a == null || now - a > this.ttlMs; });
+    const refreshed = stale.length > 0 ? await this.refresh(stale) : 0;
+    return { stale: stale.length, refreshed };
+  }
+
   /** Read-only: cached docs for `tickers` with NO provider refresh (for the Scanner snapshot). */
   async peek(tickers: string[]): Promise<Record<string, FundamentalsDoc>> {
     if (tickers.length === 0) return {};

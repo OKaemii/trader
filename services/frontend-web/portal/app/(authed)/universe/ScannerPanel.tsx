@@ -37,16 +37,18 @@ export function ScannerPanel({
   const [health, setHealth] = useState<Health | null>(initialHealth)
   const [busy, setBusy] = useState<'scan' | 'fund' | null>(null)
   const [err, setErr] = useState<string | null>(null)
+  const [note, setNote] = useState<string | null>(null)
   const [filter, setFilter] = useState<MarketFilter>('ALL')
   const [sortBy, setSortBy] = useState<SortKey>('cap')
 
-  async function refresh(): Promise<void> {
+  async function refresh(): Promise<Snapshot> {
     const [s, h] = await Promise.all([
       fetch('/portal-api/admin/scanner/snapshot').then((r) => r.json()),
       fetch('/portal-api/admin/scanner/feed-health').then((r) => r.json()).catch(() => null),
     ])
     setSnapshot(s)
     if (h) setHealth(h)
+    return s
   }
 
   async function runScan(): Promise<void> {
@@ -60,12 +62,23 @@ export function ScannerPanel({
   }
 
   async function refreshFundamentals(): Promise<void> {
-    if (!window.confirm('Refresh fundamentals (ROE / D-E / current ratio + market cap) for the active universe? ~1 provider call per name.')) return
-    setBusy('fund'); setErr(null)
+    if (!window.confirm('Refresh fundamentals (ROE / D-E / current ratio + market cap) for the active universe?\n\nThis runs in the background and is paced to stay under the provider’s rate limit, so the table fills in gradually over a few minutes.')) return
+    setBusy('fund'); setErr(null); setNote(null)
     try {
       const r = await fetch('/portal-api/admin/scanner/fundamentals-refresh', { method: 'POST' })
       if (!r.ok) throw new Error(`fundamentals refresh failed (${r.status})`)
-      await refresh()
+      setNote('Refresh started in the background — fundamentals are populating. This table updates as names land.')
+      // The refresh is non-blocking + paced, so coverage grows gradually. Poll the snapshot for
+      // progress (~2min) and stop early once every name has quality data.
+      for (let i = 0; i < 24; i++) {
+        await new Promise((res) => setTimeout(res, 5000))
+        const s = await refresh()
+        if (s.qualityKnown >= s.universeSize && s.universeSize > 0) {
+          setNote(`Fundamentals populated — ${s.qualityKnown}/${s.universeSize} names have quality data.`)
+          return
+        }
+        setNote(`Populating fundamentals… ${s.qualityKnown}/${s.universeSize} names so far (continues in the background).`)
+      }
     } catch (e) { setErr(e instanceof Error ? e.message : String(e)) } finally { setBusy(null) }
   }
 
@@ -102,6 +115,7 @@ export function ScannerPanel({
       </div>
 
       {err && <div className="rounded border border-red-900 bg-red-950 px-4 py-2 text-sm text-red-300">{err}</div>}
+      {note && <div className="rounded border border-sky-900 bg-sky-950 px-4 py-2 text-sm text-sky-300">{note}</div>}
 
       {/* Funnel: universe → market split → quality */}
       <div className="grid grid-cols-3 gap-3 md:grid-cols-6">

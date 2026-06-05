@@ -12,7 +12,7 @@ import { UniverseManager } from './modules/universe/application/UniverseManager.
 import { getPgPool } from '@trader/shared-pg';
 import { QuotePoll } from './modules/quotes/application/quote-poll.ts';
 import { QuoteWriter } from './modules/quotes/infrastructure/quote-writer.ts';
-import { buildQuoteProvider } from './modules/quotes/infrastructure/yahoo-quote-provider.ts';
+import { buildQuoteProvider } from './modules/quotes/infrastructure/quote-providers.ts';
 import { getLiveConfig } from './shared/live-config.ts';
 import { createAdminRouter, createInternalBarsRouter } from './modules/admin/routes.ts';
 import { YahooProvider } from './modules/bars/infrastructure/providers/yahoo-provider.ts';
@@ -31,6 +31,7 @@ import { backfillTickers, tickersMissingHistory, healMissingHistory } from './mo
 import { backfillDailyHistory, tickersMissingDailyHistory } from './modules/bars/infrastructure/daily-history.ts';
 import { runEodhdDailyFeed } from './modules/bars/infrastructure/eodhd-daily-feed.ts';
 import { buildFundamentalsCache } from './modules/fundamentals/wiring.ts';
+import { FundamentalsRefreshScheduler } from './modules/fundamentals/application/FundamentalsRefreshScheduler.ts';
 import { createFundamentalsRouter } from './modules/fundamentals/routes.ts';
 import { createScannerRouter } from './modules/scanner/routes.ts';
 import { writeBarRevisions, ensureBiTemporalIndexes, fetchFirstPrintCloses } from './modules/bars/infrastructure/persist-bars.ts';
@@ -662,8 +663,21 @@ app.route('/', createInternalBarsRouter(universeManager));
 const fundamentalsCache = buildFundamentalsCache(
   async (amount, currency) => (await getFxClient()).toGBP({ amount, currency }),
   env.FUNDAMENTALS_PROVIDER,
+  { requestSpacingMs: env.FUNDAMENTALS_REQUEST_SPACING_MS },
 );
-app.route('/', createFundamentalsRouter(fundamentalsCache, universeManager));
+// Background QMJ refresher — keeps company_fundamentals populated off the request path (a full
+// Yahoo walk runs for minutes; the admin endpoint just wakes this loop). Started in bootstrap()
+// once the universe is resolved.
+const fundamentalsRefresher = new FundamentalsRefreshScheduler(
+  fundamentalsCache,
+  () => universeManager.activeTickers,
+  {
+    idleMs:     env.FUNDAMENTALS_REFRESH_IDLE_MS,
+    retryMs:    env.FUNDAMENTALS_REFRESH_RETRY_MS,
+    progressMs: env.FUNDAMENTALS_REFRESH_PROGRESS_MS,
+  },
+);
+app.route('/', createFundamentalsRouter(fundamentalsCache, universeManager, fundamentalsRefresher));
 app.route('/', createScannerRouter(universeManager, fundamentalsCache));
 
 app.get('/latest/:ticker', async (c) => {
@@ -746,7 +760,7 @@ async function bootstrap(): Promise<void> {
         log.info(`[market-data] bootstrap: all ${universe.length} tickers have sufficient daily history`);
         return;
       }
-      log.info(`[market-data] bootstrap: ${missingDaily.length}/${universe.length} tickers missing long-range daily history — backfilling from Yahoo (background)`);
+      log.info(`[market-data] bootstrap: ${missingDaily.length}/${universe.length} tickers missing long-range daily history — backfilling from ${env.DAILY_HISTORY_PROVIDER} (background)`);
       const redis = await getRedisClient();
       const results = await backfillDailyHistory(db, redis, missingDaily);
       const ok    = results.filter((r) => !r.error).length;
@@ -756,6 +770,10 @@ async function bootstrap(): Promise<void> {
       log.warn('[market-data] bootstrap daily backfill failed:', err);
     }
   })();
+
+  // Universe is resolved by now — start the background QMJ refresher (first pass runs immediately,
+  // populating any missing fundamentals, then self-paces). Independent of the bar poll cadence.
+  fundamentalsRefresher.start();
 
   pollLoop().catch((err) => {
     log.error('[fatal]', err);

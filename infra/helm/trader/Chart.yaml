@@ -2,7 +2,7 @@ apiVersion: v2
 name: trader
 description: Algebraic Topology Trading Platform
 type: application
-version: 0.7.0
+version: 0.7.1
 appVersion: "1.0.0"
 
 # Subcharts are vendored in charts/ (not fetched from a repo). They must be
