@@ -138,3 +138,6 @@ mongo-backup-*/
 .turbo/
 .npmrc
 infra/scripts/setup-github-runner.sh
+
+# Kaban board (local task tracking state)
+.kaban/
