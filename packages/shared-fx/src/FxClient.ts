@@ -25,11 +25,20 @@ export interface FxClientOpts {
   minRate?:          number;     // sanity floor on GBP/USD (default 0.5)
   maxRate?:          number;     // sanity ceiling (default 1.5)
   now?:              () => number;
+  // When true, a successful provider fetch is NOT written back to the Redis cache. Used by
+  // consumer services (signal/trading/portfolio) whose provider (RedisGbpUsdProvider) READS the
+  // rate market-data-service publishes — they must not overwrite the authoritative lastGood/lastTs,
+  // or a stale rate would look perpetually fresh once market-data stops refreshing.
+  readOnly?:         boolean;
 }
 
-const KEY_RATE      = 'fx:GBPUSD';        // hot cache, TTL'd
-const KEY_LAST_GOOD = 'fx:GBPUSD:lastGood';  // value:{rate, ts}, no TTL
-const KEY_LAST_TS   = 'fx:GBPUSD:lastTs';    // unix ms
+// Shared Redis keys for the GBP-per-1-USD rate. market-data-service is the single writer (hot key
+// + lastGood/lastTs); consumer services read them via RedisGbpUsdProvider.
+export const FX_KEYS = {
+  rate:     'fx:GBPUSD',          // hot cache, TTL'd
+  lastGood: 'fx:GBPUSD:lastGood', // last good rate, no TTL
+  lastTs:   'fx:GBPUSD:lastTs',   // unix ms of the last good write
+} as const;
 
 export class FxClient {
   private readonly ttlSec:           number;
@@ -37,6 +46,7 @@ export class FxClient {
   private readonly minRate:          number;
   private readonly maxRate:          number;
   private readonly now:              () => number;
+  private readonly readOnly:         boolean;
 
   constructor(
     private readonly redis: Pick<RedisClientType, 'get' | 'set' | 'setEx'>,
@@ -48,12 +58,13 @@ export class FxClient {
     this.minRate          = opts.minRate          ?? 0.5;
     this.maxRate          = opts.maxRate          ?? 1.5;
     this.now              = opts.now              ?? (() => Date.now());
+    this.readOnly         = opts.readOnly         ?? false;
   }
 
   // GBP per 1 USD. Throws if no fresh rate is available AND lastGood is older than
   // staleFallbackSec — caller decides whether to halt trading.
   async usdGbpRate(): Promise<number> {
-    const cached = await this.redis.get(KEY_RATE);
+    const cached = await this.redis.get(FX_KEYS.rate);
     if (cached) {
       const r = Number(cached);
       if (this._inBounds(r)) return r;
@@ -101,23 +112,27 @@ export class FxClient {
       throw new Error(`fx unavailable: ${err instanceof Error ? err.message : err}`);
     }
 
-    // Persist hot + lastGood. Best-effort; cache write failures don't kill the fetch.
-    try {
-      await Promise.all([
-        this.redis.setEx(KEY_RATE,    this.ttlSec, String(rate)),
-        this.redis.set(KEY_LAST_GOOD, String(rate)),
-        this.redis.set(KEY_LAST_TS,   String(this.now())),
-      ]);
-    } catch (err) {
-      console.warn('[fx] cache write failed (non-fatal):', err);
+    // Persist hot + lastGood. Best-effort; cache write failures don't kill the fetch. readOnly
+    // clients (consumers reading market-data's published rate) skip this so they never overwrite
+    // the single writer's authoritative lastGood/lastTs.
+    if (!this.readOnly) {
+      try {
+        await Promise.all([
+          this.redis.setEx(FX_KEYS.rate,     this.ttlSec, String(rate)),
+          this.redis.set(FX_KEYS.lastGood,   String(rate)),
+          this.redis.set(FX_KEYS.lastTs,     String(this.now())),
+        ]);
+      } catch (err) {
+        console.warn('[fx] cache write failed (non-fatal):', err);
+      }
     }
     return rate;
   }
 
   private async _readLastGood(): Promise<number | null> {
     const [rateStr, tsStr] = await Promise.all([
-      this.redis.get(KEY_LAST_GOOD),
-      this.redis.get(KEY_LAST_TS),
+      this.redis.get(FX_KEYS.lastGood),
+      this.redis.get(FX_KEYS.lastTs),
     ]);
     if (!rateStr || !tsStr) return null;
     const rate = Number(rateStr);

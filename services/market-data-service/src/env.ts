@@ -10,8 +10,11 @@ const EnvSchema = z.object({
     BAR_FREQUENCY: z.enum(["daily", "intraday"]).default("daily"),
     POLL_INTERVAL_MS: z.coerce.number().int().positive().optional(),
     POLL_ANCHOR_OFFSET_MS: z.coerce.number().int().default(22 * 60 * 60_000),
-    // Bid/ask quote poll cadence (Yahoo v7/quote side-channel). Default 1h, matching bars.
+    // Bid/ask quote poll cadence. Default 1h, matching bars.
     QUOTE_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(60 * 60_000),
+    // GBP/USD refresh cadence. market-data is the single platform FX writer; consumers read the
+    // published fx:GBPUSD via RedisGbpUsdProvider. Default 1h (matches the FxClient hot-cache TTL).
+    FX_REFRESH_INTERVAL_MS: z.coerce.number().int().positive().default(60 * 60_000),
 
     UNIVERSE_REFRESH_MS: z.coerce.number().int().positive().default(30 * 24 * 60 * 60 * 1000),
     GAP_THRESHOLD: z.coerce.number().min(0).max(1).default(0.20),
