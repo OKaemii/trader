@@ -81,6 +81,12 @@ const EnvSchema = z.object({
     FUNDAMENTALS_REFRESH_RETRY_MS:    z.coerce.number().int().positive().default(20 * 60_000),
     FUNDAMENTALS_REFRESH_PROGRESS_MS: z.coerce.number().int().positive().default(2 * 60_000),
 
+    // Earnings/dividend calendar source ('yahoo' calendarEvents, free, default; 'eodhd' dormant).
+    // Weekly TTL in EarningsStore; the refresher re-checks staleness on the idle interval below.
+    EARNINGS_PROVIDER:               z.enum(["yahoo", "eodhd"]).default("yahoo"),
+    EARNINGS_REQUEST_SPACING_MS:     z.coerce.number().int().nonnegative().default(500),
+    EARNINGS_REFRESH_IDLE_MS:        z.coerce.number().int().positive().default(24 * 60 * 60_000),
+
     MONGODB_URL: z.string().url().default("mongodb://mongodb:27017"),
     REDIS_URL:   z.string().url().default("redis://redis:6379"),
 
