@@ -144,6 +144,41 @@ describe('marketStateOf — half-day', () => {
   });
 });
 
+describe('marketStateOf — 2027 weekend shifts (static fallback)', () => {
+  // Locks in the tricky 2027 observances baked into STATIC_FALLBACK so a future edit can't
+  // silently regress them. Weekdays verified: 2027-12-24 = Fri, 2027-07-05 = Mon, 2027-07-02 = Fri.
+  const us2027 = (fullClosures: string[], halfDays: { date: string; closeLocal: string }[] = []) => ({
+    'US:2027': { market: 'US' as const, year: 2027, fullClosures, halfDays, fetchedAt: 0, source: 'static-fallback' as const },
+  });
+  const lse2027 = (halfDays: { date: string; closeLocal: string }[]) => ({
+    'LSE:2027': { market: 'LSE' as const, year: 2027, fullClosures: [], halfDays, fetchedAt: 0, source: 'static-fallback' as const },
+  });
+
+  it('2027-12-24: US observed-Christmas is CLOSED all day, LSE is a 12:30 half-day', async () => {
+    // Dec 25 2027 is a Saturday → US observes Christmas on Fri Dec 24 (full closure). The same
+    // Friday is a half-day (not a closure) for LSE: Christmas Eve, 12:30 GMT close.
+    const usRegular = Date.parse('2027-12-24T15:00:00Z');   // would be EST regular hours but for the closure
+    expect(await marketStateOf(nyse(us2027(['2027-12-24'])), usRegular)).toBe('CLOSED');
+
+    const lseTables    = lse2027([{ date: '2027-12-24', closeLocal: '12:30' }]);
+    const lseMorning   = Date.parse('2027-12-24T10:00:00Z');  // before the 12:30 GMT half-day close
+    const lseAfterHalf = Date.parse('2027-12-24T12:35:00Z');  // just after the half-day close → POST (grace)
+    expect(await marketStateOf(lse(lseTables), lseMorning)).toBe('REGULAR');
+    expect(await marketStateOf(lse(lseTables), lseAfterHalf)).toBe('POST');
+  });
+
+  it('2027 Independence Day shifts to Mon Jul 5 (CLOSED); Fri Jul 2 stays a normal session', async () => {
+    // Jul 4 2027 is a Sunday → observed Mon Jul 5. Unlike 2026, Jul 2/3 carry no special closure.
+    const tables = us2027(['2027-07-05']);
+    const monJul5 = Date.parse('2027-07-05T15:00:00Z');   // would be EDT regular hours but for the closure
+    const friJul2 = Date.parse('2027-07-02T15:00:00Z');   // a normal full trading day in 2027
+    const satJul3 = Date.parse('2027-07-03T15:00:00Z');   // weekend — closed, but not a holiday
+    expect(await marketStateOf(nyse(tables), monJul5)).toBe('CLOSED');
+    expect(await marketStateOf(nyse(tables), friJul2)).toBe('REGULAR');
+    expect(await marketStateOf(nyse(tables), satJul3)).toBe('CLOSED');
+  });
+});
+
 describe('partitionByMarket', () => {
   it('splits a mixed universe by suffix', () => {
     const groups = partitionByMarket(['AAPL_US_EQ', 'VODl_EQ', 'MSFT_US_EQ', 'BPl_EQ', 'BTC_USDT']);
