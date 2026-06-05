@@ -1,7 +1,7 @@
 'use client'
 import { useEffect, useState } from 'react'
 
-const STRATEGIES = ['factor_rank_v1', 'sector_momentum_v1', 'topology_v1'] as const
+const STRATEGIES = ['factor_rank_v1', 'sector_momentum_v1', 'topology_v1', 'high_velocity_v1'] as const
 
 function isoToMs(d: string): number {
   return new Date(d + 'T00:00:00Z').getTime()
