@@ -5,7 +5,7 @@ import { TradingServiceClient } from "@trader/contracts";
 import { mintInternalJwt } from "@trader/shared-auth";
 import { getMongoDb } from "@trader/shared-mongo";
 import { getRedisClient } from "@trader/shared-redis";
-import { FxClient, YahooFxProvider } from "@trader/shared-fx";
+import { FxClient, RedisGbpUsdProvider } from "@trader/shared-fx";
 
 import type { PortfolioEnv } from "./env.ts";
 import { PositionSyncService } from "./modules/positions/application/PositionSyncService.ts";
@@ -24,7 +24,9 @@ export interface PortfolioDeps {
 
 export async function wireDependencies(env: PortfolioEnv, logger: Logger): Promise<PortfolioDeps> {
     const redis = (await getRedisClient()) as unknown as RedisClientType;
-    const fx    = new FxClient(redis as never, new YahooFxProvider());
+    // FX centralized: read the GBP/USD market-data publishes to Redis (no upstream key); readOnly
+    // so position-value conversions never overwrite the single writer's freshness timestamp.
+    const fx    = new FxClient(redis as never, new RedisGbpUsdProvider(redis as never), { readOnly: true });
     const db    = await getMongoDb();
 
     const trading = new TradingServiceClient({

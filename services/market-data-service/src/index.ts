@@ -19,7 +19,7 @@ import { YahooProvider } from './modules/bars/infrastructure/providers/yahoo-pro
 import { TwelveDataProvider } from './modules/bars/infrastructure/providers/twelvedata-provider.ts';
 import { configureEodhdClient } from './modules/bars/infrastructure/providers/eodhd-client.ts';
 import type { MarketDataProvider } from './modules/bars/infrastructure/providers/market-data-provider.ts';
-import { FxClient, YahooFxProvider } from '@trader/shared-fx';
+import { FxClient, TwelveDataFxProvider } from '@trader/shared-fx';
 import { aggregateBars, invalidateBarsBulk } from '@trader/shared-bars';
 import {
   HolidayCache, NyseIcalProvider, UkGovBankHolidayProvider, StaticFallbackProvider, STATIC_FALLBACK,
@@ -247,14 +247,15 @@ async function ensureBarIndexes(): Promise<void> {
   }
 }
 
-// FxClient: lazy-singleton, shared across the service. Backed by Yahoo GBPUSD=X with
-// 1h hot cache + 24h stale-fallback. Used here for liquidity ranking and (transitively
-// via the provider) anywhere ADV needs to be expressed in BASE_CURRENCY.
+// FxClient: lazy-singleton, shared across the service. Backed by TwelveData USD/GBP with a 1h hot
+// cache + 24h stale-fallback. market-data-service is the SINGLE platform writer of the GBP/USD rate
+// (fx:GBPUSD + lastGood/lastTs) — consumer services read those keys via RedisGbpUsdProvider, so the
+// FX upstream key lives only here. Used locally for liquidity ranking + fundamentals cap conversion.
 let _fxClient: FxClient | null = null;
 async function getFxClient(): Promise<FxClient> {
   if (_fxClient) return _fxClient;
   const redis = await getRedisClient();
-  _fxClient = new FxClient(redis as any, new YahooFxProvider());
+  _fxClient = new FxClient(redis as any, new TwelveDataFxProvider(env.TWELVEDATA_API_KEY));
   return _fxClient;
 }
 
@@ -774,6 +775,20 @@ async function bootstrap(): Promise<void> {
   // Universe is resolved by now — start the background QMJ refresher (first pass runs immediately,
   // populating any missing fundamentals, then self-paces). Independent of the bar poll cadence.
   fundamentalsRefresher.start();
+
+  // Centralized FX: market-data is the single platform writer of GBP/USD. Refresh on a fixed
+  // interval so consumers (RedisGbpUsdProvider) always read a fresh fx:GBPUSD. Best-effort — a
+  // failure leaves the last-good rate in place (the existing 24h stale-fallback covers blips).
+  const refreshFx = async (): Promise<void> => {
+    try {
+      const r = await (await getFxClient()).usdGbpRate();
+      log.info(`[fx] GBP/USD refreshed = ${r.toFixed(4)}`);
+    } catch (err) {
+      log.warn('[fx] refresh failed (serving last-good):', err);
+    }
+  };
+  void refreshFx();
+  setInterval(() => { void refreshFx(); }, env.FX_REFRESH_INTERVAL_MS);
 
   pollLoop().catch((err) => {
     log.error('[fatal]', err);

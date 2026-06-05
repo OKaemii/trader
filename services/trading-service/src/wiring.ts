@@ -4,7 +4,7 @@ import { SignalServiceClient } from "@trader/contracts";
 import { mintInternalJwt } from "@trader/shared-auth";
 import { getMongoDb } from "@trader/shared-mongo";
 import { getRedisClient, subscribe } from "@trader/shared-redis";
-import { FxClient, YahooFxProvider } from "@trader/shared-fx";
+import { FxClient, RedisGbpUsdProvider } from "@trader/shared-fx";
 
 import type { TradingEnv } from "./env.ts";
 import { Trading212Client } from "./modules/t212/infrastructure/Trading212Client.ts";
@@ -46,7 +46,9 @@ export async function wireDependencies(env: TradingEnv, logger: Logger) {
     const getFxClient = async (): Promise<FxClient> => {
         if (fxClient) return fxClient;
         const redis = await getRedisClient();
-        fxClient = new FxClient(redis as never, new YahooFxProvider());
+        // FX centralized: read the GBP/USD market-data publishes to Redis (no upstream key here);
+        // readOnly so order-sizing reads never overwrite the single writer's freshness timestamp.
+        fxClient = new FxClient(redis as never, new RedisGbpUsdProvider(redis as never), { readOnly: true });
         return fxClient;
     };
 

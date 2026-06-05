@@ -3,7 +3,7 @@ import { TradingServiceClient } from "@trader/contracts";
 import { mintInternalJwt } from "@trader/shared-auth";
 import { getMongoDb } from "@trader/shared-mongo";
 import { getRedisClient } from "@trader/shared-redis";
-import { FxClient, YahooFxProvider } from "@trader/shared-fx";
+import { FxClient, RedisGbpUsdProvider } from "@trader/shared-fx";
 
 import type { SignalEnv } from "./env.ts";
 import { createSignalDataLayer } from "./shared/data.ts";
@@ -27,8 +27,10 @@ export async function wireDependencies(env: SignalEnv, logger: Logger) {
     const redis = await getRedisClient();
     const db    = await getMongoDb();
 
-    // Single FxClient shared by RiskEngine NAV math + MongoPortfolioState drawdown reads.
-    const fx = new FxClient(redis as never, new YahooFxProvider());
+    // Single FxClient shared by RiskEngine NAV math + MongoPortfolioState drawdown reads. FX is
+    // centralized: market-data-service publishes GBP/USD to Redis; we read it (no upstream key) and
+    // never write back (readOnly) so we don't clobber the single writer's freshness timestamp.
+    const fx = new FxClient(redis as never, new RedisGbpUsdProvider(redis as never), { readOnly: true });
 
     // Typed peer-service client for trading-service /internal/* — owns auth + JSON parsing.
     const tradingClient = new TradingServiceClient({
