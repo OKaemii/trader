@@ -1,6 +1,5 @@
-import Link from 'next/link'
 import { authedFetch } from '@/app/lib/auth-fetch'
-import { CashCard } from '@/components/CashCard'
+import { PortfolioHero } from '@/components/PortfolioHero'
 import { HoldingsPanel, type HoldingsInitial } from '@/components/HoldingsPanel'
 import { AutoApproveToggle } from '@/components/AutoApproveToggle'
 import { CircuitBreakerCard } from '@/components/CircuitBreakerCard'
@@ -99,13 +98,6 @@ async function fetchCashInitial(): Promise<CashInitial | null> {
   return fetchJsonOrNull<CashInitial>('/admin/api/trading/cash')
 }
 
-const cards = [
-  { href: '/signals', title: 'Signals', desc: 'Latest strategy signals, regime, factor exposure.' },
-  { href: '/research', title: 'Research', desc: 'Run backtests, view validation reports, factor decomposition.' },
-  { href: '/universe', title: 'Universe', desc: 'Inspect the active universe and add or exclude tickers.' },
-  { href: '/market-data', title: 'Market Data', desc: 'Override bar frequency and polling interval.' },
-]
-
 export default async function DashboardPage() {
   const [health, mdHealth, autoApprove, holdings, cash, riskStatus] = await Promise.all([
     fetchHealth(),
@@ -118,13 +110,11 @@ export default async function DashboardPage() {
   const nextOpen = mdHealth?.next_session_open_ts
     ? new Date(mdHealth.next_session_open_ts).toUTCString()
     : null
+  const healthDown = (health ?? []).filter((s) => !s.ok)
   return (
     <div className="space-y-6 p-6">
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-bold text-white">Dashboard</h1>
-          <p className="mt-1 text-sm text-gray-400">Account state, holdings, and system overview.</p>
-        </div>
+      <div className="flex items-center justify-between gap-4">
+        <h1 className="text-2xl font-bold text-white">Dashboard</h1>
         {mdHealth?.session_states && (
           <div className="flex items-center gap-2">
             {(['US', 'LSE'] as const).map((m) => {
@@ -136,53 +126,42 @@ export default async function DashboardPage() {
         )}
       </div>
 
-      <section className="grid grid-cols-1 gap-4 lg:grid-cols-4">
-        <CashCard initial={cash as never} />
-        <AutoApproveToggle initialEnabled={autoApprove} />
-        <CircuitBreakerCard initial={riskStatus} />
-        <div className="rounded border border-gray-800 bg-gray-900 p-4">
-          <h2 className="mb-2 text-sm font-medium text-gray-300">System health</h2>
-          {health === null ? (
-            <div className="text-sm text-gray-500">Health endpoint unavailable (admin role required).</div>
-          ) : (
-            <ul className="grid grid-cols-2 gap-2 md:grid-cols-4">
-              {health.map((s) => (
-                <li
-                  key={s.name}
-                  className="flex items-center justify-between rounded bg-gray-950 px-3 py-2 text-sm"
-                >
-                  <span className="text-gray-300">{s.name}</span>
-                  <span className={s.ok ? 'text-emerald-400' : 'text-red-400'}>
-                    {s.ok ? 'ok' : `down${s.status ? ` (${s.status})` : ''}`}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-      </section>
+      {/* Portfolio first (Trading212-style): lead with value + holdings, not ops controls. */}
+      <PortfolioHero initial={cash as never} />
 
       <section>
         <HoldingsPanel initial={holdings} />
       </section>
 
-      <DangerZone />
-
-      <section>
-        <h2 className="mb-2 text-sm font-medium text-gray-300">Shortcuts</h2>
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-4">
-          {cards.map((c) => (
-            <Link
-              key={c.href}
-              href={c.href}
-              className="block rounded border border-gray-800 bg-gray-900 p-4 transition-colors hover:border-gray-700 hover:bg-gray-800"
-            >
-              <div className="text-base font-medium text-white">{c.title}</div>
-              <div className="mt-1 text-xs text-gray-400">{c.desc}</div>
-            </Link>
-          ))}
+      {/* Operations — secondary. Full controls live on the Console; these are the at-a-glance ones. */}
+      <section className="space-y-3">
+        <h2 className="text-xs font-semibold uppercase tracking-wide text-gray-500">Operations</h2>
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+          <AutoApproveToggle initialEnabled={autoApprove} />
+          <CircuitBreakerCard initial={riskStatus} />
+          <div className="rounded border border-gray-800 bg-gray-900 p-4">
+            <h2 className="mb-2 text-sm font-medium text-gray-300">System health</h2>
+            {health === null ? (
+              <div className="text-sm text-gray-500">Health endpoint unavailable (admin role required).</div>
+            ) : healthDown.length === 0 ? (
+              <div className="flex items-center gap-2 text-sm text-emerald-400">
+                <span>●</span> All {health.length} services healthy
+              </div>
+            ) : (
+              <ul className="space-y-1">
+                {healthDown.map((s) => (
+                  <li key={s.name} className="flex items-center justify-between rounded bg-gray-950 px-3 py-1.5 text-sm">
+                    <span className="text-gray-300">{s.name}</span>
+                    <span className="text-red-400">down{s.status ? ` (${s.status})` : ''}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
         </div>
       </section>
+
+      <DangerZone />
     </div>
   )
 }
