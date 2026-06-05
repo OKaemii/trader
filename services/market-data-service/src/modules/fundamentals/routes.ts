@@ -6,9 +6,14 @@
 import { Hono } from 'hono';
 import { parseAdminHeaders, parseInternalHeaders } from '@trader/shared-auth/middleware';
 import type { FundamentalsCache } from './application/FundamentalsCache.ts';
+import type { FundamentalsRefreshScheduler } from './application/FundamentalsRefreshScheduler.ts';
 import type { UniverseManager } from '../universe/application/UniverseManager.ts';
 
-export function createFundamentalsRouter(cache: FundamentalsCache, universe: UniverseManager): Hono {
+export function createFundamentalsRouter(
+  cache: FundamentalsCache,
+  universe: UniverseManager,
+  refresher: FundamentalsRefreshScheduler,
+): Hono {
   const r = new Hono();
 
   // Internal: fundamentals for the high-velocity strategy host (read-through; refreshes stale).
@@ -28,13 +33,21 @@ export function createFundamentalsRouter(cache: FundamentalsCache, universe: Uni
     return c.json(await cache.coverage());
   });
 
-  // Admin: force a refresh of the given tickers (or the whole active universe when none given).
+  // Admin: refresh fundamentals. A full-universe Yahoo walk runs for minutes and would 504 at the
+  // ingress, so the no-body case (the portal "Refresh" button) wakes the background refresher and
+  // returns immediately — the portal polls /coverage for progress. An explicit (small) ticker list
+  // still refreshes synchronously for targeted operator use.
   r.post('/admin/api/market-data/fundamentals/refresh', parseAdminHeaders, async (c) => {
     const body = await c.req.json().catch(() => ({})) as { tickers?: string[] };
-    const tickers = (body.tickers && body.tickers.length > 0) ? body.tickers : universe.activeTickers;
-    if (tickers.length === 0) return c.json({ error: 'no tickers (universe empty and no body.tickers)' }, 400);
-    const written = await cache.refresh(tickers);
-    return c.json({ ok: true, requested: tickers.length, written });
+    if (body.tickers && body.tickers.length > 0) {
+      const written = await cache.refresh(body.tickers);
+      return c.json({ ok: true, mode: 'sync', requested: body.tickers.length, written });
+    }
+    if (universe.activeTickers.length === 0) {
+      return c.json({ error: 'no tickers (universe empty and no body.tickers)' }, 400);
+    }
+    refresher.triggerNow();
+    return c.json({ ok: true, mode: 'background', started: true, universeSize: universe.activeTickers.length }, 202);
   });
 
   return r;

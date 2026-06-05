@@ -87,7 +87,8 @@ async function backfillDailyOne(
 ): Promise<DailyBackfillResult> {
   const bars = await fetchDailyHistory(ticker, startMs, endMs);
   if (bars.length === 0) {
-    log.warn(`[daily-history] ${ticker}: Yahoo returned no daily history`);
+    const src = (process.env.DAILY_HISTORY_PROVIDER ?? 'yahoo').toLowerCase();
+    log.warn(`[daily-history] ${ticker}: ${src} returned no daily history`);
     return { ticker, fetched: 0, upserted: 0 };
   }
   const stats = await writeBarRevisions(db, bars, 'daily');

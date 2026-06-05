@@ -1,8 +1,9 @@
 // QuoteProvider — segregated from MarketDataProvider (Interface Segregation): bid/ask quotes
 // are a separate capability the active OHLCV provider (TwelveData) does NOT supply on the free
-// tier, so we do NOT force it onto MarketDataProvider. Quotes stay on Yahoo's free v7/quote
-// endpoint, exactly like FX and sector classification. `buildQuoteProvider()` (index.ts) hands
-// consumers a Yahoo-backed QuoteProvider regardless of which OHLCV provider is active.
+// tier, so we do NOT force it onto MarketDataProvider. There is currently no free real-quote
+// source (Yahoo's v7/quote was removed — its per-IP throttling starved the fundamentals handshake),
+// so `buildQuoteProvider()` (quote-providers.ts) hands consumers a NullQuoteProvider and QuotePoll
+// writes a synthetic proxy. A paid real-time feed plugs in at that seam.
 
 export interface RawQuote {
   ticker: string;          // T212 ticker

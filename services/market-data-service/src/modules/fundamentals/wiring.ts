@@ -7,9 +7,14 @@ import { YahooFundamentalsProvider } from './infrastructure/YahooFundamentalsPro
 import { EodhdFundamentalsProvider } from './infrastructure/EodhdFundamentalsProvider.ts';
 import type { FundamentalsProvider, FxToGBP } from './infrastructure/FundamentalsProvider.ts';
 
-export function buildFundamentalsCache(fxToGBP: FxToGBP, providerName: 'yahoo' | 'eodhd'): FundamentalsCache {
+export function buildFundamentalsCache(
+  fxToGBP: FxToGBP,
+  providerName: 'yahoo' | 'eodhd',
+  opts: { requestSpacingMs?: number } = {},
+): FundamentalsCache {
   const provider: FundamentalsProvider = providerName === 'eodhd'
     ? new EodhdFundamentalsProvider()
-    : new YahooFundamentalsProvider(fxToGBP);
+    // Default qs (real Yahoo session); spacing widened from env to stay under Yahoo's per-IP limit.
+    : new YahooFundamentalsProvider(fxToGBP, undefined, opts.requestSpacingMs);
   return new FundamentalsCache(provider, providerName);
 }
