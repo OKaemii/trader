@@ -11,6 +11,7 @@ import { wireDependencies } from "./wiring.ts";
 import { createRouter } from "./modules/signals/routes/public.ts";
 import { createInternalRouter } from "./modules/signals/routes/internal.ts";
 import { createPieRouter } from "./modules/pie/routes/pie-routes.ts";
+import { createTradePlanRouter } from "./modules/tradeplans/routes/tradeplan-routes.ts";
 import { registerTopologyWebSocket, registerSystemReset } from "./modules/signals/routes/system.ts";
 
 async function main(): Promise<void> {
@@ -52,6 +53,11 @@ async function main(): Promise<void> {
         telemetrySnapshot: deps.telemetrySnapshot,
     }));
     app.route("/", createPieRouter(deps.pieRepo));
+    app.route("/", createTradePlanRouter({
+        tradePlanRepo:  deps.tradePlanRepo,
+        signalRepo:     deps.signalRepo,
+        tradingClient:  deps.tradingClient,
+    }));
 
     // WebSocket + system-reset moved here from the (deleted) api-gateway. Both belong
     // with the service that already owns the strategy:* pubsub channels and the bulk of

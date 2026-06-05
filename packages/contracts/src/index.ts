@@ -25,6 +25,7 @@ export type {
 
 export type {
     CashResponse, PositionsResponse, Position, ExecuteOrderRequest,
+    TradePlan, TradePlanRequest, EnrichedPosition,
 } from "./trading/schemas.ts";
 
 export type {
