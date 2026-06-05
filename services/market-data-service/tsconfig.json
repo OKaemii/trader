@@ -12,6 +12,7 @@
         { "path": "../../packages/core" },
         { "path": "../../packages/shared-auth" },
         { "path": "../../packages/shared-bars" },
+        { "path": "../../packages/shared-indicators" },
         { "path": "../../packages/shared-calendar" },
         { "path": "../../packages/shared-fx" },
         { "path": "../../packages/shared-mongo" },

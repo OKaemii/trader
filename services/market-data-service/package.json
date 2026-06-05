@@ -18,6 +18,7 @@
     "@trader/core": "workspace:*",
     "@trader/shared-auth": "workspace:*",
     "@trader/shared-bars": "workspace:*",
+    "@trader/shared-indicators": "workspace:*",
     "@trader/shared-calendar": "workspace:*",
     "@trader/shared-fx": "workspace:*",
     "@trader/shared-mongo": "workspace:*",
