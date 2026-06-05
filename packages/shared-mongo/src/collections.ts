@@ -28,6 +28,12 @@ export const COLLECTIONS = {
   USERS:                 'users',
   POSITIONS:             'positions',
   ORDERS:                'orders',
+  // Per-ticker swing trade plan set by the operator from the portal: protective stop +
+  // profit target (Money, listing currency) + free-text note. { _id: ticker, stop?, target?,
+  // note?, updatedBy, updatedAt }. Read by signal-service's enriched-positions join (entry +
+  // days-held from the opening BUY signal, R-multiple, stop distance) and the AlertWatcher,
+  // which auto-derives stop/target price alert rules from each plan.
+  TRADE_PLANS:           'trade_plans',
   BAD_TICKS:             'bad_ticks',
   PUSH_TOKENS:           'push_tokens',
   RISK_REJECTIONS:       'risk_rejections',
