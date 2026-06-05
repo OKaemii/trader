@@ -2,16 +2,16 @@
 
 import { useState } from 'react'
 
-// One active strategy at a time. Persists the selection (PORTAL_RUNTIME_CONFIG); strategy
-// selection is structural (universe source, rolling window, cross-cycle state), so it applies
-// on the next strategy-engine restart — the confirm + the result message spell that out.
+// One active strategy at a time. Persists the selection (PORTAL_RUNTIME_CONFIG) AND applies it
+// live — the strategy-engine rebuilds the strategy in-process on the next cycle, so no restart is
+// needed. The persisted choice also survives a restart.
 export function ActiveStrategySelector({ strategies, active }: { strategies: string[]; active: string }) {
   const [sel, setSel] = useState(active || strategies[0] || '')
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState<string | null>(null)
 
   async function save(): Promise<void> {
-    if (!window.confirm(`Set the active strategy to "${sel}"? It applies on the next strategy-engine restart (strategy selection is structural — it changes the universe source + rolling window).`)) return
+    if (!window.confirm(`Set the active strategy to "${sel}"? This applies live — the strategy-engine swaps to it on its next cycle (no restart). It changes what trades, so confirm you want the switch now.`)) return
     setBusy(true); setMsg(null)
     try {
       const r = await fetch('/portal-api/admin/strategy/active', {
@@ -19,9 +19,9 @@ export function ActiveStrategySelector({ strategies, active }: { strategies: str
       })
       const body = await r.json()
       if (!r.ok) throw new Error(body.error ?? `failed (${r.status})`)
-      setMsg(body.restartRequired
-        ? `Saved. Restart strategy-engine to apply — currently running ${body.applied}.`
-        : 'Saved — this strategy is already running.')
+      setMsg(body.appliedLive
+        ? `Applied live — now running ${sel} (no restart needed).`
+        : `Saved. Applies on the strategy-engine's next cycle — was running ${body.applied}.`)
     } catch (e) { setMsg(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
   }
 
