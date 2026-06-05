@@ -121,6 +121,9 @@ global:
     fundamentalsProvider: yahoo
     # Earnings/dividend calendar source. yahoo (free calendarEvents) | eodhd (dormant — falls back to yahoo).
     earningsProvider: yahoo
+    # Sector-rotation reference ETFs (comma-separated T212 tickers). Empty → built-in 11 SPDRs + SPY.
+    # Tracked for the heatmap only — never added to the tradeable universe.
+    sectorEtfTickers: ""
     # Real-quote source for the bid/ask poll. eodhd (real-time last-trade — needs the EODHD real-time
     # add-on; degrades to the synthetic proxy if unavailable) | none (synthetic-only). Flip to `none`
     # if EODHD real-time isn't on the plan, to avoid spending credits on calls that return nothing.
