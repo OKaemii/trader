@@ -159,6 +159,8 @@ importers:
         specifier: ^4.6.13
         version: 4.7.1
 
+  packages/shared-indicators: {}
+
   packages/shared-mongo:
     dependencies:
       mongodb:
