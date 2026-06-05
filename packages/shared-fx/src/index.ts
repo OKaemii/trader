@@ -1,2 +1,3 @@
-export { FxClient, type FxClientOpts, type FxRateProvider } from './FxClient.ts';
-export { YahooFxProvider } from './YahooFxProvider.ts';
+export { FxClient, FX_KEYS, type FxClientOpts, type FxRateProvider } from './FxClient.ts';
+export { TwelveDataFxProvider } from './TwelveDataFxProvider.ts';
+export { RedisGbpUsdProvider, type RedisGbpUsdProviderOpts } from './RedisGbpUsdProvider.ts';

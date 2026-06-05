@@ -345,6 +345,10 @@ export interface UniverseManagerOptions {
   sectorClient?: YahooSectorClient | null;
   // Stale-window override (ms). Defaults to 30 days.
   sectorStaleMs?: number;
+  // Resolves the effective max universe size at refresh time. Lets a portal runtime override
+  // (portal_market_config) take precedence over the construction-time env default without a
+  // restart. Omitted (or a non-positive/garbage return) falls back to the static config.maxSize.
+  maxSizeResolver?: () => number | Promise<number>;
 }
 
 export class UniverseManager {
@@ -353,6 +357,7 @@ export class UniverseManager {
   private readonly config: UniverseConfig;
   private readonly sectorClient: YahooSectorClient | null;
   private readonly sectorStaleMs: number;
+  private readonly maxSizeResolver: (() => number | Promise<number>) | null;
 
   // Optional FX converter for liquidity ranking. Default (identity) keeps tests and
   // any caller that doesn't supply FX working — at the cost of incorrect cross-currency
@@ -367,12 +372,30 @@ export class UniverseManager {
     // `undefined` = use the default client; explicit `null` = disable enrichment.
     this.sectorClient = options.sectorClient === undefined ? new YahooSectorClient() : options.sectorClient;
     this.sectorStaleMs = options.sectorStaleMs ?? SECTOR_STALE_MS_DEFAULT;
+    this.maxSizeResolver = options.maxSizeResolver ?? null;
+  }
+
+  // Effective max universe size for this refresh: the resolver's value (portal override) when sane,
+  // else the static env/config default. Guards against a missing/garbage resolver return.
+  private async resolveMaxSize(): Promise<number> {
+    if (!this.maxSizeResolver) return this.config.maxSize;
+    try {
+      const n = await this.maxSizeResolver();
+      return Number.isFinite(n) && n > 0 ? Math.floor(n) : this.config.maxSize;
+    } catch {
+      return this.config.maxSize;
+    }
   }
 
   /** Call once at startup, then monthly. */
   async refresh(): Promise<string[]> {
     const db = await getMongoDb();
     const now = new Date();
+
+    // Effective config for THIS refresh: maxSize may be a live portal override (resolveMaxSize),
+    // everything else is the static env config. Pass `cfg` (not this.config) to the selectors and
+    // the eligibility cap so a portal change takes effect on the next refresh without a restart.
+    const cfg: UniverseConfig = { ...this.config, maxSize: await this.resolveMaxSize() };
 
     // ── 1. Fetch all T212 instruments ──────────────────────────────────────────
     let instruments: InstrumentMeta[] = [];
@@ -401,7 +424,7 @@ export class UniverseManager {
     if (this.config.source === 'eodhd_scan') {
       // ── EODHD market-cap scan: the single universe source (US+LSE >= minCapGbp). ──
       // Feeds the same instrument_registry diff below — no parallel pool.
-      selected = await selectFromEodhdScan(rawInstruments, this.fxToGBP, this.config);
+      selected = await selectFromEodhdScan(rawInstruments, this.fxToGBP, cfg);
     } else if (this.config.includeUs.length > 0 || this.config.includeLse.length > 0) {
       // ── 2/3/4 (curated): resolve include lists → ADV rank → top N ────────────
       // Each include-list symbol is matched against T212's `shortName` (the bare symbol,
@@ -410,7 +433,7 @@ export class UniverseManager {
       // dropped — the log line reports how many. Liquidity comes from a one-shot Yahoo call
       // per candidate; ranking ensures stable selection across refreshes when the candidate
       // pool exceeds this.config.maxSize.
-      selected = await selectCurated(rawInstruments, this.fxToGBP, this.config);
+      selected = await selectCurated(rawInstruments, this.fxToGBP, cfg);
     } else {
       // ── 2. Fetch OHLCV stats for Section 29b eligibility filters ─────────────
       const allTickers = instruments.map((i) => i.ticker);
@@ -469,12 +492,12 @@ export class UniverseManager {
       // ── 4. Sector-balance cap (Section 29c) ──────────────────────────────────
       // 'Unknown' is exempt: T212 instruments API provides no sector data, so all instruments
       // fall into 'Unknown' until enriched. Capping Unknown would silently truncate the universe.
-      const sectorCap = Math.floor(this.config.maxSize * MAX_SECTOR_FRACTION);
+      const sectorCap = Math.floor(cfg.maxSize * MAX_SECTOR_FRACTION);
       const sectorCount: Record<string, number> = {};
       selected = [];
 
       for (const inst of eligible) {
-        if (selected.length >= this.config.maxSize) break;
+        if (selected.length >= cfg.maxSize) break;
         const sector = inst.sector;
         if (sector !== 'Unknown' && (sectorCount[sector] ?? 0) >= sectorCap) continue;
         selected.push(inst);

@@ -5,6 +5,12 @@ metadata:
   namespace: {{ .Release.Namespace }}
   annotations:
     kubernetes.io/ingress.class: nginx
+    # Several admin endpoints run for minutes (scanner/run does the EODHD market scan; backfill
+    # fetches multi-year history). nginx's default 60s proxy timeout returns a 504 HTML body the
+    # portal's JSON parse rejects. Match backtest-engine's long-admin-call window. (Fundamentals
+    # refresh is non-blocking and doesn't need this, but shares the ingress.)
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
 spec:
   rules:
     - host: trader.local

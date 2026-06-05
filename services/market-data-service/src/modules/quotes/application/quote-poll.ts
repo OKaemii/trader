@@ -1,12 +1,13 @@
 import type { Logger } from '@trader/core';
 import type { QuoteProvider } from '../infrastructure/quote-provider.ts';
 import type { QuoteWriter, QuoteRow } from '../infrastructure/quote-writer.ts';
-import { type BarHL, realQuoteRow, syntheticFromBar } from './quote-row.ts';
+import { type BarHL, realQuoteRow, realMidQuoteRow, syntheticFromBar } from './quote-row.ts';
 
-// Separate poll from the bars loop (different cadence + endpoint, shared rate budget). Yahoo
-// quotes when available; synthetic high-low proxy fills gaps (off-hours, thin LSE names) so
-// every active ticker has a row. Dependencies are injected (provider, writer, universe,
-// latest-bar lookup) — the loop itself is pure orchestration and unit-testable via runOnce().
+// Separate poll from the bars loop (different cadence + endpoint, shared rate budget). Real quotes
+// from the configured QuoteProvider when available; a synthetic high-low proxy fills gaps (off-hours,
+// thin names, or a provider that returns nothing) so every active ticker has a row. Dependencies are
+// injected (provider, writer, universe, latest-bar lookup) — the loop is pure orchestration,
+// unit-testable via runOnce().
 export interface QuotePollDeps {
   provider: QuoteProvider;
   writer: QuoteWriter;
@@ -37,7 +38,8 @@ export class QuotePoll {
 
     for (const q of raw) {
       seen.add(q.ticker);
-      const rq = realQuoteRow(q, now);
+      // Full bid/ask book if the feed has one; else a real last-price (paid feed); else synthetic.
+      const rq = realQuoteRow(q, now) ?? realMidQuoteRow(q, now);
       if (rq) {
         rows.push(rq);
         real += 1;

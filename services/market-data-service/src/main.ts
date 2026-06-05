@@ -40,6 +40,7 @@ configureLiveConfig({
     // POLL_INTERVAL_MS is optional in the schema; fall back to the bar-frequency-dependent
     // default that matches the legacy live-config behaviour (24h for daily, 15m for intraday).
     pollIntervalMs: env.POLL_INTERVAL_MS ?? (env.BAR_FREQUENCY === "daily" ? 24 * 60 * 60_000 : 15 * 60_000),
+    universeMaxSize: env.UNIVERSE_MAX_SIZE,
 });
 
 await import("./index.ts");
