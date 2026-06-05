@@ -75,3 +75,12 @@ export const InternalBarsResponseSchema = z.object({
     bars: z.record(z.string(), z.array(OHLCVBarSchema)),
 });
 export type InternalBarsResponse = z.infer<typeof InternalBarsResponseSchema>;
+
+// Next earnings + dividend dates for a ticker (UTC ms). null = unknown coverage (never fabricated).
+export const EarningsEventSchema = z.object({
+    ticker: z.string(),
+    nextEarningsDate: z.number().nullable(),
+    dividendDate: z.number().nullable(),
+    source: z.string(),
+});
+export type EarningsEvent = z.infer<typeof EarningsEventSchema>;

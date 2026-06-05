@@ -34,6 +34,11 @@ export const COLLECTIONS = {
   // days-held from the opening BUY signal, R-multiple, stop distance) and the AlertWatcher,
   // which auto-derives stop/target price alert rules from each plan.
   TRADE_PLANS:           'trade_plans',
+  // Per-ticker next earnings + dividend dates (UTC ms) for the swing-portal earnings calendar
+  // and the "position reports within 10 days" flag. { _id: ticker, nextEarningsDate?, dividendDate?,
+  // source, asOf, updatedAt }. Written by market-data-service's EarningsStore (Yahoo calendarEvents,
+  // weekly refresh); unknown coverage is omitted (never a fabricated date).
+  EARNINGS_CALENDAR:     'earnings_calendar',
   BAD_TICKS:             'bad_ticks',
   PUSH_TOKENS:           'push_tokens',
   RISK_REJECTIONS:       'risk_rejections',

@@ -77,6 +77,8 @@ spec:
               value: {{ .Values.global.env.eodhdDailyCallLimit | default "90000" | quote }}
             - name: FUNDAMENTALS_PROVIDER
               value: {{ .Values.global.env.fundamentalsProvider | default "yahoo" | quote }}
+            - name: EARNINGS_PROVIDER
+              value: {{ .Values.global.env.earningsProvider | default "yahoo" | quote }}
             - name: QUOTE_PROVIDER
               value: {{ .Values.global.env.quoteProvider | default "eodhd" | quote }}
             - name: BAR_FREQUENCY
