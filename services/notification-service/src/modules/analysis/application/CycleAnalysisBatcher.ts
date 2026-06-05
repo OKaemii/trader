@@ -342,6 +342,30 @@ export function resolveEffectiveCadence(declared: Cadence, override: Cadence | u
     return override;
 }
 
+/**
+ * Build the concise aggregated-push payload for one digest cycle — counts the actions and lists a
+ * few traded tickers so the operator gets a single informative tap per rebalance instead of one
+ * per signal. Pure + exported for testing and for the wiring onFlush.
+ */
+export function summariseCycleBatch(
+    batch: Pick<CycleBatch, 'strategyId' | 'cadence' | 'cycleKey' | 'signals'>,
+): { title: string; body: string; data: Record<string, unknown> } {
+    let buys = 0, sells = 0, holds = 0;
+    for (const s of batch.signals) {
+        if (s.action === 'BUY') buys++;
+        else if (s.action === 'SELL') sells++;
+        else holds++;
+    }
+    const traded = batch.signals.filter((s) => s.action !== 'HOLD').map((s) => s.ticker);
+    const shown = traded.slice(0, 6).join(', ');
+    const more = traded.length > 6 ? ` +${traded.length - 6} more` : '';
+    const title = `📊 ${batch.strategyId} · ${buys} BUY / ${sells} SELL`;
+    const body = traded.length > 0
+        ? `${shown}${more}${holds ? ` · ${holds} hold` : ''}`
+        : `${batch.signals.length} signal(s), no trades this ${batch.cadence} cycle`;
+    return { title, body, data: { cycleKey: batch.cycleKey, strategyId: batch.strategyId, buys, sells, holds } };
+}
+
 // ── Date helpers ──────────────────────────────────────────────────────────
 
 function utcDateOf(timestampMs: number): string {

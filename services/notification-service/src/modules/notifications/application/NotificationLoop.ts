@@ -65,29 +65,34 @@ export class NotificationLoop {
                         catch (err) { this.deps.logger.warn({ err, signalId: signal.id }, "analysis batcher add failed"); }
                     }
 
-                    const dedupKey = `notif:delivered:${signal.id}`;
-                    const alreadySent = await this.deps.redis.get(dedupKey);
-                    if (alreadySent) {
-                        this.deps.logger.info({ signalId: signal.id }, "dedup skip — already delivered");
-                        await xAck(sub, REDIS_STREAMS.TRADE_SIGNALS, CONSUMER_GROUP, id);
-                        continue;
+                    // Per-signal email + push are a FALLBACK channel for when the aggregated
+                    // analysis digest isn't configured (no DeepSeek/Resend). When the batcher IS
+                    // active, the operator gets ONE aggregated email + one aggregated push per
+                    // cycle (wiring onFlush) instead of a tap per signal — "do not notify on every
+                    // signal, just the aggregated result". So we skip the per-signal sends here.
+                    if (!this.deps.analysisBatcher) {
+                        const dedupKey = `notif:delivered:${signal.id}`;
+                        const alreadySent = await this.deps.redis.get(dedupKey);
+                        if (alreadySent) {
+                            this.deps.logger.info({ signalId: signal.id }, "dedup skip — already delivered");
+                        } else {
+                            const tag = `${signal.action} ${signal.ticker} (${signal.id.slice(0, 8)})`;
+                            await Promise.allSettled([
+                                (async () => {
+                                    if (!this.deps.email) return;
+                                    try { await this.deps.email.send(signal); this.deps.logger.info({ tag }, "email sent"); }
+                                    catch (err) { this.deps.logger.warn({ err, tag }, "email FAILED"); }
+                                })(),
+                                (async () => {
+                                    try { await this.deps.push.send(signal); }
+                                    catch (err) { this.deps.logger.warn({ err, tag }, "push FAILED"); }
+                                })(),
+                            ]);
+                            await this.deps.redis.setEx(dedupKey, 86400, "1");
+                        }
                     }
 
-                    const tag = `${signal.action} ${signal.ticker} (${signal.id.slice(0, 8)})`;
-                    await Promise.allSettled([
-                        (async () => {
-                            if (!this.deps.email) return;
-                            try { await this.deps.email.send(signal); this.deps.logger.info({ tag }, "email sent"); }
-                            catch (err) { this.deps.logger.warn({ err, tag }, "email FAILED"); }
-                        })(),
-                        (async () => {
-                            try { await this.deps.push.send(signal); }
-                            catch (err) { this.deps.logger.warn({ err, tag }, "push FAILED"); }
-                        })(),
-                    ]);
-
-                    await this.deps.redis.setEx(dedupKey, 86400, "1");
-                    await xAck(this.deps.redis, REDIS_STREAMS.TRADE_SIGNALS, CONSUMER_GROUP, id);
+                    await xAck(sub, REDIS_STREAMS.TRADE_SIGNALS, CONSUMER_GROUP, id);
                 } catch (err) {
                     this.deps.logger.error({ err, id }, "processing error");
                     // Don't ACK — stays in PEL for retry.
