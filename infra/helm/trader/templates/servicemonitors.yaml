@@ -1,0 +1,39 @@
+{{/*
+  One ServiceMonitor per trader service that exposes /metrics, so kube-prometheus-stack scrapes
+  them all and (with remote_write) ships the samples to Mimir. The TS services get /metrics from
+  @trader/core's shared `mountMetrics` (Node runtime metrics + any business counters); strategy-engine
+  exposes prometheus_client metrics. `targetPort` (numeric) is used so we don't have to name the
+  Service port on every subchart. backtest-engine is intentionally omitted — it's a low-traffic job
+  runner with no app /metrics; its pod-level metrics come from kube-state-metrics.
+*/}}
+{{- $svcs := list
+  (dict "app" "auth-service"         "port" 3001)
+  (dict "app" "market-data-service"  "port" 3002)
+  (dict "app" "signal-service"       "port" 3003)
+  (dict "app" "notification-service" "port" 3004)
+  (dict "app" "trading-service"      "port" 3005)
+  (dict "app" "portfolio-service"    "port" 3006)
+  (dict "app" "strategy-engine"      "port" 8000)
+-}}
+{{- range $svc := $svcs }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: trader-{{ $svc.app }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    release: kube-prometheus-stack
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ $.Release.Namespace }}
+  selector:
+    matchLabels:
+      app: {{ $svc.app }}
+  endpoints:
+    - targetPort: {{ $svc.port }}
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+{{- end }}
