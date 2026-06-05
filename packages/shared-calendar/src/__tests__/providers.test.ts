@@ -168,6 +168,47 @@ describe('StaticFallbackProvider', () => {
     }
   });
 
+  it('returns the baked-in 2027 US table with the weekend-shifted observances', async () => {
+    const origWarn = console.warn;
+    console.warn = () => {};
+    try {
+      const provider = new StaticFallbackProvider('US');
+      const table = await provider.fetchYear(2027);
+      expect(table.source).toBe('static-fallback');
+      expect(table.year).toBe(2027);
+      // 10 full closures incl. weekend-shifted Juneteenth (Fri 18th), Independence (Mon 5th), Christmas (Fri 24th).
+      expect(table.fullClosures).toHaveLength(10);
+      expect(table.fullClosures).toContain('2027-06-18');
+      expect(table.fullClosures).toContain('2027-07-05');
+      expect(table.fullClosures).toContain('2027-12-24');
+      // Exactly one half-day in 2027 — the day after Thanksgiving. No July-3 / Dec-24 early close.
+      expect(table.halfDays).toEqual([{ date: '2027-11-26', closeLocal: '13:00' }]);
+    } finally {
+      console.warn = origWarn;
+    }
+  });
+
+  it('returns the baked-in 2027 LSE table with substitute days + both half-days', async () => {
+    const origWarn = console.warn;
+    console.warn = () => {};
+    try {
+      const provider = new StaticFallbackProvider('LSE');
+      const table = await provider.fetchYear(2027);
+      expect(table.year).toBe(2027);
+      // Christmas/Boxing shift to substitute days Mon 27th / Tue 28th.
+      expect(table.fullClosures).toHaveLength(8);
+      expect(table.fullClosures).toContain('2027-12-27');
+      expect(table.fullClosures).toContain('2027-12-28');
+      // Both half-days occur (24th and 31st are Fridays in 2027).
+      expect(table.halfDays).toEqual([
+        { date: '2027-12-24', closeLocal: '12:30' },
+        { date: '2027-12-31', closeLocal: '12:30' },
+      ]);
+    } finally {
+      console.warn = origWarn;
+    }
+  });
+
   it('throws when no baked-in table for the requested year', async () => {
     const origWarn = console.warn;
     console.warn = () => {};
@@ -185,6 +226,9 @@ describe('StaticFallbackProvider', () => {
     try {
       expect(STATIC_FALLBACK.US[2026].fullClosures).toContain('2026-01-01');
       expect(STATIC_FALLBACK.LSE[2026].fullClosures).toContain('2026-04-03');
+      // 2027 baked in too (US has no other runtime source — NYSE iCal is dead).
+      expect(STATIC_FALLBACK.US[2027].fullClosures).toContain('2027-01-01');
+      expect(STATIC_FALLBACK.LSE[2027].fullClosures).toContain('2027-03-26');
     } finally {
       console.warn = origWarn;
     }
