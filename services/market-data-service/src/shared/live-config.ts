@@ -8,6 +8,7 @@ export interface MarketConfigDoc {
     _id: 'singleton';
     barFrequency: 'daily' | 'intraday' | null;
     pollIntervalMs: number | null;
+    universeMaxSize: number | null;
     updatedBy: string;
     updatedAt: Date;
 }
@@ -15,11 +16,12 @@ export interface MarketConfigDoc {
 export interface LiveConfig {
     barFrequency: 'daily' | 'intraday';
     pollIntervalMs: number;
+    universeMaxSize: number;
 }
 
 // Module-level defaults set once at boot via configureLiveConfig(). Override docs in Mongo
 // take precedence; this is the fallback when no override is set.
-let _envDefaults: LiveConfig = { barFrequency: 'daily', pollIntervalMs: 24 * 60 * 60_000 };
+let _envDefaults: LiveConfig = { barFrequency: 'daily', pollIntervalMs: 24 * 60 * 60_000, universeMaxSize: 150 };
 
 export function configureLiveConfig(envDefaults: LiveConfig): void {
     _envDefaults = envDefaults;
@@ -39,8 +41,9 @@ export async function getLiveConfig(): Promise<LiveConfig> {
         log.warn('[live-config] mongo read failed, using env defaults:', err);
     }
     const value: LiveConfig = {
-        barFrequency:   doc?.barFrequency   ?? _envDefaults.barFrequency,
-        pollIntervalMs: doc?.pollIntervalMs ?? _envDefaults.pollIntervalMs,
+        barFrequency:    doc?.barFrequency    ?? _envDefaults.barFrequency,
+        pollIntervalMs:  doc?.pollIntervalMs  ?? _envDefaults.pollIntervalMs,
+        universeMaxSize: doc?.universeMaxSize ?? _envDefaults.universeMaxSize,
     };
     cached = { value, ts: Date.now() };
     return value;

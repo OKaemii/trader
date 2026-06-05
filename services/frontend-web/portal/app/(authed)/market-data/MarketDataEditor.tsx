@@ -57,6 +57,10 @@ export function MarketDataEditor({
   const [execChoice, setExecChoice] = useState<ExecChoice>(
     initial.override.signalOrderType ?? 'default',
   )
+  const [sizeUseDefault, setSizeUseDefault] = useState(initial.override.universeMaxSize == null)
+  const [universeMaxSize, setUniverseMaxSize] = useState<number>(
+    initial.override.universeMaxSize ?? initial.defaults.universeMaxSize,
+  )
   // Touched-flag so the auto-pair only fires when the user hasn't already expressed a
   // preference. Without this the radio would snap back every time the user toggled bar
   // frequency, which is surprising.
@@ -77,17 +81,30 @@ export function MarketDataEditor({
   }, [barChoice, execChoice, execTouched])
 
   function onSave() {
+    const sizeOverride = sizeUseDefault ? null : universeMaxSize
+    // A change to the effective universe size re-shapes which instruments trade AND invalidates
+    // prior backtest_results — confirm before committing (portal convention: spell out the consequence).
+    const effectiveSizeNext = sizeOverride ?? data.defaults.universeMaxSize
+    if (effectiveSizeNext !== data.effective.universeMaxSize) {
+      const ok = window.confirm(
+        `Change the active universe size from ${data.effective.universeMaxSize} to ${effectiveSizeNext}?\n\n` +
+        `Takes effect on the next universe refresh and changes which instruments are traded. It also ` +
+        `INVALIDATES prior backtest_results — re-run validation before re-enabling topology_v1 or any go-live gate.`,
+      )
+      if (!ok) return
+    }
     startTransition(async () => {
       setFlash(null)
       const r = await saveMarketDataConfig(
         barChoice === 'default' ? null : barChoice,
         pollUseDefault ? null : pollMs,
         execChoice === 'default' ? null : execChoice,
+        sizeOverride,
       )
       if (r.ok) {
         setFlash(
           execChoice === 'default'
-            ? 'Saved. Effective on next poll iteration.'
+            ? 'Saved. Effective on next poll iteration (universe size applies on the next universe refresh).'
             : `Saved. trading-service picks up signal order type = ${orderTypeName(execChoice)} on the next order; strategy-engine self-restarts (~10s) if bar frequency changed.`,
         )
         setData((d) => ({
@@ -96,7 +113,9 @@ export function MarketDataEditor({
             barFrequency:    barChoice === 'default'  ? null : barChoice,
             pollIntervalMs:  pollUseDefault ? null : pollMs,
             signalOrderType: execChoice === 'default' ? null : execChoice,
+            universeMaxSize: sizeOverride,
           },
+          effective: { ...d.effective, universeMaxSize: effectiveSizeNext },
           updatedAt: new Date().toISOString(),
         }))
       } else {
@@ -113,8 +132,8 @@ export function MarketDataEditor({
       <div>
         <h1 className="text-2xl font-bold text-white">Market Data</h1>
         <p className="mt-1 text-sm text-gray-400">
-          Override bar frequency and poll interval. Overrides layer on top of Helm defaults; pick
-          “Use Helm default” to clear an override.
+          Override bar frequency, poll interval, signal order type, and universe size. Overrides layer
+          on top of Helm defaults; pick “Use Helm default” to clear an override.
         </p>
       </div>
 
@@ -136,6 +155,7 @@ export function MarketDataEditor({
                 : '— (default)',
             ],
             ['Signal order type', data.override.signalOrderType == null ? '— (default)' : orderTypeName(data.override.signalOrderType)],
+            ['Universe size', data.override.universeMaxSize == null ? '— (default)' : String(data.override.universeMaxSize)],
           ]}
         />
         <InfoCard
@@ -144,6 +164,7 @@ export function MarketDataEditor({
             ['Bar frequency', data.effective.barFrequency],
             ['Poll interval', `${data.effective.pollIntervalMs} ms`],
             ['Signal order type', orderTypeName(data.effective.signalOrderType)],
+            ['Universe size', String(data.effective.universeMaxSize)],
           ]}
         />
         <InfoCard
@@ -152,6 +173,7 @@ export function MarketDataEditor({
             ['Bar frequency', data.defaults.barFrequency],
             ['Poll interval', `${data.defaults.pollIntervalMs} ms`],
             ['Signal order type', orderTypeName(data.defaults.signalOrderType)],
+            ['Universe size', String(data.defaults.universeMaxSize)],
           ]}
         />
       </div>
@@ -260,6 +282,34 @@ export function MarketDataEditor({
               <span className="ml-2 text-xs text-gray-500">milliseconds (5_000 – 86_400_000)</span>
             </>
           )}
+        </div>
+
+        <div className="mb-4">
+          <label className="mb-1 flex items-center gap-2 text-xs text-gray-400">
+            <input
+              type="checkbox"
+              checked={sizeUseDefault}
+              onChange={(e) => setSizeUseDefault(e.target.checked)}
+            />
+            Use Helm default universe size
+          </label>
+          <div className="flex items-center gap-2">
+            <input
+              type="number"
+              min={10}
+              max={500}
+              step={1}
+              value={universeMaxSize}
+              disabled={sizeUseDefault}
+              onChange={(e) => setUniverseMaxSize(parseInt(e.target.value || '0'))}
+              className="w-32 rounded border border-gray-700 bg-gray-950 px-2 py-1 text-sm text-gray-100 disabled:opacity-50"
+            />
+            <span className="text-xs text-gray-500">active instruments (10–500). Applies on the next universe refresh.</span>
+          </div>
+          <p className="mt-1 text-[11px] text-amber-400/80">
+            Changing the universe size re-shapes which instruments are traded and <strong>invalidates prior
+            backtest results</strong> — re-validate before re-enabling topology_v1 or any go-live gate.
+          </p>
         </div>
 
         <button

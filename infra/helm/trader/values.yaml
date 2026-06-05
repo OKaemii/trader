@@ -160,12 +160,13 @@ global:
     # T212 legacy `FB_US_EQ` symbol; the SYMBOL_RENAMES map in yahoo-client.ts rewrites it
     # to Yahoo's `META`.
     tickerUniverse: "AAPL_US_EQ,MSFT_US_EQ,GOOGL_US_EQ,AMZN_US_EQ,NVDA_US_EQ,FB_US_EQ,TSLA_US_EQ,JPM_US_EQ,JNJ_US_EQ,UNH_US_EQ,V_US_EQ,PG_US_EQ,MA_US_EQ,HD_US_EQ,CVX_US_EQ,MRK_US_EQ,ABBV_US_EQ,PEP_US_EQ,KO_US_EQ,AVGO_US_EQ,LLY_US_EQ,COST_US_EQ,MCD_US_EQ,BAC_US_EQ,TMO_US_EQ,ABT_US_EQ,WMT_US_EQ,CSCO_US_EQ,XOM_US_EQ,CRM_US_EQ,ACN_US_EQ,DHR_US_EQ,NEE_US_EQ,INTC_US_EQ,NFLX_US_EQ,AMD_US_EQ,QCOM_US_EQ,TXN_US_EQ,INTU_US_EQ,CAT_US_EQ,HON_US_EQ,AMGN_US_EQ,SBUX_US_EQ,IBM_US_EQ,GILD_US_EQ,AXP_US_EQ,GS_US_EQ,MS_US_EQ,BLK_US_EQ,SPGI_US_EQ,SGLNl_EQ,IUKDl_EQ,SUPRl_EQ,SRSAl_EQ,VFEMl_EQ,XUSEl_EQ,SSLNl_EQ"
-    # Max active universe size. Bumping invalidates prior backtest_results — re-run validation
-    # before re-enabling topology_v1 or any go-live gate (see CLAUDE.md / Research page).
-    # Under universeSource=eodhd_scan the selection is market-balanced (balanceByMarket):
-    # maxSize/2 from each of US + LSE by descending cap, so 200 ⇒ ~100 US / ~100 UK rather than
-    # a US-dominated top-500 global cap sort. Raise only after re-validating (see note above).
-    universeMaxSize: "200"
+    # Max active universe size (DEFAULT — portal-overridable at runtime via the Market Data config
+    # page → portal_market_config; the override wins per-refresh, no restart). Changing the effective
+    # size invalidates prior backtest_results — re-run validation before re-enabling topology_v1 or
+    # any go-live gate (see CLAUDE.md / Research page). Under universeSource=eodhd_scan the selection
+    # is market-balanced (balanceByMarket): maxSize/2 from each of US + LSE by descending cap, so
+    # 60 ⇒ ~30 US / ~30 UK. Raise only after re-validating (see note above).
+    universeMaxSize: "60"
     # Curated candidate pool — bare symbols, resolved against T212 instruments at refresh time.
     # US list expected to use `_US_EQ` form in T212; LSE list uses primary listing `l_EQ` GBP/GBX.
     # Symbols T212 doesn't carry are silently skipped (logged on refresh). Verify against current

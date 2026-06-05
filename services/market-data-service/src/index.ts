@@ -93,6 +93,11 @@ const universeManager = new UniverseManager(
     source:      env.UNIVERSE_SOURCE,
     minCapGbp:   env.MIN_MARKET_CAP_GBP,
   },
+  {
+    // Live max-universe-size override (portal_market_config), resolved per refresh — a portal
+    // save takes effect on the next universe refresh with no restart. Falls back to env maxSize.
+    maxSizeResolver: async () => (await getLiveConfig()).universeMaxSize,
+  },
 );
 
 // Bi-temporal persist. Cosmetic re-polls (same content hash as the latest stored
