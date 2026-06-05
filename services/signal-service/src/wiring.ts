@@ -23,6 +23,9 @@ import { StrategyDecayMonitor } from "./modules/approval/application/StrategyDec
 import { MongoPieRepository } from "./modules/pie/infrastructure/MongoPieRepository.ts";
 import { PieManager } from "./modules/pie/application/PieManager.ts";
 import { MongoTradePlanRepository } from "./modules/tradeplans/infrastructure/MongoTradePlanRepository.ts";
+import { MongoAlertRuleRepository } from "./modules/alerts/infrastructure/MongoAlertRuleRepository.ts";
+import { LatestBarReader } from "./modules/alerts/infrastructure/LatestBarReader.ts";
+import { AlertWatcher } from "./modules/alerts/application/AlertWatcher.ts";
 
 export async function wireDependencies(env: SignalEnv, logger: Logger) {
     const redis = await getRedisClient();
@@ -57,6 +60,10 @@ export async function wireDependencies(env: SignalEnv, logger: Logger) {
     const pieRepo         = new MongoPieRepository(db);
     const pieManager      = new PieManager(pieRepo, logger);
     const tradePlanRepo   = new MongoTradePlanRepository(db);
+    const alertRuleRepo   = new MongoAlertRuleRepository(db);
+    const alertWatcher    = new AlertWatcher(
+        alertRuleRepo, new LatestBarReader(db), redis as never, logger, env.ALERT_WATCH_INTERVAL_MS,
+    );
     const publisher       = new RedisSignalPublisher(redis, logger);
     const generateSignals = new GenerateSignalsUseCase(
         signalRepo, publisher, portfolioState, riskEngine,
@@ -93,6 +100,7 @@ export async function wireDependencies(env: SignalEnv, logger: Logger) {
         logger, env, redis, db, fx, tradingClient,
         signalRepo, riskEngine, tripRecorder, decayMonitor, portfolioState, priceLookup,
         approveSignal, autoApprovalGate, publisher, generateSignals, pieRepo, tradePlanRepo,
+        alertRuleRepo, alertWatcher,
         findRecent, getProgress, telemetrySnapshot, subscribers, cache, bus,
     } as const;
 }

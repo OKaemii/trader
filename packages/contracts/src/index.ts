@@ -21,6 +21,7 @@ export type {
     ClaimedSignal, ExecutedNotification, ClosedNotification, DecrementQuantityRequest,
     QueueFailedRequest, QueueSweepRequest, AutoApproveBody,
     TelemetrySnapshotQuery, TelemetrySnapshotResponse, PriorAppearance,
+    AlertRule, AlertRuleRequest,
 } from "./signals/schemas.ts";
 
 export type {

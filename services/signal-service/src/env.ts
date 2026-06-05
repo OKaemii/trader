@@ -42,6 +42,10 @@ const EnvSchema = z.object({
     // permanently-stuck row when auto-approve is on.
     AUTO_APPROVE_SWEEP_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
 
+    // AlertWatcher cadence — how often enabled price-alert rules are evaluated against the latest
+    // bar. Swing alerts are EOD-grained, so hourly is ample (per-rule cooldownH prevents spam).
+    ALERT_WATCH_INTERVAL_MS: z.coerce.number().int().positive().default(60 * 60_000),
+
     OTLP_ENDPOINT: z.string().url().optional(),
 });
 
