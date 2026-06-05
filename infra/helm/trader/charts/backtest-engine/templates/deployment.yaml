@@ -32,6 +32,15 @@ spec:
               value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb-headless:27017/trader?authSource=trader&directConnection=true"
             - name: MONGODB_DB
               value: trader
+            # Plain-English report explanations (DeepSeek, OpenAI-compatible). Same key the
+            # notification-service uses. optional so the pod still boots if it's unset — the
+            # explainer just no-ops and the portal shows reports without the write-up.
+            - name: DEEPSEEK_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: DEEPSEEK_API_KEY
+                  optional: true
             - name: TIMESCALEDB_PASSWORD
               valueFrom:
                 secretKeyRef:
