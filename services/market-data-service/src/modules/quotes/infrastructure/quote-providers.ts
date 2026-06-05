@@ -11,6 +11,7 @@
 // (NOT TwelveData, whose free budget must stay reserved for the live bar poll).
 
 import type { QuoteProvider, RawQuote } from './quote-provider.ts';
+import { EodhdQuoteProvider } from './eodhd-quote-provider.ts';
 
 /** Returns no real quotes — every ticker falls through to QuotePoll's synthetic proxy. */
 export class NullQuoteProvider implements QuoteProvider {
@@ -18,6 +19,9 @@ export class NullQuoteProvider implements QuoteProvider {
   async fetchQuotes(_tickers: string[]): Promise<RawQuote[]> { return []; }
 }
 
-export function buildQuoteProvider(): QuoteProvider {
-  return new NullQuoteProvider();
+// Selected by QUOTE_PROVIDER. `eodhd` uses EODHD real-time last-trade (mid only, no bid/ask;
+// requires the real-time add-on — degrades to synthetic if the plan lacks it). `none` writes
+// synthetic-only. NOT TwelveData: its free credit budget is reserved for the live bar poll.
+export function buildQuoteProvider(providerName: 'none' | 'eodhd'): QuoteProvider {
+  return providerName === 'eodhd' ? new EodhdQuoteProvider() : new NullQuoteProvider();
 }

@@ -15,6 +15,10 @@ const EnvSchema = z.object({
     // GBP/USD refresh cadence. market-data is the single platform FX writer; consumers read the
     // published fx:GBPUSD via RedisGbpUsdProvider. Default 1h (matches the FxClient hot-cache TTL).
     FX_REFRESH_INTERVAL_MS: z.coerce.number().int().positive().default(60 * 60_000),
+    // Real-quote source for the bid/ask poll. `eodhd` = EODHD real-time last-trade (mid only, no
+    // bid/ask; needs the EODHD real-time add-on — degrades to the synthetic proxy if unavailable).
+    // `none` = synthetic-only. NOT TwelveData (its free budget is reserved for the bar poll).
+    QUOTE_PROVIDER: z.enum(["none", "eodhd"]).default("eodhd"),
 
     UNIVERSE_REFRESH_MS: z.coerce.number().int().positive().default(30 * 24 * 60 * 60 * 1000),
     GAP_THRESHOLD: z.coerce.number().min(0).max(1).default(0.20),

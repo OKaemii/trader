@@ -795,12 +795,12 @@ async function bootstrap(): Promise<void> {
     process.exit(1);
   });
 
-  // Quote poll — separate cadence + endpoint from bars (Yahoo v7/quote), shared rate budget.
+  // Quote poll — separate cadence + endpoint from bars (QUOTE_PROVIDER: EODHD real-time or synthetic).
   // Best-effort: a quote-poll crash must never take down the bar pipeline. latestBar feeds the
   // synthetic high-low fallback from the most recent stored 5m bar.
   try {
     const quotePoll = new QuotePoll({
-      provider: buildQuoteProvider(),
+      provider: buildQuoteProvider(env.QUOTE_PROVIDER),
       writer: new QuoteWriter(),
       activeTickers: () => universeManager.activeTickers,
       latestBar: async (ticker) => {

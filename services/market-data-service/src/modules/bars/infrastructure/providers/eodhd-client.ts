@@ -17,7 +17,7 @@ const EODHD_BASE = 'https://eodhd.com/api';
 // Approximate per-endpoint EODHD API-call consumption. EODHD weights heavier endpoints more
 // than a single /eod call; the exact weights vary by plan, so these are conservative and the
 // limiter's day budget carries headroom. Verify against EODHD's current consumption table.
-export const EODHD_COST = { eod: 1, bulk: 100, screener: 5, fundamentals: 10 } as const;
+export const EODHD_COST = { eod: 1, bulk: 100, screener: 5, fundamentals: 10, realtime: 1 } as const;
 
 // Legacy-rename overrides — mirror twelvedata/yahoo so the curated/scanned universe resolves
 // identically across providers (T212 keeps the pre-rebrand symbol; EODHD wants the new one).
@@ -67,6 +67,12 @@ export interface EodhdEodRow {
   volume: number;
 }
 export interface EodhdBulkRow extends EodhdEodRow { code: string; }
+
+export interface EodhdRealTimeRow {
+  code: string;        // the SYMBOL.EXCHANGE as requested (maps back to the T212 ticker)
+  close: number;       // last trade price, in the listing's native unit (LSE = pence — scale at the boundary)
+  timestampMs: number; // quote time (UTC ms); Date.now() when EODHD returns 'NA'
+}
 
 export interface EodhdScreenerRow {
   code: string;
@@ -186,6 +192,37 @@ export class EodhdClient {
         volume:         numOr(r.volume, 0),
       }))
       .filter((r) => r.date !== '' && Number.isFinite(r.close));
+  }
+
+  /**
+   * Real-time (delayed) last-trade prices for multiple `SYMBOL.EXCHANGE`s. EODHD batches via the
+   * `s=` param (first symbol in the path, the rest comma-separated); each symbol counts as one
+   * call against the budget. Returns last `close` (NOT a bid/ask book — EODHD real-time has no
+   * book) tagged with the symbol so the caller maps back to its T212 ticker. Empty on budget
+   * exhaustion / not-entitled / error (degrades to synthetic upstream). Requires the EODHD
+   * real-time add-on; on a plan without it the endpoint 4xxs and this returns [].
+   */
+  async realTimeQuotes(eodhdSymbols: string[]): Promise<EodhdRealTimeRow[]> {
+    const out: EodhdRealTimeRow[] = [];
+    const BATCH = 20;
+    for (let i = 0; i < eodhdSymbols.length; i += BATCH) {
+      const batch = eodhdSymbols.slice(i, i + BATCH);
+      const first = batch[0];
+      if (!first) continue;
+      const rest = batch.slice(1);
+      const query: Record<string, string> = rest.length ? { s: rest.join(',') } : {};
+      const body = await this.get<unknown>(`/real-time/${first}`, query, batch.length * EODHD_COST.realtime);
+      if (!body) continue;
+      const rows = Array.isArray(body) ? body : [body];
+      for (const raw of rows as Array<Record<string, unknown>>) {
+        const code = String(raw.code ?? '');
+        const close = numOr(raw.close, NaN);
+        const tsSec = numOr(raw.timestamp, NaN);
+        if (code === '' || !Number.isFinite(close) || close <= 0) continue;
+        out.push({ code, close, timestampMs: Number.isFinite(tsSec) ? tsSec * 1000 : Date.now() });
+      }
+    }
+    return out;
   }
 }
 
