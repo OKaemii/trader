@@ -14,6 +14,7 @@ const links = [
   { href: '/universe', label: 'Universe' },
   { href: '/screener', label: 'Screener' },
   { href: '/sectors', label: 'Sectors' },
+  { href: '/calendar', label: 'Calendar' },
   { href: '/market-data', label: 'Market Data' },
   { href: '/operations/console', label: 'Console' },
   { href: '/operations/performance', label: 'Performance' },
