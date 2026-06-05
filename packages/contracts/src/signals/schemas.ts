@@ -1,4 +1,36 @@
 import { z } from "zod";
+import { MoneySchema } from "../money.ts";
+
+// ── Price alert rules ─────────────────────────────────────────────────────────
+// A rule fires when the latest bar's range crosses `level`: direction 'above' → high ≥ level
+// (entry/target reached), 'below' → low ≤ level (stop approached). `source` distinguishes
+// operator-created rules from those auto-derived from a trade plan's stop/target.
+export const AlertRuleKindSchema = z.enum(["entry", "stop", "target"]);
+export const AlertDirectionSchema = z.enum(["above", "below"]);
+
+export const AlertRuleSchema = z.object({
+    id: z.string(),
+    ticker: z.string(),
+    kind: AlertRuleKindSchema,
+    direction: AlertDirectionSchema,
+    level: MoneySchema,
+    enabled: z.boolean(),
+    cooldownH: z.number().nonnegative(),
+    lastFiredAt: z.number().optional(),
+    source: z.enum(["manual", "tradeplan"]),
+    updatedAt: z.number(),
+});
+export type AlertRule = z.infer<typeof AlertRuleSchema>;
+
+export const AlertRuleRequestSchema = z.object({
+    ticker: z.string().min(1),
+    kind: AlertRuleKindSchema,
+    direction: AlertDirectionSchema,
+    level: MoneySchema,
+    enabled: z.boolean().optional(),
+    cooldownH: z.number().nonnegative().optional(),
+});
+export type AlertRuleRequest = z.infer<typeof AlertRuleRequestSchema>;
 
 // /internal/trading/signals/:id/executed
 export const ExecutedNotificationSchema = z.object({

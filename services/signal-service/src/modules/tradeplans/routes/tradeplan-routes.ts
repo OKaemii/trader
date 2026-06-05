@@ -7,12 +7,16 @@ import { parseAdminHeaders } from '@trader/shared-auth/middleware';
 import { Trading, type TradingServiceClient } from '@trader/contracts';
 import type { ITradePlanRepository } from '../domain/TradePlan.ts';
 import type { ISignalRepository } from '../../signals/domain/ISignalRepository.ts';
+import type { IAlertRuleRepository } from '../../alerts/domain/AlertRule.ts';
 import { enrichPosition } from '../application/EnrichedPositions.ts';
+import { deriveRulesFromPlan } from '../../alerts/application/detect.ts';
 
 export interface TradePlanRouterDeps {
     tradePlanRepo: ITradePlanRepository;
     signalRepo: ISignalRepository;
     tradingClient: TradingServiceClient;
+    // When present, saving a plan auto-derives stop/target price-alert rules (visible on /alerts).
+    alertRules?: IAlertRuleRepository | undefined;
     now?: () => number;
 }
 
@@ -46,6 +50,15 @@ export function createTradePlanRouter(deps: TradePlanRouterDeps): Hono {
                 updatedBy: body.updatedBy ?? 'unknown',
                 updatedAt: now(),
             });
+            // Auto-derive stop/target price-alert rules from the saved plan (deterministic ids, so
+            // re-saving updates rather than duplicates; cleared fields remove their derived rule).
+            if (deps.alertRules) {
+                const { upsert, removeIds } = deriveRulesFromPlan({ ticker, stop: plan.stop, target: plan.target });
+                await Promise.all([
+                    ...upsert.map((dr) => deps.alertRules!.upsert(dr)),
+                    ...removeIds.map((id) => deps.alertRules!.remove(id)),
+                ]);
+            }
             return c.json(plan);
         },
     );
