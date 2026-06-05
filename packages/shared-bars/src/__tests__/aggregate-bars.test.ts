@@ -7,7 +7,7 @@
 // by several hours.
 
 import { describe, it, expect } from "vitest";
-import { aggregateBars } from '../index.ts';
+import { aggregateBars, weekStartUtc } from '../index.ts';
 import type { OHLCVBar } from '@trader/shared-types';
 
 function bar(ts: number, o: number, h: number, l: number, c: number, v: number): OHLCVBar {
@@ -97,5 +97,73 @@ describe('aggregateBars', () => {
     ];
     const out = aggregateBars(src, 'daily');
     expect(out.map((b) => b.open)).toEqual([10, 20, 30]);
+  });
+
+  it('aggregates 5m → 4h on 04:00 UTC boundaries', () => {
+    // Two bars in the 12:00–16:00 bucket and one in the 16:00–20:00 bucket.
+    const noon  = Date.UTC(2026, 4, 14, 12, 5, 0);
+    const half  = Date.UTC(2026, 4, 14, 14, 30, 0);   // still 12:00 bucket
+    const after = Date.UTC(2026, 4, 14, 16, 5, 0);     // 16:00 bucket
+    const src = [
+      bar(noon,  100, 105, 99,  102, 500),
+      bar(half,  102, 110, 101, 108, 800),
+      bar(after, 108, 112, 107, 109, 300),
+    ];
+    const out = aggregateBars(src, '4h');
+    expect(out).toHaveLength(2);
+    expect(out[0].timestamp).toBe(Date.UTC(2026, 4, 14, 12, 0, 0));
+    expect(out[0].interval).toBe('4h');
+    expect(out[0].open).toBe(100);
+    expect(out[0].close).toBe(108);
+    expect(out[0].high).toBe(110);
+    expect(out[0].low).toBe(99);
+    expect(out[0].volume).toBe(1300);
+    expect(out[1].timestamp).toBe(Date.UTC(2026, 4, 14, 16, 0, 0));
+    expect(out[1].volume).toBe(300);
+  });
+
+  it('aggregates daily → weekly anchored to Monday (not the Unix-epoch Thursday)', () => {
+    // Mon 2026-05-11 anchors the week. Wed 05-13 and *Sun* 05-17 both fold into it;
+    // Mon 05-18 opens the next week. A naive floor(ts / 7d) would land these on Thursday.
+    const mondayA = Date.UTC(2026, 4, 11);
+    const mondayB = Date.UTC(2026, 4, 18);
+    const daily = (ts: number, o: number, h: number, l: number, c: number, v: number): OHLCVBar => ({
+      ticker: 'AAPL_US_EQ', observation_ts: ts, timestamp: ts, interval: 'daily',
+      open: o, high: h, low: l, close: c, volume: v,
+    });
+    const src = [
+      daily(Date.UTC(2026, 4, 13), 10, 12, 9,  11, 100),   // Wed — week A
+      daily(Date.UTC(2026, 4, 17), 11, 15, 10, 14, 200),   // Sun — week A (boundary)
+      daily(Date.UTC(2026, 4, 18), 14, 16, 13, 15, 300),   // Mon — week B
+    ];
+    const out = aggregateBars(src, 'weekly');
+    expect(out).toHaveLength(2);
+    expect(out[0].timestamp).toBe(mondayA);
+    expect(new Date(out[0].timestamp).getUTCDay()).toBe(1);   // Monday — the regression guard
+    expect(out[0].interval).toBe('weekly');
+    expect(out[0].open).toBe(10);   // Wed open
+    expect(out[0].close).toBe(14);  // Sun close
+    expect(out[0].high).toBe(15);
+    expect(out[0].low).toBe(9);
+    expect(out[0].volume).toBe(300);
+    expect(out[1].timestamp).toBe(mondayB);
+    expect(out[1].volume).toBe(300);
+  });
+});
+
+describe('weekStartUtc', () => {
+  it('returns the Monday 00:00 UTC of the containing week for every weekday', () => {
+    const monday = Date.UTC(2026, 4, 11);
+    for (const ts of [
+      Date.UTC(2026, 4, 11, 0, 0, 0),    // Mon (start)
+      Date.UTC(2026, 4, 13, 9, 30, 0),   // Wed midday
+      Date.UTC(2026, 4, 16, 23, 59, 0),  // Sat late
+      Date.UTC(2026, 4, 17, 23, 59, 0),  // Sun late — the boundary that maps back, not forward
+    ]) {
+      expect(weekStartUtc(ts)).toBe(monday);
+      expect(new Date(weekStartUtc(ts)).getUTCDay()).toBe(1);
+    }
+    // Next Monday rolls to its own week.
+    expect(weekStartUtc(Date.UTC(2026, 4, 18, 0, 0, 1))).toBe(Date.UTC(2026, 4, 18));
   });
 });
