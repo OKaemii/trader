@@ -79,6 +79,8 @@ spec:
               value: {{ .Values.global.env.fundamentalsProvider | default "yahoo" | quote }}
             - name: EARNINGS_PROVIDER
               value: {{ .Values.global.env.earningsProvider | default "yahoo" | quote }}
+            - name: SECTOR_ETF_TICKERS
+              value: {{ .Values.global.env.sectorEtfTickers | default "" | quote }}
             - name: QUOTE_PROVIDER
               value: {{ .Values.global.env.quoteProvider | default "eodhd" | quote }}
             - name: BAR_FREQUENCY
