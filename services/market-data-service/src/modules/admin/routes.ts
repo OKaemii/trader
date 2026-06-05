@@ -64,7 +64,9 @@ const MAX_POLL_MS = 24 * 60 * 60_000;
 const MIN_UNIVERSE_SIZE = 10;
 const MAX_UNIVERSE_SIZE = 500;
 
-const VALID_INTERVALS: BarInterval[] = ['5m', '15m', '1h', 'daily'];
+// '4h' aggregates from the 5m series (best-effort — depends on 5m freshness); 'weekly'
+// from the persisted daily series. Both are derived-on-read in aggregateBars.
+const VALID_INTERVALS: BarInterval[] = ['5m', '15m', '1h', '4h', 'daily', 'weekly'];
 const VALID_RANGES: RangeKey[]     = ['30d', '60d', '90d', '180d', '1y', '2y', '5y', 'max'];
 
 // Read a downsampled OHLCV series for one ticker. `daily` reads the persisted

@@ -49,14 +49,29 @@ const RANGE_DAYS: Record<RangeKey, number> = {
   'max': 36500,
 };
 
-// Bucket size in ms for each interval the consumer might request. Storage is always
-// 5m — anything coarser is aggregated on read via aggregateBars below.
-const INTERVAL_MS: Record<BarInterval, number> = {
+// Bucket size in ms for each *fixed-width* interval. Storage is always 5m (intraday) or
+// daily (long horizons) — anything coarser is aggregated on read via aggregateBars below.
+// 'weekly' is deliberately absent: a fixed 7-day ms width floored from the Unix epoch
+// would anchor weeks to the epoch's weekday (a Thursday), mislabelling every weekly bar.
+// Weekly is ISO-week-bucketed via weekStartUtc instead.
+const INTERVAL_MS: Record<Exclude<BarInterval, 'weekly'>, number> = {
   '5m':   5  * 60_000,
   '15m':  15 * 60_000,
   '1h':   60 * 60_000,
+  '4h':   4  * 60 * 60_000,
   'daily': 24 * 60 * 60_000,
 };
+
+/**
+ * Start of the ISO week (Monday 00:00:00 UTC) that contains `ts`. The anchor for weekly
+ * bar aggregation. A naive `floor(ts / 604_800_000) * 604_800_000` would anchor to the
+ * Unix epoch's Thursday, so every weekly bucket would start mid-week — hence this helper.
+ */
+export function weekStartUtc(ts: number): number {
+  const d = new Date(ts);
+  const dow = (d.getUTCDay() + 6) % 7;            // Mon=0, Tue=1, … Sun=6
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - dow);
+}
 
 /**
  * Aggregate finer-grained bars into coarser ones. Standard OHLCV aggregation:
@@ -76,11 +91,16 @@ export function aggregateBars(source: OHLCVBar[], to: BarInterval): OHLCVBar[] {
   if (!head) return [];
   const fromInterval = head.interval ?? '5m';
   if (fromInterval === to) return source;
-  const bucketMs = INTERVAL_MS[to];
+
+  // Weekly buckets by ISO week (Monday-anchored); every other target is a fixed-width
+  // floor. Keeping weekly out of INTERVAL_MS means we never index it with `undefined`.
+  const bucketOf = to === 'weekly'
+    ? weekStartUtc
+    : (ts: number) => { const m = INTERVAL_MS[to]; return Math.floor(ts / m) * m; };
 
   const buckets = new Map<number, OHLCVBar[]>();
   for (const b of source) {
-    const key = Math.floor(b.observation_ts / bucketMs) * bucketMs;
+    const key = bucketOf(b.observation_ts);
     let list = buckets.get(key);
     if (!list) { list = []; buckets.set(key, list); }
     list.push(b);
