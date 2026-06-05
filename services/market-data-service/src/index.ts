@@ -12,14 +12,14 @@ import { UniverseManager } from './modules/universe/application/UniverseManager.
 import { getPgPool } from '@trader/shared-pg';
 import { QuotePoll } from './modules/quotes/application/quote-poll.ts';
 import { QuoteWriter } from './modules/quotes/infrastructure/quote-writer.ts';
-import { buildQuoteProvider } from './modules/quotes/infrastructure/yahoo-quote-provider.ts';
+import { buildQuoteProvider } from './modules/quotes/infrastructure/quote-providers.ts';
 import { getLiveConfig } from './shared/live-config.ts';
 import { createAdminRouter, createInternalBarsRouter } from './modules/admin/routes.ts';
 import { YahooProvider } from './modules/bars/infrastructure/providers/yahoo-provider.ts';
 import { TwelveDataProvider } from './modules/bars/infrastructure/providers/twelvedata-provider.ts';
 import { configureEodhdClient } from './modules/bars/infrastructure/providers/eodhd-client.ts';
 import type { MarketDataProvider } from './modules/bars/infrastructure/providers/market-data-provider.ts';
-import { FxClient, YahooFxProvider } from '@trader/shared-fx';
+import { FxClient, TwelveDataFxProvider } from '@trader/shared-fx';
 import { aggregateBars, invalidateBarsBulk } from '@trader/shared-bars';
 import {
   HolidayCache, NyseIcalProvider, UkGovBankHolidayProvider, StaticFallbackProvider, STATIC_FALLBACK,
@@ -31,6 +31,7 @@ import { backfillTickers, tickersMissingHistory, healMissingHistory } from './mo
 import { backfillDailyHistory, tickersMissingDailyHistory } from './modules/bars/infrastructure/daily-history.ts';
 import { runEodhdDailyFeed } from './modules/bars/infrastructure/eodhd-daily-feed.ts';
 import { buildFundamentalsCache } from './modules/fundamentals/wiring.ts';
+import { FundamentalsRefreshScheduler } from './modules/fundamentals/application/FundamentalsRefreshScheduler.ts';
 import { createFundamentalsRouter } from './modules/fundamentals/routes.ts';
 import { createScannerRouter } from './modules/scanner/routes.ts';
 import { writeBarRevisions, ensureBiTemporalIndexes, fetchFirstPrintCloses } from './modules/bars/infrastructure/persist-bars.ts';
@@ -91,6 +92,11 @@ const universeManager = new UniverseManager(
     minAdvGbp:   env.UNIVERSE_MIN_ADV,
     source:      env.UNIVERSE_SOURCE,
     minCapGbp:   env.MIN_MARKET_CAP_GBP,
+  },
+  {
+    // Live max-universe-size override (portal_market_config), resolved per refresh — a portal
+    // save takes effect on the next universe refresh with no restart. Falls back to env maxSize.
+    maxSizeResolver: async () => (await getLiveConfig()).universeMaxSize,
   },
 );
 
@@ -246,14 +252,15 @@ async function ensureBarIndexes(): Promise<void> {
   }
 }
 
-// FxClient: lazy-singleton, shared across the service. Backed by Yahoo GBPUSD=X with
-// 1h hot cache + 24h stale-fallback. Used here for liquidity ranking and (transitively
-// via the provider) anywhere ADV needs to be expressed in BASE_CURRENCY.
+// FxClient: lazy-singleton, shared across the service. Backed by TwelveData USD/GBP with a 1h hot
+// cache + 24h stale-fallback. market-data-service is the SINGLE platform writer of the GBP/USD rate
+// (fx:GBPUSD + lastGood/lastTs) — consumer services read those keys via RedisGbpUsdProvider, so the
+// FX upstream key lives only here. Used locally for liquidity ranking + fundamentals cap conversion.
 let _fxClient: FxClient | null = null;
 async function getFxClient(): Promise<FxClient> {
   if (_fxClient) return _fxClient;
   const redis = await getRedisClient();
-  _fxClient = new FxClient(redis as any, new YahooFxProvider());
+  _fxClient = new FxClient(redis as any, new TwelveDataFxProvider(env.TWELVEDATA_API_KEY));
   return _fxClient;
 }
 
@@ -662,8 +669,21 @@ app.route('/', createInternalBarsRouter(universeManager));
 const fundamentalsCache = buildFundamentalsCache(
   async (amount, currency) => (await getFxClient()).toGBP({ amount, currency }),
   env.FUNDAMENTALS_PROVIDER,
+  { requestSpacingMs: env.FUNDAMENTALS_REQUEST_SPACING_MS },
 );
-app.route('/', createFundamentalsRouter(fundamentalsCache, universeManager));
+// Background QMJ refresher — keeps company_fundamentals populated off the request path (a full
+// Yahoo walk runs for minutes; the admin endpoint just wakes this loop). Started in bootstrap()
+// once the universe is resolved.
+const fundamentalsRefresher = new FundamentalsRefreshScheduler(
+  fundamentalsCache,
+  () => universeManager.activeTickers,
+  {
+    idleMs:     env.FUNDAMENTALS_REFRESH_IDLE_MS,
+    retryMs:    env.FUNDAMENTALS_REFRESH_RETRY_MS,
+    progressMs: env.FUNDAMENTALS_REFRESH_PROGRESS_MS,
+  },
+);
+app.route('/', createFundamentalsRouter(fundamentalsCache, universeManager, fundamentalsRefresher));
 app.route('/', createScannerRouter(universeManager, fundamentalsCache));
 
 app.get('/latest/:ticker', async (c) => {
@@ -746,7 +766,7 @@ async function bootstrap(): Promise<void> {
         log.info(`[market-data] bootstrap: all ${universe.length} tickers have sufficient daily history`);
         return;
       }
-      log.info(`[market-data] bootstrap: ${missingDaily.length}/${universe.length} tickers missing long-range daily history — backfilling from Yahoo (background)`);
+      log.info(`[market-data] bootstrap: ${missingDaily.length}/${universe.length} tickers missing long-range daily history — backfilling from ${env.DAILY_HISTORY_PROVIDER} (background)`);
       const redis = await getRedisClient();
       const results = await backfillDailyHistory(db, redis, missingDaily);
       const ok    = results.filter((r) => !r.error).length;
@@ -757,17 +777,35 @@ async function bootstrap(): Promise<void> {
     }
   })();
 
+  // Universe is resolved by now — start the background QMJ refresher (first pass runs immediately,
+  // populating any missing fundamentals, then self-paces). Independent of the bar poll cadence.
+  fundamentalsRefresher.start();
+
+  // Centralized FX: market-data is the single platform writer of GBP/USD. Refresh on a fixed
+  // interval so consumers (RedisGbpUsdProvider) always read a fresh fx:GBPUSD. Best-effort — a
+  // failure leaves the last-good rate in place (the existing 24h stale-fallback covers blips).
+  const refreshFx = async (): Promise<void> => {
+    try {
+      const r = await (await getFxClient()).usdGbpRate();
+      log.info(`[fx] GBP/USD refreshed = ${r.toFixed(4)}`);
+    } catch (err) {
+      log.warn('[fx] refresh failed (serving last-good):', err);
+    }
+  };
+  void refreshFx();
+  setInterval(() => { void refreshFx(); }, env.FX_REFRESH_INTERVAL_MS);
+
   pollLoop().catch((err) => {
     log.error('[fatal]', err);
     process.exit(1);
   });
 
-  // Quote poll — separate cadence + endpoint from bars (Yahoo v7/quote), shared rate budget.
+  // Quote poll — separate cadence + endpoint from bars (QUOTE_PROVIDER: EODHD real-time or synthetic).
   // Best-effort: a quote-poll crash must never take down the bar pipeline. latestBar feeds the
   // synthetic high-low fallback from the most recent stored 5m bar.
   try {
     const quotePoll = new QuotePoll({
-      provider: buildQuoteProvider(),
+      provider: buildQuoteProvider(env.QUOTE_PROVIDER),
       writer: new QuoteWriter(),
       activeTickers: () => universeManager.activeTickers,
       latestBar: async (ticker) => {

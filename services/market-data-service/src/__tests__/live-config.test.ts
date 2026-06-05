@@ -17,7 +17,7 @@ describe('live-config', () => {
     liveConfig.invalidateLiveConfig();
     // Reset to a known baseline. Each test calls configureLiveConfig() again with the
     // specific env defaults it wants to assert against.
-    liveConfig.configureLiveConfig({ barFrequency: 'daily', pollIntervalMs: 24 * 60 * 60_000 });
+    liveConfig.configureLiveConfig({ barFrequency: 'daily', pollIntervalMs: 24 * 60 * 60_000, universeMaxSize: 150 });
   });
   afterEach(() => {
     findOneImpl = async () => null;
@@ -25,7 +25,7 @@ describe('live-config', () => {
 
   it('falls back to env defaults when override doc is missing', async () => {
     findOneImpl = async () => null;
-    liveConfig.configureLiveConfig({ barFrequency: 'daily', pollIntervalMs: 24 * 60 * 60_000 });
+    liveConfig.configureLiveConfig({ barFrequency: 'daily', pollIntervalMs: 24 * 60 * 60_000, universeMaxSize: 150 });
     const cfg = await liveConfig.getLiveConfig();
     expect(cfg.barFrequency).toBe('daily');
     expect(cfg.pollIntervalMs).toBe(24 * 60 * 60_000);
@@ -33,7 +33,7 @@ describe('live-config', () => {
 
   it('uses intraday env default when set', async () => {
     findOneImpl = async () => null;
-    liveConfig.configureLiveConfig({ barFrequency: 'intraday', pollIntervalMs: 15 * 60_000 });
+    liveConfig.configureLiveConfig({ barFrequency: 'intraday', pollIntervalMs: 15 * 60_000, universeMaxSize: 150 });
     liveConfig.invalidateLiveConfig();
     const cfg = await liveConfig.getLiveConfig();
     expect(cfg.barFrequency).toBe('intraday');
@@ -45,14 +45,16 @@ describe('live-config', () => {
       _id: 'singleton',
       barFrequency: 'intraday',
       pollIntervalMs: null,
+      universeMaxSize: 60,
       updatedBy: 'tester',
       updatedAt: new Date(),
     });
-    liveConfig.configureLiveConfig({ barFrequency: 'daily', pollIntervalMs: 24 * 60 * 60_000 });
+    liveConfig.configureLiveConfig({ barFrequency: 'daily', pollIntervalMs: 24 * 60 * 60_000, universeMaxSize: 150 });
     liveConfig.invalidateLiveConfig();
     const cfg = await liveConfig.getLiveConfig();
     expect(cfg.barFrequency).toBe('intraday');     // from override
     expect(cfg.pollIntervalMs).toBe(24 * 60 * 60_000);  // from env default (override null)
+    expect(cfg.universeMaxSize).toBe(60);          // from override
   });
 
   it('caches reads for 15 s', async () => {
@@ -77,7 +79,7 @@ describe('live-config', () => {
 
   it('returns env defaults when mongo read throws', async () => {
     findOneImpl = async () => { throw new Error('mongo down'); };
-    liveConfig.configureLiveConfig({ barFrequency: 'daily', pollIntervalMs: 24 * 60 * 60_000 });
+    liveConfig.configureLiveConfig({ barFrequency: 'daily', pollIntervalMs: 24 * 60 * 60_000, universeMaxSize: 150 });
     liveConfig.invalidateLiveConfig();
     const cfg = await liveConfig.getLiveConfig();
     expect(cfg.barFrequency).toBe('daily');

@@ -45,6 +45,9 @@ interface MarketConfigDoc {
   // enum value (0=Limit, 1=Market) alongside the bar/poll knobs so a single doc + single
   // PUT propagates everything from one save.
   signalOrderType: 0 | 1 | null;
+  // Max active-universe size override, consumed by UniverseManager.refresh() (live via the
+  // maxSizeResolver). null = use the Helm/env UNIVERSE_MAX_SIZE.
+  universeMaxSize: number | null;
   updatedBy: string;
   updatedAt: Date;
 }
@@ -56,6 +59,10 @@ export const CONFIG_INVALIDATED_TOPIC = 'config:invalidated';
 
 const MIN_POLL_MS = 5_000;
 const MAX_POLL_MS = 24 * 60 * 60_000;
+// Universe-size override bounds. Floor keeps the sector cap + US/LSE balance meaningful; ceiling
+// guards the optimiser's conditioning band (see CLAUDE.md Top-K / mathematical-foundations §6.1).
+const MIN_UNIVERSE_SIZE = 10;
+const MAX_UNIVERSE_SIZE = 500;
 
 const VALID_INTERVALS: BarInterval[] = ['5m', '15m', '1h', 'daily'];
 const VALID_RANGES: RangeKey[]     = ['30d', '60d', '90d', '180d', '1y', '2y', '5y', 'max'];
@@ -192,6 +199,7 @@ export function createAdminRouter(
         barFrequency: doc?.barFrequency ?? null,
         pollIntervalMs: doc?.pollIntervalMs ?? null,
         signalOrderType: doc?.signalOrderType ?? null,
+        universeMaxSize: doc?.universeMaxSize ?? null,
       },
       effective: {
         ...effective,
@@ -211,6 +219,10 @@ export function createAdminRouter(
     zValidator('json', MarketDataContracts.MarketConfigRequestSchema),
     async (c) => {
       const body = c.req.valid('json');
+      if (body.universeMaxSize != null &&
+          (body.universeMaxSize < MIN_UNIVERSE_SIZE || body.universeMaxSize > MAX_UNIVERSE_SIZE)) {
+        return c.json({ error: `universeMaxSize out of range (${MIN_UNIVERSE_SIZE}..${MAX_UNIVERSE_SIZE})` }, 400);
+      }
       if (body.pollIntervalMs != null) {
         if (body.pollIntervalMs < MIN_POLL_MS || body.pollIntervalMs > MAX_POLL_MS) {
           return c.json({ error: `pollIntervalMs out of range (${MIN_POLL_MS}..${MAX_POLL_MS})` }, 400);
@@ -232,6 +244,7 @@ export function createAdminRouter(
           barFrequency: body.barFrequency ?? null,
           pollIntervalMs: body.pollIntervalMs ?? null,
           signalOrderType: body.signalOrderType ?? null,
+          universeMaxSize: body.universeMaxSize ?? null,
           updatedBy: body.userId ?? 'unknown',
           updatedAt: new Date(),
         }},
