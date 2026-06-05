@@ -4,20 +4,24 @@ import { subscribe } from '@trader/shared-redis';
 import { ALERTS_TOPIC, type Alert, type AlertTier } from '@trader/shared-types';
 import type { EmailSender } from '../infrastructure/email.ts';
 import type { WebhookSender } from '../infrastructure/webhook.ts';
+import type { PushSender } from '../infrastructure/push.ts';
 
 // Tier → channel routing. The webhook is the loud "page me now" channel reserved for `critical`;
-// email covers `warning`+`critical`; `info` is log-only (audit/digest, never pages anyone). Each
-// channel is independent + best-effort — one failing never blocks the other or crashes the loop.
-const TIER_CHANNELS: Record<AlertTier, { webhook: boolean; email: boolean }> = {
-  critical: { webhook: true, email: true },
-  warning: { webhook: false, email: true },
-  info: { webhook: false, email: false },
+// email covers `warning`+`critical`; phone push also covers `warning`+`critical` (the swing-trading
+// workflow is "don't watch the screen" — stop/target/entry crosses land on the phone); `info` is
+// log-only (audit/digest, never pages anyone). Each channel is independent + best-effort — one
+// failing never blocks the others or crashes the loop.
+const TIER_CHANNELS: Record<AlertTier, { webhook: boolean; email: boolean; push: boolean }> = {
+  critical: { webhook: true, email: true, push: true },
+  warning: { webhook: false, email: true, push: true },
+  info: { webhook: false, email: false, push: false },
 };
 
 export interface AlertConsumerDeps {
   redis: RedisClientType;
   email: EmailSender | null;
   webhook: WebhookSender | null;
+  push?: PushSender | null | undefined;
   alertEmailTo?: string | undefined;
   logger: Logger;
 }
@@ -60,7 +64,24 @@ export class AlertConsumer {
         try { await this.deps.email.sendRaw(this.subject(alert), this.html(alert), this.deps.alertEmailTo); }
         catch (err) { this.deps.logger.warn({ err, kind: alert.kind }, 'alert email failed'); }
       })(),
+      (async () => {
+        if (!route.push || !this.deps.push) return;
+        try { await this.deps.push.sendDigest(this.pushPayload(alert)); }
+        catch (err) { this.deps.logger.warn({ err, kind: alert.kind }, 'alert push failed'); }
+      })(),
     ]);
+  }
+
+  // Concise phone push from an alert. Surfaces the ticker (when present in meta) up front so a
+  // glance at the lock screen says "AAPL — stop approached" without opening the app.
+  private pushPayload(a: Alert): { title: string; body: string; data: Record<string, unknown> } {
+    const icon = a.tier === 'critical' ? '🚨' : a.tier === 'warning' ? '⚠️' : 'ℹ️';
+    const ticker = typeof a.meta?.['ticker'] === 'string' ? (a.meta['ticker'] as string) : undefined;
+    return {
+      title: `${icon} ${ticker ? `${ticker} — ` : ''}${a.title}`,
+      body: a.detail,
+      data: { kind: a.kind, source: a.source, tier: a.tier, ...(ticker ? { ticker } : {}) },
+    };
   }
 
   private subject(a: Alert): string {
