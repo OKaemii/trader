@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { MoneySchema } from "../money.ts";
+import { MoneySchema, CurrencySchema } from "../money.ts";
 
 export const PositionSchema = z.object({
     ticker: z.string().min(1),
@@ -37,3 +37,44 @@ export const SystemResetRequestSchema = z.object({
     confirm: z.string().optional(),
 });
 export type SystemResetRequest = z.infer<typeof SystemResetRequestSchema>;
+
+// ── Swing trade plan ─────────────────────────────────────────────────────────
+// Operator-set protective stop + profit target per ticker (Money, listing currency).
+// PUT body: each field nullable to allow clearing just the stop or just the target.
+export const TradePlanRequestSchema = z.object({
+    stop: MoneySchema.nullable().optional(),
+    target: MoneySchema.nullable().optional(),
+    note: z.string().max(500).nullable().optional(),
+    updatedBy: z.string().optional(),
+});
+export type TradePlanRequest = z.infer<typeof TradePlanRequestSchema>;
+
+export const TradePlanSchema = z.object({
+    ticker: z.string().min(1),
+    stop: MoneySchema.optional(),
+    target: MoneySchema.optional(),
+    note: z.string().optional(),
+    updatedBy: z.string(),
+    updatedAt: z.number(),
+});
+export type TradePlan = z.infer<typeof TradePlanSchema>;
+
+// A live position joined with its opening BUY (entry price + days held) and the operator's
+// trade plan (stop/target), plus the derived R-multiple and stop distance. Money fields are
+// in the position's listing currency; `rMultiple`/`stopDistancePct` are null when an input
+// is missing (no entry, no stop, or entry === stop).
+export const EnrichedPositionSchema = z.object({
+    ticker: z.string(),
+    quantity: z.number(),
+    currency: CurrencySchema.nullable(),
+    currentPrice: MoneySchema.nullable(),
+    entryPrice: z.number().nullable(),
+    entryAt: z.number().nullable(),
+    daysHeld: z.number().nullable(),
+    stop: MoneySchema.nullable(),
+    target: MoneySchema.nullable(),
+    rMultiple: z.number().nullable(),
+    stopDistancePct: z.number().nullable(),
+    note: z.string().nullable(),
+});
+export type EnrichedPosition = z.infer<typeof EnrichedPositionSchema>;
