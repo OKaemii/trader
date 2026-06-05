@@ -32,7 +32,7 @@ export type {
 export type {
     BarInterval, RangeKey, OHLCVBar,
     UniverseOverridesRequest, BackfillRequest, ClearCacheRequest, MarketConfigRequest,
-    InternalBarsRequest, InternalBarsResponse, EarningsEvent,
+    InternalBarsRequest, InternalBarsResponse, EarningsEvent, SwingScreenRow,
 } from "./market-data/schemas.ts";
 
 export type { InternalSectorsResponse } from "./universe/schemas.ts";

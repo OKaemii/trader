@@ -92,6 +92,10 @@ const EnvSchema = z.object({
     SECTOR_ETF_TICKERS:              z.string().optional(),
     SECTOR_ETF_REFRESH_MS:           z.coerce.number().int().positive().default(24 * 60 * 60_000),
 
+    // Swing screener cadence. The run is Redis-NX-gated to once per UTC day; this interval just
+    // re-checks the gate (so a restart mid-day still runs, and we never double-scan).
+    SCREENER_INTERVAL_MS:            z.coerce.number().int().positive().default(6 * 60 * 60_000),
+
     MONGODB_URL: z.string().url().default("mongodb://mongodb:27017"),
     REDIS_URL:   z.string().url().default("redis://redis:6379"),
 
