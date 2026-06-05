@@ -36,11 +36,13 @@ async function main(): Promise<void> {
     });
 
     // Operational alerts (G4): subscribe to the `alerts` pub/sub topic and route by tier
-    // (critical → webhook + email, warning → email, info → log). Independent of the trade loop.
+    // (critical → webhook + email + push, warning → email + push, info → log). Independent of
+    // the trade loop. Push reaches the registered phone for price/stop/target/earnings alerts.
     const alertConsumer = new AlertConsumer({
         redis: deps.redis as unknown as RedisClientType,
         email: deps.email,
         webhook: deps.webhook,
+        push: deps.push,
         alertEmailTo: env.ALERT_EMAIL_TO ?? env.EMAIL_TO,
         logger,
     });
