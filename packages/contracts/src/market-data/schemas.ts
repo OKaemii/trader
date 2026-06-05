@@ -39,6 +39,8 @@ export const MarketConfigRequestSchema = z.object({
     barFrequency: z.enum(["daily", "intraday"]).nullable().optional(),
     pollIntervalMs: z.number().int().positive().nullable().optional(),
     signalOrderType: z.union([z.literal(0), z.literal(1), z.null()]).optional(),
+    // Max active-universe size override (null = use the Helm/env default). Bounds enforced server-side.
+    universeMaxSize: z.number().int().positive().nullable().optional(),
     userId: z.string().optional(),
 });
 export type MarketConfigRequest = z.infer<typeof MarketConfigRequestSchema>;

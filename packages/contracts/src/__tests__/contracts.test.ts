@@ -49,8 +49,10 @@ describe("schemas", () => {
             barFrequency: null,
             pollIntervalMs: null,
             signalOrderType: null,
+            universeMaxSize: null,
         });
         expect(r.barFrequency).toBeNull();
+        expect(r.universeMaxSize).toBeNull();
     });
 });
 

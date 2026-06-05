@@ -28,16 +28,19 @@ export interface MarketDataConfig {
     pollIntervalMs: number | null
     // Numeric enum value (0 = Limit, 1 = Market). null = no override, use Helm default.
     signalOrderType: OrderType | null
+    universeMaxSize: number | null
   }
   effective: {
     barFrequency: 'daily' | 'intraday'
     pollIntervalMs: number
     signalOrderType: OrderType
+    universeMaxSize: number
   }
   defaults: {
     barFrequency: 'daily' | 'intraday'
     pollIntervalMs: number
     signalOrderType: OrderType
+    universeMaxSize: number
   }
   updatedBy: string | null
   updatedAt: string | null
@@ -111,11 +114,12 @@ export async function saveMarketDataConfig(
   barFrequency: 'daily' | 'intraday' | null,
   pollIntervalMs: number | null,
   signalOrderType: OrderType | null,
+  universeMaxSize: number | null,
 ): Promise<{ ok: boolean; status: number; error?: string }> {
   const r = await authedFetch('/admin/api/market-data/config', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ barFrequency, pollIntervalMs, signalOrderType }),
+    body: JSON.stringify({ barFrequency, pollIntervalMs, signalOrderType, universeMaxSize }),
   })
   if (r.ok) {
     revalidatePath('/market-data')
