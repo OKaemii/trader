@@ -36,6 +36,8 @@ import { createFundamentalsRouter } from './modules/fundamentals/routes.ts';
 import { buildEarningsStore } from './modules/earnings/wiring.ts';
 import { EarningsRefreshScheduler } from './modules/earnings/application/EarningsRefreshScheduler.ts';
 import { createEarningsRouter } from './modules/earnings/routes.ts';
+import { createSectorsRouter } from './modules/sectors/routes.ts';
+import { startSectorEtfTracking } from './modules/sectors/tracking.ts';
 import { createScannerRouter } from './modules/scanner/routes.ts';
 import { writeBarRevisions, ensureBiTemporalIndexes, fetchFirstPrintCloses } from './modules/bars/infrastructure/persist-bars.ts';
 import { msUntilNextTick } from './modules/bars/application/poll-scheduling.ts';
@@ -700,6 +702,10 @@ const earningsRefresher = new EarningsRefreshScheduler(
 );
 app.route('/', createEarningsRouter(earningsStore, earningsRefresher));
 
+// Sector-rotation heatmap — tracks the SPDR sector ETFs' daily bars (NOT in the tradeable
+// universe) and serves weekly sector-momentum. Tracking started in bootstrap() below.
+app.route('/', createSectorsRouter());
+
 app.get('/latest/:ticker', async (c) => {
   const redis = await getRedisClient();
   const raw = await redis.get(`market:latest:${c.req.param('ticker')}`);
@@ -795,6 +801,7 @@ async function bootstrap(): Promise<void> {
   // populating any missing fundamentals, then self-paces). Independent of the bar poll cadence.
   fundamentalsRefresher.start();
   earningsRefresher.start();
+  startSectorEtfTracking(env.SECTOR_ETF_REFRESH_MS);
 
   // Centralized FX: market-data is the single platform writer of GBP/USD. Refresh on a fixed
   // interval so consumers (RedisGbpUsdProvider) always read a fresh fx:GBPUSD. Best-effort — a

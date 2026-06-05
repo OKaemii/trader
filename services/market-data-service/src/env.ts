@@ -87,6 +87,11 @@ const EnvSchema = z.object({
     EARNINGS_REQUEST_SPACING_MS:     z.coerce.number().int().nonnegative().default(500),
     EARNINGS_REFRESH_IDLE_MS:        z.coerce.number().int().positive().default(24 * 60 * 60_000),
 
+    // Sector-rotation reference ETFs (comma-separated; default the 11 SPDRs + SPY, read in
+    // sector-etfs.ts). Tracked for the heatmap only — never added to the tradeable universe.
+    SECTOR_ETF_TICKERS:              z.string().optional(),
+    SECTOR_ETF_REFRESH_MS:           z.coerce.number().int().positive().default(24 * 60 * 60_000),
+
     MONGODB_URL: z.string().url().default("mongodb://mongodb:27017"),
     REDIS_URL:   z.string().url().default("redis://redis:6379"),
 
