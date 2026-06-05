@@ -44,6 +44,10 @@ export const COLLECTIONS = {
   // level: Money, enabled, cooldownH, lastFiredAt?, source, updatedAt }. Derived rules use a
   // deterministic id `${ticker}:${kind}` so re-saving a plan updates rather than duplicates.
   ALERT_RULES:           'alert_rules',
+  // Append-only nightly swing-screener snapshots. One doc per run: { runAt, criteria, scanned,
+  // rows: top-N candidates with their fired technical signals + score }. Read latest-first by the
+  // portal /screener page; written by market-data-service's SwingScreener.
+  SWING_SCREEN_RESULTS:  'swing_screen_results',
   BAD_TICKS:             'bad_ticks',
   PUSH_TOKENS:           'push_tokens',
   RISK_REJECTIONS:       'risk_rejections',

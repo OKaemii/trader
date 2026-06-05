@@ -38,6 +38,8 @@ import { EarningsRefreshScheduler } from './modules/earnings/application/Earning
 import { createEarningsRouter } from './modules/earnings/routes.ts';
 import { createSectorsRouter } from './modules/sectors/routes.ts';
 import { startSectorEtfTracking } from './modules/sectors/tracking.ts';
+import { SwingScreener, startScreenerSchedule } from './modules/screener/SwingScreener.ts';
+import { createScreenerRouter } from './modules/screener/routes.ts';
 import { createScannerRouter } from './modules/scanner/routes.ts';
 import { writeBarRevisions, ensureBiTemporalIndexes, fetchFirstPrintCloses } from './modules/bars/infrastructure/persist-bars.ts';
 import { msUntilNextTick } from './modules/bars/application/poll-scheduling.ts';
@@ -706,6 +708,11 @@ app.route('/', createEarningsRouter(earningsStore, earningsRefresher));
 // universe) and serves weekly sector-momentum. Tracking started in bootstrap() below.
 app.route('/', createSectorsRouter());
 
+// Swing screener — nightly technical scan (52w highs, 50-MA breakouts, unusual volume,
+// pullback-in-uptrend) over the active universe. Schedule started in bootstrap() below.
+const swingScreener = new SwingScreener(() => universeManager.activeTickers);
+app.route('/', createScreenerRouter(swingScreener));
+
 app.get('/latest/:ticker', async (c) => {
   const redis = await getRedisClient();
   const raw = await redis.get(`market:latest:${c.req.param('ticker')}`);
@@ -802,6 +809,7 @@ async function bootstrap(): Promise<void> {
   fundamentalsRefresher.start();
   earningsRefresher.start();
   startSectorEtfTracking(env.SECTOR_ETF_REFRESH_MS);
+  startScreenerSchedule(swingScreener, env.SCREENER_INTERVAL_MS);
 
   // Centralized FX: market-data is the single platform writer of GBP/USD. Refresh on a fixed
   // interval so consumers (RedisGbpUsdProvider) always read a fresh fx:GBPUSD. Best-effort — a
