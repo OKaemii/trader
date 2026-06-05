@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const BarIntervalSchema = z.enum(["5m", "15m", "1h", "daily"]);
+export const BarIntervalSchema = z.enum(["5m", "15m", "1h", "4h", "daily", "weekly"]);
 export type BarInterval = z.infer<typeof BarIntervalSchema>;
 
 export const RangeKeySchema = z.enum(["30d", "60d", "90d", "180d", "1y", "2y", "5y", "max"]);
