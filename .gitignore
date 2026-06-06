@@ -91,6 +91,11 @@ dist/
 build/
 coverage/
 
+# The portal's `build` IS a source route (the Build workspace: Strategy·Console·Alerts), not a
+# build-output dir — un-ignore it so the App Router route is committed and built by CI.
+!services/frontend-web/portal/app/(authed)/build/
+!services/frontend-web/portal/app/(authed)/build/**
+
 *.log
 
 # =========================================================
