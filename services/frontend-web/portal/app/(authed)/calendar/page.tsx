@@ -1,31 +1,8 @@
-import { authedFetch } from '@/app/lib/auth-fetch'
-import { EarningsWarning } from '@/components/EarningsWarning'
-import { CalendarView, type EarningsEvent } from './CalendarView'
+import { redirect } from 'next/navigation'
 
-// Earnings & dividends — the calendar tied to positions. Holding through a surprise report is the
-// biggest avoidable swing-trade disaster, so positions reporting within 10 days are flagged.
-export default async function CalendarPage() {
-  const r = await authedFetch('/admin/api/market-data/earnings/upcoming?days=30')
-  const data = r.ok ? await r.json().catch(() => null) : null
-  const events: EarningsEvent[] = data?.events ?? []
-
-  return (
-    <div className="space-y-6 p-6">
-      <div>
-        <h1 className="text-2xl font-bold text-white">Earnings &amp; Dividends</h1>
-        <p className="text-sm text-gray-400">
-          Upcoming earnings and dividend dates (next 30 days). Names you hold are highlighted; any
-          holding reporting within 10 days is flagged in red.
-        </p>
-      </div>
-      <EarningsWarning />
-      {r.ok ? (
-        <CalendarView initial={events} />
-      ) : (
-        <div className="rounded border border-amber-900 bg-amber-950 px-4 py-2 text-sm text-amber-300">
-          {r.status === 401 || r.status === 403 ? 'Admin role required.' : `Calendar unavailable (${r.status}).`}
-        </div>
-      )}
-    </div>
-  )
+// The Earnings & Dividends calendar moved into the Discover workspace (Task 7). Kept as a redirect
+// so old links / bookmarks don't 404. (Distinct from /market-data/calendar — the exchange-session
+// schedule — which lives in the Research workspace.)
+export default function CalendarPage() {
+  redirect('/discover?tab=calendar')
 }
