@@ -8,6 +8,7 @@ import { WorldClock } from './WorldClock'
 const links = [
   { href: '/dashboard', label: 'Dashboard' },
   { href: '/positions', label: 'Positions' },
+  { href: '/alerts', label: 'Alerts' },
   { href: '/signals', label: 'Signals' },
   { href: '/research', label: 'Research' },
   { href: '/strategy-config', label: 'Strategy' },
