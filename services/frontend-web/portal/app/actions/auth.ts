@@ -32,7 +32,7 @@ export async function login(
 
   const { accessToken, refreshToken } = await res.json()
   await createSession(accessToken, refreshToken)
-  redirect('/dashboard')
+  redirect('/workspace')
 }
 
 export async function logout() {
