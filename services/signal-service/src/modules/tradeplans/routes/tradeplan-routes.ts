@@ -4,17 +4,20 @@
 import { Hono } from 'hono';
 import { zValidator } from '@hono/zod-validator';
 import { parseAdminHeaders } from '@trader/shared-auth/middleware';
-import { Trading, type TradingServiceClient } from '@trader/contracts';
+import { Trading, type Position } from '@trader/contracts';
 import type { ITradePlanRepository } from '../domain/TradePlan.ts';
 import type { ISignalRepository } from '../../signals/domain/ISignalRepository.ts';
 import type { IAlertRuleRepository } from '../../alerts/domain/AlertRule.ts';
-import { enrichPosition } from '../application/EnrichedPositions.ts';
+import { enrichAll } from '../application/EnrichedPositions.ts';
 import { deriveRulesFromPlan } from '../../alerts/application/detect.ts';
 
 export interface TradePlanRouterDeps {
     tradePlanRepo: ITradePlanRepository;
     signalRepo: ISignalRepository;
-    tradingClient: TradingServiceClient;
+    // Positions come from the synced Mongo `positions` collection (what signal-service already
+    // reads for NAV) — NOT trading-service's internal endpoint, which only authorizes
+    // portfolio-service as a caller (a signal-service call gets 403).
+    listPositions: () => Promise<Position[]>;
     // When present, saving a plan auto-derives stop/target price-alert rules (visible on /alerts).
     alertRules?: IAlertRuleRepository | undefined;
     now?: () => number;
@@ -70,23 +73,22 @@ export function createTradePlanRouter(deps: TradePlanRouterDeps): Hono {
         return c.json({ removed });
     });
 
-    // Live positions joined with entry/days-held + trade plan + derived R-multiple/stop distance.
+    // Positions (from the synced Mongo collection) joined with entry/days-held + trade plan +
+    // derived R-multiple/stop distance. A read-only panel must never hard-500 because the source
+    // is momentarily unavailable, so a fetch failure degrades to an empty list.
     r.get('/admin/api/signals/positions/enriched', parseAdminHeaders, async (c) => {
-        const { positions } = await deps.tradingClient.getPositions();
-        const t = now();
-        const rows = await Promise.all(positions.map(async (pos) => {
-            const [openBuys, plan] = await Promise.all([
-                deps.signalRepo.findOpenBuysByTicker(pos.ticker),
-                deps.tradePlanRepo.get(pos.ticker),
-            ]);
-            try {
-                return enrichPosition(pos, openBuys, plan, t);
-            } catch {
-                // A stale plan in a different currency than the position — degrade that row
-                // (no R/stop math) rather than failing the whole panel.
-                return enrichPosition(pos, openBuys, null, t);
-            }
-        }));
+        let positions: Position[];
+        try {
+            positions = await deps.listPositions();
+        } catch {
+            return c.json({ positions: [], error: 'positions temporarily unavailable' });
+        }
+        const rows = await enrichAll(
+            positions,
+            (ticker) => deps.signalRepo.findOpenBuysByTicker(ticker),
+            (ticker) => deps.tradePlanRepo.get(ticker),
+            now(),
+        );
         return c.json({ positions: rows });
     });
 
