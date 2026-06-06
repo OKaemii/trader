@@ -18,8 +18,8 @@ export const Popover = RadixPopover.Root
 export const PopoverTrigger = RadixPopover.Trigger
 export const PopoverAnchor = RadixPopover.Anchor
 export const PopoverClose = RadixPopover.Close
-export const PopoverPortal = RadixPopover.Portal
 
+// PopoverContent portals itself — don't wrap it in a Portal yourself.
 export const PopoverContent = forwardRef<
   React.ComponentRef<typeof RadixPopover.Content>,
   React.ComponentPropsWithoutRef<typeof RadixPopover.Content>

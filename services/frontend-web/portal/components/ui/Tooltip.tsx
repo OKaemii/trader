@@ -9,6 +9,7 @@
 // Or compose the primitives directly for full control:
 //   <TooltipRoot><TooltipTrigger asChild>…</TooltipTrigger>
 //     <TooltipContent>…</TooltipContent></TooltipRoot>
+// (TooltipContent self-portals — don't wrap it in a Portal yourself.)
 //
 // Tooltips are for terse, hover/focus one-liners. Rich, click-to-pin content with a
 // value + interpretation band belongs in the Popover-based <Explain> toggletip (Task 5).
@@ -19,26 +20,27 @@ import { cn } from './cn'
 export const TooltipProvider = RadixTooltip.Provider
 export const TooltipRoot = RadixTooltip.Root
 export const TooltipTrigger = RadixTooltip.Trigger
-export const TooltipPortal = RadixTooltip.Portal
 
+// TooltipContent portals itself so callers never have to (matches PopoverContent).
 export const TooltipContent = forwardRef<
   React.ComponentRef<typeof RadixTooltip.Content>,
   React.ComponentPropsWithoutRef<typeof RadixTooltip.Content>
 >(function TooltipContent({ className, sideOffset = 6, ...props }, ref) {
   return (
-    <RadixTooltip.Content
-      ref={ref}
-      sideOffset={sideOffset}
-      className={cn(
-        'z-50 max-w-xs rounded border border-gray-700 bg-gray-950 px-2.5 py-1.5 text-xs text-gray-200 shadow-lg',
-        'data-[state=delayed-open]:animate-in data-[state=closed]:animate-out',
-        className,
-      )}
-      {...props}
-    >
-      {props.children}
-      <RadixTooltip.Arrow className="fill-gray-700" />
-    </RadixTooltip.Content>
+    <RadixTooltip.Portal>
+      <RadixTooltip.Content
+        ref={ref}
+        sideOffset={sideOffset}
+        className={cn(
+          'z-50 max-w-xs rounded border border-gray-700 bg-gray-950 px-2.5 py-1.5 text-xs text-gray-200 shadow-lg',
+          className,
+        )}
+        {...props}
+      >
+        {props.children}
+        <RadixTooltip.Arrow className="fill-gray-700" />
+      </RadixTooltip.Content>
+    </RadixTooltip.Portal>
   )
 })
 
@@ -57,9 +59,7 @@ export function Tooltip({
   return (
     <RadixTooltip.Root delayDuration={delayDuration}>
       <RadixTooltip.Trigger asChild>{children}</RadixTooltip.Trigger>
-      <RadixTooltip.Portal>
-        <TooltipContent side={side}>{content}</TooltipContent>
-      </RadixTooltip.Portal>
+      <TooltipContent side={side}>{content}</TooltipContent>
     </RadixTooltip.Root>
   )
 }
