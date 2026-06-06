@@ -87,6 +87,25 @@ describe('COMMANDS registry integrity', () => {
     }
   })
 
+  it('the Actions group is exactly {toggle-mode, sign-out}', () => {
+    // Lock the action set: catches both a dropped action and an untested new one
+    // (a new palette action must land with its call-site wiring + a test).
+    const actionIds = COMMANDS.filter((c) => c.group === 'Actions').map((c) => c.id).sort()
+    expect(actionIds).toEqual(['act.sign-out', 'act.toggle-mode'])
+  })
+
+  it('every one of the 6 workspaces has at least one deep-linked tab command', () => {
+    // Beyond "the workspace root exists": each workspace must surface ≥1 `?tab=` entry
+    // in the palette so a workspace can never silently lose all its deep links on a
+    // refactor. (The home `workspace` is a single page with no tabs, so it is exempt.)
+    for (const ws of ['discover', 'research', 'build', 'portfolio', 'operations']) {
+      const tabCmds = COMMANDS.filter(
+        (c) => c.id.startsWith(`ws.${ws}.`) && c.href?.includes('?tab='),
+      )
+      expect(tabCmds.length, `workspace ${ws} has no deep-linked tab commands`).toBeGreaterThan(0)
+    }
+  })
+
   it('has unique command ids', () => {
     const ids = COMMANDS.map((c) => c.id)
     expect(new Set(ids).size).toBe(ids.length)
