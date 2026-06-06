@@ -183,5 +183,17 @@ export function createRouter(deps: Deps): Hono {
     return c.json(trip);
   });
 
+  // Single signal by id — backs the portal /signals/:id detail page (and the
+  // notification-email "View full analysis →" deep link). Reads THIS service's own
+  // signals collection via the repo, so there is no cross-service /internal/* hop and
+  // no 403 trap. Registered after the literal /admin/api/signals/* routes so Hono's
+  // static segments (history, approve, retry, cancel, risk/*, …) keep priority over
+  // this `:id` param.
+  router.get('/admin/api/signals/:id', async (c) => {
+    const signal = await deps.signalRepo.findById(c.req.param('id')!);
+    if (!signal) return c.json({ error: 'not found' }, 404);
+    return c.json(signal);
+  });
+
   return router;
 }
