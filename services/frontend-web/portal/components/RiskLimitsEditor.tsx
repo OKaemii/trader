@@ -1,6 +1,7 @@
 'use client'
 
 import { useState } from 'react'
+import { QuantOnly } from '@/components/QuantOnly'
 
 // Mirrors the signal-service /admin/api/signals/risk/limits payload (RiskLimitsProvider).
 export interface RiskLimitsView {
@@ -20,6 +21,11 @@ const LABELS: Record<string, { name: string; hint: string }> = {
 }
 
 const pct = (v: number) => `${(v * 100).toFixed(v < 0.1 ? 1 : 0)}%`
+
+// Circuit-breaker halt thresholds are SAFETY config — they stay visible in both modes. The
+// optimiser caps (everything else) are the quant-only "internals" Beginner mode curates away.
+// Categorise by an allow-list so an unknown future field stays visible (never hide safety).
+const SAFETY_FIELDS = new Set(['maxDailyLoss', 'maxDrawdownHalt'])
 
 function seedInputs(v: RiskLimitsView): Record<string, string> {
   const out: Record<string, string> = {}
@@ -87,10 +93,49 @@ export function RiskLimitsEditor({ initial }: { initial: RiskLimitsView }) {
     (f) => (inputs[f] ?? '') !== (view.overrides[f] != null ? String(view.overrides[f]) : ''),
   )
 
-  return (
-    <div className="space-y-4">
+  // Split the tunable fields by group, preserving server order within each. Save/refresh still
+  // iterate the FULL view.tunableFields, so optimiser-cap rows hidden in Beginner keep their
+  // seeded override value (no spurious dirty, nothing dropped on save).
+  const safetyFields = view.tunableFields.filter((f) => SAFETY_FIELDS.has(f))
+  const optimiserFields = view.tunableFields.filter((f) => !SAFETY_FIELDS.has(f))
+
+  // Plain render helpers (NOT components — called directly, lowercase — so they don't reset
+  // state per render and don't trip react-hooks/static-components). Both close over the live
+  // view/inputs state, so the row markup stays single-sourced across the two group tables.
+  const renderRow = (f: string) => {
+    const meta = LABELS[f]
+    const overridden = view.overrides[f] != null
+    const [lo, hi] = view.bounds[f] ?? [0, 1]
+    return (
+      <tr key={f}>
+        <td className="px-4 py-3">
+          <div className="font-medium text-gray-100">{meta?.name ?? f}</div>
+          <div className="text-xs text-gray-500">{meta?.hint ?? ''}</div>
+        </td>
+        <td className="px-4 py-3">
+          <span className={overridden ? 'text-amber-300' : 'text-gray-200'}>{view.effective[f]}</span>
+          <span className="ml-1 text-xs text-gray-500">({pct(view.effective[f] ?? 0)})</span>
+        </td>
+        <td className="px-4 py-3 text-gray-400">{view.defaults[f]}</td>
+        <td className="px-4 py-3">
+          <input
+            type="number" step="0.01" min={lo} max={hi}
+            value={inputs[f] ?? ''}
+            placeholder={`${view.defaults[f]} (default)`}
+            onChange={(e) => setInputs((s) => ({ ...s, [f]: e.target.value }))}
+            className="w-32 rounded border border-gray-700 bg-gray-900 px-2 py-1 text-gray-100 focus:border-emerald-600 focus:outline-none"
+          />
+        </td>
+        <td className="px-4 py-3 text-xs text-gray-500">{lo} – {hi}</td>
+      </tr>
+    )
+  }
+
+  const renderTable = (caption: string, fields: string[]) =>
+    fields.length === 0 ? null : (
       <div className="overflow-hidden rounded border border-gray-800">
         <table className="w-full text-sm">
+          <caption className="bg-gray-900 px-4 py-2 text-left text-xs font-semibold uppercase tracking-wide text-gray-400">{caption}</caption>
           <thead className="bg-gray-900 text-left text-xs uppercase text-gray-400">
             <tr>
               <th className="px-4 py-2">Limit</th>
@@ -101,37 +146,22 @@ export function RiskLimitsEditor({ initial }: { initial: RiskLimitsView }) {
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-800 bg-gray-950">
-            {view.tunableFields.map((f) => {
-              const meta = LABELS[f]
-              const overridden = view.overrides[f] != null
-              const [lo, hi] = view.bounds[f] ?? [0, 1]
-              return (
-                <tr key={f}>
-                  <td className="px-4 py-3">
-                    <div className="font-medium text-gray-100">{meta?.name ?? f}</div>
-                    <div className="text-xs text-gray-500">{meta?.hint ?? ''}</div>
-                  </td>
-                  <td className="px-4 py-3">
-                    <span className={overridden ? 'text-amber-300' : 'text-gray-200'}>{view.effective[f]}</span>
-                    <span className="ml-1 text-xs text-gray-500">({pct(view.effective[f] ?? 0)})</span>
-                  </td>
-                  <td className="px-4 py-3 text-gray-400">{view.defaults[f]}</td>
-                  <td className="px-4 py-3">
-                    <input
-                      type="number" step="0.01" min={lo} max={hi}
-                      value={inputs[f] ?? ''}
-                      placeholder={`${view.defaults[f]} (default)`}
-                      onChange={(e) => setInputs((s) => ({ ...s, [f]: e.target.value }))}
-                      className="w-32 rounded border border-gray-700 bg-gray-900 px-2 py-1 text-gray-100 focus:border-emerald-600 focus:outline-none"
-                    />
-                  </td>
-                  <td className="px-4 py-3 text-xs text-gray-500">{lo} – {hi}</td>
-                </tr>
-              )
-            })}
+            {fields.map(renderRow)}
           </tbody>
         </table>
       </div>
+    )
+
+  return (
+    <div className="space-y-4">
+      {/* Circuit-breaker halt thresholds are safety config — visible in both modes. */}
+      {renderTable('Circuit-breaker thresholds', safetyFields)}
+
+      {/* Optimiser caps are quant-only internals — Beginner mode curates them away. The values are
+          still applied; they're just not surfaced for editing in the simplified view. */}
+      <QuantOnly>
+        {renderTable('Optimiser caps', optimiserFields)}
+      </QuantOnly>
 
       <div className="flex flex-wrap items-center gap-3">
         <button onClick={save} disabled={busy || !dirty}
