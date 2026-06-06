@@ -27,7 +27,7 @@ import { TradingMode, OrderStatus, OrderType, OrderSide } from '../domain/Order.
 //      lifecycle (executed / failed / requeue) based on outcome.
 //   4. Sleep minIntervalMs before the next claim regardless, to throttle T212 calls.
 //
-// Failure handling rules — see CLAUDE.md and the in-repo plan for the rationale:
+// Failure handling rules — see the design doc and the in-repo plan for the rationale:
 //   - cash_insufficient (quantity=0):    → failed (terminal)
 //   - market_drift (>tolerance):          → failed (terminal)
 //   - queue_expired (age > ttl):          → failed (terminal)

@@ -1,7 +1,7 @@
 // Numeric enums: comparison is `OrderType.Limit === 0` true; reverse lookup via
 // `OrderType[OrderType.Limit] === 'Limit'` covers logging. Persisted to Mongo as the
 // integer value — no parallel string vocabulary. NOTE: existing pre-rename rows in
-// `orders` get wiped on deploy (`db.orders.deleteMany({})`); see CLAUDE.md.
+// `orders` get wiped on deploy (`db.orders.deleteMany({})`); see the design doc.
 
 export enum OrderSide {
   Buy,

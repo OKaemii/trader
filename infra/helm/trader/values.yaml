@@ -28,7 +28,7 @@ global:
 
     # Single source of truth for all service-tunable env vars. Lives under `global` so subchart
     # deployment templates can read `.Values.global.env.*` directly. Bump these and redeploy —
-    # no code change required for any of the toggles documented in CLAUDE.md.
+    # no code change required for any of the toggles documented in the design doc.
     tradingMode: Demo                   # Paper (notify only) | Demo (demo.trading212) | Live (trading212; admin gate required)
     # Market-data upstream for OHLCV bars + liquidity ranking. twelvedata (default; needs
     # TWELVEDATA_API_KEY in trader-secrets) | yahoo (legacy free fallback, no key). FX rates
@@ -88,7 +88,7 @@ global:
     fillPollIntervalMs: "30000"
     # ---- Order-dispatcher (trading-service) knobs ----
     # The dispatcher drains the signal queue (lifecycle='queued') one row at a time, throttling
-    # T212 calls to avoid 429s. See CLAUDE.md "Order dispatcher" for the full state machine.
+    # T212 calls to avoid 429s. See the design doc "Order dispatcher" for the full state machine.
     orderMinIntervalMs:   "1100"          # min ms between T212 placeOrder calls
     accountCacheTtlMs:    "30000"         # cash/positions snapshot TTL (in-process)
     orderMaxAttempts:     "5"             # attempts cap → lifecycle=failed/retries_exhausted
@@ -168,7 +168,7 @@ global:
     # Max active universe size (DEFAULT — portal-overridable at runtime via the Market Data config
     # page → portal_market_config; the override wins per-refresh, no restart). Changing the effective
     # size invalidates prior backtest_results — re-run validation before re-enabling topology_v1 or
-    # any go-live gate (see CLAUDE.md / Research page). Under universeSource=eodhd_scan the selection
+    # any go-live gate (see the design doc / Research page). Under universeSource=eodhd_scan the selection
     # is market-balanced (balanceByMarket): maxSize/2 from each of US + LSE by descending cap, so
     # 60 ⇒ ~30 US / ~30 UK. Raise only after re-validating (see note above).
     universeMaxSize: "60"

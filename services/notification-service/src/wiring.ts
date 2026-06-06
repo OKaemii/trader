@@ -107,7 +107,7 @@ export async function wireDependencies(env: NotificationEnv, logger: Logger): Pr
         // gov.uk + NYSE iCal sources as market-data-service. STATIC_FALLBACK is the
         // baked-in closure table the cache reaches for when both Mongo and the live
         // provider are unavailable (currently the source of truth for US, since the
-        // NYSE iCal URL is a 404 — see CLAUDE.md).
+        // NYSE iCal URL is a 404 — see the design doc).
         const holidayCache = new HolidayCache(
             db,
             { US: new NyseIcalProvider(), LSE: new UkGovBankHolidayProvider() },

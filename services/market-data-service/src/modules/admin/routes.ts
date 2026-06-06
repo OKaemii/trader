@@ -60,7 +60,7 @@ export const CONFIG_INVALIDATED_TOPIC = 'config:invalidated';
 const MIN_POLL_MS = 5_000;
 const MAX_POLL_MS = 24 * 60 * 60_000;
 // Universe-size override bounds. Floor keeps the sector cap + US/LSE balance meaningful; ceiling
-// guards the optimiser's conditioning band (see CLAUDE.md Top-K / mathematical-foundations §6.1).
+// guards the optimiser's conditioning band (see the design doc Top-K / mathematical-foundations §6.1).
 const MIN_UNIVERSE_SIZE = 10;
 const MAX_UNIVERSE_SIZE = 500;
 

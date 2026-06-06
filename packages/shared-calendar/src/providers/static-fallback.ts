@@ -2,7 +2,7 @@
 // unavailable. Carries the current year plus the next — the NYSE iCal provider is dead,
 // so US closures have no other runtime source. Older years are unlikely to be queried
 // (the cache walks back at most 7 days). Operators must extend this before year-end (see
-// CLAUDE.md); a missing year degrades to an empty-closures stub, not an error.
+// the design doc); a missing year degrades to an empty-closures stub, not an error.
 //
 // When this provider is read, log loudly: `source: 'static-fallback'` shows up on
 // the portal in red, and operators see a console warn.

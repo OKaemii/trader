@@ -102,7 +102,7 @@ resource "helm_release" "timescaledb" {
     { name = "auth.database",       value = "trader_ts" },
     # Single-node k3s — replication off; primary architecture only. Bumping to HA
     # later means flipping to architecture=replication and replicaCount=N with a
-    # full restore from the logical dump (see CLAUDE.md storage section, task 21).
+    # full restore from the logical dump (see the design doc storage section, task 21).
     { name = "architecture", value = "standalone" },
     # Sized to fit the existing homeserver: 60d × 200 tickers × 78 5m bars/day
     # ≈ 1M rows, compressed to ~200MB after the 7d compression policy kicks in.

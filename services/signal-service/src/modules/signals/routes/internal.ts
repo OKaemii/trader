@@ -20,7 +20,7 @@ import type { GetTelemetrySnapshotUseCase } from '../application/GetTelemetrySna
 interface Deps {
     signalRepo: ISignalRepository;
     // Publisher gated on the executed transition so notification-service only emails
-    // signals that actually went through to T212 (policy b — see CLAUDE.md).
+    // signals that actually went through to T212 (policy b — see the design doc).
     publisher: ISignalPublisher;
     logger: Logger;
     // Optional in tests that only exercise the queue endpoints. Production wiring always

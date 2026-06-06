@@ -143,7 +143,7 @@ describe('HolidayCache', () => {
 
   it('degrades to empty-closures stub when provider, Mongo, AND fallback all miss', async () => {
     // Operator-relevant case: system uptime spans past the last year the static table covers
-    // (currently 2026-2027; 2028 is the next gap — see the CLAUDE.md operator obligation). We
+    // (currently 2026-2027; 2028 is the next gap — see the design doc operator obligation). We
     // return a no-holidays stub rather than throw — the gate keeps working, we waste at most a
     // few cycles on unrecognised holidays, operator sees source='never' on portal and ships an update.
     const db = new StubDb();
