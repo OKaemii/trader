@@ -1,7 +1,7 @@
 'use client'
 import { useRouter } from 'next/navigation'
 import { useState, useTransition } from 'react'
-import { setMode } from '@/app/lib/mode'
+import { setMode } from '@/app/lib/mode-actions'
 import { useMode } from './ModeProvider'
 
 // Beginner⇄Quant switch, styled on the AutoApproveToggle idiom (role="switch" pill).
