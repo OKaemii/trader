@@ -128,9 +128,9 @@ export function MarketDataEditor({
   const intradayNeedsMarket = barChoice === 'intraday' && effectiveExec !== OrderType.Market
 
   return (
-    <div className="space-y-6 p-6">
+    <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-bold text-white">Market Data</h1>
+        <h2 className="text-lg font-semibold text-white">Market Data</h2>
         <p className="mt-1 text-sm text-gray-400">
           Override bar frequency, poll interval, signal order type, and universe size. Overrides layer
           on top of Helm defaults; pick “Use Helm default” to clear an override.
