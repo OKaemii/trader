@@ -55,6 +55,38 @@ describe('COMMANDS registry integrity', () => {
     }
   })
 
+  // The tab keys below mirror the `TABS` arrays in each workspace's page.tsx (the
+  // `?tab=` deep-link is matched against those keys via resolveTab). Task 12 reconciled
+  // the registry against the now-real routes; this asserts a palette entry exists for
+  // every real tab and catches drift if a future card renames a tab key.
+  const WORKSPACE_TABS: Record<string, string[]> = {
+    discover: ['universe', 'screener', 'sectors', 'calendar'],
+    research: ['charts', 'market-data', 'backtests', 'signals'],
+    build: ['strategy', 'console', 'alerts'],
+    portfolio: ['positions', 'performance', 'risk-limits', 'trips'],
+    operations: ['trade-audit', 'reconciliation', 'tca'],
+  }
+
+  it('exposes a deep-linked entry for every workspace tab pointing at the real route', () => {
+    for (const [ws, tabs] of Object.entries(WORKSPACE_TABS)) {
+      for (const tab of tabs) {
+        const cmd = COMMANDS.find((c) => c.id === `ws.${ws}.${tab}`)
+        expect(cmd, `missing tab command ws.${ws}.${tab}`).toBeDefined()
+        expect(cmd?.href, `tab ws.${ws}.${tab} must deep-link the real route`).toBe(
+          `/${ws}?tab=${tab}`,
+        )
+      }
+    }
+  })
+
+  it('exposes the global actions (toggle mode + sign out)', () => {
+    for (const id of ['act.toggle-mode', 'act.sign-out']) {
+      const cmd = COMMANDS.find((c) => c.id === id)
+      expect(cmd, `missing action command ${id}`).toBeDefined()
+      expect(cmd?.group).toBe('Actions')
+    }
+  })
+
   it('has unique command ids', () => {
     const ids = COMMANDS.map((c) => c.id)
     expect(new Set(ids).size).toBe(ids.length)
