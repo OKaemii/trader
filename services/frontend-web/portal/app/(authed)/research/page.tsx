@@ -1,38 +1,35 @@
-import { ResearchView } from '@/components/ResearchView'
-import { FeatureAuditPanel } from '@/components/FeatureAuditPanel'
-import { authedFetch } from '@/app/lib/auth-fetch'
+import { WorkspaceShell } from '@/components/WorkspaceShell'
+import { resolveTab } from '@/app/lib/tabs'
+import { ChartsTab } from './ChartsTab'
+import { MarketDataTab } from './MarketDataTab'
+import { BacktestsTab } from './BacktestsTab'
+import { SignalsTab } from './SignalsTab'
 
-// SSR-seed the validation-reports table so it renders 10 rows on first paint instead of
-// waiting for client hydration + a backtest results round-trip.
-async function fetchInitialReports(): Promise<Array<Record<string, unknown>> | null> {
-  try {
-    const r = await authedFetch('/admin/api/backtest/results?limit=10')
-    if (!r.ok) return null
-    const d = (await r.json()) as { results?: Array<Record<string, unknown>> }
-    return d.results ?? []
-  } catch {
-    return null
-  }
-}
+// Research workspace (IA-redesign Task 8): collapses the former Charts, Market Data,
+// Market Calendar, Research (backtests), and Signals (list) pages into one
+// deep-linkable `?tab=` workspace. Only the active tab's async server component is
+// rendered/awaited, so exactly one tab's authedFetch runs per request. The old
+// /charts, /market-data, /market-data/calendar, and /signals (list) routes are now
+// redirect stubs into this workspace; this route replaces the old /research page,
+// whose backtests body lives on as the Backtests tab.
+const TABS = [
+  { key: 'charts',      label: 'Charts' },
+  { key: 'market-data', label: 'Market Data' },
+  { key: 'backtests',   label: 'Backtests' },
+  { key: 'signals',     label: 'Signals' },
+] as const
 
-export default async function ResearchPage() {
-  const initialReports = await fetchInitialReports()
+export default async function ResearchPage(
+  { searchParams }: { searchParams: Promise<{ tab?: string }> },
+) {
+  const { tab } = await searchParams           // searchParams is a Promise in Next 16 — MUST await
+  const active = resolveTab(TABS, tab)          // unknown/absent -> first tab (charts)
   return (
-    <div className="space-y-6 p-6">
-      <div>
-        <h1 className="text-2xl font-bold text-white">Research & Investigation</h1>
-        <p className="mt-1 text-sm text-gray-400">
-          Queue walk-forward backtests and permutation-tested (MCPT) validations — both run as
-          background jobs (parallelised across cores) with a live progress tracker + ETA; watch them
-          in the Jobs table below. Results persist to MongoDB and <span className="text-gray-300">inform</span>{' '}
-          the live-trading decision — they do not auto-open it. The gate is a separate manual
-          step (the <code className="text-gray-300">trading:live_approved</code> Redis flag).
-        </p>
-      </div>
-
-      <ResearchView initialReports={initialReports} />
-
-      <FeatureAuditPanel />
-    </div>
+    <WorkspaceShell title="Research" tabs={TABS} active={active}>
+      {active === 'charts'      && <ChartsTab />}
+      {active === 'market-data' && <MarketDataTab />}
+      {active === 'backtests'   && <BacktestsTab />}
+      {active === 'signals'     && <SignalsTab />}
+    </WorkspaceShell>
   )
 }
