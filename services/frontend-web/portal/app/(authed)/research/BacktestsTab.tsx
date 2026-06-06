@@ -1,6 +1,7 @@
 import { ResearchView } from '@/components/ResearchView'
 import { FeatureAuditPanel } from '@/components/FeatureAuditPanel'
 import { authedFetch } from '@/app/lib/auth-fetch'
+import { QuantOnly } from '@/components/QuantOnly'
 
 // Backtests tab (IA-redesign Task 8 — was app/(authed)/research/page.tsx, the
 // route this workspace now replaces). SSR-seed the validation-reports table so it
@@ -29,9 +30,14 @@ export async function BacktestsTab() {
         step (the <code className="text-gray-300">trading:live_approved</code> Redis flag).
       </p>
 
-      <ResearchView initialReports={initialReports} />
+      {/* The walk-forward / MCPT runners + their PBO/DSR/permutation-test report internals are
+          quant-only — Beginner mode hides the validation machinery (and the feature-importance
+          audit) and shows the explainer above instead. Nothing here is operationally critical. */}
+      <QuantOnly>
+        <ResearchView initialReports={initialReports} />
 
-      <FeatureAuditPanel />
+        <FeatureAuditPanel />
+      </QuantOnly>
     </div>
   )
 }

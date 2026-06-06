@@ -5,6 +5,7 @@ import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ReferenceLine,
   ResponsiveContainer, Cell,
 } from 'recharts';
+import { Explain } from '@/components/Explain';
 
 const FACTOR_LABELS: Record<string, string> = {
   momentum: 'Momentum',
@@ -20,7 +21,10 @@ export function FactorExposureChart({ initial = null }: { initial?: StrategyOutp
   if (!features?.factor_attributions) {
     return (
       <div className="bg-gray-900 rounded-lg p-4">
-        <h2 className="text-lg font-semibold text-white mb-2">Factor Exposures</h2>
+        <h2 className="text-lg font-semibold text-white mb-2 inline-flex items-center gap-1.5">
+          Factor Exposures
+          <Explain id="factorExposure" />
+        </h2>
         <p className="text-xs text-gray-400">Portfolio-level factor attributions from last cycle</p>
         <div className="animate-pulse bg-gray-800 rounded h-48 mt-4" />
       </div>
@@ -64,7 +68,10 @@ export function FactorExposureChart({ initial = null }: { initial?: StrategyOutp
 
   return (
     <div className="bg-gray-900 rounded-lg p-4">
-      <h2 className="text-lg font-semibold text-white mb-1">Factor Exposures</h2>
+      <h2 className="text-lg font-semibold text-white mb-1 inline-flex items-center gap-1.5">
+        Factor Exposures
+        <Explain id="factorExposure" />
+      </h2>
       <p className="text-xs text-gray-400 mb-4">
         Conviction-weighted factor tilt of the held set (top-{held.length}) from last strategy cycle
       </p>

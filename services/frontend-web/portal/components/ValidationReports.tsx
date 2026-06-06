@@ -1,5 +1,6 @@
 'use client'
 import { Fragment, useCallback, useEffect, useState } from 'react'
+import { Explain } from '@/components/Explain'
 
 interface Report {
   strategy_id: string
@@ -104,8 +105,12 @@ export function ValidationReports({ refreshKey, initial = null }: ValidationRepo
               <th className="py-1 text-center font-normal">Bench</th>
               <th className="py-1 text-right font-normal">OOS SR</th>
               <th className="py-1 text-right font-normal">Mean IC</th>
-              <th className="py-1 text-right font-normal">DSR</th>
-              <th className="py-1 text-right font-normal">PBO</th>
+              <th className="py-1 text-right font-normal">
+                <span className="inline-flex items-center justify-end gap-1">DSR <Explain id="dsr" /></span>
+              </th>
+              <th className="py-1 text-right font-normal">
+                <span className="inline-flex items-center justify-end gap-1">PBO <Explain id="pbo" /></span>
+              </th>
               <th className="py-1 text-right font-normal">FDR p</th>
               <th className="py-1 text-right font-normal">Trials</th>
               <th className="py-1 text-right font-normal">N</th>
