@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react'
 import { type Money, formatMoney } from '@/types/trader'
+import { Explain } from '@/components/Explain'
 
 // Mirror of signal-service's EnrichedPosition (Trading.EnrichedPosition). Kept local per the
 // portal convention — don't import service-side types into client components.
@@ -89,7 +90,12 @@ export function PositionsPanel({ initial }: { initial: EnrichedPosition[] }) {
             <th className="px-3 py-2 text-right">Stop (dist)</th>
             <th className="px-3 py-2 text-right">Target</th>
             <th className="px-3 py-2 text-right">Days</th>
-            <th className="px-3 py-2 text-right">R</th>
+            <th className="px-3 py-2 text-right">
+              <span className="inline-flex items-center justify-end gap-1">
+                R
+                <Explain id="rMultiple" />
+              </span>
+            </th>
             <th className="px-3 py-2"></th>
           </tr>
         </thead>
