@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
-    rMultiple, stopDistancePct, daysHeld, pickEntryBuy, enrichPosition, CurrencyMismatchError,
+    rMultiple, stopDistancePct, daysHeld, pickEntryBuy, enrichPosition, enrichAll, CurrencyMismatchError,
 } from '../application/EnrichedPositions.ts';
 import type { TradeSignal } from '../../signals/domain/TradeSignal.ts';
 import type { Position, TradePlan } from '@trader/contracts';
@@ -82,3 +82,31 @@ describe('enrichPosition', () => {
             .toThrow(CurrencyMismatchError);
     });
 });
+
+describe('enrichAll', () => {
+    const position = (ticker: string, current: number): Position =>
+        ({ ticker, quantity: 10, currentPrice: { amount: current, currency: 'USD' } });
+    const usdPlan = (stop: number, target: number): TradePlan =>
+        ({ ticker: 'X', updatedBy: 'op', updatedAt: 0, stop: { amount: stop, currency: 'USD' }, target: { amount: target, currency: 'USD' } });
+
+    it('joins each position with its open BUYs + plan (the cross-row path the panel renders)', async () => {
+        const out = await enrichAll(
+            [position('AAPL_US_EQ', 110)],
+            async () => [buy(100, Date.UTC(2026, 0, 1))],
+            async () => usdPlan(90, 130),
+            Date.UTC(2026, 0, 11),
+        )
+        expect(out).toHaveLength(1)
+        expect(out[0]!.entryPrice).toBe(100)
+        expect(out[0]!.rMultiple).toBeCloseTo(1.0)
+        expect(out[0]!.stop).toEqual({ amount: 90, currency: 'USD' })
+    })
+
+    it('degrades a currency-mismatched plan to a plain row instead of throwing', async () => {
+        const gbpPlan: TradePlan = { ticker: 'X', updatedBy: 'op', updatedAt: 0, stop: { amount: 90, currency: 'GBP' } }
+        const out = await enrichAll([position('AAPL_US_EQ', 110)], async () => [buy(100, 1)], async () => gbpPlan, 0)
+        expect(out).toHaveLength(1)
+        expect(out[0]!.rMultiple).toBeNull()
+        expect(out[0]!.stop).toBeNull()
+    })
+})
