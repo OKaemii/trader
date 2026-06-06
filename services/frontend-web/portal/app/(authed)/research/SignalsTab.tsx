@@ -3,6 +3,7 @@ import { BettiCurveChart } from '@/components/BettiCurveChart';
 import { FactorExposureChart } from '@/components/FactorExposureChart';
 import { RegimeWidget } from '@/components/RegimeWidget';
 import { StrategyHealthBanner } from '@/components/StrategyHealthBanner';
+import { QuantOnly } from '@/components/QuantOnly';
 import { authedFetch } from '@/app/lib/auth-fetch';
 import type { StrategyOutput, SignalProgressDTO } from '@/types/trader';
 
@@ -62,8 +63,12 @@ export async function SignalsTab() {
       </div>
       <div className="col-span-2 flex flex-col gap-4 md:col-span-1">
         <RegimeWidget initial={topo} />
-        <FactorExposureChart initial={topo} />
-        <BettiCurveChart initial={topo} />
+        {/* Factor-decomposition + topology (Betti) are quant-only — Beginner mode curates them
+            away, but the regime context + signal feed above stay visible in both modes. */}
+        <QuantOnly>
+          <FactorExposureChart initial={topo} />
+          <BettiCurveChart initial={topo} />
+        </QuantOnly>
       </div>
     </div>
   );

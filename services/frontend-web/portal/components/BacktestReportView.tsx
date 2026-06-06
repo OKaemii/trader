@@ -1,15 +1,21 @@
 'use client'
 import type { BacktestReport } from './validation-types'
+import { Explain } from '@/components/Explain'
 
 // Completed walk-forward backtest report (extracted from the old inline BacktestRunner result).
 function pct(x: number): string {
   return `${(x * 100).toFixed(1)}%`
 }
 
-function Stat({ label, value }: { label: string; value: string }) {
+// `explain` threads a learning-layer toggletip onto the stat label: pass the registry id +
+// the raw value the band selector expects (Sharpe as-is; DSR/PBO as a 0–1 fraction).
+function Stat({ label, value, explain }: { label: string; value: string; explain?: { id: string; value: number } }) {
   return (
     <div>
-      <div className="text-[10px] uppercase tracking-wide text-gray-500">{label}</div>
+      <div className="flex items-center gap-1 text-[10px] uppercase tracking-wide text-gray-500">
+        {label}
+        {explain && <Explain id={explain.id} value={explain.value} />}
+      </div>
       <div className="font-mono text-sm text-gray-200">{value}</div>
     </div>
   )
@@ -29,10 +35,10 @@ export function BacktestReportView({ report }: { report: BacktestReport }) {
       </div>
 
       <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 md:grid-cols-5">
-        <Stat label="OOS Sharpe" value={report.oos_sharpe.toFixed(3)} />
+        <Stat label="OOS Sharpe" value={report.oos_sharpe.toFixed(3)} explain={{ id: 'sharpe', value: report.oos_sharpe }} />
         <Stat label="Mean IC" value={report.mean_ic.toFixed(4)} />
-        <Stat label="Deflated SR" value={report.deflated_sharpe.toFixed(3)} />
-        <Stat label="PBO" value={report.pbo.toFixed(3)} />
+        <Stat label="Deflated SR" value={report.deflated_sharpe.toFixed(3)} explain={{ id: 'dsr', value: report.deflated_sharpe }} />
+        <Stat label="PBO" value={report.pbo.toFixed(3)} explain={{ id: 'pbo', value: report.pbo }} />
         <Stat label="FDR p-value" value={report.fdr_corrected_pvalue.toFixed(4)} />
       </dl>
 

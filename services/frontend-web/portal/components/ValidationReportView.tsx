@@ -4,11 +4,17 @@ import { quasiPLabel } from './validation-types'
 import { InSamplePanel } from './InSamplePanel'
 import { MCPTHistogramPanel } from './MCPTHistogramPanel'
 import { WalkForwardPanel } from './WalkForwardPanel'
+import { Explain } from '@/components/Explain'
 
-function Stat({ label, value }: { label: string; value: string }) {
+// `explain` threads a learning-layer toggletip onto the stat label: pass the registry id +
+// the raw value the band selector expects (ratios as-is; DSR/drawdown as a 0–1 fraction).
+function Stat({ label, value, explain }: { label: string; value: string; explain?: { id: string; value: number } }) {
   return (
     <div>
-      <div className="text-[10px] uppercase tracking-wide text-gray-500">{label}</div>
+      <div className="flex items-center gap-1 text-[10px] uppercase tracking-wide text-gray-500">
+        {label}
+        {explain && <Explain id={explain.id} value={explain.value} />}
+      </div>
       <div className="font-mono text-sm text-gray-200">{value}</div>
     </div>
   )
@@ -32,10 +38,22 @@ export function ValidationReportView({ report }: { report: ValidationReportV2 })
         <dl className="mt-3 grid grid-cols-3 gap-x-4 gap-y-1 md:grid-cols-6">
           <Stat label="IS-MCPT p" value={quasiPLabel(report.step2_in_sample_mcpt)} />
           <Stat label="WF-MCPT p" value={quasiPLabel(report.step4_walk_forward_mcpt)} />
-          <Stat label="OOS Sharpe" value={lg.oos_sharpe?.toFixed(2) ?? '—'} />
+          <Stat
+            label="OOS Sharpe"
+            value={lg.oos_sharpe?.toFixed(2) ?? '—'}
+            explain={lg.oos_sharpe != null ? { id: 'sharpe', value: lg.oos_sharpe } : undefined}
+          />
           <Stat label="Mean IC" value={lg.mean_ic?.toFixed(4) ?? '—'} />
-          <Stat label="DSR" value={lg.deflated_sharpe?.toFixed(3) ?? '—'} />
-          <Stat label="Max DD" value={lg.max_drawdown !== undefined ? `${(lg.max_drawdown * 100).toFixed(1)}%` : '—'} />
+          <Stat
+            label="DSR"
+            value={lg.deflated_sharpe?.toFixed(3) ?? '—'}
+            explain={lg.deflated_sharpe != null ? { id: 'dsr', value: lg.deflated_sharpe } : undefined}
+          />
+          <Stat
+            label="Max DD"
+            value={lg.max_drawdown !== undefined ? `${(lg.max_drawdown * 100).toFixed(1)}%` : '—'}
+            explain={lg.max_drawdown !== undefined ? { id: 'maxDrawdown', value: Math.abs(lg.max_drawdown) } : undefined}
+          />
         </dl>
         {report.failures?.length > 0 && (
           <div className="mt-3">

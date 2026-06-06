@@ -1,6 +1,7 @@
 'use client'
 
 import { useState } from 'react'
+import { Explain } from '@/components/Explain'
 
 // Mirrors trading-service /admin/api/trading/equity (computeEquityKpis).
 interface NavPoint { t: number; nav: number; cash: number; positionsValue: number }
@@ -54,11 +55,16 @@ export function EquityView({ initial }: { initial: EquityPayload }) {
   // rather than letting it look like a broken toggle.
   const spanDays = k.firstAt && k.lastAt ? Math.max(1, Math.round((k.lastAt - k.firstAt) / 86_400_000)) : 0
   const shortHistory = k.nSnapshots > 0 && spanDays < days
-  const cards: Array<[string, string, string?]> = [
+  // [label, formatted value, optional text-colour class, optional learning-layer Explain].
+  // The KPI text stays as-is (signed percent); the Explain toggletip receives the raw value the
+  // registry expects — drawdown is reported as a positive fraction, but computeEquityKpis returns
+  // it ≤ 0, so abs() it before handing it to the maxDrawdown band selector.
+  type Card = [string, string, string?, { id: string; value: number }?]
+  const cards: Card[] = [
     ['Total return', fmtPct(k.totalReturnPct), k.totalReturnPct >= 0 ? 'text-emerald-400' : 'text-red-400'],
     ['Current NAV', fmtGbp(k.current)],
-    ['Max drawdown', fmtPct(k.maxDrawdownPct), 'text-red-400'],
-    ['Current drawdown', fmtPct(k.currentDrawdownPct), k.currentDrawdownPct < 0 ? 'text-amber-300' : 'text-gray-200'],
+    ['Max drawdown', fmtPct(k.maxDrawdownPct), 'text-red-400', { id: 'maxDrawdown', value: Math.abs(k.maxDrawdownPct) }],
+    ['Current drawdown', fmtPct(k.currentDrawdownPct), k.currentDrawdownPct < 0 ? 'text-amber-300' : 'text-gray-200', { id: 'maxDrawdown', value: Math.abs(k.currentDrawdownPct) }],
     ['Period high', fmtGbp(k.high)],
     ['Period low', fmtGbp(k.low)],
     ['Cash / positions', `${fmtGbp(k.cash)} / ${fmtGbp(k.positionsValue)}`],
@@ -91,9 +97,12 @@ export function EquityView({ initial }: { initial: EquityPayload }) {
       </div>
 
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-        {cards.map(([label, value, cls]) => (
+        {cards.map(([label, value, cls, explain]) => (
           <div key={label} className="rounded border border-gray-800 bg-gray-900 p-3">
-            <div className="text-xs text-gray-400">{label}</div>
+            <div className="flex items-center gap-1 text-xs text-gray-400">
+              {label}
+              {explain && <Explain id={explain.id} value={explain.value} />}
+            </div>
             <div className={`mt-1 text-lg font-semibold ${cls ?? 'text-gray-100'}`}>{value}</div>
           </div>
         ))}
