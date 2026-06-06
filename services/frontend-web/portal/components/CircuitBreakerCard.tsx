@@ -18,8 +18,8 @@ interface Props {
 
 // Dashboard card showing circuit-breaker state. The breaker stops new signal
 // emission on a NAV-driven trip (daily loss > 3% or drawdown > 10%). Reset is
-// manual after investigation — the trip post-mortem is captured in
-// /risk/trips for forensics. See CLAUDE.md "Risk engine" section.
+// manual after investigation — the trip post-mortem is captured in the
+// Portfolio › Circuit Trips tab for forensics. See CLAUDE.md "Risk engine" section.
 export function CircuitBreakerCard({ initial }: Props) {
   const [status, setStatus] = useState<RiskStatus | null>(initial)
   const [resetting, setResetting] = useState(false)
@@ -110,7 +110,7 @@ export function CircuitBreakerCard({ initial }: Props) {
           </button>
         )}
       </div>
-      <Link href="/risk/trips" className="mt-2 inline-block text-[11px] text-gray-400 underline hover:text-gray-200">
+      <Link href="/portfolio?tab=trips" className="mt-2 inline-block text-[11px] text-gray-400 underline hover:text-gray-200">
         Trip history & post-mortems →
       </Link>
       {error && <p className="mt-2 text-xs text-red-400">{error}</p>}
