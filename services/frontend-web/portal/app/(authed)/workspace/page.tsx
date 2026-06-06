@@ -61,18 +61,6 @@ async function fetchJsonOrNull<T>(path: string): Promise<T | null> {
   }
 }
 
-// SSR all three holdings-related endpoints in parallel. With this seed the panel paints real
-// positions, sector pie, and held-signals strip on first byte instead of waiting for client
-// hydration → 3 sequential fetches. (Mirrors dashboard/page.tsx's fetchHoldingsInitial.)
-async function fetchHoldingsInitial(): Promise<HoldingsInitial> {
-  const [positions, universe, signalsBody] = await Promise.all([
-    fetchJsonOrNull<HoldingsInitial['positions']>('/admin/api/trading/positions'),
-    fetchJsonOrNull<HoldingsInitial['universe']>('/admin/api/universe/overrides'),
-    fetchJsonOrNull<{ signals?: NonNullable<HoldingsInitial['signals']> }>('/api/signals/progress'),
-  ])
-  return { positions, universe, signals: signalsBody?.signals ?? [] }
-}
-
 // Latest validation/backtest verdicts for the Recent Research snapshot. Returns null on a failed
 // fetch (so the card can say "endpoint unavailable" vs. "no runs"); the helper caps to 5 newest.
 async function fetchRecentResearch(): Promise<ReturnType<typeof summariseRecentResearch> | null> {
@@ -84,20 +72,37 @@ async function fetchRecentResearch(): Promise<ReturnType<typeof summariseRecentR
 }
 
 export default async function WorkspacePage() {
-  const [mdHealth, autoApprove, holdings, cash, riskStatus, signalsBody, health, research] =
-    await Promise.all([
-      fetchJsonOrNull<MarketDataHealth>('/admin/api/market-data/health'),
-      fetchJsonOrNull<{ enabled?: boolean }>('/admin/api/signals/auto-approve').then((d) =>
-        d ? !!d.enabled : null,
-      ),
-      fetchHoldingsInitial(),
-      fetchJsonOrNull<CashInitial>('/admin/api/trading/cash'),
-      fetchJsonOrNull<RiskStatusInitial>('/admin/api/signals/risk/status'),
-      fetchJsonOrNull<{ signals?: SignalProgressDTO[] }>('/api/signals/progress'),
-      fetchJsonOrNull<HealthRow[]>('/api/admin/system/health'),
-      fetchRecentResearch(),
-    ])
+  // One flat parallel batch — every panel's seed fetched once. `/api/signals/progress` feeds BOTH
+  // the HoldingsPanel held-signals strip and the SignalFeed snapshot, so it is fetched a single time
+  // here and shared (the dashboard fetched it once for holdings; adding SignalFeed must not double it).
+  const [
+    mdHealth,
+    autoApprove,
+    positions,
+    universe,
+    cash,
+    riskStatus,
+    signalsBody,
+    health,
+    research,
+  ] = await Promise.all([
+    fetchJsonOrNull<MarketDataHealth>('/admin/api/market-data/health'),
+    fetchJsonOrNull<{ enabled?: boolean }>('/admin/api/signals/auto-approve').then((d) =>
+      d ? !!d.enabled : null,
+    ),
+    fetchJsonOrNull<HoldingsInitial['positions']>('/admin/api/trading/positions'),
+    fetchJsonOrNull<HoldingsInitial['universe']>('/admin/api/universe/overrides'),
+    fetchJsonOrNull<CashInitial>('/admin/api/trading/cash'),
+    fetchJsonOrNull<RiskStatusInitial>('/admin/api/signals/risk/status'),
+    fetchJsonOrNull<{ signals?: SignalProgressDTO[] }>('/api/signals/progress'),
+    fetchJsonOrNull<HealthRow[]>('/api/admin/system/health'),
+    fetchRecentResearch(),
+  ])
 
+  const signals = signalsBody?.signals ?? null
+  // HoldingsPanel wants [] (not null) for its held-signals strip; SignalFeed wants null to mean
+  // "not seeded, fetch on mount" vs [] "seeded empty".
+  const holdings: HoldingsInitial = { positions, universe, signals: signals ?? [] }
   const nextOpen = mdHealth?.next_session_open_ts
     ? new Date(mdHealth.next_session_open_ts).toUTCString()
     : null
@@ -168,7 +173,7 @@ export default async function WorkspacePage() {
           <div className="flex items-center justify-between">
             <h2 className="text-xs font-semibold uppercase tracking-wide text-gray-500">Active Signals</h2>
           </div>
-          <SignalFeed initial={signalsBody?.signals ?? null} />
+          <SignalFeed initial={signals} />
         </section>
 
         <section className="space-y-3">
