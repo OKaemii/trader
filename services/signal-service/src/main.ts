@@ -4,6 +4,9 @@ import { createNodeWebSocket } from "@hono/node-ws";
 import { createLogger, registerGracefulShutdown, errorHandler } from "@trader/core";
 import { startTracer, traceMixin } from "@trader/telemetry";
 import { publish, subscribe } from "@trader/shared-redis";
+import { COLLECTIONS } from "@trader/shared-mongo";
+import type { Position } from "@trader/contracts";
+import type { Money } from "@trader/shared-types";
 import type { RedisClientType } from "redis";
 
 import { loadSignalEnv } from "./env.ts";
@@ -54,10 +57,26 @@ async function main(): Promise<void> {
         telemetrySnapshot: deps.telemetrySnapshot,
     }));
     app.route("/", createPieRouter(deps.pieRepo));
+    // Positions for the /positions panel come from the synced Mongo `positions` collection
+    // (portfolio-service writes it; this is the same source RiskEngine uses for NAV) — not the
+    // trading-service internal endpoint, which only authorizes portfolio-service as a caller.
+    const positionsColl = deps.db.collection(COLLECTIONS.POSITIONS);
+    const listPositions = async (): Promise<Position[]> => {
+        const docs = await positionsColl.find({}).toArray();
+        return docs
+            .filter((d) => typeof d.ticker === "string" && d.ticker)
+            .map((d): Position => ({
+                ticker:   d.ticker as string,
+                quantity: typeof d.quantity === "number" ? d.quantity : 0,
+                ...(d.currentPrice  ? { currentPrice:  d.currentPrice  as Money } : {}),
+                ...(d.currentValue  ? { currentValue:  d.currentValue  as Money } : {}),
+                ...(d.averagePrice  ? { averagePrice:  d.averagePrice  as Money } : {}),
+            }));
+    };
     app.route("/", createTradePlanRouter({
         tradePlanRepo:  deps.tradePlanRepo,
         signalRepo:     deps.signalRepo,
-        tradingClient:  deps.tradingClient,
+        listPositions,
         alertRules:     deps.alertRuleRepo,
     }));
     app.route("/", createAlertRouter(deps.alertRuleRepo));

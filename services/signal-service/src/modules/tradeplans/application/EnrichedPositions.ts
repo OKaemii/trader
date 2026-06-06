@@ -93,3 +93,23 @@ export function enrichPosition(
         note: plan?.note ?? null,
     };
 }
+
+/**
+ * Enrich a whole position list: join each with its open BUYs + trade plan. A per-row
+ * CurrencyMismatchError degrades that single row (plan dropped) rather than failing the batch.
+ */
+export async function enrichAll(
+    positions: Position[],
+    openBuysOf: (ticker: string) => Promise<TradeSignal[]>,
+    planOf: (ticker: string) => Promise<TradePlan | null>,
+    now: number,
+): Promise<EnrichedPosition[]> {
+    return Promise.all(positions.map(async (pos) => {
+        const [openBuys, plan] = await Promise.all([openBuysOf(pos.ticker), planOf(pos.ticker)]);
+        try {
+            return enrichPosition(pos, openBuys, plan, now);
+        } catch {
+            return enrichPosition(pos, openBuys, null, now);
+        }
+    }));
+}
