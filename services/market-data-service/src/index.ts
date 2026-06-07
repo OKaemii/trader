@@ -34,6 +34,8 @@ import { runEodhdDailyFeed } from './modules/bars/infrastructure/eodhd-daily-fee
 import { buildFundamentalsCache } from './modules/fundamentals/wiring.ts';
 import { FundamentalsRefreshScheduler } from './modules/fundamentals/application/FundamentalsRefreshScheduler.ts';
 import { createFundamentalsRouter } from './modules/fundamentals/routes.ts';
+import { YahooAnalystEstimates } from './modules/fundamentals/infrastructure/YahooAnalystEstimates.ts';
+import { YahooQuoteSummary } from './modules/bars/infrastructure/providers/yahoo-quote-summary.ts';
 import { buildEarningsStore } from './modules/earnings/wiring.ts';
 import { EarningsRefreshScheduler } from './modules/earnings/application/EarningsRefreshScheduler.ts';
 import { createEarningsRouter } from './modules/earnings/routes.ts';
@@ -703,7 +705,10 @@ const fundamentalsRefresher = new FundamentalsRefreshScheduler(
     progressMs: env.FUNDAMENTALS_REFRESH_PROGRESS_MS,
   },
 );
-app.route('/', createFundamentalsRouter(fundamentalsCache, universeManager, fundamentalsRefresher));
+// Best-effort analyst estimates for the per-symbol Research Fundamentals tab (additive/may-trail,
+// §H) — its own quoteSummary session so a session reset here never disturbs the QMJ provider's.
+const analystEstimates = new YahooAnalystEstimates(new YahooQuoteSummary());
+app.route('/', createFundamentalsRouter(fundamentalsCache, universeManager, fundamentalsRefresher, analystEstimates));
 app.route('/', createScannerRouter(universeManager, fundamentalsCache));
 
 // Earnings/dividend calendar — earnings_calendar store (Yahoo calendarEvents, weekly refresh) +
