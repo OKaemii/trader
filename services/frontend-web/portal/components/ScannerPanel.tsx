@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from 'react'
 import { MarketBadge } from '@/components/MarketBadge'
+import { TickerChip } from '@/components/TickerChip'
 
 // Consolidated Universe ⇆ Scanner view. The EODHD-fed scan IS the universe, so the scanner funnel
 // (cap → QMJ quality) and the per-name table live here on the Universe page rather than a separate
@@ -153,7 +154,7 @@ export function ScannerPanel({
           <div className="flex flex-wrap gap-2">
             {[...initialPie.targets].sort((a, b) => b.targetWeight - a.targetWeight).map((t) => (
               <span key={t.ticker} className="rounded bg-gray-800 px-2 py-1 font-mono text-xs text-gray-200">
-                {t.ticker} <span className="text-emerald-400">{(t.targetWeight * 100).toFixed(1)}%</span>
+                <TickerChip symbol={t.ticker} /> <span className="text-emerald-400">{(t.targetWeight * 100).toFixed(1)}%</span>
               </span>
             ))}
           </div>
@@ -211,7 +212,8 @@ export function ScannerPanel({
                 return (
                   <tr key={r.ticker} className={`hover:bg-gray-900/50 ${held ? 'bg-emerald-950/20' : ''}`}>
                     <td className="px-3 py-1.5 font-mono text-gray-100">
-                      {held && <span title="In the selected basket" className="mr-1 text-emerald-400">●</span>}{r.ticker}
+                      {held && <span title="In the selected basket" className="mr-1 text-emerald-400">●</span>}
+                      <TickerChip symbol={r.ticker} />
                     </td>
                     <td className="px-3 py-1.5 text-gray-400" title={r.name}>{truncate(r.name, 30)}</td>
                     <td className="px-3 py-1.5"><MarketBadge market={(r.market === 'US' || r.market === 'LSE') ? r.market : 'OTHER'} /></td>

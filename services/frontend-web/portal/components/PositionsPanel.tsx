@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import { type Money, formatMoney } from '@/types/trader'
 import { Explain } from '@/components/Explain'
+import { TickerChip } from '@/components/TickerChip'
 
 // Mirror of signal-service's EnrichedPosition (Trading.EnrichedPosition). Kept local per the
 // portal convention — don't import service-side types into client components.
@@ -105,7 +106,7 @@ export function PositionsPanel({ initial }: { initial: EnrichedPosition[] }) {
             const editing = e != null
             return (
               <tr key={p.ticker} className="text-gray-200">
-                <td className="px-3 py-2 font-medium">{p.ticker}</td>
+                <td className="px-3 py-2 font-medium"><TickerChip symbol={p.ticker} /></td>
                 <td className="px-3 py-2 text-right tabular-nums">{p.quantity}</td>
                 <td className="px-3 py-2 text-right tabular-nums">{p.entryPrice != null ? p.entryPrice.toFixed(2) : '—'}</td>
                 <td className="px-3 py-2 text-right tabular-nums">{formatMoney(p.currentPrice)}</td>

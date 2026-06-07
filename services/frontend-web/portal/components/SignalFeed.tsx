@@ -13,6 +13,7 @@ function failureReasonLabel(reason: number | string): string {
 }
 import { MARKET_STYLES, marketOf } from './market';
 import { MarketBadge } from './MarketBadge';
+import { TickerChip } from './TickerChip';
 
 const REFRESH_MS = 30_000;
 
@@ -247,7 +248,7 @@ export function SignalFeed({ initial = null }: { initial?: SignalProgressDTO[] |
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-2">
                 <MarketBadge market={market} />
-                <span className="font-bold text-white">{s.ticker}</span>
+                <TickerChip symbol={s.ticker} className="font-bold text-white" />
                 <span className={`px-2 py-0.5 rounded text-xs font-semibold ${
                   s.action === 'BUY' ? 'bg-green-600' : 'bg-red-600'
                 } text-white`}>{s.action}</span>
