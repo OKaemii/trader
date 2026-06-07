@@ -76,12 +76,25 @@ async function fetchScores(symbol: string): Promise<FactorScores> {
   return (await r.json().catch(() => ({}))) as FactorScores
 }
 
-/** Per-symbol signals filtered from the existing progress feed (no new endpoint). */
+// "Active" = a signal still in the live pipeline (not a terminal Closed/Failed/Cancelled row). The
+// panel is labelled "Active signals", so terminal history is excluded here — the per-symbol Signals
+// tab (a sibling card) owns the full signal history view.
+const TERMINAL_LIFECYCLES = new Set<SignalLifecycle>([
+  SignalLifecycle.Closed,
+  SignalLifecycle.Failed,
+  SignalLifecycle.Cancelled,
+])
+
+/** Per-symbol ACTIVE signals filtered from the existing progress feed (no new endpoint). */
 async function fetchSymbolSignals(symbol: string): Promise<SignalProgressDTO[]> {
   const r = await authedFetch('/api/signals/progress')
   if (!r.ok) return []
   const data = (await r.json().catch(() => null)) as { signals?: SignalProgressDTO[] } | null
-  return (data?.signals ?? []).filter((s) => s.ticker === symbol)
+  return (data?.signals ?? []).filter((s) => {
+    if (s.ticker !== symbol) return false
+    const lifecycle = s.lifecycleResolved ?? s.lifecycle ?? SignalLifecycle.Pending
+    return !TERMINAL_LIFECYCLES.has(lifecycle)
+  })
 }
 
 /** Per-strategy exposure rows for the ticker. Best-effort — degrades to []. */

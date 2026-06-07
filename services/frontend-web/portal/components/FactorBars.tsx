@@ -95,9 +95,10 @@ export function FactorBars({
   initial?: FactorScores | null
 }) {
   // `null` ⇒ still loading the client fetch; a `FactorScores` (incl. `{}`) ⇒ resolved. Seeded
-  // surfaces start resolved with the seed; the drawer (no seed) starts null and fetches on mount.
-  // Re-keying the component by ticker (below) gives a fresh null state on a symbol change, so we
-  // never need a setState-in-effect to flip back to loading.
+  // surfaces start resolved with the seed; the no-seed case (the drawer) starts null and fetches on
+  // mount. A consumer that swaps `ticker` on a long-lived no-seed instance should mount this with
+  // `key={ticker}` so React remounts it (fresh null/loading state) rather than briefly showing the
+  // prior symbol's bars — this keeps the component free of a setState-in-effect reset.
   const [scores, setScores] = useState<FactorScores | null>(initial)
 
   useEffect(() => {
