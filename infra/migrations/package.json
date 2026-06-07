@@ -3,6 +3,11 @@
   "private": true,
   "version": "0.0.1",
   "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint lib test 2026-06-07-research-backfill.ts",
+    "test": "vitest run"
+  },
   "dependencies": {
     "mongodb": "^6.5.0",
     "pg": "^8.11.5"
