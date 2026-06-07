@@ -7,9 +7,6 @@ import {
     type SectorReturnInput,
 } from '../modules/research/application/MarketSummary.ts';
 
-// A leg with both raw + pct present.
-const leg = (raw: number | null, pct: number | null) => ({ raw, pct, source: 'eod' });
-
 function row(ticker: string, f: Partial<Record<(typeof FACTOR_KEYS)[number], { raw: number | null; pct: number | null }>>): FactorScoreRow {
     const factors: FactorScoreRow['factors'] = {};
     for (const k of FACTOR_KEYS) {
