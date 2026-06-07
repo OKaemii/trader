@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 // RELATIVE import on purpose: the portal vitest config does NOT resolve the `@/` alias
 // (it is a node-env unit harness), so the pure registry is imported by path.
-import { interpret, METRICS, type Metric } from './learning-content'
+import { DEPTHS, interpret, maxDepth, METRICS, type Metric } from './learning-content'
 
 describe('interpret — band selection', () => {
   it('picks the band by the inclusive upper bound (value <= max)', () => {
@@ -121,5 +121,103 @@ describe('METRICS registry integrity', () => {
     expect((METRICS.maxDrawdown.fmt as Metric['fmt'])!(0.123)).toBe('12.3%')
     expect((METRICS.winRate.fmt as Metric['fmt'])!(0.5)).toBe('50%')
     expect((METRICS.sharpe.fmt as Metric['fmt'])!(1.4234)).toBe('1.42')
+  })
+})
+
+describe('research metrics broadened for the epic (Task 32 §F)', () => {
+  it('adds the research metrics the epic surfaces', () => {
+    for (const id of [
+      'factorPercentile',
+      'momentum',
+      'quality',
+      'value',
+      'volatilityFactor',
+      'inclusion',
+      'contribution',
+      'breadth',
+      'hhi',
+    ]) {
+      expect(METRICS[id], `missing research metric ${id}`).toBeDefined()
+    }
+  })
+
+  it('interprets the cross-sectional factor z-scores around the universe mean', () => {
+    // central/positive-is-leading: a z of 0 is average, +2 leads, −2 lags.
+    expect(interpret('momentum', -2)?.label).toBe('lagging')
+    expect(interpret('momentum', 0)?.label).toBe('average')
+    expect(interpret('momentum', 2)?.label).toBe('strong')
+    expect(interpret('quality', 2)?.tone).toBe('strong')
+    expect(interpret('value', -2)?.label).toBe('expensive')
+  })
+
+  it('reads factorPercentile as a 0–1 rank (top of book scores best)', () => {
+    expect(interpret('factorPercentile', 0.2)?.label).toBe('low')
+    expect(interpret('factorPercentile', 0.95)?.label).toBe('top')
+    // bounded ∈ [0,1]: a value past the domain is unknown, not mislabelled.
+    expect(interpret('factorPercentile', 1.2)).toBeNull()
+  })
+
+  it('reads lower-is-better concentration/inclusion correctly', () => {
+    // HHI: an equal-weight 20-name book sits near 0.05 → diversified; piling in → top-heavy.
+    expect(interpret('hhi', 0.05)?.tone).toBe('strong')
+    expect(interpret('hhi', 0.5)?.label).toBe('top-heavy')
+    // inclusion: a narrow funnel is the selective (good) end.
+    expect(interpret('inclusion', 0.03)?.label).toBe('very narrow')
+    expect(interpret('inclusion', 0.9)?.tone).toBe('weak')
+  })
+
+  it('treats contribution as signed (detractors are negative)', () => {
+    expect(interpret('contribution', -0.2)?.label).toBe('detractor')
+    expect(interpret('contribution', -0.2)?.tone).toBe('bad')
+    expect(interpret('contribution', 0.2)?.label).toBe('major driver')
+  })
+})
+
+describe('progressive disclosure — layered registry (Task 32 §F)', () => {
+  const entries = Object.entries(METRICS)
+
+  it('exposes the depth ladder summary → factors → detail', () => {
+    expect(DEPTHS).toEqual(['summary', 'factors', 'detail'])
+  })
+
+  it('maxDepth reports the deepest populated layer (0..2)', () => {
+    // sharpe carries both factors and detail → depth 2.
+    expect(maxDepth('sharpe')).toBe(2)
+    // every broadened metric ships full three-layer copy.
+    expect(maxDepth('hhi')).toBe(2)
+    expect(maxDepth('breadth')).toBe(2)
+  })
+
+  it('returns 0 for an unknown id (degrades silently, like interpret)', () => {
+    expect(maxDepth('does-not-exist')).toBe(0)
+    expect(maxDepth('')).toBe(0)
+  })
+
+  it('keeps the layer ordering invariant: a detail layer implies a factors layer', () => {
+    // The component reveals factors at depth 1 before detail at depth 2; a metric that
+    // skipped the middle rung would show "Full detail" with no "Key factors" before it.
+    for (const [id, metric] of entries) {
+      if (metric.detail) {
+        expect(metric.factors && metric.factors.length > 0, `${id} has detail but no factors`).toBe(true)
+      }
+    }
+  })
+
+  it('agrees maxDepth with the populated fields for every metric', () => {
+    for (const [id, metric] of entries) {
+      const expected = metric.detail ? 2 : metric.factors && metric.factors.length > 0 ? 1 : 0
+      expect(maxDepth(id), `${id} maxDepth disagrees with its layers`).toBe(expected)
+    }
+  })
+
+  it('gives every factors entry and detail non-empty copy when present', () => {
+    for (const [id, metric] of entries) {
+      if (metric.factors) {
+        for (const factor of metric.factors) {
+          expect(factor, `${id} has an empty factor bullet`).toBeTruthy()
+        }
+      }
+      if (metric.detail) expect(metric.detail.length, `${id} detail`).toBeGreaterThan(0)
+    }
   })
 })
