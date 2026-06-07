@@ -114,6 +114,19 @@ export function computeMissingRanges(
  * Returns observations ascending. An empty `observed` means "nothing held in range" →
  * computeMissingRanges yields the whole span.
  *
+ * **Grid-alignment caveat for daily callers.** `neededStart`/`neededEnd` are anchored to
+ * the raw `now` instant (mid-day in practice), while daily bars are stamped at 00:00:00Z.
+ * Feeding these bounds straight into `computeMissingRanges(_, _, _, 86_400_000)` therefore
+ * puts the grid points a fractional day off the bar stamps, so the trailing grid point can
+ * read as a ≤1-step gap on a calendar-complete ticker (one redundant, hash-gated no-op
+ * fetch — never a data error). A gap-aware backfill that wants a true zero-fetch tail should
+ * floor `neededEnd` (and its step grid) to the bar-stamp convention — e.g. UTC midnight for
+ * the daily series — before calling `computeMissingRanges`.
+ *
+ * Reads Mongo (`COLLECTIONS.OHLCV_BARS`) directly — this matches where the current backfills
+ * write and the default `BARS_BACKEND=mongo`. It does **not** consult `BARS_BACKEND`; if
+ * Timescale ever becomes the live bars store, coverage detection must move with it.
+ *
  * @param now  injectable clock for deterministic tests; defaults to Date.now().
  */
 export async function coverageOf(
