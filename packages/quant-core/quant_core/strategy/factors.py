@@ -115,7 +115,7 @@ def _blend(components: list[np.ndarray]) -> np.ndarray:
 
 
 def _fundamentals_factor(
-    history: HistoryView, components: list[np.ndarray], tickers: list[str]
+    components: list[np.ndarray], tickers: list[str]
 ) -> FactorScores:
     """Blend pre-z-scored component columns and emit only the names with a finite blend."""
     blended = _blend(components)
@@ -150,7 +150,7 @@ class QualityFactor:
             [float(d["earnings_stability"]) if "earnings_stability" in d else float("nan") for d in f]
         )
         components = [nan_zscore(roe), nan_zscore(margin), nan_zscore(leverage), nan_zscore(stability)]
-        return _fundamentals_factor(history, components, tickers)
+        return _fundamentals_factor(components, tickers)
 
 
 class ValueFactor:
@@ -179,7 +179,7 @@ class ValueFactor:
         earnings_yield = np.array([_safe_ratio(d.get("net_income"), d.get("market_cap_gbp")) for d in f])
         book_to_market = np.array([_safe_ratio(d.get("total_equity"), d.get("market_cap_gbp")) for d in f])
         components = [nan_zscore(div_yield), nan_zscore(earnings_yield), nan_zscore(book_to_market)]
-        return _fundamentals_factor(history, components, tickers)
+        return _fundamentals_factor(components, tickers)
 
 
 class CompositeFactor:
