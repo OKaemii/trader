@@ -178,6 +178,20 @@ export const COLLECTIONS = {
   //     source, asOf, updatedAt }
   // Read by the admin GET /admin/api/market-data/news?ticker= (Overview Recent Events — T24/T30/T35).
   NEWS:                      'news',
+  // Cached day's market narrative — the data-grounded hybrid prose served by signal-service's
+  // research module (GET /admin/api/market/narrative; T30). The portal_* config pattern: one
+  // singleton doc regenerated on a new trading day (the keying field is the UTC date string of the
+  // generation day) or on demand (?refresh=1). The narrative is CONSTRAINED to the numbers in
+  // GET /admin/api/market/summary — a post-check rejects any figure not in that payload and falls
+  // back to a deterministic template. Doc:
+  //   { _id:'singleton',
+  //     tradingDay,   // 'YYYY-MM-DD' the narrative was generated for (the cache key); a request on a
+  //                   // later UTC day regenerates
+  //     narrative,    // the prose served to the portal
+  //     source,       // 'llm' (LLM prose passed the post-check) | 'template' (deterministic fallback)
+  //     summary,      // the exact MarketSummary the narrative was built from (audit / numbers source)
+  //     generatedAt } // ms the doc was written
+  MARKET_NARRATIVE:          'market_narrative',
 } as const;
 
 export type CollectionName = typeof COLLECTIONS[keyof typeof COLLECTIONS];

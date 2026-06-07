@@ -80,6 +80,15 @@ spec:
   {{- $streams = append $streams (printf "signals:strategy:%s:%s" .mode .strategyId) -}}
 {{- end }}
               value: {{ join "," $streams | quote }}
+            # Market-narrative LLM phrasing (DeepSeek, OpenAI-compatible). Same key the
+            # notification-service + backtest-engine use. optional so the pod still boots if it's
+            # unset — the narrative endpoint then serves the deterministic template (never blocked).
+            - name: DEEPSEEK_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: DEEPSEEK_API_KEY
+                  optional: true
           livenessProbe:
             httpGet:
               path: /health

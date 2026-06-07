@@ -17,6 +17,7 @@ import { createPieRouter } from "./modules/pie/routes/pie-routes.ts";
 import { createTradePlanRouter } from "./modules/tradeplans/routes/tradeplan-routes.ts";
 import { createAlertRouter } from "./modules/alerts/routes/alert-routes.ts";
 import { createResearchRouter } from "./modules/research/routes/research-routes.ts";
+import { DeepSeekClient } from "./modules/research/infrastructure/LlmClient.ts";
 import { registerTopologyWebSocket, registerSystemReset } from "./modules/signals/routes/system.ts";
 
 async function main(): Promise<void> {
@@ -84,11 +85,19 @@ async function main(): Promise<void> {
     app.route("/", createAlertRouter(deps.alertRuleRepo));
     // Research module — signal-service owns /admin/api/market/* (added to its ingress). Reads
     // factor_scores (strategy-engine's per-cycle write) + sector ETF bars + positions from shared
-    // Mongo; no cross-service HTTP. T30/T33/T25 extend this same module.
+    // Mongo; no cross-service HTTP. T30/T33/T25 extend this same module. The market-narrative
+    // endpoint phrases the deterministic skeleton via DeepSeek when DEEPSEEK_API_KEY is set; unset ⇒
+    // it serves the template (the page is never blocked).
+    const narrativeLlm = env.DEEPSEEK_API_KEY
+        ? new DeepSeekClient({ apiKey: env.DEEPSEEK_API_KEY, logger })
+        : null;
+    if (!narrativeLlm) logger.info("market narrative: DEEPSEEK_API_KEY unset — serving deterministic template");
     app.route("/", createResearchRouter({
         db:    deps.db,
         redis: deps.redis as unknown as RedisClientType,
         topK:  env.FACTOR_RANK_TOP_K,
+        narrativeLlm,
+        logger,
     }));
 
     // WebSocket + system-reset moved here from the (deleted) api-gateway. Both belong

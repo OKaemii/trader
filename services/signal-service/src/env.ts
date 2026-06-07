@@ -28,6 +28,12 @@ const EnvSchema = z.object({
     // (the optimiser still owns the live top-K in GenerateSignals).
     FACTOR_RANK_TOP_K:         z.coerce.number().int().positive().default(20),
 
+    // DeepSeek API key (OpenAI-compatible). When set, the research module's market-narrative
+    // endpoint (GET /admin/api/market/narrative) phrases the deterministic skeleton via the LLM,
+    // constrained to the summary's numbers. Optional — unset ⇒ the narrative serves the deterministic
+    // template (never blocks the page). Same secret the notification-service + backtest-engine use.
+    DEEPSEEK_API_KEY: z.string().optional(),
+
     // Per-pod consumer name on Redis-stream subscriber.
     POD_NAME: z.string().default("local"),
 

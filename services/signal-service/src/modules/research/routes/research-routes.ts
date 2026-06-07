@@ -13,13 +13,20 @@ import { parseAdminHeaders } from '@trader/shared-auth/middleware';
 import { getBars, aggregateBars } from '@trader/shared-bars';
 import { sma, pctReturn } from '@trader/shared-indicators';
 import { COLLECTIONS } from '@trader/shared-mongo';
+import type { Logger } from '@trader/core';
 import type { Db } from 'mongodb';
 import type { RedisClientType } from 'redis';
 import {
     computeMarketSummary,
     type FactorScoreRow,
+    type MarketSummary,
     type SectorReturnInput,
 } from '../application/MarketSummary.ts';
+import {
+    generateNarrative,
+    type NarrativeChat,
+    type NarrativeSource,
+} from '../application/MarketNarrative.ts';
 
 // The SPDR sector-ETF reference set powering the sector heatmap. Mirror of market-data-service's
 // sector-etfs.ts (the source of truth for the tracked-but-untradeable ETF set) — duplicated here as
@@ -46,6 +53,25 @@ export interface ResearchRouterDeps {
     redis: RedisClientType;
     /** Held-position target (per-strategy top-K) for the concentration HHI target. */
     topK: number;
+    /**
+     * LLM seam for the market narrative (GET /admin/api/market/narrative). null when DEEPSEEK_API_KEY
+     * is unset — the narrative then degrades to the deterministic template (never blocks the page).
+     */
+    narrativeLlm?: NarrativeChat | null;
+    logger?: Logger;
+}
+
+interface NarrativeCacheDoc {
+    tradingDay: string;
+    narrative: string;
+    source: NarrativeSource;
+    summary: MarketSummary;
+    generatedAt: number;
+}
+
+/** UTC date string (YYYY-MM-DD) used as the narrative cache key — regenerate on a new UTC day. */
+function utcDay(nowMs: number): string {
+    return new Date(nowMs).toISOString().slice(0, 10);
 }
 
 /** Latest completed-week return for one sector ETF, from its daily series. */
@@ -114,32 +140,90 @@ async function positionWeights(db: Db): Promise<number[]> {
     return total > 0 ? amounts.map((v) => v / total) : [];
 }
 
+/**
+ * Read all inputs from shared Mongo (sector ETF bars, latest factor cycle, breadth flags, position
+ * weights) and run the pure aggregation. Shared by the /summary endpoint and the narrative endpoint
+ * (which is CONSTRAINED to exactly these numbers — so it must build the prose from the same payload).
+ */
+async function loadMarketSummary(deps: ResearchRouterDeps): Promise<MarketSummary> {
+    const [sectorReturns, factorCycle, weights] = await Promise.all([
+        Promise.all(SECTOR_ETFS.map((etf) => sectorLatestReturn(deps, etf))),
+        latestFactorCycle(deps.db),
+        positionWeights(deps.db),
+    ]);
+
+    // Breadth over exactly the latest factor cycle's universe — the same names the strategy
+    // ranked this cycle. Empty pre-backfill ⇒ an honest empty breadth read.
+    const breadthFlags = await Promise.all(
+        factorCycle.rows.map((row) => breadthFlag(deps, row.ticker)),
+    );
+
+    return computeMarketSummary({
+        sectorReturns,
+        factorRows: factorCycle.rows,
+        factorCycleTs: factorCycle.cycleTs,
+        breadthFlags,
+        positionWeights: weights,
+        topK: deps.topK,
+    });
+}
+
 export function createResearchRouter(deps: ResearchRouterDeps): Hono {
     const r = new Hono();
+    const narrativeColl = deps.db.collection<NarrativeCacheDoc>(COLLECTIONS.MARKET_NARRATIVE);
 
     r.get('/admin/api/market/summary', parseAdminHeaders, async (c) => {
-        const [sectorReturns, factorCycle, weights] = await Promise.all([
-            Promise.all(SECTOR_ETFS.map((etf) => sectorLatestReturn(deps, etf))),
-            latestFactorCycle(deps.db),
-            positionWeights(deps.db),
-        ]);
+        return c.json(await loadMarketSummary(deps));
+    });
 
-        // Breadth over exactly the latest factor cycle's universe — the same names the strategy
-        // ranked this cycle. Empty pre-backfill ⇒ an honest empty breadth read.
-        const breadthFlags = await Promise.all(
-            factorCycle.rows.map((row) => breadthFlag(deps, row.ticker)),
+    // GET /admin/api/market/narrative — the data-grounded hybrid prose (locked decision #8). Cached
+    // per UTC day (the portal_* singleton pattern); ?refresh=1 regenerates on demand. The prose is
+    // CONSTRAINED to the numbers in /admin/api/market/summary — a post-check in generateNarrative
+    // rejects any invented figure and falls back to the deterministic template, so the page is never
+    // blocked by an LLM outage or hallucination.
+    r.get('/admin/api/market/narrative', parseAdminHeaders, async (c) => {
+        const forceRefresh = c.req.query('refresh') === '1' || c.req.query('refresh') === 'true';
+        const today = utcDay(Date.now());
+
+        if (!forceRefresh) {
+            const cached = await narrativeColl.findOne({ _id: 'singleton' } as never);
+            if (cached && cached.tradingDay === today) {
+                return c.json({
+                    narrative: cached.narrative,
+                    source: cached.source,
+                    asOf: cached.summary.asOf,
+                    tradingDay: cached.tradingDay,
+                    generatedAt: cached.generatedAt,
+                    cached: true,
+                    summary: cached.summary,
+                });
+            }
+        }
+
+        const summary = await loadMarketSummary(deps);
+        const { narrative, source } = await generateNarrative(
+            summary,
+            deps.narrativeLlm ?? null,
+            (reason, detail) =>
+                deps.logger?.warn({ reason, ...detail }, 'market narrative llm fell back to template'),
         );
 
-        const summary = computeMarketSummary({
-            sectorReturns,
-            factorRows: factorCycle.rows,
-            factorCycleTs: factorCycle.cycleTs,
-            breadthFlags,
-            positionWeights: weights,
-            topK: deps.topK,
-        });
+        const doc: NarrativeCacheDoc = { tradingDay: today, narrative, source, summary, generatedAt: Date.now() };
+        // Best-effort cache write — a Mongo hiccup must not block the page. The narrative is already
+        // computed; serve it regardless of whether the upsert lands.
+        await narrativeColl
+            .updateOne({ _id: 'singleton' } as never, { $set: doc }, { upsert: true })
+            .catch((err) => deps.logger?.warn({ err: String(err) }, 'market narrative cache write failed'));
 
-        return c.json(summary);
+        return c.json({
+            narrative,
+            source,
+            asOf: summary.asOf,
+            tradingDay: today,
+            generatedAt: doc.generatedAt,
+            cached: false,
+            summary,
+        });
     });
 
     return r;
