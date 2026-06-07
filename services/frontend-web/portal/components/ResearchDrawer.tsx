@@ -6,15 +6,16 @@
 // the full /research?symbol=… route.
 //
 // State lives here (not in the URL) so opening the drawer never pushes a history
-// entry — it's an overlay, not a navigation. The body is a placeholder for now;
-// Task 35 fills it with the shared symbol panels (header, chart, factor bars, active
-// signals, strategy exposure, notes, recent events).
+// entry — it's an overlay, not a navigation. The body (Task 35) is <DrawerBody>: the
+// shared, condensed symbol panels (header, chart, factor bars, active signals + Why?,
+// strategy exposure, notes, recent events) — the SAME components the full
+// /research?symbol= route uses, client-fetched on open.
 //
 // Client-only by construction: this file and ui/Drawer.tsx must NOT import any
 // `server-only` module (e.g. app/lib/mode.ts) — doing so fails the Next build.
 import { createContext, useCallback, useContext, useMemo, useState } from 'react'
 import { Drawer, DrawerContent, DrawerTitle } from '@/components/ui/Drawer'
-import { DrawerNotes } from '@/components/DrawerNotes'
+import { DrawerBody } from '@/components/DrawerBody'
 
 type ResearchDrawerContextValue = {
   /** The symbol the drawer is currently showing, or null when closed. */
@@ -56,19 +57,14 @@ export function DrawerProvider({ children }: { children: React.ReactNode }) {
       <Drawer open={symbol !== null} onOpenChange={onOpenChange}>
         {symbol !== null && (
           <DrawerContent aria-describedby={undefined}>
-            <DrawerTitle>{symbol}</DrawerTitle>
-            {/* Placeholder for the shared symbol panels (header, chart, factor bars, signals,
-                exposure, recent events) — Task 35 fills the drawer body here. */}
-            <p className="mt-4 text-sm text-gray-400">
-              Research panels for {symbol} load here.
-            </p>
-            {/* Notes slot (Task 34 §G). Self-contained: client-fetches + renders the symbol's note.
-                key={symbol} remounts it on symbol change so it re-fetches the right note. Kept as a
-                discrete block so the Task 35 body fill drops in around it without conflict. */}
-            <div className="mt-6 border-t border-gray-800 pt-4">
-              <h3 className="mb-2 text-sm font-semibold text-white">Research notes</h3>
-              <DrawerNotes key={symbol} ticker={symbol} />
-            </div>
+            <DrawerTitle>
+              <span className="font-mono">{symbol}</span>
+            </DrawerTitle>
+            {/* The shared, condensed symbol panels — chart, factor bars, active signals + Why?,
+                strategy exposure, notes (Task 34's slot, relocated in), recent events. Client-fetched
+                on open with a per-symbol in-memory cache. key={symbol} so a symbol switch remounts the
+                whole body (fresh load + the keyed FactorBars/DrawerNotes re-fetch). */}
+            <DrawerBody key={symbol} symbol={symbol} />
           </DrawerContent>
         )}
       </Drawer>
