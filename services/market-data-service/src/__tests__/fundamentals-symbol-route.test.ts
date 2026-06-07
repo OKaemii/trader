@@ -186,4 +186,26 @@ describe('YahooAnalystEstimates extractor', () => {
     const est = await new YahooAnalystEstimates(thrower).fetch('AAPL_US_EQ');
     expect(est).toBeNull();
   });
+
+  it('serves a successful result from the TTL cache (one upstream call across repeated fetches)', async () => {
+    let calls = 0;
+    const counting: QuoteSummaryFetcher = { fetchModules: async () => { calls++; return QS_RESULT; } };
+    const est = new YahooAnalystEstimates(counting);
+    const a = await est.fetch('AAPL_US_EQ');
+    const b = await est.fetch('AAPL_US_EQ');
+    expect(calls).toBe(1); // second fetch hit the cache
+    expect(b).toEqual(a);
+  });
+
+  it('does NOT cache a transient error — the next render retries', async () => {
+    let calls = 0;
+    const flaky: QuoteSummaryFetcher = {
+      fetchModules: async () => { calls++; if (calls === 1) throw new Error('session reset'); return QS_RESULT; },
+    };
+    const est = new YahooAnalystEstimates(flaky);
+    expect(await est.fetch('AAPL_US_EQ')).toBeNull(); // first call errors → null, not cached
+    const recovered = await est.fetch('AAPL_US_EQ'); // second call retries upstream and succeeds
+    expect(calls).toBe(2);
+    expect(recovered?.priceTargetMean).toBe(200.5);
+  });
 });

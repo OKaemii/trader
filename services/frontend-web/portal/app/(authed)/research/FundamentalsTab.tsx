@@ -278,8 +278,10 @@ export async function FundamentalsTab({ symbol }: { symbol: string }) {
                 </tr>
               </thead>
               <tbody className="font-mono text-gray-200">
-                {dividends.slice(0, 12).map((d) => (
-                  <tr key={d.date} className="border-t border-gray-800/60">
+                {dividends.slice(0, 12).map((d, i) => (
+                  // ex-date + index: a special + regular dividend can share an ex-date, so the date
+                  // alone is not a unique React key.
+                  <tr key={`${d.date}-${i}`} className="border-t border-gray-800/60">
                     <td className="py-1">{d.date}</td>
                     <td className="py-1 text-right">
                       {curSym(d.currency)}

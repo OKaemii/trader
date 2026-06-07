@@ -72,21 +72,39 @@ function extractGrowth(trend: unknown[], estimateKey: string): GrowthEstimate[] 
   return out;
 }
 
+// Estimates move slowly (analysts revise over days). The Research tab calls this per render on the
+// request path, so a short in-process TTL cache stops repeated page loads of the same symbol from
+// each issuing a fresh Yahoo session bootstrap + quoteSummary fetch (slow, and a rate-limit risk).
+const CACHE_TTL_MS = 30 * 60_000;
+
 export class YahooAnalystEstimates {
-  constructor(private readonly qs: QuoteSummaryFetcher) {}
+  private readonly cache = new Map<string, { at: number; value: AnalystEstimates | null }>();
+
+  constructor(
+    private readonly qs: QuoteSummaryFetcher,
+    private readonly ttlMs = CACHE_TTL_MS,
+  ) {}
 
   /** Best-effort estimates for one ticker. `null` on a blacklisted symbol, 404, or any error. */
   async fetch(ticker: string): Promise<AnalystEstimates | null> {
+    const cached = this.cache.get(ticker);
+    if (cached && Date.now() - cached.at < this.ttlMs) return cached.value;
     try {
       const sym = toYahooSymbol(ticker);
-      if (isBlacklisted(sym)) return null;
+      if (isBlacklisted(sym)) return this.remember(ticker, null);
       const result = await this.qs.fetchModules(sym, MODULES);
-      if (!result) return null;
-      return this.extract(result);
+      if (!result) return this.remember(ticker, null);
+      return this.remember(ticker, this.extract(result));
     } catch (err) {
       log.warn(`[fundamentals/analyst] ${ticker}: ${err instanceof Error ? err.message : String(err)}`);
+      // Don't cache transient errors — the next render should retry, not serve a stale null for 30m.
       return null;
     }
+  }
+
+  private remember(ticker: string, value: AnalystEstimates | null): AnalystEstimates | null {
+    this.cache.set(ticker, { at: Date.now(), value });
+    return value;
   }
 
   private extract(r: Record<string, unknown>): AnalystEstimates {
