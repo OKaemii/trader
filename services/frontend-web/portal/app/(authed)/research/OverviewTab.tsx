@@ -3,6 +3,8 @@ import { CandlestickChart } from '@/components/CandlestickChart'
 import { FactorBars, type FactorScores } from '@/components/FactorBars'
 import { MarketBadge } from '@/components/MarketBadge'
 import { marketOf } from '@/components/market'
+import { ResearchNotes } from '@/components/ResearchNotes'
+import { fetchResearchNote } from '@/app/lib/research-notes'
 import type { SignalProgressDTO } from '@/types/trader'
 import { SignalLifecycle } from '@/types/trader'
 
@@ -246,12 +248,13 @@ function RecentEvents({ articles }: { articles: NewsArticle[] }) {
 
 export async function OverviewTab({ symbol }: { symbol: string }) {
   // Independent reads — fetch in parallel so a slow/absent source never blocks another panel.
-  const [bars, scores, signals, exposure, news] = await Promise.all([
+  const [bars, scores, signals, exposure, news, note] = await Promise.all([
     fetchBars(symbol),
     fetchScores(symbol),
     fetchSymbolSignals(symbol),
     fetchExposure(symbol),
     fetchNews(symbol),
+    fetchResearchNote(symbol),
   ])
   const market = marketOf(symbol)
 
@@ -274,6 +277,12 @@ export async function OverviewTab({ symbol }: { symbol: string }) {
 
       <Panel title="Strategy exposure">
         <StrategyExposure rows={exposure} />
+      </Panel>
+
+      <Panel title="Research notes">
+        {/* The notebook for this symbol — markdown editor/preview, server-seeded. @-mentions in the
+            body (e.g. @strategy:factor_rank_v1) become backlinks surfaced on those entities' views. */}
+        <ResearchNotes ticker={symbol} initial={note} />
       </Panel>
 
       <Panel title="Recent events">

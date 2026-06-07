@@ -1,5 +1,7 @@
 import Link from 'next/link'
 import { authedFetch } from '@/app/lib/auth-fetch'
+import { Backlinks } from '@/components/Backlinks'
+import { fetchBacklinks } from '@/app/lib/research-notes'
 
 // IA-redesign Task 14. The signals LIST lives in the Research workspace (Signals tab,
 // see app/(authed)/signals/page.tsx → redirect stub); THIS is the per-signal detail page
@@ -103,7 +105,8 @@ const lifecycleAccent: Record<number, string> = {
 
 export default async function SignalDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params
-  const signal = await fetchSignal(id)
+  // Signal + the research notes that @-mention this signal (T34 §G backlinks) — independent reads.
+  const [signal, backlinks] = await Promise.all([fetchSignal(id), fetchBacklinks('signal', id)])
 
   if (!signal) {
     return (
@@ -272,6 +275,10 @@ export default async function SignalDetailPage({ params }: { params: Promise<{ i
           </table>
         </div>
       </section>
+
+      {/* `id` (the URL param) is the same value the SSR seed above queried, so the client re-fetch
+          ref matches the seed exactly. signal.id echoes it. */}
+      <Backlinks kind="signal" ref_={id} initial={backlinks} />
     </div>
   )
 }

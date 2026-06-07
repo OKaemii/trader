@@ -14,6 +14,7 @@
 // `server-only` module (e.g. app/lib/mode.ts) — doing so fails the Next build.
 import { createContext, useCallback, useContext, useMemo, useState } from 'react'
 import { Drawer, DrawerContent, DrawerTitle } from '@/components/ui/Drawer'
+import { DrawerNotes } from '@/components/DrawerNotes'
 
 type ResearchDrawerContextValue = {
   /** The symbol the drawer is currently showing, or null when closed. */
@@ -56,10 +57,18 @@ export function DrawerProvider({ children }: { children: React.ReactNode }) {
         {symbol !== null && (
           <DrawerContent aria-describedby={undefined}>
             <DrawerTitle>{symbol}</DrawerTitle>
-            {/* Placeholder — Task 35 renders the shared symbol panels here. */}
+            {/* Placeholder for the shared symbol panels (header, chart, factor bars, signals,
+                exposure, recent events) — Task 35 fills the drawer body here. */}
             <p className="mt-4 text-sm text-gray-400">
               Research panels for {symbol} load here.
             </p>
+            {/* Notes slot (Task 34 §G). Self-contained: client-fetches + renders the symbol's note.
+                key={symbol} remounts it on symbol change so it re-fetches the right note. Kept as a
+                discrete block so the Task 35 body fill drops in around it without conflict. */}
+            <div className="mt-6 border-t border-gray-800 pt-4">
+              <h3 className="mb-2 text-sm font-semibold text-white">Research notes</h3>
+              <DrawerNotes key={symbol} ticker={symbol} />
+            </div>
           </DrawerContent>
         )}
       </Drawer>
