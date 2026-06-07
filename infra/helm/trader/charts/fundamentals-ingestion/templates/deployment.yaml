@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fundamentals-ingestion
+  namespace: {{ .Release.Namespace }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fundamentals-ingestion
+  template:
+    metadata:
+      labels:
+        app: fundamentals-ingestion
+    spec:
+      containers:
+        - name: fundamentals-ingestion
+          image: {{ .Values.image | default (printf "%strader-fundamentals-ingestion:%s" (.Values.global.imageRegistry | default "") (.Values.global.imageTag | default "latest")) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy | default "IfNotPresent" }}
+          ports:
+            - containerPort: 8010
+          envFrom:
+            - secretRef:
+                name: trader-secrets
+          env:
+            # Mongo (security-master-adjacent singletons + ingest job / quarantine bookkeeping). Same
+            # assembly the other Python services use — password from the secret, URL composed here.
+            - name: MONGODB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: MONGODB_PASSWORD
+            - name: MONGODB_URL
+              value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb-headless:27017/trader?authSource=trader&directConnection=true"
+            - name: MONGODB_DB
+              value: trader
+            # Timescale (the bi-temporal `fundamentals` write target — epic Task 7). Password from the
+            # secret, URL assembled like backtest-engine's so the writer points at trader_ts.
+            - name: TIMESCALEDB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: TIMESCALEDB_PASSWORD
+            - name: TIMESCALE_URL
+              value: "postgresql://trader:$(TIMESCALEDB_PASSWORD)@timescaledb-postgresql:5432/trader_ts"
+            # SEC EDGAR requires a descriptive User-Agent on every request; the downloader (epic Task
+            # 5) fails closed without it. Non-secret env (plan: EDGAR_USER_AGENT is env, not a secret).
+            - name: EDGAR_USER_AGENT
+              value: {{ .Values.global.env.edgarUserAgent | default "trader-platform fundamentals-ingestion" | quote }}
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+              ephemeral-storage: "128Mi"
+            limits:
+              memory: "512Mi"
+              ephemeral-storage: "256Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8010
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8010
+            initialDelaySeconds: 10
+            periodSeconds: 10

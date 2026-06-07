@@ -1,0 +1,22 @@
+# Scientific stack (numpy/scipy/pandas/...) and the fundamentals contract come from the quant-core
+# package, installed FIRST from packages/quant-core (see fundamentals-ingestion.Dockerfile). quant-core
+# is the single source of truth for those pins — do NOT re-pin them here. asyncpg is listed below to
+# make the Timescale-writer dependency explicit at the service level; the version MUST match
+# quant-core's core pin (it already ships asyncpg==0.29.0, used by quant_core.features.timescale_store).
+fastapi==0.111.0
+uvicorn==0.30.1
+
+# Timescale (bi-temporal `fundamentals` writer, epic Task 7) — async driver, same as
+# quant_core/features/timescale_store.py. Pinned to quant-core's core version to avoid a split.
+asyncpg==0.29.0
+
+# Mongo bookkeeping — security-master-adjacent singletons + ingest job / quarantine records.
+motor==3.5.1
+pymongo==4.7.0
+
+# EDGAR / Companies House HTTP downloaders (epic Tasks 5/18). Same pin as quant-core's [http] extra.
+httpx==0.27.2
+
+# Test-only
+pytest==8.3.3
+pytest-asyncio==0.24.0

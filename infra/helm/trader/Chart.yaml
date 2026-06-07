@@ -28,5 +28,7 @@ dependencies:
     version: ">=0.0.0"
   - name: backtest-engine
     version: ">=0.0.0"
+  - name: fundamentals-ingestion
+    version: ">=0.0.0"
   - name: frontend-web
     version: ">=0.0.0"
