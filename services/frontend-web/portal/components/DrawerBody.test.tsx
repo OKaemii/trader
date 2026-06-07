@@ -14,6 +14,16 @@ vi.mock('@/components/ui/Markdown', () => ({
 }))
 
 import { DrawerBody } from './DrawerBody'
+import { ModeProvider } from './ModeProvider'
+import type { Mode } from '@/app/lib/mode-parse'
+
+// The body now mounts <StrategyExposureTable>, which reads useMode() (advanced attribution columns
+// are gated by <QuantOnly>, consistent with the full route + Strategy Impact tab). useMode() throws
+// outside a provider, so every render goes through a <ModeProvider>. Default `quant` so the existing
+// assertions (which check the advanced columns render) hold; a dedicated test pins the beginner gate.
+function renderInMode(ui: React.ReactElement, mode: Mode = 'quant') {
+  return render(<ModeProvider initial={mode}>{ui}</ModeProvider>)
+}
 
 // Task 35 §G/§A: the universal drawer body composes the SAME condensed symbol panels the full
 // /research?symbol= route shows, client-fetched via /portal-api/* on open with a per-symbol in-memory
@@ -95,7 +105,7 @@ describe('DrawerBody (populated)', () => {
   })
 
   it('paints the identity strip, exposure, active signal, and news from the proxies', async () => {
-    render(<DrawerBody symbol="AAPL_US_EQ" />)
+    renderInMode(<DrawerBody symbol="AAPL_US_EQ" />)
     // Identity (name + sector + last close + 1-day change off the two bars).
     await waitFor(() => expect(screen.getByText('Apple Inc.')).toBeInTheDocument())
     expect(screen.getByText('Technology')).toBeInTheDocument()
@@ -119,17 +129,27 @@ describe('DrawerBody (populated)', () => {
   })
 
   it('excludes terminal-lifecycle signals from the active slice', async () => {
-    render(<DrawerBody symbol="AAPL_US_EQ" />)
+    renderInMode(<DrawerBody symbol="AAPL_US_EQ" />)
     await waitFor(() => expect(screen.getByText('BUY')).toBeInTheDocument())
     // The closed SELL must not appear as an active card.
     expect(screen.queryByText('SELL')).not.toBeInTheDocument()
+  })
+
+  it('gates the advanced exposure columns in beginner mode but keeps the safe baseline', async () => {
+    renderInMode(<DrawerBody symbol="AAPL_US_EQ" />, 'beginner')
+    // Safe baseline stays visible in beginner: the strategy ranked/held this name.
+    await waitFor(() => expect(screen.getByText('held')).toBeInTheDocument())
+    // Advanced attribution (Held %/inclusion + Contribution) is curated away in beginner mode.
+    expect(screen.queryByText('Held %')).not.toBeInTheDocument()
+    expect(screen.queryByText('42%')).not.toBeInTheDocument()
+    expect(screen.queryByText('Contribution')).not.toBeInTheDocument()
   })
 })
 
 describe('DrawerBody (honest empty states)', () => {
   it('renders explicit empty copy when a symbol has no signals/exposure/news', async () => {
     vi.stubGlobal('fetch', routedFetch({})) // every source returns {}
-    render(<DrawerBody symbol="EMPTY_US_EQ" />)
+    renderInMode(<DrawerBody symbol="EMPTY_US_EQ" />)
     await waitFor(() => expect(screen.getByText('No active signals for this symbol.')).toBeInTheDocument())
     expect(screen.getByText('No strategy has ranked or traded this symbol yet.')).toBeInTheDocument()
     expect(screen.getByText('No recent news for this symbol.')).toBeInTheDocument()
@@ -150,7 +170,7 @@ describe('DrawerBody (per-symbol cache)', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     // First open: the body fetches its 5 direct panels (bars/universe/by-ticker/exposure/news).
-    const first = render(<DrawerBody symbol="CACHE_US_EQ" />)
+    const first = renderInMode(<DrawerBody symbol="CACHE_US_EQ" />)
     await waitFor(() => expect(screen.getByText('BUY')).toBeInTheDocument())
     const directCalls = (url: string) =>
       url.includes('CACHE_US_EQ') &&
@@ -160,7 +180,7 @@ describe('DrawerBody (per-symbol cache)', () => {
     first.unmount()
 
     // Reopen the SAME symbol — the cached promise resolves with no new direct proxy calls.
-    render(<DrawerBody symbol="CACHE_US_EQ" />)
+    renderInMode(<DrawerBody symbol="CACHE_US_EQ" />)
     await waitFor(() => expect(screen.getByText('BUY')).toBeInTheDocument())
     const callsAfterSecond = fetchMock.mock.calls.filter(([u]) => directCalls(u as string)).length
     expect(callsAfterSecond).toBe(callsAfterFirst)

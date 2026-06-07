@@ -21,6 +21,7 @@ import { WhyPanel } from '@/components/WhyPanel'
 import { DrawerNotes } from '@/components/DrawerNotes'
 import { MarketBadge } from '@/components/MarketBadge'
 import { marketOf } from '@/components/market'
+import { StrategyExposureTable } from '@/components/StrategyExposureTable'
 
 // ── Wire shapes (minimal subsets of the proxied responses) ────────────────────────────────────────
 interface RawBar {
@@ -249,45 +250,6 @@ function ActiveSignals({ signals }: { signals: SignalRow[] }) {
   )
 }
 
-/** Condensed strategy-exposure table (rank · held% · contribution · in-book). */
-function StrategyExposure({ rows }: { rows: StrategyImpactRow[] }) {
-  if (rows.length === 0) {
-    return <p className="text-sm text-gray-400">No strategy has ranked or traded this symbol yet.</p>
-  }
-  return (
-    <div className="overflow-x-auto">
-      <table className="w-full text-left text-xs">
-        <thead>
-          <tr className="text-[10px] uppercase tracking-wide text-gray-500">
-            <th className="pb-1 pr-3 font-medium">Strategy</th>
-            <th className="pb-1 pr-3 font-medium">Rank</th>
-            <th className="pb-1 pr-3 font-medium">Held %</th>
-            <th className="pb-1 pr-3 font-medium">Contribution</th>
-            <th className="pb-1 font-medium">In book</th>
-          </tr>
-        </thead>
-        <tbody className="font-mono text-gray-300">
-          {rows.map((r) => (
-            <tr key={r.strategyId} className="border-t border-gray-800">
-              <td className="py-1.5 pr-3 font-sans text-gray-200">{r.strategyId}</td>
-              {/* currentRank null ⇒ ranked-never; show "—", not a fabricated rank. */}
-              <td className="py-1.5 pr-3">{r.currentRank === null ? '—' : r.currentRank}</td>
-              <td className="py-1.5 pr-3">{(r.historicalInclusionPct * 100).toFixed(0)}%</td>
-              <td className={`py-1.5 pr-3 ${r.contributionPct >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                {r.contributionPct >= 0 ? '+' : ''}
-                {(r.contributionPct * 100).toFixed(2)}%
-              </td>
-              <td className="py-1.5">
-                {r.selected ? <span className="text-emerald-400">held</span> : <span className="text-gray-500">no</span>}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  )
-}
-
 function SentimentChip({ sentiment }: { sentiment?: NewsArticle['sentiment'] }) {
   if (!sentiment || typeof sentiment.polarity !== 'number') return null
   const p = sentiment.polarity
@@ -379,12 +341,13 @@ export function DrawerBody({ symbol }: { symbol: string }) {
         )}
       </Section>
 
-      {/* Strategy exposure */}
+      {/* Strategy exposure — shared table (advanced attribution columns gated by <QuantOnly>, same
+          as the full route + Strategy Impact tab). `dense` for the drawer's tighter type/padding. */}
       <Section title="Strategy exposure">
         {data === null ? (
           <div className="h-16 animate-pulse rounded-lg bg-gray-800" />
         ) : (
-          <StrategyExposure rows={data.exposure} />
+          <StrategyExposureTable rows={data.exposure} dense />
         )}
       </Section>
 
