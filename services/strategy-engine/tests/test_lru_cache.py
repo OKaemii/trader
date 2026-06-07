@@ -162,3 +162,8 @@ def test_scores_cache_key_maps_the_three_read_shapes():
     # The three keys are mutually distinct (no cross-shape collision).
     keys = {scores_cache_key("", None), scores_cache_key("AAPL_US_EQ", None), scores_cache_key("AAPL_US_EQ", asof)}
     assert len(keys) == 3
+    # asOf is ignored for the all-universe read (latest_all has no point-in-time variant): an empty
+    # ticker collapses to the SAME latest_all entry regardless of asOf — no redundant per-bucket
+    # entries that would evict real per-ticker rows.
+    assert scores_cache_key("", asof) == (ALL_UNIVERSE, None)
+    assert scores_cache_key("", asof) == scores_cache_key("", None)

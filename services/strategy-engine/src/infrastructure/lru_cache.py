@@ -55,8 +55,15 @@ def bucket_asof(as_of_ms: Optional[int]) -> Optional[int]:
 def scores_cache_key(ticker: str, as_of_ms: Optional[int]) -> tuple[str, Optional[int]]:
     """The (ticker, asOf-bucket) key the scores endpoint caches on. An empty ticker (the
     all-universe ``latest_all`` read) maps to the ``ALL_UNIVERSE`` sentinel so it can't collide
-    with a real symbol; the asOf is bucketed (``None`` → the distinct "latest" bucket)."""
-    return (ticker or ALL_UNIVERSE, bucket_asof(as_of_ms))
+    with a real symbol; the asOf is bucketed (``None`` → the distinct "latest" bucket).
+
+    asOf only narrows a per-ticker read — the all-universe read ignores it (latest_all has no
+    point-in-time variant) — so we drop asOf from the key when there's no ticker. This keeps every
+    ``?asOf=…``-with-no-ticker request on the SAME cache entry (the latest_all result) instead of
+    minting a redundant entry per asOf bucket that would evict real per-ticker rows."""
+    if not ticker:
+        return (ALL_UNIVERSE, None)
+    return (ticker, bucket_asof(as_of_ms))
 
 
 class TTLCache:
