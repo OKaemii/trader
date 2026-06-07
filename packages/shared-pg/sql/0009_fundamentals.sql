@@ -33,7 +33,11 @@ CREATE TABLE IF NOT EXISTS fundamentals_raw_facts (
   filing_id       BIGINT           NOT NULL,
   raw_tag         TEXT             NOT NULL,   -- 'us-gaap:NetIncomeLoss', 'dei:EntityCommonStockSharesOutstanding'
   taxonomy        TEXT             NOT NULL,   -- 'us-gaap'|'dei'|'ifrs-full'|frc taxonomy id
-  context_id      TEXT,                        -- XBRL context (segment/period framing)
+  -- XBRL context (segment/period framing). A PK column must be NOT NULL, and the
+  -- raw zone must preserve every distinct fact, so context_id defaults to '' (the
+  -- "no explicit context" sentinel) rather than NULL — two facts under different
+  -- contexts must be two rows, not a PK collision.
+  context_id      TEXT             NOT NULL DEFAULT '',
   period_type     TEXT             NOT NULL CHECK (period_type IN ('instant', 'duration')),
   period_start    BIGINT,
   period_end      BIGINT           NOT NULL,   -- observation
@@ -43,9 +47,11 @@ CREATE TABLE IF NOT EXISTS fundamentals_raw_facts (
   currency        TEXT,
   dim_signature   TEXT             NOT NULL DEFAULT '',   -- '' = consolidated/undimensioned
   content_hash    TEXT             NOT NULL,
-  -- context_id can be NULL but is part of the natural key. Coalesce to '' so the
-  -- PK stays enforceable (NULLs are distinct in a UNIQUE/PK and would let dupes in).
-  PRIMARY KEY (filing_id, raw_tag, period_end, knowledge_ts, dim_signature)
+  -- Natural key spans the full XBRL fact identity. period_type is in the key so an
+  -- instant fact and a duration fact that share a period_end (different period_start)
+  -- don't collide; context_id + dim_signature keep distinct framings of the same
+  -- tag/period as separate rows — the raw zone is full-preservation, never deduped.
+  PRIMARY KEY (filing_id, raw_tag, context_id, period_type, period_end, knowledge_ts, dim_signature)
 );
 -- ~90-day chunks. chunk_time_interval is bigint-ms because period_end is BIGINT.
 SELECT create_hypertable(

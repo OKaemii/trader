@@ -189,6 +189,34 @@ describe.skipIf(!dockerAvailable)('runMigrations', () => {
     await pool.query("DELETE FROM fundamentals WHERE instrument_id = 1 AND metric = 'net_income'");
   }, TEST_TIMEOUT_MS);
 
+  it('preserves every distinct raw fact (context_id + period_type are key discriminators)', async () => {
+    // The raw zone is full-preservation: a filing that reports the same us-gaap tag
+    // under two XBRL contexts (mapping to the same undimensioned signature) must
+    // yield TWO rows, not a PK collision. context_id is part of the natural key.
+    await pool.query(`
+      INSERT INTO fundamentals_raw_facts
+        (filing_id, raw_tag, taxonomy, context_id, period_type, period_end, knowledge_ts, value, dim_signature, content_hash)
+      VALUES
+        (101, 'us-gaap:Revenues', 'us-gaap', 'ctxA', 'duration', 1577836800000, 1580000000000, 100, '', 'h1'),
+        (101, 'us-gaap:Revenues', 'us-gaap', 'ctxB', 'duration', 1577836800000, 1580000000000, 200, '', 'h2')
+    `);
+    // And an instant fact and a duration fact sharing the same period_end must not
+    // collapse — period_type discriminates (instant balance-sheet vs duration flow).
+    await pool.query(`
+      INSERT INTO fundamentals_raw_facts
+        (filing_id, raw_tag, taxonomy, context_id, period_type, period_start, period_end, knowledge_ts, value, dim_signature, content_hash)
+      VALUES
+        (102, 'us-gaap:SomeTag', 'us-gaap', 'i', 'instant',  NULL,          1577836800000, 1580000000000, 50, '', 'hi'),
+        (102, 'us-gaap:SomeTag', 'us-gaap', 'd', 'duration', 1546300800000, 1577836800000, 1580000000000, 75, '', 'hd')
+    `);
+    const { rows } = await pool.query<{ n: number }>(
+      'SELECT count(*)::int AS n FROM fundamentals_raw_facts WHERE filing_id IN (101, 102)',
+    );
+    expect(rows[0].n).toBe(4);
+
+    await pool.query('DELETE FROM fundamentals_raw_facts WHERE filing_id IN (101, 102)');
+  }, TEST_TIMEOUT_MS);
+
   it('is idempotent on re-run', async () => {
     const result = await runMigrations(sqlDir, pool);
     expect(result.applied).toEqual([]);
