@@ -297,6 +297,7 @@ export function createAdminRouter(
       const redis = await getRedisClient();
       const results = await backfillTickers(db, redis, provider, tickers, {
         windowMs: days * 24 * 60 * 60_000,
+        forceRefetch: body.force ?? false,
       });
       return c.json({
         tickers: results.length,
@@ -325,7 +326,10 @@ export function createAdminRouter(
       if (tickers.length === 0) return c.json({ error: 'no tickers (universe empty and no body.tickers)' }, 400);
       const db = await getMongoDb();
       const redis = await getRedisClient();
-      const results = await backfillDailyHistory(db, redis, tickers, body.years !== undefined ? { years: body.years } : {});
+      const results = await backfillDailyHistory(db, redis, tickers, {
+        ...(body.years !== undefined ? { years: body.years } : {}),
+        forceRefetch: body.force ?? false,
+      });
       return c.json({
         tickers: results.length,
         bars:    results.reduce((acc, r) => acc + r.upserted, 0),
