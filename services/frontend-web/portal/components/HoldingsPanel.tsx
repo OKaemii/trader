@@ -5,6 +5,7 @@ import { type SignalProgressDTO, type Money, SignalLifecycle } from '@/types/tra
 import { resolveSector } from './sectorLookup'
 import { MARKET_STYLES, marketOf } from './market'
 import { MarketBadge } from './MarketBadge'
+import { TickerChip } from './TickerChip'
 
 // Wire shape from /portal-api/admin/trading/positions (post-FX-fix). averagePrice /
 // currentPrice / currentValue are Money-tagged so a USD-listed position shows USD prices.
@@ -151,7 +152,7 @@ export function HoldingsPanel({ initial = null }: { initial?: HoldingsInitial | 
                     <td className="py-1.5 pl-2 font-mono text-gray-200">
                       <span className="inline-flex items-center gap-1.5">
                         <MarketBadge market={market} />
-                        {p.ticker ?? '—'}
+                        {p.ticker ? <TickerChip symbol={p.ticker} /> : '—'}
                       </span>
                     </td>
                     <td className="py-1.5 text-gray-400">{sector}</td>
@@ -216,7 +217,7 @@ export function HoldingsPanel({ initial = null }: { initial?: HoldingsInitial | 
               <li key={s.id} className={`flex items-center justify-between rounded border-l-2 ${accent} bg-gray-950 px-3 py-2 text-xs`}>
                 <div className="flex items-center gap-2">
                   <MarketBadge market={market} />
-                  <span className="font-mono font-semibold text-white">{s.ticker}</span>
+                  <TickerChip symbol={s.ticker} className="font-mono font-semibold text-white" />
                   <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${
                     s.action === 'BUY' ? 'bg-emerald-700 text-white' :
                     s.action === 'SELL' ? 'bg-red-700 text-white' :

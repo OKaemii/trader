@@ -3,6 +3,7 @@ import { useMemo, useState } from 'react'
 import type { ActiveInstrument } from '@/app/actions/admin'
 import { MarketBadge } from './MarketBadge'
 import { MARKET_STYLES } from './market'
+import { TickerChip } from './TickerChip'
 
 interface Props {
   instruments: ActiveInstrument[]
@@ -142,7 +143,7 @@ export function UniverseOverview({ instruments, updatedAt }: Props) {
                 const accent = MARKET_STYLES[i.market].border
                 return (
                   <tr key={i.ticker} className={`border-b border-gray-800/50 border-l-2 ${accent}`}>
-                    <td className="px-3 py-1.5 font-mono text-gray-200">{i.ticker}</td>
+                    <td className="px-3 py-1.5 font-mono text-gray-200"><TickerChip symbol={i.ticker} /></td>
                     <td className="px-3 py-1.5 text-gray-400" title={i.name}>{truncate(i.name, 32)}</td>
                     <td className="px-3 py-1.5"><MarketBadge market={i.market} /></td>
                     <td className="px-3 py-1.5 text-gray-400">{i.sector}</td>
