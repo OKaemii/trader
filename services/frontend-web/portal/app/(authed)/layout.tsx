@@ -2,6 +2,7 @@ import { NuqsAdapter } from 'nuqs/adapters/next/app'
 import { AppNav } from '@/components/AppNav'
 import { CommandPalette } from '@/components/CommandPalette'
 import { ModeProvider } from '@/components/ModeProvider'
+import { DrawerProvider } from '@/components/ResearchDrawer'
 import { TooltipProvider } from '@/components/ui/Tooltip'
 import { getMode } from '@/app/lib/mode'
 
@@ -12,6 +13,9 @@ import { getMode } from '@/app/lib/mode'
 //   - ModeProvider    — Beginner⇄Quant complexity mode, seeded from the server-read
 //     cookie (`getMode()`) so the first client paint already matches the SSR markup
 //     (no flash). <ModeToggle/> in the nav and any <QuantOnly> read it via useMode().
+//   - DrawerProvider  — the universal research drawer (research-trading-os Task 1);
+//     any authed component opens the right-anchored symbol slide-over via
+//     useResearchDrawer().open(symbol). Mounts the single <Drawer> overlay itself.
 // <CommandPalette/> is the always-mounted global ⌘K island (self-contained, no props);
 // mounting it once here makes the chord live across the authed surface.
 export default async function AuthedLayout({ children }: { children: React.ReactNode }) {
@@ -20,11 +24,13 @@ export default async function AuthedLayout({ children }: { children: React.React
     <NuqsAdapter>
       <TooltipProvider delayDuration={200}>
         <ModeProvider initial={mode}>
-          <div className="min-h-screen bg-gray-950">
-            <AppNav />
-            <CommandPalette />
-            <main>{children}</main>
-          </div>
+          <DrawerProvider>
+            <div className="min-h-screen bg-gray-950">
+              <AppNav />
+              <CommandPalette />
+              <main>{children}</main>
+            </div>
+          </DrawerProvider>
         </ModeProvider>
       </TooltipProvider>
     </NuqsAdapter>
