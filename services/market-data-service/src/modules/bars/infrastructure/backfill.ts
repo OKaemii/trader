@@ -27,9 +27,14 @@ import { writeBarRevisions } from './persist-bars.ts';
 import { log } from '../../../logger.ts';
 
 const FIVE_MIN_MS = 5 * 60_000;
-// Bridge any intraday hole up to ~18h — an overnight/weekend close between two covered
-// sessions is intrinsic to a 5m series, not missing data. A fully-missing trading day still
-// exceeds this and stays a fetchable interior gap.
+// Bridge a weeknight overnight close (~17.5h, e.g. Mon 16:00 → Tue 09:30) between two covered
+// sessions — it's intrinsic to a 5m series, not missing data. Sized BELOW a fully-missing
+// trading day (Mon 16:00 → Wed 09:30 ≈ 41.5h) so a real interior hole stays a fetchable gap.
+// A weekend close (~65.5h) deliberately exceeds this and is re-fetched: a single time threshold
+// can't tell a long weekend from a genuinely-missing trading week, so we err toward fetching
+// (the provider returns ~nothing for a truly-closed window, and the write is a hash-gated
+// no-op). The clean zero-fetch-on-full-coverage guarantee is on the DAILY series — its weekday
+// grid lets a ≤4-day bridge separate weekends from real gaps unambiguously.
 const INTRADAY_BRIDGE_MS = 18 * 60 * 60_000;
 
 // Topic for the cross-service cache-invalidation pubsub. Anything maintaining a
