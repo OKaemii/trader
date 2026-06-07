@@ -187,9 +187,14 @@ export function narrativeFiguresAllowed(prose: string, allowed: Set<string>): bo
 // ---- LLM prompt --------------------------------------------------------------------------------
 
 /**
- * Build the LLM prompt: the deterministic skeleton (already carrying every number) + the raw summary
- * JSON as structured context, with HARD RULES that forbid inventing figures. The model's job is to
- * make the skeleton read fluently, not to add data.
+ * Build the LLM prompt: ONLY the deterministic skeleton (already carrying every number, each in the
+ * exact rendered form the post-check allows) + a clean AS-OF label, with HARD RULES that forbid
+ * inventing figures. The model's job is to make the skeleton read fluently, not to add data.
+ *
+ * Deliberately NOT the raw summary JSON: that JSON carries figures the skeleton does NOT (the asOf
+ * epoch-ms, raw return fractions like 0.0523, meanRaw z-scores), none of which are in the post-check
+ * allow-set — so a faithful model echoing them would trip the post-check and bounce to the template.
+ * The skeleton is the single source of permitted figures, so it is the only context the model gets.
  */
 export function buildNarrativePrompt(summary: MarketSummary, skeleton: string): string {
     const asOfLabel = summary.asOf === null ? 'pre-first-cycle (no factor scores yet)'
@@ -198,11 +203,8 @@ export function buildNarrativePrompt(summary: MarketSummary, skeleton: string): 
 
 AS OF: ${asOfLabel}
 
-DETERMINISTIC SKELETON (already contains EVERY number you may use — rewrite it into fluent prose, do NOT add or change any figure):
+DETERMINISTIC SKELETON (this is the COMPLETE set of facts and the ONLY numbers that exist — rewrite it into fluent prose, do NOT add, change, or derive any figure):
 ${skeleton}
-
-STRUCTURED SUMMARY (the source of truth — the ONLY numbers that exist):
-${JSON.stringify(summary, null, 2)}
 
 WRITE one tight paragraph (3–5 sentences) that reads naturally while restating the skeleton's facts.
 
