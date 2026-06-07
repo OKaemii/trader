@@ -95,6 +95,15 @@ const EnvSchema = z.object({
     CORPORATE_ACTIONS_REFRESH_IDLE_MS:    z.coerce.number().int().positive().default(24 * 60 * 60_000),
     CORPORATE_ACTIONS_REQUEST_SPACING_MS: z.coerce.number().int().nonnegative().default(250),
 
+    // Per-symbol EODHD news incremental sync (Overview "Recent Events"). The store re-checks a symbol
+    // no more often than the TTL and fetches only articles on/after its stored publish-date cursor
+    // (§I), so a current universe spends ~no credits. News is fetched lazily (on symbol open + a
+    // once-daily background pass); the idle interval paces full passes, spacing throttles per-ticker
+    // EODHD news calls under the rate budget.
+    NEWS_SYNC_TTL_MS:        z.coerce.number().int().positive().default(24 * 60 * 60_000),
+    NEWS_REFRESH_IDLE_MS:    z.coerce.number().int().positive().default(24 * 60 * 60_000),
+    NEWS_REQUEST_SPACING_MS: z.coerce.number().int().nonnegative().default(250),
+
     // Sector-rotation reference ETFs (comma-separated; default the 11 SPDRs + SPY, read in
     // sector-etfs.ts). Tracked for the heatmap only — never added to the tradeable universe.
     SECTOR_ETF_TICKERS:              z.string().optional(),

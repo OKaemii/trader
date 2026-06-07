@@ -41,6 +41,9 @@ import { buildCorporateActionsStore } from './modules/corporate-actions/wiring.t
 import { CorporateActionsRefreshScheduler } from './modules/corporate-actions/application/CorporateActionsRefreshScheduler.ts';
 import { createCorporateActionsRouter } from './modules/corporate-actions/routes.ts';
 import { closeAtOrBefore } from './modules/corporate-actions/application/price-at.ts';
+import { buildNewsStore } from './modules/news/wiring.ts';
+import { NewsRefreshScheduler } from './modules/news/application/NewsRefreshScheduler.ts';
+import { createNewsRouter } from './modules/news/routes.ts';
 import { createSectorsRouter } from './modules/sectors/routes.ts';
 import { startSectorEtfTracking } from './modules/sectors/tracking.ts';
 import { SwingScreener, startScreenerSchedule } from './modules/screener/SwingScreener.ts';
@@ -734,6 +737,18 @@ app.route('/', createCorporateActionsRouter(corporateActionsStore, corporateActi
   return closeAtOrBefore(bars, asOfMs);
 }));
 
+// News — `news` store (EODHD News feed, incremental sync §I) + the admin GET
+// /admin/api/market-data/news?ticker= that backs the Overview "Recent Events" panel + the
+// narrative/"Why?" event context (T24/T30/T35). Fetched lazily (on symbol open via the endpoint +
+// a once-daily background pass) — never per page-load. Refresher started in bootstrap().
+const newsStore = buildNewsStore({ syncTtlMs: env.NEWS_SYNC_TTL_MS });
+const newsRefresher = new NewsRefreshScheduler(
+  newsStore,
+  () => universeManager.activeTickers,
+  { idleMs: env.NEWS_REFRESH_IDLE_MS, spacingMs: env.NEWS_REQUEST_SPACING_MS },
+);
+app.route('/', createNewsRouter(newsStore, newsRefresher));
+
 // Sector-rotation heatmap — tracks the SPDR sector ETFs' daily bars (NOT in the tradeable
 // universe) and serves weekly sector-momentum. Tracking started in bootstrap() below.
 app.route('/', createSectorsRouter());
@@ -839,6 +854,7 @@ async function bootstrap(): Promise<void> {
   fundamentalsRefresher.start();
   earningsRefresher.start();
   corporateActionsRefresher.start();
+  newsRefresher.start();
   startSectorEtfTracking(env.SECTOR_ETF_REFRESH_MS);
   startScreenerSchedule(swingScreener, env.SCREENER_INTERVAL_MS);
 
