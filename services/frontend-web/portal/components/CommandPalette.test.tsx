@@ -234,4 +234,26 @@ describe('CommandPalette frecency', () => {
       expect(raw).toContain('ticker')
     })
   })
+
+  it('reopening after a selection clears the stale query and shows the Recent shortlist', async () => {
+    mockSearch(SEARCH_BODY)
+    renderPalette('quant')
+    typeQuery('aapl')
+    await screen.findByText('Tickers')
+    clickByValue('ticker:AAPL') // closes the palette + records the recent
+    // Reopen via the same ⌘K handler. The query must have been reset on close, so the
+    // empty-query view (the Recent group) shows — not the stale "aapl" search.
+    act(() => {
+      hotkeyHandler?.({ preventDefault: () => {} })
+    })
+    const recentHeading = await screen.findByText('Recent')
+    // The Recent group lists the just-selected ticker (scoped to the recent item's
+    // stable value so it can't collide with the open drawer's "AAPL" title).
+    expect(document.querySelector('[data-value="recent:ticker:AAPL"]')).not.toBeNull()
+    expect(recentHeading).toBeInTheDocument()
+    // The input is empty again (no residual "aapl").
+    expect(screen.getByPlaceholderText(/Search tickers/i)).toHaveValue('')
+    // No entity-search groups (those only render for a non-empty query).
+    expect(screen.queryByText('Tickers')).not.toBeInTheDocument()
+  })
 })

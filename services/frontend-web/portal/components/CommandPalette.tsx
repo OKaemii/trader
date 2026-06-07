@@ -84,6 +84,12 @@ export function CommandPalette() {
     else setQuery('')
   }, [])
 
+  // Close after a selection. Goes through onOpenChange(false) — not a bare
+  // setOpen(false) — so the query is cleared too; otherwise the stale search term
+  // would persist and the NEXT open would re-show that search instead of the
+  // empty/recents view.
+  const closeAfterSelect = useCallback(() => onOpenChange(false), [onOpenChange])
+
   // ⌘K (Mac) / Ctrl+K (Win/Linux). preventDefault so the browser's own
   // ⌘K (focus address bar / search) doesn't also fire. enableOnFormTags:false
   // keeps the chord from hijacking keystrokes while a user is typing in an input
@@ -161,34 +167,34 @@ export function CommandPalette() {
   // reflects the just-used name on the next open. Closes the palette either way.
   const openTicker = useCallback(
     (t: { symbol: string; name: string; sector: string }) => {
-      setOpen(false)
+      closeAfterSelect()
       setRecents(recordRecent({ kind: 'ticker', id: t.symbol, label: t.symbol, sublabel: t.name || t.sector }))
       // The in-context overlay is the primary affordance; the full /research?symbol=
       // route is the deep-link equivalent the drawer mirrors.
       drawer.open(t.symbol)
     },
-    [drawer],
+    [drawer, closeAfterSelect],
   )
 
   const openSignal = useCallback(
     (s: { id: string; ticker: string; action: string }) => {
-      setOpen(false)
+      closeAfterSelect()
       setRecents(
         recordRecent({ kind: 'signal', id: s.id, label: `${s.ticker} ${s.action}`.trim(), sublabel: s.id }),
       )
       router.push(`/signals/${s.id}`)
     },
-    [router],
+    [router, closeAfterSelect],
   )
 
   const openStrategy = useCallback(
     (st: { id: string }) => {
-      setOpen(false)
+      closeAfterSelect()
       setRecents(recordRecent({ kind: 'strategy', id: st.id, label: st.id, sublabel: 'Strategy' }))
       // The Build · Strategy view owns the active-strategy selector + params.
       router.push('/build?tab=strategy')
     },
-    [router],
+    [router, closeAfterSelect],
   )
 
   // Re-open a frecency entry by replaying the same routing as a fresh hit (also
@@ -204,7 +210,7 @@ export function CommandPalette() {
 
   const onSelectCommand = useCallback(
     (cmd: PaletteCommand) => {
-      setOpen(false)
+      closeAfterSelect()
       // Navigation commands carry an href → jump to their route.
       if (cmd.href) {
         router.push(cmd.href)
@@ -226,7 +232,7 @@ export function CommandPalette() {
           break
       }
     },
-    [router, mode],
+    [router, mode, closeAfterSelect],
   )
 
   const hasEntities =
@@ -255,7 +261,7 @@ export function CommandPalette() {
       <Command.Input
         value={query}
         onValueChange={setQuery}
-        placeholder="Search tickers, strategies, signals… (› for commands)"
+        placeholder="Search tickers, strategies, signals… (> for commands)"
         className="w-full border-b border-gray-800 bg-transparent px-4 py-3 text-sm text-gray-100 placeholder:text-gray-500 focus:outline-none"
       />
       <Command.List className="max-h-80 overflow-y-auto overflow-x-hidden p-2">
