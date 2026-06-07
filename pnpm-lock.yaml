@@ -497,12 +497,18 @@ importers:
       '@trader/shared-auth':
         specifier: workspace:*
         version: link:../../packages/shared-auth
+      '@trader/shared-bars':
+        specifier: workspace:*
+        version: link:../../packages/shared-bars
       '@trader/shared-data':
         specifier: workspace:*
         version: link:../../packages/shared-data
       '@trader/shared-fx':
         specifier: workspace:*
         version: link:../../packages/shared-fx
+      '@trader/shared-indicators':
+        specifier: workspace:*
+        version: link:../../packages/shared-indicators
       '@trader/shared-mongo':
         specifier: workspace:*
         version: link:../../packages/shared-mongo

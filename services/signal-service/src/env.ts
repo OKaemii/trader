@@ -23,6 +23,11 @@ const EnvSchema = z.object({
     MIN_POSITIVE_PEERS:        z.coerce.number().int().min(1).default(5),
     MIN_SCORE_EPSILON:         z.coerce.number().min(0).default(0.1),
 
+    // Held-position target for the market-summary concentration read (HHI target = 1/topK). Matches
+    // the FACTOR_RANK_TOP_K Helm knob — the default strategy's held-set size. Display-only here
+    // (the optimiser still owns the live top-K in GenerateSignals).
+    FACTOR_RANK_TOP_K:         z.coerce.number().int().positive().default(20),
+
     // Per-pod consumer name on Redis-stream subscriber.
     POD_NAME: z.string().default("local"),
 

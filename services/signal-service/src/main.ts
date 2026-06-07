@@ -16,6 +16,7 @@ import { createInternalRouter } from "./modules/signals/routes/internal.ts";
 import { createPieRouter } from "./modules/pie/routes/pie-routes.ts";
 import { createTradePlanRouter } from "./modules/tradeplans/routes/tradeplan-routes.ts";
 import { createAlertRouter } from "./modules/alerts/routes/alert-routes.ts";
+import { createResearchRouter } from "./modules/research/routes/research-routes.ts";
 import { registerTopologyWebSocket, registerSystemReset } from "./modules/signals/routes/system.ts";
 
 async function main(): Promise<void> {
@@ -81,6 +82,14 @@ async function main(): Promise<void> {
         alertRules:     deps.alertRuleRepo,
     }));
     app.route("/", createAlertRouter(deps.alertRuleRepo));
+    // Research module — signal-service owns /admin/api/market/* (added to its ingress). Reads
+    // factor_scores (strategy-engine's per-cycle write) + sector ETF bars + positions from shared
+    // Mongo; no cross-service HTTP. T30/T33/T25 extend this same module.
+    app.route("/", createResearchRouter({
+        db:    deps.db,
+        redis: deps.redis as unknown as RedisClientType,
+        topK:  env.FACTOR_RANK_TOP_K,
+    }));
 
     // WebSocket + system-reset moved here from the (deleted) api-gateway. Both belong
     // with the service that already owns the strategy:* pubsub channels and the bulk of
