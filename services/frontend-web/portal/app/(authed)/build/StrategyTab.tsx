@@ -1,6 +1,7 @@
 import { authedFetch } from '@/app/lib/auth-fetch'
 import { StrategyConfigEditor, type StrategyConfig } from '@/components/StrategyConfigEditor'
 import { ActiveStrategySelector } from '@/components/ActiveStrategySelector'
+import { ForceRebalanceButton } from '@/components/ForceRebalanceButton'
 
 // Strategy tab (Build workspace, IA-redesign Task 9) — the body of the old /strategy-config page
 // verbatim: SSR-seed the per-strategy tunable surface from strategy-engine
@@ -24,6 +25,7 @@ export async function StrategyTab() {
   return (
     <div className="space-y-6">
       <ActiveStrategySelector strategies={(data.strategies ?? []).map((s) => s.strategy_id)} active={data.active ?? ''} />
+      <ForceRebalanceButton active={data.active ?? ''} />
       <StrategyConfigEditor initial={data.strategies ?? []} active={data.active ?? ''} />
     </div>
   )

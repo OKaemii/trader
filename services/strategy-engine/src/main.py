@@ -488,6 +488,7 @@ async def process_cycle(
     source: str,
     entry_id: str | None = None,
     publish: bool = True,
+    force_rebalance: bool = False,
 ) -> dict:
     """
     Run one strategy cycle. Used by both the live runLoop (source="stream") and
@@ -599,9 +600,16 @@ async def process_cycle(
                 fundamentals_map = await _bars_client.fetch_fundamentals(active_tickers)
             except Exception as exc:  # noqa: BLE001
                 print(f"[strategy-engine] cycle {cycle_n} fundamentals fetch failed (continuing): {exc!r}", flush=True)
+        # Operator "Rebalance now" injects a transient force_rebalance flag so a monthly strategy
+        # (high_velocity_v1) rebalances on demand instead of waiting for the month boundary. Merged
+        # per-cycle ONLY — never persisted to portal_strategy_config — so normal live cycles and the
+        # backtest/replay path are unaffected (parity preserved).
+        _params = dict(_live_params)
+        if force_rebalance:
+            _params["force_rebalance"] = 1.0
         features = _strategy.compute_features(
             _history_view(_lookup, active_tickers, _ts_lookup, fundamentals_map),
-            as_of_ms, StrategyParams(values=_live_params),
+            as_of_ms, StrategyParams(values=_params),
         )
         # Persist the feature vector bi-temporally (audit + replay parity). Best-effort:
         # a store failure logs but never blocks signal emission.
@@ -745,6 +753,9 @@ async def replay(body: dict) -> dict:
     """
     universe = body.get("universe") or []
     dry_run  = bool(body.get("dry_run", True))
+    # force_rebalance bypasses a monthly strategy's RebalanceClock for this one cycle (portal
+    # "Rebalance now"). Harmless for per-cycle strategies (they emit every cycle regardless).
+    force_rebalance = bool(body.get("force_rebalance", False))
     if not isinstance(universe, list) or not all(isinstance(t, str) for t in universe):
         return {"error": "universe must be a list of ticker strings", "status": 400}
     if not universe:
@@ -761,7 +772,9 @@ async def replay(body: dict) -> dict:
         for t in universe
     ]
 
-    result = await process_cycle(bars, source="admin:replay", entry_id=None, publish=not dry_run)
+    result = await process_cycle(
+        bars, source="admin:replay", entry_id=None, publish=not dry_run, force_rebalance=force_rebalance,
+    )
     return result
 
 
