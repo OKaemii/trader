@@ -26,6 +26,16 @@ spec:
                 name: signal-service
                 port:
                   number: 3003
+          # signal-service owns /admin/api/market/* (research module — market summary, narrative,
+          # notes). Distinct path element from market-data-service's /admin/api/market-data/*, so the
+          # Prefix matches never collide (k8s matches on path-element boundaries).
+          - path: /admin/api/market
+            pathType: Prefix
+            backend:
+              service:
+                name: signal-service
+                port:
+                  number: 3003
           - path: /ws/api/signals
             pathType: Prefix
             backend:
