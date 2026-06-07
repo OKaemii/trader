@@ -26,10 +26,21 @@ spec:
                 name: signal-service
                 port:
                   number: 3003
-          # signal-service owns /admin/api/market/* (research module — market summary, narrative,
-          # notes). Distinct path element from market-data-service's /admin/api/market-data/*, so the
-          # Prefix matches never collide (k8s matches on path-element boundaries).
+          # signal-service owns /admin/api/market/* (research module — market summary, narrative).
+          # Distinct path element from market-data-service's /admin/api/market-data/*, so the Prefix
+          # matches never collide (k8s matches on path-element boundaries).
           - path: /admin/api/market
+            pathType: Prefix
+            backend:
+              service:
+                name: signal-service
+                port:
+                  number: 3003
+          # /admin/api/research/* — the research notebook (notes GET/PUT/DELETE + backlink index),
+          # served by the same research module. Its own prefix so the notebook surface is routed even
+          # though the note keys are tickers (nesting it under /admin/api/market/notes would have read
+          # as a market-summary sub-path).
+          - path: /admin/api/research
             pathType: Prefix
             backend:
               service:

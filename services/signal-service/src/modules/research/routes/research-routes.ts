@@ -1,12 +1,16 @@
 // Research module — portal-facing, admin-gated market intelligence. signal-service owns the
-// /admin/api/market/* prefix (added to its ingress alongside /admin/api/signals). This is the first
-// route in the module; T30 (narrative), T33 (notes) and T25 (by-ticker) extend the SAME module and
-// public surface, so the wiring is kept thin and the maths pure (see application/MarketSummary.ts).
+// /admin/api/market/* AND /admin/api/research/* prefixes (both added to its ingress alongside
+// /admin/api/signals). T30 (narrative), T33 (notes) and T25 (by-ticker) extend the SAME module and
+// public surface, so the wiring is kept thin and the maths pure (see application/*).
 //
 // GET /admin/api/market/summary → a typed, deterministic payload of sector returns + factor
 // leadership (cross-sectional means of factor_scores) + breadth (% above 200-DMA) + concentration
 // (HHI vs target). All inputs are read from shared Mongo — factor_scores is written by
 // strategy-engine and read here directly (no cross-service HTTP, the contract from card #64).
+//
+// GET/PUT/DELETE /admin/api/research/notes/:ticker + GET /admin/api/research/notes/backlinks (T33
+// §G) → the research notebook: a per-entity markdown note whose `@`-links are parsed into a backlink
+// index ("notes referencing entity X"). Persisted in COLLECTIONS.RESEARCH_NOTES (Task 5 contract).
 
 import { Hono } from 'hono';
 import { parseAdminHeaders } from '@trader/shared-auth/middleware';
@@ -27,6 +31,8 @@ import {
     type NarrativeChat,
     type NarrativeSource,
 } from '../application/MarketNarrative.ts';
+import { isResearchLinkKind, normaliseRef } from '../application/ResearchNotes.ts';
+import { MongoResearchNotesStore } from '../infrastructure/MongoResearchNotesStore.ts';
 
 // The SPDR sector-ETF reference set powering the sector heatmap. Mirror of market-data-service's
 // sector-etfs.ts (the source of truth for the tracked-but-untradeable ETF set) — duplicated here as
@@ -171,6 +177,7 @@ async function loadMarketSummary(deps: ResearchRouterDeps): Promise<MarketSummar
 export function createResearchRouter(deps: ResearchRouterDeps): Hono {
     const r = new Hono();
     const narrativeColl = deps.db.collection<NarrativeCacheDoc>(COLLECTIONS.MARKET_NARRATIVE);
+    const notesStore = new MongoResearchNotesStore(deps.db);
 
     r.get('/admin/api/market/summary', parseAdminHeaders, async (c) => {
         return c.json(await loadMarketSummary(deps));
@@ -224,6 +231,66 @@ export function createResearchRouter(deps: ResearchRouterDeps): Hono {
             cached: false,
             summary,
         });
+    });
+
+    // ── Research notebook (T33 §G) ────────────────────────────────────────────────────────────────
+    // GET /admin/api/research/notes/backlinks?kind=&ref= — "notes referencing entity X". Registered
+    // BEFORE the /:ticker route so the literal `backlinks` segment is never captured as a :ticker
+    // param. Returns the referrer notes (with their full body + links) newest-first.
+    r.get('/admin/api/research/notes/backlinks', parseAdminHeaders, async (c) => {
+        const kind = c.req.query('kind') ?? '';
+        const rawRef = c.req.query('ref') ?? '';
+        if (!isResearchLinkKind(kind)) {
+            return c.json({ error: 'kind must be one of strategy|signal|symbol' }, 400);
+        }
+        if (rawRef.length === 0) {
+            return c.json({ error: 'ref is required' }, 400);
+        }
+        // Normalise the ref the SAME way parseLinks stored it (symbol upper-cased) so the lookup hits.
+        const ref = normaliseRef(kind, rawRef);
+        const notes = await notesStore.backlinks(kind, ref);
+        return c.json({ kind, ref, notes });
+    });
+
+    // GET /admin/api/research/notes/:ticker — read the note for an entity. A missing note is NOT a
+    // 404: the editor renders a blank page, so we return an empty-but-200 shape (body '', no links).
+    r.get('/admin/api/research/notes/:ticker', parseAdminHeaders, async (c) => {
+        const ticker = c.req.param('ticker');
+        if (!ticker) return c.json({ error: 'ticker is required' }, 400);
+        const note = await notesStore.get(ticker);
+        return c.json(note ?? { ticker, body: '', links: [], updatedBy: null, updatedAt: null });
+    });
+
+    // PUT /admin/api/research/notes/:ticker — upsert the markdown body. The `@`-links are parsed
+    // server-side out of the body into the persisted `links` array (the body is the source of
+    // truth; the client never sends links). updatedBy defaults to the admin caller's `sub`, with an
+    // optional body override. Returns the saved note (parsed links + stamped updatedAt) so the
+    // editor can echo the authoritative state without a re-read.
+    r.put('/admin/api/research/notes/:ticker', parseAdminHeaders, async (c) => {
+        const ticker = c.req.param('ticker');
+        if (!ticker) return c.json({ error: 'ticker is required' }, 400);
+        const payload = (await c.req.json().catch(() => null)) as { body?: unknown; updatedBy?: unknown } | null;
+        if (!payload || typeof payload.body !== 'string') {
+            return c.json({ error: 'body (markdown string) is required' }, 400);
+        }
+        // parseAdminHeaders stamps the verified claims onto the context (c.set('user', …)). The Hono
+        // generic isn't augmented with that var, so read it through a narrow cast.
+        const caller = (c.get as (k: string) => { sub?: string } | undefined)('user');
+        const updatedBy =
+            typeof payload.updatedBy === 'string' && payload.updatedBy.length > 0
+                ? payload.updatedBy
+                : (caller?.sub ?? null);
+        const note = await notesStore.put(ticker, payload.body, updatedBy);
+        return c.json(note);
+    });
+
+    // DELETE /admin/api/research/notes/:ticker — remove a note (UI delete + QA cleanup). Idempotent:
+    // deleting an absent note returns deleted:false, still 200.
+    r.delete('/admin/api/research/notes/:ticker', parseAdminHeaders, async (c) => {
+        const ticker = c.req.param('ticker');
+        if (!ticker) return c.json({ error: 'ticker is required' }, 400);
+        const deleted = await notesStore.delete(ticker);
+        return c.json({ ticker, deleted });
     });
 
     return r;
