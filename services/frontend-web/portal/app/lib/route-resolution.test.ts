@@ -142,8 +142,10 @@ describe('QA-checklist redirect matrix matches the stubs on disk', () => {
     'operations/console': '/build?tab=console',
     'risk/trips': '/portfolio?tab=trips',
     scanner: '/discover?tab=universe',
-    // Relocation (Task 22): the operational Market Data admin moved to Operations and
-    // the standalone Charts/price view folded into Research's `history` placeholder.
+    // Relocation (Task 22): the operational Market Data admin moved to Operations and the
+    // standalone Charts/price view folded into Research. Task 23 made Research symbol-centric;
+    // `history` is now a real question-tab (the no-symbol /charts stub renders the chart for a
+    // default ticker), and `signals` (the /signals stub) renders the whole-market feed.
     charts: '/research?tab=history',
     'market-data': '/operations?tab=market-data',
     'market-data/calendar': '/operations?tab=market-data',

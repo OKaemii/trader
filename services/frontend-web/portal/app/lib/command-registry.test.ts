@@ -61,9 +61,9 @@ describe('COMMANDS registry integrity', () => {
   // every real tab and catches drift if a future card renames a tab key.
   const WORKSPACE_TABS: Record<string, string[]> = {
     discover: ['universe', 'screener', 'sectors', 'calendar'],
-    // Relocation (Task 22): Market Data → Operations, Backtests → Build; charts repurposed as
-    // the `history` placeholder (Task 23 grows the per-symbol History tab + the rest).
-    research: ['history', 'signals'],
+    // Symbol-centric Research workspace (Task 23): five `?symbol=`-keyed question-tabs. The
+    // earlier 2-tab placeholder set (history/signals from the Task 22 relocation) is replaced.
+    research: ['overview', 'signals', 'strategy-impact', 'fundamentals', 'history'],
     build: ['strategy', 'console', 'alerts', 'backtests'],
     portfolio: ['positions', 'performance', 'risk-limits', 'trips'],
     operations: ['trade-audit', 'reconciliation', 'tca', 'market-data'],
