@@ -1,28 +1,34 @@
 'use client'
-// Global ⌘K command palette (Task 4 — agent-docs/plans/portal-ia-redesign.md).
+// Global ⌘K command palette (agent-docs/plans/portal-ia-redesign.md, then wired
+// by epic-portal-post-redesign-fixes Task 1 — agent-docs/plans/portal-post-redesign-fixes.md).
 //
-// MOUNTING: this component is intentionally NOT mounted yet. Task 12 mounts a
-// single <CommandPalette/> in app/(authed)/layout.tsx (inside the existing
-// NuqsAdapter + TooltipProvider) so the hotkey is live across the authed tree.
-// It is self-contained — drop it in once and it listens for ⌘K everywhere; there
-// is nothing for the layout to pass in.
+// MOUNTING: a single <CommandPalette/> is mounted in app/(authed)/layout.tsx
+// (inside the existing NuqsAdapter + TooltipProvider + ModeProvider) so the hotkey
+// is live across the authed tree. It is self-contained — there is nothing for the
+// layout to pass in.
 //
 // HYDRATION: `open` starts false, so on the server (and the first client render)
 // cmdk's Command.Dialog renders nothing — no portal, no markup mismatch. The
 // hotkey only flips it open after mount.
 //
-// ROUTES: the hrefs come from command-registry.ts and point at the planned
-// workspace routes, several of which 404 until Tasks 6–11 land. That is expected
-// for this card; Task 16 reconciles the registry against the real routes.
+// ROUTES: the hrefs come from command-registry.ts and point at the live 6-workspace
+// routes (locked by command-registry.test.ts + route-resolution.test.ts).
 import * as RadixDialog from '@radix-ui/react-dialog'
 import { Command } from 'cmdk'
 import { useRouter } from 'next/navigation'
 import { useCallback, useMemo, useState } from 'react'
 import { useHotkeys } from 'react-hotkeys-hook'
+import { logout } from '@/app/actions/auth'
+// setMode comes from the dedicated 'use server' module — NOT @/app/lib/mode, which
+// carries `import 'server-only'` and would fail the build when pulled into this
+// 'use client' component (AGENTS.md mode.ts gotcha).
+import { setMode } from '@/app/lib/mode-actions'
 import { COMMANDS, type Command as PaletteCommand } from '@/app/lib/command-registry'
+import { useMode } from '@/components/ModeProvider'
 
 export function CommandPalette() {
   const router = useRouter()
+  const mode = useMode()
   const [open, setOpen] = useState(false)
 
   // ⌘K (Mac) / Ctrl+K (Win/Linux). preventDefault so the browser's own
@@ -42,13 +48,28 @@ export function CommandPalette() {
   const onSelect = useCallback(
     (cmd: PaletteCommand) => {
       setOpen(false)
-      // Navigation commands jump to their route. Action commands (no href —
-      // toggle mode, sign out) are wired to real behaviour by Task 12 when this
-      // is mounted; here they simply dismiss the palette so the contract
-      // (close-on-select) holds and nothing throws in the dormant state.
-      if (cmd.href) router.push(cmd.href)
+      // Navigation commands carry an href → jump to their route.
+      if (cmd.href) {
+        router.push(cmd.href)
+        return
+      }
+      // Action commands carry no href and are dispatched by id. The registry +
+      // command-registry.test.ts lock the action set to exactly
+      // {act.toggle-mode, act.sign-out}, so this switch is exhaustive.
+      switch (cmd.id) {
+        case 'act.toggle-mode':
+          // Mirror <ModeToggle/>: flip the display cookie, then router.refresh()
+          // so server surfaces (getMode() + any <QuantOnly>) re-evaluate. Display
+          // preference only — never a trading mutation, never gates safety controls.
+          void setMode(mode === 'quant' ? 'beginner' : 'quant').then(() => router.refresh())
+          break
+        case 'act.sign-out':
+          // Server action: deleteSession() + redirect('/login').
+          void logout()
+          break
+      }
     },
-    [router],
+    [router, mode],
   )
 
   // Stable group order, derived from the registry so new groups appear without
