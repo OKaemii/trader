@@ -82,19 +82,22 @@ const RANK_SUBSTRING = 2
 const RANK_NONE = 3
 
 /**
- * Score one candidate against the lower-cased query. `primary` is the identity field
- * (symbol / strategy id / signal ticker) — it carries the exact/prefix tiers; `extra`
- * fields (name, sector) only ever reach SUBSTRING, so a name match never outranks a
- * symbol prefix. Empty query ⇒ everything is RANK_NONE (upstream order preserved).
+ * Score one candidate against the query (case-insensitive — the query is lower-cased
+ * here, so the fn is correct for any caller, not only ones that pre-normalise). `primary`
+ * is the identity field (symbol / strategy id / signal ticker) — it carries the
+ * exact/prefix tiers; `extra` fields (name, sector) only ever reach SUBSTRING, so a name
+ * match never outranks a symbol prefix. Empty query ⇒ everything is RANK_NONE (upstream
+ * order preserved).
  */
 function relevance(query: string, primary: string, ...extra: string[]): number {
-  if (query === '') return RANK_NONE
+  const q = query.toLowerCase()
+  if (q === '') return RANK_NONE
   const p = primary.toLowerCase()
-  if (p === query) return RANK_EXACT
-  if (p.startsWith(query)) return RANK_PREFIX
-  if (p.includes(query)) return RANK_SUBSTRING
+  if (p === q) return RANK_EXACT
+  if (p.startsWith(q)) return RANK_PREFIX
+  if (p.includes(q)) return RANK_SUBSTRING
   for (const e of extra) {
-    if (e.toLowerCase().includes(query)) return RANK_SUBSTRING
+    if (e.toLowerCase().includes(q)) return RANK_SUBSTRING
   }
   return RANK_NONE
 }

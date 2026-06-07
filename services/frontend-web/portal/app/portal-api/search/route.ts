@@ -26,10 +26,27 @@ const SIGNALS_LIMIT = 50
 // 15s shared cache. All three upstreams are admin-global list state (active universe,
 // strategy list, recent signals) — not per-user — so a module-level cache keyed by the
 // normalised query is safe and matches the 15s cadence the rest of the portal polls at.
-// Bounded to a handful of distinct queries; an LRU isn't worth it for an as-you-type box
-// whose keys churn fast and expire in 15s.
 const CACHE_TTL_MS = 15_000
+// Hard size cap. An as-you-type box (T21 ⌘K) sends a fresh key per keystroke
+// ("a","aa","aap"…), so without a bound the Map grows forever in the long-lived server
+// process. cacheSet() prunes expired entries and evicts oldest-first past this cap.
+const CACHE_MAX = 200
 const cache = new Map<string, { at: number; body: SearchResults }>()
+
+// Write a result while keeping the Map bounded: drop expired entries, then evict
+// oldest-insertion keys until at/under CACHE_MAX (Map iterates in insertion order).
+function cacheSet(key: string, body: SearchResults): void {
+  const now = Date.now()
+  for (const [k, v] of cache) {
+    if (now - v.at >= CACHE_TTL_MS) cache.delete(k)
+  }
+  cache.set(key, { at: now, body })
+  while (cache.size > CACHE_MAX) {
+    const oldest = cache.keys().next().value
+    if (oldest === undefined) break
+    cache.delete(oldest)
+  }
+}
 
 async function fetchJson<T>(path: string): Promise<T | null> {
   try {
@@ -67,6 +84,6 @@ export async function GET(req: Request): Promise<Response> {
   }
 
   const body = buildSearchResults(query, universe, strategies, signals)
-  cache.set(key, { at: Date.now(), body })
+  cacheSet(key, body)
   return NextResponse.json(body)
 }
