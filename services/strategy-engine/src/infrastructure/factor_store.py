@@ -49,6 +49,11 @@ READER API (T10 builds endpoints on these):
                                                   ``observation_ts <= as_of_ms`` (point-in-time
                                                   read; the signal "Why?" reads as-of
                                                   ``signal.timestamp`` for honesty), or None.
+- ``history(ticker, limit=...)``                → the ticker's factor rows as a TIME-SERIES, oldest
+                                                  → newest by ``observation_ts`` (so a chart plots
+                                                  left-to-right without re-sorting). Backs
+                                                  ``GET .../factor-history?ticker=`` (Factor
+                                                  Evolution). Empty list when the ticker is unseen.
 
 BEST-EFFORT INVARIANT (the most important contract): the WRITE path mirrors the feature-store
 persist — a Mongo blip logs and returns False at the host, but NEVER raises into the cycle. Signal
@@ -165,6 +170,23 @@ def build_docs(
     return docs
 
 
+def factor_history_points(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Flatten ``history`` rows to the lean time-series the Factor-Evolution chart plots: one point
+    per cycle carrying ``observation_ts`` + each factor's PERCENTILE (``pct`` in [0,100], or ``None``
+    for a factor that couldn't be computed that cycle — a charted gap, never a fabricated 0). Pure,
+    so the endpoint's projection is unit-testable without the FastAPI host. The raw z-score + source
+    stay in the latest/as-of ``scores`` reads; this is the charting projection only."""
+    points: list[dict[str, Any]] = []
+    for row in rows:
+        factors = row.get("factors") or {}
+        point: dict[str, Any] = {"observation_ts": row.get("observation_ts")}
+        for factor in RESEARCH_FACTORS:
+            cell = factors.get(factor) or {}
+            point[factor] = cell.get("pct")
+        points.append(point)
+    return points
+
+
 class FactorStore:
     """Mongo writer/reader for ``factor_scores``. One instance per host process; reuses the shared
     MONGODB_URL client. All methods are async (motor)."""
@@ -250,6 +272,26 @@ class FactorStore:
             projection={"_id": False},
         )
         return doc
+
+    async def history(self, ticker: str, *, limit: int = 365) -> list[dict[str, Any]]:
+        """The ticker's factor rows as a TIME-SERIES, oldest → newest by ``observation_ts`` — the
+        four factor percentiles over time for the Factor-Evolution chart. Backs
+        ``GET .../factor-history?ticker=``. Empty list for an unseen ticker.
+
+        We pull the most-recent ``limit`` rows newest-first off the ``(ticker, observation_ts desc)``
+        index (so a long-lived ticker returns the latest window, not the oldest), then reverse to
+        chronological order so the consumer plots left-to-right with no re-sort. Each row carries
+        ``{observation_ts, factors}`` (``_id`` projected out) — the same per-row shape as the latest
+        reads, so a chart can reuse the same cell-extraction. ``limit`` is the doc cap (≈ a year of
+        daily cycles by default); the host clamps the query value to a sane bound."""
+        cursor = self._coll.find(
+            {"ticker": ticker},
+            sort=[("observation_ts", DESCENDING)],
+            projection={"_id": False},
+        ).limit(limit)
+        rows = [doc async for doc in cursor]
+        rows.reverse()   # newest-first off the index → chronological for the time-series consumer
+        return rows
 
 
 async def persist_research_cycle(

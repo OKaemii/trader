@@ -16,8 +16,9 @@ from quant_core.wiring import build_feature_store
 from .domain.dataclasses import OHLCVBar
 from .infrastructure.market_data_client import MarketDataClient, range_for_bars
 from .infrastructure import strategy_config
-from .infrastructure.factor_store import FactorStore, persist_research_cycle
+from .infrastructure.factor_store import FactorStore, factor_history_points, persist_research_cycle
 from .infrastructure.fundamentals_as_of import YahooFundamentalsAsOf
+from .infrastructure.lru_cache import TTLCache, scores_cache_key
 
 # Live decide() takes default params + an empty portfolio (none of the current strategies'
 # decide() reads portfolio — sizing happens in signal-service). Phase 1 wires a real
@@ -89,6 +90,13 @@ _feature_persist_logged = False  # one-shot "first feature row written" log
 _factor_store = None      # type: ignore[var-annotated]  # FactorStore (Mongo factor_scores writer)
 _fundamentals_provider = None  # type: ignore[var-annotated]  # FundamentalsAsOf seam (PIT socket)
 _factor_persist_logged = False   # one-shot "first factor_scores row written" log
+
+# In-process TTL+LRU fronting the factor_scores reads (T10 scores endpoint). Keyed by
+# (ticker, asOf-bucket); short TTL so a read is at most one cycle stale and concurrent reads for the
+# same key coalesce onto one Mongo query. Module-scope (not a startup singleton) so the read
+# handlers can use it before/independently of the engine singletons.
+_FACTOR_SCORES_TTL_S = float(os.getenv("FACTOR_SCORES_CACHE_TTL_S", "10"))
+_factor_scores_cache = TTLCache(maxsize=512, ttl_s=_FACTOR_SCORES_TTL_S)
 _history_interval: str = "daily"
 _history_range:    str = "30d"
 _needed:           int = 20
@@ -294,6 +302,64 @@ async def put_active_strategy(req: Request):
     return {"ok": True, "selected": sid, "applied": ACTIVE_STRATEGY,
             "restartRequired": False, "appliedLive": applied_live,
             "note": "applied live — no restart required"}
+
+
+# Cap on factor-history rows returned (≈ two years of daily cycles); bounds the Mongo read + payload.
+_FACTOR_HISTORY_MAX = 730
+
+
+@app.get("/admin/api/strategy/scores")
+async def strategy_scores(ticker: str = "", asOf: int = 0):
+    """Factor scores read for the Research surface (T24 FactorBars, T25 WhyPanel as-of, entity
+    search). Three shapes off the SAME factor_scores store (T9), fronted by a short-TTL in-process
+    LRU keyed by (ticker, asOf-bucket):
+
+    - no ``ticker``                  → latest_all(): ``{ ticker: {observation_ts, factors} }`` over
+                                       the whole universe.
+    - ``?ticker=X``                  → latest_for(X): the newest row ``{ticker, observation_ts,
+                                       factors}`` for one name.
+    - ``?ticker=X&asOf=<ms>``        → as_of(X, ms): the point-in-time row (newest with
+                                       ``observation_ts <= asOf``) — the signal "Why?" reads as-of
+                                       ``signal.timestamp`` so it shows the scores the signal
+                                       actually saw, not today's.
+
+    Empty/pre-backfill store, or an unknown ticker → ``{}`` (degrade, never error). The store is
+    best-effort: if the FactorStore singleton isn't wired yet (very early boot) the endpoint also
+    returns ``{}`` rather than 500-ing the Research page."""
+    if _factor_store is None:
+        return {}
+    as_of_ms = asOf if asOf > 0 else None
+
+    async def _compute():
+        if not ticker:
+            return await _factor_store.latest_all()
+        if as_of_ms is not None:
+            return await _factor_store.as_of(ticker, as_of_ms)
+        return await _factor_store.latest_for(ticker)
+
+    key = scores_cache_key(ticker, as_of_ms)
+    result = await _factor_scores_cache.get_or_compute(key, _compute)
+    # latest_for / as_of return None for an unseen name (or unseen-at-asOf) — degrade to {} so the
+    # caller never has to distinguish None from "no factors", consistent with the empty-store path.
+    return result if result is not None else {}
+
+
+@app.get("/admin/api/strategy/factor-history")
+async def strategy_factor_history(ticker: str = "", limit: int = _FACTOR_HISTORY_MAX):
+    """Time-series of the four factor PERCENTILES for one ticker over ``observation_ts``, oldest →
+    newest — the data behind the Factor-Evolution chart (T28).
+
+    Returns ``{ ticker, points: [{ observation_ts, momentum, quality, value, volatility }, …] }``
+    where each factor value is that cycle's cross-sectional percentile in [0, 100] (``None`` for a
+    factor the strategy couldn't compute that cycle — plotted as a gap, never a fabricated 0). The
+    full per-factor cell (raw/source) stays in the latest/as-of ``scores`` reads; this endpoint is
+    the lean charting shape. Empty ``points`` for a missing ticker or a pre-backfill store (degrade,
+    never error)."""
+    if _factor_store is None or not ticker:
+        return {"ticker": ticker, "points": []}
+    capped = max(1, min(int(limit), _FACTOR_HISTORY_MAX))
+    rows = await _factor_store.history(ticker, limit=capped)
+    return {"ticker": ticker, "points": factor_history_points(rows)}
 
 
 @app.get("/metrics", response_class=PlainTextResponse)
