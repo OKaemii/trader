@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false,
+    "types": ["node"]
+  },
+  "//": "Scoped to this card's files. The pre-existing one-off migrations were authored before this package had a typecheck script and carry their own loose casts; this gate covers the research-backfill migration + its testable core only.",
+  "include": ["lib/**/*.ts", "test/**/*.ts", "2026-06-07-research-backfill.ts"]
+}
