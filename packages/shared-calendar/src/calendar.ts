@@ -36,7 +36,7 @@ export interface HolidayTable {
   readonly fullClosures: readonly string[];   // 'YYYY-MM-DD' exchange-local
   readonly halfDays:     readonly HalfDay[];
   readonly fetchedAt:    number;              // Unix ms when this table was sourced
-  readonly source:       'ical' | 'gov-uk' | 'cache' | 'static-fallback';
+  readonly source:       'eodhd' | 'ical' | 'gov-uk' | 'cache' | 'static-fallback';
 }
 
 export interface ExchangeCalendar {

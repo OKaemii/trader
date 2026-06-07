@@ -17,12 +17,13 @@ import { getLiveConfig } from './shared/live-config.ts';
 import { createAdminRouter, createInternalBarsRouter } from './modules/admin/routes.ts';
 import { YahooProvider } from './modules/bars/infrastructure/providers/yahoo-provider.ts';
 import { TwelveDataProvider } from './modules/bars/infrastructure/providers/twelvedata-provider.ts';
-import { configureEodhdClient } from './modules/bars/infrastructure/providers/eodhd-client.ts';
+import { configureEodhdClient, getEodhdClient } from './modules/bars/infrastructure/providers/eodhd-client.ts';
 import type { MarketDataProvider } from './modules/bars/infrastructure/providers/market-data-provider.ts';
 import { FxClient, TwelveDataFxProvider } from '@trader/shared-fx';
 import { aggregateBars, invalidateBarsBulk } from '@trader/shared-bars';
 import {
-  HolidayCache, NyseIcalProvider, UkGovBankHolidayProvider, StaticFallbackProvider, STATIC_FALLBACK,
+  HolidayCache, NyseIcalProvider, UkGovBankHolidayProvider, EodhdExchangeHolidayProvider,
+  StaticFallbackProvider, STATIC_FALLBACK,
   nyseCalendar, lseCalendar, marketStateOf, shouldPollMarket, partitionByMarket,
   soonestNextOpen, expectedLatestBarMs, soonestEodPollInstant,
   type Market, type MarketState, type ExchangeCalendar,
@@ -313,17 +314,22 @@ if (env.DAILY_HISTORY_PROVIDER === 'eodhd' && !env.EODHD_API_KEY) {
 
 // Calendar wiring: one HolidayCache per process, shared by both ExchangeCalendars.
 // Hydrated in bootstrap() before pollLoop starts. The cache walks
-// mem → Mongo → live providers (NYSE iCal, gov.uk JSON) → static fallback;
-// failures degrade loudly rather than substituting wrong data.
+// mem → Mongo → live providers → static fallback; failures degrade loudly rather than
+// substituting wrong data. US chains the live EODHD Exchange-Details source ahead of
+// the legacy NYSE iCal provider (kept intact as an internal fallback), both ahead of
+// the baked-in static US table (which needs manual year-end maintenance). LSE stays on
+// the gov.uk bank-holidays feed.
 let _holidayCache: HolidayCache | null = null;
 let _nyseCal: ExchangeCalendar | null = null;
 let _lseCal:  ExchangeCalendar | null = null;
 async function getHolidayCache(): Promise<HolidayCache> {
   if (_holidayCache) return _holidayCache;
   const db = await getMongoDb();
+  // EODHD first → NYSE iCal → (cache) static fallback → no-closures stub.
+  const usProvider = new EodhdExchangeHolidayProvider('US', getEodhdClient(), new NyseIcalProvider());
   _holidayCache = new HolidayCache(
     db,
-    { US: new NyseIcalProvider(), LSE: new UkGovBankHolidayProvider() },
+    { US: usProvider, LSE: new UkGovBankHolidayProvider() },
     STATIC_FALLBACK,
   );
   return _holidayCache;

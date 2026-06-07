@@ -26,6 +26,12 @@ export { parseIcal, type IcalEvent } from './ical-parser.ts';
 
 export { NyseIcalProvider } from './providers/ical-provider.ts';
 export { UkGovBankHolidayProvider } from './providers/uk-gov-provider.ts';
+export {
+  EodhdExchangeHolidayProvider,
+  type ExchangeDetailsClient,
+  type ExchangeDetails,
+  type ExchangeHolidayRow,
+} from './providers/eodhd-exchange-provider.ts';
 export { StaticFallbackProvider, STATIC_FALLBACK } from './providers/static-fallback.ts';
 
 export { HolidayCache, type HolidaySourceHealth, type HolidayProvider } from './holiday-cache.ts';
