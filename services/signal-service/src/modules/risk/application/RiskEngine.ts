@@ -12,6 +12,11 @@ import type { ISignalRepository } from '../../signals/domain/ISignalRepository.t
 import { SignalFailureReason, ALERTS_TOPIC, type Alert } from '@trader/shared-types';
 import { publish } from '@trader/shared-redis';
 
+// Last-good NAV, persisted in Redis so a transient cash-fetch failure (T212 429, pod
+// restart before AccountCache warms) reports a realistic figure instead of 0. No TTL —
+// survives restarts, like the circuit-breaker flag. Only written from a COMPLETE reading.
+const LAST_GOOD_NAV_KEY = 'risk:last_good_nav';
+
 export interface RiskStatus {
   circuit_open: boolean;
   circuit_reason: string | null;
@@ -336,12 +341,22 @@ export class RiskEngine {
   // 100% phantom-loss circuit trip we saw when trading-service was unreachable
   // (positions=0 + cash fetch error → nav=0 vs persisted day_open_nav=X → 100% loss).
   //
-  // If cash fetch fails we degrade to positions-only with a warning AND mark incomplete.
-  // If positions FX conversion fails we degrade to cash-only AND mark incomplete.
-  // If both succeed AND positions table is empty AND cash is genuinely 0, that's a
-  // "real zero" — `complete=true`, NAV=0 is a legitimate reading (paper mode, fresh
-  // account, etc.). The day_open_nav check below treats that as "no comparison
+  // If cash fetch fails we degrade to the last-good NAV (persisted in Redis, see below)
+  // with a warning AND mark incomplete. If positions FX conversion fails we mark
+  // incomplete. If both succeed AND positions table is empty AND cash is genuinely 0,
+  // that's a "real zero" — `complete=true`, NAV=0 is a legitimate reading (paper mode,
+  // fresh account, etc.). The day_open_nav check below treats that as "no comparison
   // baseline" if day_open_nav was also 0, or "real loss" if it was positive.
+  //
+  // Last-good-NAV fallback (`risk:last_good_nav`): the internal cash read goes through
+  // trading-service's AccountCache (30s TTL + 5min stale-fallback), but a sustained T212
+  // 429 / pod restart can leave it with no fresh-enough snapshot, so getCash() throws and
+  // a naive degrade reports nav=0 — alarming on the operator's risk/status card and
+  // indistinguishable from a real wipeout. Instead, every COMPLETE reading caches its NAV
+  // in Redis (no TTL — survives restarts, like the circuit-breaker flag), and a degraded
+  // reading reports that last-good figure while STILL returning `complete:false` so the
+  // daily-loss/drawdown gates stay suppressed (the phantom-loss guard is untouched —
+  // callers never gate against a degraded/stale reading).
   private async _computeNav(): Promise<{ nav: number; complete: boolean }> {
     // NAV comes from T212's `cash.total` — the broker's authoritative figure that already
     // includes free + blocked + invested + ppl + pieCash. Previously we summed cash.free
@@ -380,7 +395,40 @@ export class RiskEngine {
       cashOk = false;
     }
 
-    return { nav: navGBP, complete: positionsOk && cashOk };
+    const complete = positionsOk && cashOk;
+    if (complete) {
+      // Cache this clean reading so a later degraded read can report a realistic NAV
+      // instead of 0. Best-effort: a Redis write failure must not corrupt the reading.
+      await this._setLastGoodNav(navGBP);
+      return { nav: navGBP, complete };
+    }
+
+    // Degraded reading: prefer the last-good NAV (so the operator's risk/status card and
+    // currentNavGBP() don't read a phantom 0) but keep complete=false so the loss/drawdown
+    // gates stay suppressed — callers never gate against this figure.
+    const lastGood = await this._getLastGoodNav();
+    return { nav: lastGood ?? navGBP, complete };
+  }
+
+  // ── Last-good NAV cache (Redis, no TTL — survives restarts) ───────────────────────
+  private async _setLastGoodNav(nav: number): Promise<void> {
+    try {
+      await this.redis.set(LAST_GOOD_NAV_KEY, String(nav));
+    } catch (err) {
+      this.logger.warn({ err }, 'failed to cache last-good NAV (non-fatal)');
+    }
+  }
+
+  private async _getLastGoodNav(): Promise<number | null> {
+    try {
+      const raw = await this.redis.get(LAST_GOOD_NAV_KEY);
+      if (raw === null) return null;
+      const n = Number(raw);
+      return Number.isFinite(n) ? n : null;
+    } catch (err) {
+      this.logger.warn({ err }, 'failed to read last-good NAV (non-fatal)');
+      return null;
+    }
   }
 
   // Single trip transition. Order matters:

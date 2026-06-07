@@ -149,6 +149,37 @@ describe('trading-service routing', () => {
       expect(res.status).toBe(200);
     });
 
+    it('short-circuits to GBP zero in Paper mode (parity with the admin /cash route)', async () => {
+      // Paper deployments place no orders, so the internal cash read must not hit the broker —
+      // it returns a real Money(0,'GBP') exactly like /admin/api/trading/cash. Without parity,
+      // the admin route reads £0 while RiskEngine reads a live broker figure in a paper mode.
+      const app = buildApp(paperDeps());
+      const res = await app.request('/internal/api/trading/cash', {
+        headers: { Authorization: `Bearer ${await mintInternalJwt('signal-service')}` },
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toEqual({
+        free:  { amount: 0, currency: 'GBP' },
+        total: { amount: 0, currency: 'GBP' },
+      });
+    });
+
+    it('returns the live broker cash in non-Paper mode (Demo hits getCash / AccountCache)', async () => {
+      // Guards the short-circuit from over-reaching: in Demo it must still return the real
+      // T212 figure, not the paper zero.
+      const app = buildApp({ ...paperDeps(), tradingMode: TradingMode.Demo });
+      const res = await app.request('/internal/api/trading/cash', {
+        headers: { Authorization: `Bearer ${await mintInternalJwt('signal-service')}` },
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toEqual({
+        free:  { amount: 1000, currency: 'GBP' },
+        total: { amount: 1000, currency: 'GBP' },
+      });
+    });
+
     it('returns 403 on /cash when the caller in the token is neither portfolio nor signal', async () => {
       const app = buildApp(paperDeps());
       const res = await app.request('/internal/api/trading/cash', {
@@ -189,8 +220,11 @@ describe('trading-service routing', () => {
     it('serves /cash from the AccountCache, coalescing concurrent requests onto ONE T212 call', async () => {
       const cc = countingClient();
       const accountCache = new AccountCache(cc.client as any, { ttlMs: 60_000 });
+      // Demo mode: the AccountCache path is only exercised in non-Paper modes (Paper
+      // short-circuits to GBP zero before the broker read — parity with the admin route).
       const app = buildApp({
         ...paperDeps(),
+        tradingMode: TradingMode.Demo,
         client: () => cc.client,
         accountCache,
       });
@@ -217,6 +251,7 @@ describe('trading-service routing', () => {
       const accountCache = new AccountCache(cc.client as any, { ttlMs: 60_000 });
       const app = buildApp({
         ...paperDeps(),
+        tradingMode: TradingMode.Demo,
         client: () => cc.client,
         accountCache,
       });
