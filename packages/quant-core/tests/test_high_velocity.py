@@ -97,6 +97,18 @@ def test_holds_off_rebalance_month():
     assert _strat().compute_features(_history(month_edge=False), AS_OF, StrategyParams(values={})) is None
 
 
+def test_force_rebalance_bypasses_monthly_gate():
+    # Off the month boundary the strategy normally holds (see test_holds_off_rebalance_month). The
+    # portal "Rebalance now" injects force_rebalance=1.0, which must run the full pipeline anyway —
+    # while the default (no flag) keeps holding, so backtest/replay parity is preserved.
+    assert _strat().compute_features(_history(month_edge=False), AS_OF, StrategyParams(values={})) is None
+    forced = _strat().compute_features(
+        _history(month_edge=False), AS_OF, StrategyParams(values={"force_rebalance": 1.0})
+    )
+    assert forced is not None
+    assert set(forced.ticker_universe) == {"A", "B"}   # same selection an on-edge rebalance would make
+
+
 def test_thin_pool_returns_none():
     assert _strat().compute_features(_history(all_fail_quality=True), AS_OF, StrategyParams(values={})) is None
 

@@ -83,7 +83,10 @@ class HighVelocityStrategy:
 
     def compute_features(self, history: HistoryView, as_of_ms: int, params: StrategyParams) -> Optional[FeatureVector]:
         # Monthly gate — emit only on the first session of a new calendar month; else hold.
-        if not self._clock.is_rebalance(history.timestamps):
+        # `force_rebalance` (the portal "Rebalance now" operator action) bypasses the clock for ONE
+        # cycle. It is NEVER set by backtest/replay — only the live host injects it on an explicit
+        # operator trigger — so MCPT / walk-forward parity is preserved.
+        if not params.get("force_rebalance", 0.0) and not self._clock.is_rebalance(history.timestamps):
             return None
         for t in history.closes:
             self._sectors.setdefault(t, "Unknown")
