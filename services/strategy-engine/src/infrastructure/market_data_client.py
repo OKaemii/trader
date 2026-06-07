@@ -223,3 +223,34 @@ class MarketDataClient:
                 "current_liabilities": float(raw.get("currentLiabilities") or 0.0),
             }
         return out
+
+    async def fetch_dividend_yields(
+        self, tickers: list[str], *, as_of_ms: int | None = None
+    ) -> dict[str, float]:
+        """Point-in-time trailing-12m dividend yield per ticker from market-data
+        /internal/api/dividend-yield (the Value div-yield leg the factor host injects into
+        HistoryView.fundamentals[t].dividend_yield — Task 14 contract).
+
+        CROSS-SERVICE: market-data-service authorizes 'strategy-engine' on this route (same caller as
+        /internal/api/fundamentals), so the internal JWT here is accepted — no 403→500 trap. `as_of_ms`
+        is the knowledge-time cutoff (ex-date <= asOf over the price at/<= asOf); omitting it defaults
+        to now server-side.
+
+        Returns only the names with a FINITE yield — a `null` dividendYield (no price as-of) is
+        dropped, so the host never injects a fabricated 0; a non-payer with a real price yields a
+        finite 0.0 and IS kept. Empty on no tickers."""
+        if not tickers:
+            return {}
+        url = f"{self._base_url}/internal/api/dividend-yield?tickers={','.join(tickers)}"
+        if as_of_ms is not None:
+            url += f"&asOf={as_of_ms}"
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            r = await client.get(url, headers=self._auth_header())
+            r.raise_for_status()
+            payload = r.json()
+        out: dict[str, float] = {}
+        for t, d in (payload.get("dividendYields") or {}).items():
+            dy = (d or {}).get("dividendYield")
+            if dy is not None:
+                out[t] = float(dy)
+        return out
