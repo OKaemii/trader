@@ -1,11 +1,13 @@
 'use client'
 
+import { useRouter } from 'next/navigation'
 import { useState } from 'react'
 
 // One active strategy at a time. Persists the selection (PORTAL_RUNTIME_CONFIG) AND applies it
 // live — the strategy-engine rebuilds the strategy in-process on the next cycle, so no restart is
 // needed. The persisted choice also survives a restart.
 export function ActiveStrategySelector({ strategies, active }: { strategies: string[]; active: string }) {
+  const router = useRouter()
   const [sel, setSel] = useState(active || strategies[0] || '')
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState<string | null>(null)
@@ -21,7 +23,11 @@ export function ActiveStrategySelector({ strategies, active }: { strategies: str
       if (!r.ok) throw new Error(body.error ?? `failed (${r.status})`)
       setMsg(body.appliedLive
         ? `Applied live — now running ${sel} (no restart needed).`
-        : `Saved. Applies on the strategy-engine's next cycle — was running ${body.applied}.`)
+        : `Saved, but not yet applied live (still running ${body.applied}). It will apply on the strategy-engine's next cycle.`)
+      // Re-run the StrategyTab server component so the "Currently running" line re-seeds from
+      // /admin/api/strategy/config (the in-memory ACTIVE_STRATEGY) — without this the displayed
+      // active never moves after a save, which is the whole "selecting a strategy does nothing" bug.
+      router.refresh()
     } catch (e) { setMsg(e instanceof Error ? e.message : String(e)) } finally { setBusy(false) }
   }
 
