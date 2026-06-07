@@ -32,13 +32,17 @@ import { getBarsFromPg, pgCacheKey } from './pg-bar-reader.ts';
 
 export { hashBarContent } from './content-hash.ts';
 export { getBarsFromPg, getLastClosePg, pgCacheKey } from './pg-bar-reader.ts';
+export { computeMissingRanges, coverageOf } from './coverage.ts';
+export type { MissingRange } from './coverage.ts';
 
 // Short keys (30d–180d) bound 5m-derived reads; the long keys (1y–max) exist for the
 // persisted `interval:'daily'` series that backs strategy lookbacks (e.g. 12-1 momentum
 // needs ~273 trading days). `max` is a sentinel that predates any stored row.
 export type RangeKey = '30d' | '60d' | '90d' | '180d' | '1y' | '2y' | '5y' | 'max';
 
-const RANGE_DAYS: Record<RangeKey, number> = {
+// Exported so the gap-aware coverage helper (coverage.ts) derives the same read window
+// getBars uses — one source of truth for how many days each RangeKey spans.
+export const RANGE_DAYS: Record<RangeKey, number> = {
   '30d': 30,
   '60d': 60,
   '90d': 90,
