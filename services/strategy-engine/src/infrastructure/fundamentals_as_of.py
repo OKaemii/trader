@@ -102,9 +102,18 @@ class FundamentalsAsOf(Protocol):
     Quality/Value factors read (see module docstring), or `{}` when no fundamentals are known
     for that name as-of that knowledge-time. The Yahoo-snapshot impl below answers ≈`now` only;
     the future EdgarCompaniesHousePitProvider answers any past `as_of_ms`.
+
+    The lookups are `async` because every impl reaches an out-of-process source (HTTP today, a
+    warehouse query later); `fetch_many` is the per-cycle hot path the host calls to fill the
+    whole universe in one round-trip, with `fetch` the single-name convenience over it.
     """
 
-    def fetch(self, ticker: str, as_of_ms: int) -> dict[str, float]:
+    async def fetch_many(self, tickers: list[str], as_of_ms: int) -> dict[str, dict[str, float]]:
+        """Line-item dicts keyed by ticker as known at `as_of_ms`; names with none are absent
+        (an all-`{}` result is the forward-only "no PIT source" signal)."""
+        ...
+
+    async def fetch(self, ticker: str, as_of_ms: int) -> dict[str, float]:
         """Line items for `ticker` as known at knowledge-time `as_of_ms`, or `{}` if none."""
         ...
 
