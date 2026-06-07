@@ -16,6 +16,9 @@ export type UniverseOverridesRequest = z.infer<typeof UniverseOverridesRequestSc
 export const BackfillRequestSchema = z.object({
     tickers: z.array(z.string()).optional(),
     days: z.number().int().min(1).max(60).optional(),
+    // Gap-aware by default (fetch only uncovered observation dates). `force: true` re-downloads
+    // the whole window to repair a suspected-bad span — never the default. See §I.
+    force: z.boolean().optional(),
 });
 export type BackfillRequest = z.infer<typeof BackfillRequestSchema>;
 
@@ -25,6 +28,9 @@ export type BackfillRequest = z.infer<typeof BackfillRequestSchema>;
 export const BackfillDailyRequestSchema = z.object({
     tickers: z.array(z.string()).optional(),
     years: z.number().int().min(1).max(30).optional(),
+    // Gap-aware by default (fetch only uncovered daily dates). `force: true` re-downloads the
+    // whole multi-year span to repair a suspected-bad span — never the default. See §I.
+    force: z.boolean().optional(),
 });
 export type BackfillDailyRequest = z.infer<typeof BackfillDailyRequestSchema>;
 

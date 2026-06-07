@@ -19,11 +19,18 @@
 import type { Db } from 'mongodb';
 import type { RedisClientType } from 'redis';
 import { COLLECTIONS } from '@trader/shared-mongo';
-import { invalidateBars } from '@trader/shared-bars';
+import { invalidateBars, computeMissingRanges } from '@trader/shared-bars';
+import type { MissingRange } from '@trader/shared-bars';
 import type { BarInterval } from '@trader/shared-types';
 import type { MarketDataProvider } from './providers/market-data-provider.ts';
 import { writeBarRevisions } from './persist-bars.ts';
 import { log } from '../../../logger.ts';
+
+const FIVE_MIN_MS = 5 * 60_000;
+// Bridge any intraday hole up to ~18h — an overnight/weekend close between two covered
+// sessions is intrinsic to a 5m series, not missing data. A fully-missing trading day still
+// exceeds this and stays a fetchable interior gap.
+const INTRADAY_BRIDGE_MS = 18 * 60 * 60_000;
 
 // Topic for the cross-service cache-invalidation pubsub. Anything maintaining a
 // derived view of bar history (signal-service' price-lookup cache, the portal's
@@ -40,6 +47,87 @@ export interface BackfillResult {
 export interface BackfillOpts {
   windowMs?:  number;   // default: 60 days (matches Yahoo 5m lookback cap)
   concurrency?: number; // tickers handled in parallel; default 5
+  // Gap-aware escape hatch. Default (false): fetch ONLY the observation_ts sub-ranges we
+  // don't already hold — a fully-covered ticker spends zero upstream calls / zero credits.
+  // `forceRefetch: true` re-downloads the whole window (the pre-gap-aware behaviour) to
+  // repair a suspected-bad span; never the default. See research-trading-os.md §I.
+  forceRefetch?: boolean;
+}
+
+/**
+ * Drop gaps shorter than `bridgeMs` — the market-closure holes that are intrinsic to a price
+ * series, NOT missing data. A daily series has no Sat/Sun bar; an intraday 5m series has no
+ * overnight bar. On the calendar grid those closures read as little holes between two covered
+ * trading days (or at a window boundary that happens to land on a weekend). Re-fetching them
+ * every run would (a) cost an upstream call that returns nothing and (b) break the §I "full
+ * coverage ⇒ zero fetch" contract — including the #57 ≤1-step spurious trailing gap. So a gap
+ * is kept only when it spans more than `bridgeMs` of wall-clock (`end − start ≥ bridgeMs`) — a
+ * genuine multi-session hole worth filling. The position of the gap is irrelevant: a weekend at
+ * the very start/end of the window is still just a weekend, and the live `healMissingHistory`
+ * tail-heal + live poll already cover the most-recent ≤1-session tail.
+ *
+ * `bridgeMs = 0` keeps every gap (raw grid math). For daily, ~4 days bridges a weekend + an
+ * adjacent long-weekend holiday; for intraday 5m, ~18h bridges any overnight/weekend close while
+ * still flagging a fully-missing trading day as a fetchable gap.
+ */
+function dropClosureGaps(gaps: MissingRange[], bridgeMs: number): MissingRange[] {
+  if (bridgeMs <= 0) return gaps;
+  return gaps.filter((g) => g.end - g.start >= bridgeMs);
+}
+
+/**
+ * Gap-aware fetch planning. Reads the observation_ts we already hold for (`ticker`,
+ * `interval`) inside `[startMs, endMs]`, then returns the uncovered sub-ranges to fetch as
+ * provider `(startMs, endMs)` pairs (genuine interior gaps AND leading/trailing tail). Full
+ * coverage ⇒ `[]` ⇒ the caller makes zero upstream calls.
+ *
+ * **Grid flooring (the #57 caveat).** `computeMissingRanges` walks a fixed `stepMs` grid
+ * anchored at `neededStart`; a held bar covers the grid point in whose `[point, point+step)`
+ * bucket it lands. Bars are stamped on a step-aligned grid (5m bars at HH:00/05/…; daily at
+ * 00:00:00Z), but `[startMs, endMs]` come from `now − window … now` — mid-grid instants. If
+ * we anchored the grid to those raw bounds, every held bar would sit a fraction of a step off
+ * its grid point and read as a gap. So we floor both bounds to the `stepMs` grid first — then
+ * grid points line up with bar stamps and a calendar-complete ticker yields `[]` (true
+ * zero-fetch tail), exactly as #57's release notes prescribe.
+ *
+ * **Closure bridging.** `bridgeMs` drops the intrinsic market-closure holes (weekends for
+ * daily, overnights for intraday) so a fully-seeded ticker re-runs at zero fetch — see
+ * `dropClosureGaps`. Pass `0` to keep the raw grid math.
+ *
+ * Live (`is_superseded:false`) rows only — the same fast lane `coverageOf` and the live read
+ * path use. Reads Mongo directly (matches where these backfills write + the default
+ * `BARS_BACKEND=mongo`); if Timescale ever becomes the live bars store, coverage detection
+ * must move with it.
+ */
+export async function planGapWindows(
+  db: Db,
+  ticker: string,
+  interval: BarInterval,
+  startMs: number,
+  endMs: number,
+  stepMs: number,
+  bridgeMs = 0,
+): Promise<MissingRange[]> {
+  // Floor both bounds onto the step grid so grid points coincide with bar stamps.
+  const neededStart = Math.floor(startMs / stepMs) * stepMs;
+  const neededEnd   = Math.floor(endMs   / stepMs) * stepMs;
+
+  const docs = await db
+    .collection(COLLECTIONS.OHLCV_BARS)
+    .find(
+      { ticker, interval, is_superseded: false, observation_ts: { $gte: neededStart, $lte: endMs } },
+      { projection: { _id: 0, observation_ts: 1 } },
+    )
+    .toArray();
+
+  const observed: number[] = [];
+  for (const d of docs) {
+    const ts = (d as { observation_ts?: unknown }).observation_ts;
+    if (typeof ts === 'number') observed.push(ts);
+  }
+
+  const gaps = computeMissingRanges(observed, neededStart, neededEnd, stepMs);
+  return dropClosureGaps(gaps, bridgeMs);
 }
 
 /**
@@ -56,6 +144,7 @@ export async function backfillTickers(
 ): Promise<BackfillResult[]> {
   const windowMs    = opts.windowMs    ?? 60 * 24 * 60 * 60_000;
   const concurrency = opts.concurrency ?? 5;
+  const force       = opts.forceRefetch ?? false;
   const endTs       = Date.now();
   const startTs     = endTs - windowMs;
 
@@ -63,7 +152,7 @@ export async function backfillTickers(
   for (let i = 0; i < tickers.length; i += concurrency) {
     const slice = tickers.slice(i, i + concurrency);
     const settled = await Promise.allSettled(
-      slice.map((t) => backfillOne(db, redis, provider, t, startTs, endTs)),
+      slice.map((t) => backfillOne(db, redis, provider, t, startTs, endTs, force)),
     );
     for (let j = 0; j < settled.length; j++) {
       const r = settled[j];
@@ -83,11 +172,33 @@ async function backfillOne(
   ticker: string,
   startTs: number,
   endTs: number,
+  force: boolean,
 ): Promise<BackfillResult> {
-  const bars = await provider.fetchHistory(ticker, startTs, endTs);
+  const interval: BarInterval = '5m';
+
+  // Gap-aware FETCH planning. Unless `force`, fetch only the observation_ts sub-ranges we
+  // don't already hold — a fully-covered ticker spends zero upstream calls. The provider
+  // paginates each gap window internally. `force` re-fetches the whole window (one call) to
+  // repair a suspected-bad span. The write path stays unchanged either way: every fetched
+  // bar still flows through the hash-gated, bi-temporal writeBarRevisions.
+  let fetchWindows: Array<{ startMs: number; endMs: number }>;
+  if (force) {
+    fetchWindows = [{ startMs: startTs, endMs: endTs }];
+  } else {
+    const gaps = await planGapWindows(db, ticker, interval, startTs, endTs, FIVE_MIN_MS, INTRADAY_BRIDGE_MS);
+    if (gaps.length === 0) {
+      // Fully covered: zero upstream calls, zero credits. Nothing to invalidate either —
+      // no new bars, so cached ranges remain valid.
+      return { ticker, fetched: 0, upserted: 0 };
+    }
+    fetchWindows = gaps.map((g) => ({ startMs: g.start, endMs: g.end + FIVE_MIN_MS }));
+  }
+
+  const bars = (
+    await Promise.all(fetchWindows.map((w) => provider.fetchHistory(ticker, w.startMs, w.endMs)))
+  ).flat();
   if (bars.length === 0) return { ticker, fetched: 0, upserted: 0 };
 
-  const interval: BarInterval = '5m';
   // Bi-temporal write path: cosmetic re-polls are no-ops (idempotent re-backfill),
   // genuine revisions append a new row with the prior superseded. Replaces the old
   // bulkWrite-upsert which silently overwrote every column on each re-run.
@@ -216,7 +327,12 @@ export async function healMissingHistory(
     const cappedWindowMs    = Math.min(requestedWindowMs, provider.maxLookbackMs);
     const startTs = now - cappedWindowMs;
 
-    const results = await backfillTickers(db, redis, provider, [ticker], { windowMs: cappedWindowMs });
+    // forceRefetch: heal has ALREADY established this ticker is gapped and computed the exact
+    // tail window it wants — re-running gap detection inside backfillTickers would be a
+    // redundant coverage query AND would change heal's long-standing semantics (it fetches its
+    // computed window unconditionally). Forcing keeps the tail-heal path UNCHANGED by the
+    // gap-aware retrofit; the gap-aware path governs only bootstrap + the admin backfill.
+    const results = await backfillTickers(db, redis, provider, [ticker], { windowMs: cappedWindowMs, forceRefetch: true });
     const upserted = results[0]?.upserted ?? 0;
     barsAdded += upserted;
 

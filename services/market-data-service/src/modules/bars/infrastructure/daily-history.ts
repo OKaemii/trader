@@ -16,10 +16,14 @@ import type { OHLCVBar } from '@trader/shared-types';
 import { writeBarRevisions } from './persist-bars.ts';
 import { fetchYahooDailyHistory } from './providers/yahoo-client.ts';
 import { fetchEodhdDailyHistory } from './providers/eodhd-client.ts';
-import { CACHE_INVALIDATED_TOPIC } from './backfill.ts';
+import { CACHE_INVALIDATED_TOPIC, planGapWindows } from './backfill.ts';
 import { log } from '../../../logger.ts';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+// Bridge interior daily holes up to 4 days — a weekend (2d) plus an adjacent long-weekend
+// holiday — so weekends/holidays in a fully-seeded series don't trigger no-yield re-fetches.
+// A genuinely-missing run of trading days exceeds this and stays a fetchable interior gap.
+const DAILY_BRIDGE_MS = 4 * DAY_MS;
 
 export interface DailyBackfillResult {
   ticker:   string;
@@ -31,6 +35,11 @@ export interface DailyBackfillResult {
 export interface DailyBackfillOpts {
   years?:       number;   // default: DAILY_BACKFILL_YEARS env or 5
   concurrency?: number;   // default 4 (Yahoo is gentle but unmetered; keep it polite)
+  // Gap-aware escape hatch. Default (false): fetch ONLY the daily observation dates we don't
+  // already hold — a fully-seeded ticker spends zero upstream calls / zero EODHD credits.
+  // `forceRefetch: true` re-downloads the whole multi-year span (the pre-gap-aware behaviour)
+  // to repair a suspected-bad span; never the default. See research-trading-os.md §I.
+  forceRefetch?: boolean;
 }
 
 /**
@@ -46,6 +55,7 @@ export async function backfillDailyHistory(
 ): Promise<DailyBackfillResult[]> {
   const years       = opts.years ?? Number(process.env.DAILY_BACKFILL_YEARS ?? 5);
   const concurrency = opts.concurrency ?? 4;
+  const force       = opts.forceRefetch ?? false;
   const endMs       = Date.now();
   const startMs     = endMs - Math.max(1, years) * 365 * DAY_MS;
 
@@ -53,7 +63,7 @@ export async function backfillDailyHistory(
   for (let i = 0; i < tickers.length; i += concurrency) {
     const slice = tickers.slice(i, i + concurrency);
     const settled = await Promise.allSettled(
-      slice.map((t) => backfillDailyOne(db, redis, t, startMs, endMs)),
+      slice.map((t) => backfillDailyOne(db, redis, t, startMs, endMs, force)),
     );
     for (let j = 0; j < settled.length; j++) {
       const r = settled[j];
@@ -84,8 +94,30 @@ async function backfillDailyOne(
   ticker: string,
   startMs: number,
   endMs: number,
+  force: boolean,
 ): Promise<DailyBackfillResult> {
-  const bars = await fetchDailyHistory(ticker, startMs, endMs);
+  // Gap-aware FETCH planning. Unless `force`, fetch only the daily observation dates we don't
+  // already hold — a fully-seeded ticker spends zero upstream calls / zero EODHD credits. The
+  // provider paginates each gap window internally. `force` re-fetches the whole span (one call)
+  // to repair a suspected-bad span. The write path stays unchanged either way: every fetched
+  // bar still flows through the hash-gated, bi-temporal writeBarRevisions.
+  let fetchWindows: Array<{ startMs: number; endMs: number }>;
+  if (force) {
+    fetchWindows = [{ startMs, endMs }];
+  } else {
+    const gaps = await planGapWindows(db, ticker, 'daily', startMs, endMs, DAY_MS, DAILY_BRIDGE_MS);
+    if (gaps.length === 0) {
+      // Fully covered: zero upstream calls, zero credits. No new bars ⇒ nothing to invalidate.
+      return { ticker, fetched: 0, upserted: 0 };
+    }
+    // MissingRange.end is the last missing day (00:00:00Z); +DAY_MS makes the provider's upper
+    // bound inclusive of that day.
+    fetchWindows = gaps.map((g) => ({ startMs: g.start, endMs: g.end + DAY_MS }));
+  }
+
+  const bars = (
+    await Promise.all(fetchWindows.map((w) => fetchDailyHistory(ticker, w.startMs, w.endMs)))
+  ).flat();
   if (bars.length === 0) {
     const src = (process.env.DAILY_HISTORY_PROVIDER ?? 'yahoo').toLowerCase();
     log.warn(`[daily-history] ${ticker}: ${src} returned no daily history`);
