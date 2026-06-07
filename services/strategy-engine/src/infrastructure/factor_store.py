@@ -34,9 +34,13 @@ SOURCE STAMP RULES (drawn ONLY from the T5 allowed set, applied by ``stamp_facto
   factor we couldn't compute).
 
 INDEXES (created here by ``ensure_indexes``, NOT by T5):
-- ``(ticker, observation_ts)`` — the as-of / factor-history time-series read path.
-- a partial "latest per ticker" lookup — ``(ticker, observation_ts desc)`` fronts the
-  latest-all-universe + latest-by-ticker reads without scanning the whole append-only history.
+- ``(ticker asc, observation_ts desc)`` — ONE compound index serving all three reads. Its ``ticker``
+  prefix + ``observation_ts`` descending order makes ``latest_for`` / ``as_of`` (ticker equality →
+  newest-first by ``observation_ts``) index-only, and matches ``latest_all``'s ``{ticker:1,
+  observation_ts:-1}`` aggregation sort exactly (no in-memory sort). A second "latest per ticker"
+  index would need an ``is_latest`` flag on the docs to be a *partial* index that adds anything —
+  we don't write such a flag (the compound prefix already fronts the latest reads), so a second
+  same-key index would only double write cost for no read benefit. One index, intentionally.
 
 READER API (T10 builds endpoints on these):
 - ``latest_all()``                              → newest row per ticker across the universe.
@@ -58,7 +62,7 @@ import os
 from typing import Any, Callable, Optional
 
 import motor.motor_asyncio
-from pymongo import DESCENDING, UpdateOne
+from pymongo import ASCENDING, DESCENDING, UpdateOne
 
 # Mirrors COLLECTIONS.FACTOR_SCORES in packages/shared-mongo/src/collections.ts. The collection
 # name is the cross-service contract from T5 — keep this literal in lockstep with that constant
@@ -173,20 +177,20 @@ class FactorStore:
         return self._db[COLLECTION]
 
     async def ensure_indexes(self) -> None:
-        """Create the two factor_scores indexes (T5 documents the intent; the writer task — this
-        one — creates them). Idempotent: Mongo no-ops a create on an existing index.
+        """Create the factor_scores index (T5 documents the intent; the writer task — this one —
+        creates it). Idempotent: Mongo no-ops a create on an existing index.
 
-        - ``(ticker, observation_ts)`` — the as-of / factor-history time-series read path.
-        - ``(ticker, observation_ts desc)`` partial "latest per ticker" lookup — fronts the
-          latest-all / latest-by-ticker reads (descending so the newest row sorts first per ticker).
+        ONE compound ``(ticker asc, observation_ts desc)`` index serves every read path:
+        - ``latest_for`` / ``as_of`` — ticker equality on the prefix, newest-first by the descending
+          ``observation_ts`` (index-only, no fetch-then-sort);
+        - ``latest_all`` — matches the ``{ticker:1, observation_ts:-1}`` aggregation sort exactly.
+        A second index keyed the same way would only double write cost for no read benefit (a
+        genuinely-useful "latest per ticker" partial index would need an ``is_latest`` flag we don't
+        write), so this is deliberately the single index.
         """
         await self._coll.create_index(
-            [("ticker", DESCENDING), ("observation_ts", DESCENDING)],
+            [("ticker", ASCENDING), ("observation_ts", DESCENDING)],
             name="factor_scores_ticker_obs",
-        )
-        await self._coll.create_index(
-            [("ticker", DESCENDING), ("observation_ts", DESCENDING)],
-            name="factor_scores_latest_per_ticker",
         )
 
     # ── Write path ───────────────────────────────────────────────────────────────────────────

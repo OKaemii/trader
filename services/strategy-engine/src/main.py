@@ -403,7 +403,10 @@ async def _persist_research_factors(
             fundamentals_source_for=_fundamentals_provider.source_for,
             div_yield_tickers=div_yield_tickers,
         )
-        if not _factor_persist_logged:
+        # One-shot success log — only when rows actually landed. A swallowed store failure returns
+        # written=0 (persist_research_cycle already logged it); don't latch the flag or print a
+        # misleading "OK" then, so the genuine first-write still gets logged on a later good cycle.
+        if written > 0 and not _factor_persist_logged:
             print(f"[strategy-engine] factor_scores persist OK — first cycle written "
                   f"(observation_ts={as_of_ms} tickers={written} "
                   f"div_yield_legs={len(div_yield_tickers)} fundamentals_names={len(fundamentals)})", flush=True)

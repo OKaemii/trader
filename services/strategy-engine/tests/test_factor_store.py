@@ -175,12 +175,13 @@ class _FakeDb:
 
 
 @pytest.mark.asyncio
-async def test_ensure_indexes_creates_two():
+async def test_ensure_indexes_creates_the_compound_index():
+    """One compound (ticker asc, observation_ts desc) index serves all three reads — a second
+    same-key index would only double write cost, so ensure_indexes creates exactly one."""
     coll = _FakeCollection()
     store = FactorStore(db=_FakeDb(coll))
     await store.ensure_indexes()
-    assert "factor_scores_ticker_obs" in coll.indexes
-    assert "factor_scores_latest_per_ticker" in coll.indexes
+    assert coll.indexes == ["factor_scores_ticker_obs"]
 
 
 @pytest.mark.asyncio
