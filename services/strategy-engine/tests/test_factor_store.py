@@ -15,6 +15,7 @@ from src.infrastructure.factor_store import (
     SOURCE_EOD,
     FactorStore,
     build_docs,
+    factor_history_points,
     persist_research_cycle,
     stamp_factor_sources,
 )
@@ -120,6 +121,24 @@ def test_build_docs_shape_and_per_ticker_source():
 
 
 # ── Writer + reader (against a tiny in-memory fake motor collection) ────────────────────────────
+class _FakeCursor:
+    """Async cursor over a list of docs — `.limit(n)` truncates, `async for` yields. Mirrors the
+    slice of motor's cursor API the history() reader touches."""
+
+    def __init__(self, rows: list[dict]) -> None:
+        self._rows = rows
+
+    def limit(self, n: int) -> "_FakeCursor":
+        self._rows = self._rows[:n]
+        return self
+
+    def __aiter__(self):
+        async def _gen():
+            for r in self._rows:
+                yield r
+        return _gen()
+
+
 class _FakeCollection:
     """In-memory stand-in for a motor collection: applies bulk_write upserts by (ticker,
     observation_ts), answers find_one over the stored docs (newest observation_ts first, optional
@@ -154,6 +173,21 @@ class _FakeCollection:
         if projection and projection.get("_id") is False:
             doc.pop("_id", None)
         return doc
+
+    def find(self, query, *, sort=None, projection=None):
+        """A tiny async cursor supporting `.limit(n)` + `async for` — mirrors the motor
+        find().limit() shape the history() reader uses."""
+        matches = [d for d in self.docs if self._match(d, query)]
+        if sort:
+            key, direction = sort[0]
+            matches.sort(key=lambda d: d.get(key, 0), reverse=direction < 0)
+        rows = []
+        for d in matches:
+            doc = dict(d)
+            if projection and projection.get("_id") is False:
+                doc.pop("_id", None)
+            rows.append(doc)
+        return _FakeCursor(rows)
 
     @staticmethod
     def _match(doc, query) -> bool:
@@ -210,6 +244,54 @@ async def test_persist_then_latest_for_and_as_of():
     assert await store.as_of("AAPL_US_EQ", 500) is None
     # latest_for an unknown ticker → None.
     assert await store.latest_for("NOPE_US_EQ") is None
+
+
+@pytest.mark.asyncio
+async def test_history_is_chronological_and_limited():
+    """history() returns the ticker's rows oldest → newest (chronological for the time-series
+    chart), capped to the most-recent `limit` rows; an unseen ticker → []."""
+    coll = _FakeCollection()
+    store = FactorStore(db=_FakeDb(coll))
+    rows = {"AAPL_US_EQ": _full_row()}
+    for ts in (1000, 2000, 3000):
+        await store.persist_cycle(
+            build_docs(rows, observation_ts=ts, fundamentals_source_for=_yahoo_for, div_yield_tickers=set())
+        )
+
+    series = await store.history("AAPL_US_EQ")
+    assert [r["observation_ts"] for r in series] == [1000, 2000, 3000]   # chronological
+    assert "_id" not in series[0]                                        # projection drops _id
+    assert series[0]["factors"]["momentum"]["pct"] == 92.0              # full per-factor cell kept
+
+    # limit keeps the MOST-RECENT n, still chronological.
+    last_two = await store.history("AAPL_US_EQ", limit=2)
+    assert [r["observation_ts"] for r in last_two] == [2000, 3000]
+
+    # Unseen ticker → empty series.
+    assert await store.history("NOPE_US_EQ") == []
+
+
+# ── Factor-history charting projection (pure) ──────────────────────────────────────────────────
+def test_factor_history_points_flattens_to_percentiles():
+    """factor_history_points → one point/cycle of observation_ts + each factor's PERCENTILE; a
+    no-value factor (raw=None ⇒ pct=None) becomes a charted gap (None), never a fabricated 0."""
+    row = stamp_factor_sources(_full_row(), fundamentals_source=SOURCE_YAHOO, div_yield_tickers=set(), ticker="X")
+    gap = _full_row()
+    gap["quality"] = {"raw": None, "pct": None}
+    row_gap = stamp_factor_sources(gap, fundamentals_source=SOURCE_YAHOO, div_yield_tickers=set(), ticker="X")
+    rows = [
+        {"observation_ts": 1000, "factors": row},
+        {"observation_ts": 2000, "factors": row_gap},
+    ]
+    points = factor_history_points(rows)
+    assert points[0] == {"observation_ts": 1000, "momentum": 92.0, "quality": 84.0, "value": 31.0, "volatility": 61.0}
+    # The no-value quality factor is a None gap; the others still carry their percentile.
+    assert points[1]["quality"] is None
+    assert points[1]["momentum"] == 92.0
+
+
+def test_factor_history_points_empty_is_empty():
+    assert factor_history_points([]) == []
 
 
 @pytest.mark.asyncio
