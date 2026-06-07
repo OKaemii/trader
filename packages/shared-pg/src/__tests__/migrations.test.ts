@@ -88,6 +88,22 @@ describe.skipIf(!dockerAvailable)('runMigrations', () => {
     expect(tableNames).toContain('nav_history');
     expect(tableNames).toContain('quotes');
     expect(tableNames).toContain('tca_log');
+    // 0009_fundamentals.sql — the four fact-zone tables.
+    expect(tableNames).toContain('fundamentals_raw_facts');
+    expect(tableNames).toContain('fundamentals');
+    expect(tableNames).toContain('fundamentals_revisions_log');
+    expect(tableNames).toContain('fundamentals_quarantine');
+
+    // 0008_security_master.sql — the security_master schema + its four tables.
+    const { rows: secmasterTables } = await pool.query<{ tablename: string }>(
+      "SELECT tablename FROM pg_tables WHERE schemaname='security_master' ORDER BY tablename",
+    );
+    expect(secmasterTables.map((r) => r.tablename)).toEqual([
+      'companies',
+      'filings',
+      'identifiers',
+      'instruments',
+    ]);
 
     // Feature-store live fast-lane partial index exists.
     const { rows: featIdx } = await pool.query<{ indexname: string }>(
@@ -101,11 +117,104 @@ describe.skipIf(!dockerAvailable)('runMigrations', () => {
     );
     expect(indexes.map((r) => r.indexname)).toContain('bars_latest_unique');
 
-    // Both append-only roles exist.
-    const { rows: roles } = await pool.query<{ rolname: string }>(
-      "SELECT rolname FROM pg_roles WHERE rolname IN ('audit_writer','bars_writer')",
+    // Fundamentals live fast-lane partial-unique index + as-of lookup index exist.
+    const { rows: fundIdx } = await pool.query<{ indexname: string }>(
+      "SELECT indexname FROM pg_indexes WHERE tablename='fundamentals'",
     );
-    expect(roles.length).toBe(2);
+    const fundIdxNames = fundIdx.map((r) => r.indexname);
+    expect(fundIdxNames).toContain('fundamentals_latest_unique');
+    expect(fundIdxNames).toContain('fundamentals_knowledge_lookup');
+
+    // Identifier effective-dated lookup index exists.
+    const { rows: identIdx } = await pool.query<{ indexname: string }>(
+      "SELECT indexname FROM pg_indexes WHERE schemaname='security_master' AND tablename='identifiers'",
+    );
+    expect(identIdx.map((r) => r.indexname)).toContain('identifiers_lookup');
+
+    // Append-only roles from every migration exist.
+    const { rows: roles } = await pool.query<{ rolname: string }>(
+      "SELECT rolname FROM pg_roles WHERE rolname IN ('audit_writer','bars_writer','secmaster_writer','secmaster_reader','fundamentals_writer','fundamentals_reader')",
+    );
+    expect(roles.length).toBe(6);
+  }, TEST_TIMEOUT_MS);
+
+  it('enforces the fundamentals bi-temporal contract (partial-unique + append-only roles)', async () => {
+    // Two revisions of the same logical fact: the live partial-unique index allows
+    // both only because exactly one is is_superseded=FALSE. This proves the
+    // supersede-in-transaction contract the writer relies on (mirror of bars).
+    await pool.query(`
+      INSERT INTO fundamentals
+        (instrument_id, metric, observation_ts, knowledge_ts, period_type,
+         value, source, content_hash, is_superseded)
+      VALUES
+        (1, 'net_income', 1577836800000, 1580000000000, 'duration', 100.0, 'pit-edgar', 'h1', TRUE),
+        (1, 'net_income', 1577836800000, 1590000000000, 'duration', 110.0, 'pit-edgar', 'h2', FALSE)
+    `);
+
+    // A second live (is_superseded=FALSE) row for the SAME logical fact must be
+    // rejected by fundamentals_latest_unique.
+    await expect(
+      pool.query(`
+        INSERT INTO fundamentals
+          (instrument_id, metric, observation_ts, knowledge_ts, period_type,
+           value, source, content_hash, is_superseded)
+        VALUES
+          (1, 'net_income', 1577836800000, 1600000000000, 'duration', 120.0, 'pit-edgar', 'h3', FALSE)
+      `),
+    ).rejects.toThrow(/fundamentals_latest_unique/);
+
+    // The append-only contract: fundamentals_writer holds table-level INSERT+SELECT
+    // and must NOT be able to DELETE. The role is NOLOGIN, so we assert via the
+    // information_schema grant catalog rather than connecting as it.
+    const { rows: tablePrivs } = await pool.query<{ privilege_type: string }>(
+      `SELECT privilege_type FROM information_schema.role_table_grants
+       WHERE grantee='fundamentals_writer' AND table_name='fundamentals'`,
+    );
+    const tableGrants = tablePrivs.map((r) => r.privilege_type);
+    expect(tableGrants).toContain('INSERT');
+    expect(tableGrants).toContain('SELECT');
+    expect(tableGrants).not.toContain('DELETE');
+
+    // The supersede flow needs UPDATE on is_superseded ONLY — a column-level grant,
+    // which surfaces in role_column_grants (not role_table_grants). Assert it is
+    // scoped to exactly that column (mirror of bars_writer in 0002_bars.sql).
+    const { rows: colPrivs } = await pool.query<{ column_name: string; privilege_type: string }>(
+      `SELECT column_name, privilege_type FROM information_schema.role_column_grants
+       WHERE grantee='fundamentals_writer' AND table_name='fundamentals'
+         AND privilege_type='UPDATE'`,
+    );
+    expect(colPrivs.map((r) => r.column_name)).toEqual(['is_superseded']);
+
+    // Clean up so the idempotency re-run test starts from an empty table.
+    await pool.query("DELETE FROM fundamentals WHERE instrument_id = 1 AND metric = 'net_income'");
+  }, TEST_TIMEOUT_MS);
+
+  it('preserves every distinct raw fact (context_id + period_type are key discriminators)', async () => {
+    // The raw zone is full-preservation: a filing that reports the same us-gaap tag
+    // under two XBRL contexts (mapping to the same undimensioned signature) must
+    // yield TWO rows, not a PK collision. context_id is part of the natural key.
+    await pool.query(`
+      INSERT INTO fundamentals_raw_facts
+        (filing_id, raw_tag, taxonomy, context_id, period_type, period_end, knowledge_ts, value, dim_signature, content_hash)
+      VALUES
+        (101, 'us-gaap:Revenues', 'us-gaap', 'ctxA', 'duration', 1577836800000, 1580000000000, 100, '', 'h1'),
+        (101, 'us-gaap:Revenues', 'us-gaap', 'ctxB', 'duration', 1577836800000, 1580000000000, 200, '', 'h2')
+    `);
+    // And an instant fact and a duration fact sharing the same period_end must not
+    // collapse — period_type discriminates (instant balance-sheet vs duration flow).
+    await pool.query(`
+      INSERT INTO fundamentals_raw_facts
+        (filing_id, raw_tag, taxonomy, context_id, period_type, period_start, period_end, knowledge_ts, value, dim_signature, content_hash)
+      VALUES
+        (102, 'us-gaap:SomeTag', 'us-gaap', 'i', 'instant',  NULL,          1577836800000, 1580000000000, 50, '', 'hi'),
+        (102, 'us-gaap:SomeTag', 'us-gaap', 'd', 'duration', 1546300800000, 1577836800000, 1580000000000, 75, '', 'hd')
+    `);
+    const { rows } = await pool.query<{ n: number }>(
+      'SELECT count(*)::int AS n FROM fundamentals_raw_facts WHERE filing_id IN (101, 102)',
+    );
+    expect(rows[0].n).toBe(4);
+
+    await pool.query('DELETE FROM fundamentals_raw_facts WHERE filing_id IN (101, 102)');
   }, TEST_TIMEOUT_MS);
 
   it('is idempotent on re-run', async () => {
