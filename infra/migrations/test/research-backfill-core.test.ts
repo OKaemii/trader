@@ -267,19 +267,47 @@ describe('buildFactorBlock (per-factor source-stamping, mirror of factor_store s
 });
 
 describe('hasNullSourceFactor (the fill-missing / idempotency predicate)', () => {
-  it('a row with any source:null factor is fill-missing eligible', () => {
+  // The CRITICAL invariant: a steady-state backfill row (Quality always null, price + value
+  // sourced) is NOT fill-missing eligible — otherwise every row would always be eligible and a
+  // non-force re-run would rewrite the whole span, breaking the §I "second run writes ~nothing"
+  // guarantee. Only a null momentum/volatility/value (the legs THIS backfill can compute) counts.
+  it('a steady-state row (price+value sourced, Quality null) is NOT eligible', () => {
     const doc = {
       factors: {
         momentum: { raw: 1, pct: 90, source: SOURCE_EOD },
         volatility: { raw: -1, pct: 10, source: SOURCE_EOD },
         value: { raw: 0.04, pct: 60, source: SOURCE_DIV },
-        quality: { raw: null, pct: null, source: null }, // forward-only → eligible
+        quality: { raw: null, pct: null, source: null }, // forward-only — NOT a trigger
+      },
+    };
+    expect(hasNullSourceFactor(doc)).toBe(false);
+  });
+
+  it('a null momentum (then-missing history) IS eligible', () => {
+    const doc = {
+      factors: {
+        momentum: { raw: null, pct: null, source: null }, // short history at first write
+        volatility: { raw: -1, pct: 10, source: SOURCE_EOD },
+        value: { raw: 0.04, pct: 60, source: SOURCE_DIV },
+        quality: { raw: null, pct: null, source: null },
       },
     };
     expect(hasNullSourceFactor(doc)).toBe(true);
   });
 
-  it('a row with every factor sourced is NOT eligible', () => {
+  it('a null value leg (no div-yield yet) IS eligible', () => {
+    const doc = {
+      factors: {
+        momentum: { raw: 1, pct: 90, source: SOURCE_EOD },
+        volatility: { raw: -1, pct: 10, source: SOURCE_EOD },
+        value: { raw: null, pct: null, source: null }, // div-yield landed later
+        quality: { raw: null, pct: null, source: null },
+      },
+    };
+    expect(hasNullSourceFactor(doc)).toBe(true);
+  });
+
+  it('a fully-sourced row (incl. a future PIT Quality) is NOT eligible', () => {
     const doc = {
       factors: {
         momentum: { raw: 1, pct: 90, source: SOURCE_EOD },
@@ -291,7 +319,8 @@ describe('hasNullSourceFactor (the fill-missing / idempotency predicate)', () =>
     expect(hasNullSourceFactor(doc)).toBe(false);
   });
 
-  it('a missing factor cell counts as eligible (defensive)', () => {
+  it('a missing backfillable factor cell counts as eligible (defensive)', () => {
+    // momentum present but volatility/value cells absent → eligible.
     expect(hasNullSourceFactor({ factors: { momentum: { raw: 1, pct: 90, source: SOURCE_EOD } } })).toBe(true);
   });
 });

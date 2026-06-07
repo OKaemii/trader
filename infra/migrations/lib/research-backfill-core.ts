@@ -325,17 +325,25 @@ export interface FactorScoreDoc {
   factors: FactorBlock;
 }
 
+// The factors THIS backfill can populate. Quality is permanently out (forward-only, §H), so a
+// null Quality cell must NOT make a row "fill-missing eligible" — otherwise EVERY row this
+// backfill ever wrote would always be eligible (Quality is always null), and a re-run would
+// rewrite the whole span, defeating the §I gap-aware "second run writes ~nothing" guarantee.
+const BACKFILLABLE_FACTORS = ['momentum', 'value', 'volatility'] as const;
+
 /**
- * Whether a factor_scores row is "fill-missing eligible" — i.e. it has at least one factor
- * cell that is the honest no-source cell (source:null) that a re-run COULD upgrade. The
- * fill-missing pass (no --force) targets exactly these rows: a fully-populated price row
- * whose Quality is still null is eligible (a future PIT warehouse fills Quality), whereas
- * the gap-aware skip alone would never revisit it. With this backfill (Quality always null)
- * every written row is technically fill-missing eligible on Quality; the predicate exists so
- * the fill-missing pass is a distinct, source:null-targeted re-run from the date-gap skip.
+ * Whether a factor_scores row is "fill-missing eligible" — it has a null-source cell among the
+ * factors THIS backfill can compute (momentum / volatility / value). The dedicated fill-missing
+ * pass (opt-in via `--fill-missing`, NOT the default) re-visits exactly these rows so a date that
+ * lacked enough daily history (or a div-yield) at first write gets upgraded once the daily-store
+ * tail extends back. Quality is deliberately EXCLUDED: it is always this-backfill-null, so a null
+ * Quality is the expected steady state, not a gap — including it would make every row eligible and
+ * turn a fill-missing re-run into a full rewrite (the bug this exclusion prevents). A future PIT
+ * fundamentals warehouse upgrades Quality in place through its OWN fill-missing path, guarded by the
+ * `source` field, never by this predicate.
  */
 export function hasNullSourceFactor(doc: { factors: Partial<FactorBlock> }): boolean {
-  for (const factor of RESEARCH_FACTORS) {
+  for (const factor of BACKFILLABLE_FACTORS) {
     const cell = doc.factors[factor];
     if (!cell || cell.source == null) return true;
   }

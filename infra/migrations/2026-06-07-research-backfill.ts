@@ -25,11 +25,14 @@
  *
  * GAP-AWARE (§I). Per ticker, the dates we ALREADY have a factor_scores row for are detected
  * (one indexed aggregation), missing dates computed via the shared computeMissingRanges grid math,
- * and only the missing dates are (re)computed + written. A fully-covered ticker writes nothing.
- * `--force` re-computes the whole span (repairs a suspected-bad run). A `--fill-missing` pass
- * (default behaviour without --force) targets rows that still carry a source:null factor (the
- * upgrade seam for a future PIT fundamentals warehouse). Writes are upserts keyed on
- * (ticker, observation_ts) — idempotent: a re-run overwrites, never duplicates.
+ * and only the missing dates are (re)computed + written. A fully-covered ticker writes nothing — a
+ * second run over covered data writes ~nothing (the §I guarantee). `--force` ignores coverage and
+ * re-computes the whole span (repairs a suspected-bad run). The OPT-IN `--fill-missing` pass
+ * additionally re-visits existing rows that still carry a null BACKFILLABLE factor (momentum /
+ * volatility / value) — a date that lacked enough daily history or a div-yield at first write — so a
+ * now-deeper daily-store tail upgrades them in place. (Quality is permanently this-backfill-null and
+ * is NOT a fill-missing trigger; a future PIT warehouse upgrades it through its own path.) Writes
+ * are upserts keyed on (ticker, observation_ts) — idempotent: a re-run overwrites, never duplicates.
  *
  * CREDIT BUDGET: the only upstream calls are the EODHD /eod fallback for names absent from the
  * daily store, each metered + capped by EODHD_BACKFILL_CALL_LIMIT (default 2000). The bi-temporal
@@ -43,6 +46,8 @@
  *       [--years=5] [--limit-tickers=N]
  *
  *   --force            re-fetch + re-compute covered regions (default: gap-aware skip).
+ *   --fill-missing     also re-visit existing rows whose momentum/volatility/value is still null
+ *                      (upgrade them once the daily-store tail extends back). Off by default.
  *   --tickers=A,B      restrict to a comma-separated T212 ticker set (default: the active universe).
  *   --years=N          lookback in years (default 5; clamped to the seeded daily history depth).
  *   --limit-tickers=N  process only the first N universe tickers (a small-set dry run).
@@ -97,6 +102,7 @@ const MOMENTUM_WINDOW_ROWS = 320;
 
 interface Args {
   force: boolean;
+  fillMissing: boolean;
   tickers: string[] | null;
   years: number;
   limitTickers: number | null;
@@ -104,11 +110,13 @@ interface Args {
 
 function parseArgs(argv: string[]): Args {
   let force = false;
+  let fillMissing = false;
   let tickers: string[] | null = null;
   let years = 5;
   let limitTickers: number | null = null;
   for (const a of argv) {
     if (a === '--force') force = true;
+    else if (a === '--fill-missing') fillMissing = true;
     else if (a.startsWith('--tickers=')) {
       const list = a
         .slice('--tickers='.length)
@@ -124,7 +132,7 @@ function parseArgs(argv: string[]): Args {
       if (Number.isFinite(n) && n > 0) limitTickers = Math.floor(n);
     }
   }
-  return { force, tickers, years, limitTickers };
+  return { force, fillMissing, tickers, years, limitTickers };
 }
 
 // ── EODHD /eod fallback — minimal, metered, only for names absent from the daily store ──
@@ -270,9 +278,11 @@ async function loadExistingScoreDays(db: Db, ticker: string, fromDay: number, to
 }
 
 /**
- * The observation dates whose existing factor_scores row still carries a source:null factor — the
- * fill-missing targets. Subset of loadExistingScoreDays; a non-force run re-computes these too so a
- * later PIT warehouse (or a newly-seeded daily tail) upgrades them in place.
+ * The observation dates whose existing factor_scores row still has a null BACKFILLABLE factor
+ * (momentum / volatility / value) — the --fill-missing targets. Subset of loadExistingScoreDays;
+ * the opt-in --fill-missing pass re-computes these so a newly-seeded daily tail (or a now-present
+ * div-yield) upgrades them in place. Quality nulls are excluded by hasNullSourceFactor, so a
+ * steady-state row is NOT a target (that keeps the default gap-aware run zero-write).
  */
 async function loadFillMissingDays(db: Db, ticker: string, fromDay: number, toDay: number): Promise<number[]> {
   const docs = await db
@@ -370,7 +380,7 @@ async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   console.log(
     `[research-backfill] mongo=${MONGO_URI.replace(/:[^@/]*@/, ':***@')} db=${DB_NAME} ` +
-      `force=${args.force} dryRun=${DRY_RUN} years=${args.years} strategy=${STRATEGY_ID}`,
+      `force=${args.force} fillMissing=${args.fillMissing} dryRun=${DRY_RUN} years=${args.years} strategy=${STRATEGY_ID}`,
   );
 
   const nowMs = Date.now();
@@ -428,11 +438,16 @@ async function main(): Promise<void> {
 
       const dividends = await loadDividends(db, ticker);
 
-      // Gap-aware date plan: every grid date we don't already have a row for, PLUS (non-force) the
-      // existing rows that still carry a source:null factor (the fill-missing upgrade targets).
+      // Gap-aware date plan: every grid date we don't already have a row for. --force ignores
+      // coverage and re-computes the whole span. The OPT-IN --fill-missing pass additionally
+      // re-visits existing rows that still carry a null backfillable factor (a date that lacked
+      // history/div-yield at first write) so a now-deeper daily-store tail upgrades them in place.
+      // Without --fill-missing the default run is purely gap-aware — a fully-covered span writes
+      // ~nothing (the §I "second run writes ~nothing" guarantee).
       const existing = args.force ? [] : await loadExistingScoreDays(db, ticker, startDay, endDay);
       const gapDays = planScoreDays(existing, startDay, endDay, args.force);
-      const fillMissing = args.force ? [] : await loadFillMissingDays(db, ticker, startDay, endDay);
+      const fillMissing =
+        args.fillMissing && !args.force ? await loadFillMissingDays(db, ticker, startDay, endDay) : [];
       // The needed date set is constrained to dates the ticker actually has >=1 close at/<=, so we
       // don't write rows before the series starts.
       const earliest = daily[0]!.observation_ts;
