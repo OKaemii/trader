@@ -26,7 +26,15 @@ export function WorkspaceTabs({
   active?: string | undefined
 }) {
   const pathname = usePathname()
-  const active = resolveTab(tabs, useSearchParams().get('tab') ?? serverActive)
+  const params = useSearchParams()
+  const active = resolveTab(tabs, params.get('tab') ?? serverActive)
+  // Preserve the entity context across a tab switch: the Research symbol workspace deep-links
+  // as `?symbol=<sym>&tab=<key>`, so a tab link that dropped `symbol` would bounce back to the
+  // no-symbol landing. `symbol` is the only cross-tab query param in the IA; other workspaces
+  // simply have none, so this is a no-op there.
+  const symbol = params.get('symbol')
+  const hrefFor = (key: string) =>
+    symbol ? `${pathname}?symbol=${encodeURIComponent(symbol)}&tab=${key}` : `${pathname}?tab=${key}`
   return (
     <div role="tablist" className="flex gap-1 border-b border-gray-800">
       {tabs.map((t) => {
@@ -36,7 +44,7 @@ export function WorkspaceTabs({
             key={t.key}
             role="tab"
             aria-selected={on}
-            href={`${pathname}?tab=${t.key}`}
+            href={hrefFor(t.key)}
             className={cn(
               'rounded-t px-3 py-2 text-sm transition-colors',
               'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-emerald-500',

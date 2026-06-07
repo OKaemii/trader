@@ -61,7 +61,7 @@ export const COMMANDS: Command[] = [
     label: 'Research',
     group: GO_TO,
     href: '/research',
-    keywords: ['history', 'charts', 'price', 'signals'],
+    keywords: ['symbol', 'overview', 'signals', 'strategy impact', 'fundamentals', 'history', 'charts', 'price'],
   },
   {
     id: 'ws.build',
@@ -92,11 +92,16 @@ export const COMMANDS: Command[] = [
   { id: 'ws.discover.calendar', label: 'Discover · Calendar', group: GO_TO, href: '/discover?tab=calendar', keywords: ['earnings', 'events'] },
 
   // ── Research tabs ─────────────────────────────────────────────────────────
-  // `history` is the price/candlestick view (the relocation kept it under this key as a
-  // placeholder; Task 23 grows it into the full per-symbol History tab). Market Data + Backtests
-  // relocated to Operations + Build respectively (Task 22).
-  { id: 'ws.research.history', label: 'Research · History', group: GO_TO, href: '/research?tab=history', keywords: ['charts', 'candlestick', 'price', 'ohlc', 'history'] },
-  { id: 'ws.research.signals', label: 'Research · Signals', group: GO_TO, href: '/research?tab=signals', keywords: ['feed', 'regime', 'factor exposure', 'betti'] },
+  // The Research workspace is symbol-centric (Task 23): the five question-tabs key off a
+  // selected `?symbol=` (the bare `/research?tab=<key>` deep links resolve the tab; with no
+  // symbol the page lands on the picker, except `signals`→whole-market feed and `history`→a
+  // chart, the /signals + /charts stub targets). Market Data + Backtests relocated to
+  // Operations + Build respectively (Task 22).
+  { id: 'ws.research.overview', label: 'Research · Overview', group: GO_TO, href: '/research?tab=overview', keywords: ['symbol', 'chart', 'factors', 'summary'] },
+  { id: 'ws.research.signals', label: 'Research · Signals', group: GO_TO, href: '/research?tab=signals', keywords: ['feed', 'regime', 'factor exposure', 'betti', 'why'] },
+  { id: 'ws.research.strategy-impact', label: 'Research · Strategy Impact', group: GO_TO, href: '/research?tab=strategy-impact', keywords: ['attribution', 'contribution', 'per strategy'] },
+  { id: 'ws.research.fundamentals', label: 'Research · Fundamentals', group: GO_TO, href: '/research?tab=fundamentals', keywords: ['financials', 'valuation', 'dividends', 'analyst'] },
+  { id: 'ws.research.history', label: 'Research · History', group: GO_TO, href: '/research?tab=history', keywords: ['charts', 'candlestick', 'price', 'ohlc', 'drawdowns', 'corporate actions'] },
 
   // ── Build tabs ────────────────────────────────────────────────────────────
   { id: 'ws.build.strategy', label: 'Build · Strategy', group: GO_TO, href: '/build?tab=strategy', keywords: ['active strategy', 'params', 'config'] },
