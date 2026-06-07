@@ -159,6 +159,25 @@ export const COLLECTIONS = {
   // Value dividend-yield leg the strategy factor host injects into HistoryView.fundamentals — §H;
   // T9 factor host + T17 research-backfill consume it).
   CORPORATE_ACTIONS:         'corporate_actions',
+
+  // Per-symbol EODHD news (Overview "Recent Events" panel + the narrative/"Why?" event context).
+  // A read-through store with an INCREMENTAL, credit-thrifty sync (plan §H/§I): each doc carries a
+  // `lastFetchedDate` cursor (the publish-date of the newest stored article); a re-sync fetches only
+  // articles after that date and appends genuinely-new links, so a current symbol spends ~no EODHD
+  // credits. Body text is dropped (headline/link/date/symbols/tags + optional sentiment only).
+  // Fetched lazily (on symbol open / once-daily background pass) — NEVER per page-load. One doc per
+  // ticker:
+  //   { _id: ticker,
+  //     articles: [ { date,        // ISO-8601 publish timestamp from EODHD (the dedupe/ordering key
+  //                                 // is `link`; multiple articles can share a publish day)
+  //                   title, link,
+  //                   symbols,      // related EODHD symbols (may be empty)
+  //                   tags,         // EODHD topic tags (may be empty)
+  //                   sentiment? }],// { polarity, neg, neu, pos } — ONLY when the tier returns it
+  //     lastFetchedDate?,          // 'YYYY-MM-DD' max publish-date stored — the incremental `from` cursor
+  //     source, asOf, updatedAt }
+  // Read by the admin GET /admin/api/market-data/news?ticker= (Overview Recent Events — T24/T30/T35).
+  NEWS:                      'news',
 } as const;
 
 export type CollectionName = typeof COLLECTIONS[keyof typeof COLLECTIONS];
