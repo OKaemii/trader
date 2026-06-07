@@ -25,18 +25,22 @@ export function ResearchView({ initialReports = null }: ResearchViewProps = {}) 
   const [detail, setDetail] = useState<ValidationJob | null>(null)
   const [clone, setClone] = useState<{ kind: JobKind; req: Record<string, unknown> } | null>(null)
 
-  // Mount: restore ?job=, else auto-select a running job if one exists.
+  // Mount: restore ?job=, else auto-select a running job if one exists. All state writes happen
+  // inside the async closure (off the synchronous effect body) so the URL read stays client-only
+  // and we never set state synchronously during the effect.
   useEffect(() => {
-    const j = new URL(window.location.href).searchParams.get('job')
-    if (j) { setSelectedId(j); return }
+    let cancelled = false
     void (async () => {
+      const j = new URL(window.location.href).searchParams.get('job')
+      if (j) { if (!cancelled) setSelectedId(j); return }
       try {
         const r = await fetch('/portal-api/admin/validator/jobs?limit=20')
         const d = await r.json()
         const running = (d.jobs ?? []).find((x: ValidationJob) => x.status === 'running')
-        if (running) setSelectedId(running._id)
+        if (running && !cancelled) setSelectedId(running._id)
       } catch { /* ignore */ }
     })()
+    return () => { cancelled = true }
   }, [])
 
   // Mirror the selection to the URL (deep-link / refresh-survival).
@@ -47,9 +51,11 @@ export function ResearchView({ initialReports = null }: ResearchViewProps = {}) 
     window.history.replaceState(null, '', u.toString())
   }, [selectedId])
 
-  // Poll the selected job every 5s until terminal.
+  // Poll the selected job every 5s until terminal. No synchronous clear when selectedId is
+  // null — `shown` (below) already masks a stale detail whose _id !== selectedId, so render
+  // is correct without setting state in the effect body.
   useEffect(() => {
-    if (!selectedId) { setDetail(null); return }
+    if (!selectedId) return
     let cancelled = false
     let done = false
     const tick = async () => {
