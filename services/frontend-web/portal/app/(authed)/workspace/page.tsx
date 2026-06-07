@@ -13,6 +13,7 @@ import { RecentResearchCard } from '@/components/RecentResearchCard'
 import { AutoApproveToggle } from '@/components/AutoApproveToggle'
 import { CircuitBreakerCard } from '@/components/CircuitBreakerCard'
 import { MarketStateBadge, type MarketState } from '@/components/MarketStateBadge'
+import { MarketNarrative, type NarrativePayload } from '@/components/MarketNarrative'
 import type { SignalProgressDTO } from '@/types/trader'
 
 // Workspace home — the command center. This is the post-login landing page (the old /dashboard,
@@ -33,10 +34,10 @@ import type { SignalProgressDTO } from '@/types/trader'
 // system health stay visible in BOTH Beginner and Quant modes — nothing on this page is gated by
 // <QuantOnly>. Only advanced/quant-only panels elsewhere are.
 //
-// LAYOUT SEAM (T31): the ThreeCol below leaves its LEFT rail open. T31 mounts <MarketNarrative> as
-// the `left` rail of this ThreeCol (market-context prose beside the hero/positions) — the layout
-// already collapses the empty left track today, so adding it is a one-prop change with no reflow of
-// the center/right columns.
+// MARKET-CONTEXT RAIL (T31): the ThreeCol below mounts <MarketNarrative> as its LEFT rail — the
+// data-grounded "Today's Market" prose (GET /admin/api/market/narrative, SSR-seeded here so it paints
+// populated). It sits beside the hero/positions; the layout already collapsed an empty left track, so
+// filling it added the rail without reflowing the center/right columns (the T19 seam).
 
 // Subset of market-data /health used by the top-bar session badges.
 interface MarketDataHealth {
@@ -96,6 +97,7 @@ export default async function WorkspacePage() {
     signalsBody,
     health,
     research,
+    narrative,
   ] = await Promise.all([
     fetchJsonOrNull<MarketDataHealth>('/admin/api/market-data/health'),
     fetchJsonOrNull<{ enabled?: boolean }>('/admin/api/signals/auto-approve').then((d) =>
@@ -116,6 +118,9 @@ export default async function WorkspacePage() {
     // shared fan-out directly. Always resolves to HealthRow[] (down service ⇒ ok:false row).
     getSystemHealth(),
     fetchRecentResearch(),
+    // "Today's Market" narrative for the left rail. Cached per-UTC-day upstream, so this seed is
+    // cheap; null on any failure ⇒ the panel self-fetches on mount (the component handles both).
+    fetchJsonOrNull<NarrativePayload>('/admin/api/market/narrative'),
   ])
 
   const signals = signalsBody?.signals ?? null
@@ -151,9 +156,14 @@ export default async function WorkspacePage() {
 
       {/* Subordinate rail: positions take the center (the most-watched supporting surface); the
           right rail stacks the at-a-glance ops controls, active signals, and recent research as
-          flat, lower-contrast cards. The LEFT rail is the T31 MarketNarrative seam (see header). */}
+          flat, lower-contrast cards. The LEFT rail carries the MarketNarrative market-context prose. */}
       <ThreeCol
         centerSpan={2}
+        left={
+          // SSR-seeded when the fetch succeeded; on a null seed pass `undefined` so the panel
+          // self-fetches on mount (its contract: a non-null `initial` skips the client fetch).
+          <MarketNarrative initial={narrative ?? undefined} />
+        }
         center={
           <section className="space-y-3">
             <h2 className="text-xs font-semibold uppercase tracking-wide text-gray-500">
