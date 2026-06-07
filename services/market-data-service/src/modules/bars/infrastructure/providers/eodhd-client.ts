@@ -17,7 +17,13 @@ const EODHD_BASE = 'https://eodhd.com/api';
 // Approximate per-endpoint EODHD API-call consumption. EODHD weights heavier endpoints more
 // than a single /eod call; the exact weights vary by plan, so these are conservative and the
 // limiter's day budget carries headroom. Verify against EODHD's current consumption table.
-export const EODHD_COST = { eod: 1, bulk: 100, screener: 5, fundamentals: 10, realtime: 1 } as const;
+//
+// technical/dividends/splits/news bill like a single /eod call (1); the exchange-metadata
+// endpoints (exchangeDetails/exchangesList) are low-volume reference lookups — also 1.
+export const EODHD_COST = {
+  eod: 1, bulk: 100, screener: 5, fundamentals: 10, realtime: 1,
+  technical: 1, dividends: 1, splits: 1, news: 1, exchangeDetails: 1, exchangesList: 1,
+} as const;
 
 // Legacy-rename overrides — mirror twelvedata/yahoo so the curated/scanned universe resolves
 // identically across providers (T212 keeps the pre-rebrand symbol; EODHD wants the new one).
@@ -59,6 +65,31 @@ function numOr(v: unknown, fallback: number): number {
   return Number.isFinite(n) ? n : fallback;
 }
 
+// Build an object holding only the optional string fields EODHD actually sent (non-empty strings),
+// each mapped to its output key. Skips absent/empty/non-string values so under
+// `exactOptionalPropertyTypes` the result never carries an explicit `undefined` — a consumer's `?.`
+// check means "EODHD didn't send it", not "it sent an empty string". Returned typed so spreading it
+// keeps each value strictly `string`.
+function pickStrings<K extends string>(src: Record<string, unknown>, keyMap: Record<string, K>): Partial<Record<K, string>> {
+  const out: Partial<Record<K, string>> = {};
+  for (const [srcKey, outKey] of Object.entries(keyMap)) {
+    const v = src[srcKey];
+    if (typeof v === 'string' && v !== '') out[outKey] = v;
+  }
+  return out;
+}
+
+// Parse an EODHD split ratio string ('2/1', '3/2', '1/4' for a reverse split) into a share-count
+// multiplier (numerator / denominator). NaN when the string is missing a finite numerator or a
+// non-zero denominator — the caller keeps the raw `ratio` and treats NaN as "don't auto-adjust".
+function parseSplitFactor(ratio: string): number {
+  const [num, den] = ratio.split('/');
+  const n = Number(num);
+  const d = Number(den);
+  if (!Number.isFinite(n) || !Number.isFinite(d) || d === 0) return NaN;
+  return n / d;
+}
+
 // ── Response shapes (the subset we read) ──────────────────────────────────────────
 export interface EodhdEodRow {
   date: string;            // 'YYYY-MM-DD'
@@ -81,6 +112,89 @@ export interface EodhdScreenerRow {
   marketCap: number;       // in the listing currency (FX-normalised by the caller)
   currency?: string;       // currency_symbol, when present
   sector?: string;         // GICS-ish sector from the screener — sourced for free (no Yahoo)
+}
+
+// One point on an EODHD Technical-API series (RSI/MACD/ADX/ATR/Bollinger/beta/volatility/…).
+// EODHD returns one object per date whose value keys depend on the requested `function`; we keep
+// the raw numeric values map so a caller picks the keys it asked for (e.g. `macd`/`signal`/
+// `divergence` for MACD, or `value` for a single-output function) without this client owning the
+// per-indicator schema. Display/supplement only — factors stay computed in quant-core.
+export interface EodhdTechnicalPoint {
+  date: string;                         // 'YYYY-MM-DD' observation date
+  values: Record<string, number>;       // indicator outputs for that date (finite numbers only)
+}
+
+// One cash-dividend event. `value` is per-share in the listing's native unit (LSE = pence); the
+// caller scales at the boundary like prices. `date` is the ex-dividend date (the point-in-time
+// instant the market prices it in) — the field the backfillable Value dividend-yield input keys on.
+export interface EodhdDividendEvent {
+  date: string;                         // 'YYYY-MM-DD' ex-dividend date
+  value: number;                        // gross dividend per share (native unit)
+  currency?: string;                    // EODHD-declared currency, when present
+  declarationDate?: string;             // 'YYYY-MM-DD', when present
+  recordDate?: string;                  // 'YYYY-MM-DD', when present
+  paymentDate?: string;                 // 'YYYY-MM-DD', when present
+}
+
+// One stock-split event. `ratio` is the raw EODHD string ('2/1', '3/2', …); `factor` is that
+// parsed into a multiplier on the share count (2/1 → 2, 1/4 reverse-split → 0.25), or NaN if the
+// ratio string is unparseable. Corporate-actions correctness for adjusted prices.
+export interface EodhdSplitEvent {
+  date: string;                         // 'YYYY-MM-DD' split-effective date
+  ratio: string;                        // raw EODHD ratio, e.g. '2/1'
+  factor: number;                       // ratio parsed to a share-count multiplier (NaN if unparseable)
+}
+
+// One news article for a symbol. Body text is dropped (only title/link/date/symbols/tags kept);
+// `sentiment` is present only when the EODHD tier returns it (it is on this plan's News add-on but
+// callers must treat it as optional). Powers the Overview "Recent Events" panel + narrative context.
+export interface EodhdNewsArticle {
+  date: string;                         // ISO-8601 publish timestamp as returned by EODHD
+  title: string;
+  link: string;
+  symbols: string[];                    // related EODHD symbols (may be empty)
+  tags: string[];                       // EODHD topic tags (may be empty)
+  sentiment?: { polarity: number; neg: number; neu: number; pos: number };  // only if the tier returns it
+}
+
+// Exchange metadata + the holiday schedule that backs the live EODHD holiday provider (replacing
+// the static US fallback in @trader/shared-calendar). `tradingHours`/`holidays` are present only on
+// the Exchange-Details endpoint (the Exchanges-List rows carry just the identity fields).
+export interface EodhdExchangeDetails {
+  name: string;
+  code: string;                         // EODHD exchange code, e.g. 'US' | 'LSE'
+  operatingMIC?: string;
+  country?: string;
+  currency?: string;
+  countryISO2?: string;
+  countryISO3?: string;
+  tradingHours?: {
+    open?: string;                      // 'HH:MM:SS' local
+    close?: string;                     // 'HH:MM:SS' local
+    workingDays?: string;               // e.g. 'Mon,Tue,Wed,Thu,Fri'
+    openUTC?: string;
+    closeUTC?: string;
+  };
+  holidays: EodhdExchangeHoliday[];     // [] when absent (degrade-safe for the calendar provider)
+}
+
+// One market holiday from Exchange-Details. `type` distinguishes a full close from an early close;
+// EODHD spells it variably, so it is passed through verbatim for the calendar provider to interpret.
+export interface EodhdExchangeHoliday {
+  date: string;                         // 'YYYY-MM-DD'
+  name: string;
+  type?: string;                        // e.g. 'holiday' | 'half-day' (verbatim from EODHD)
+}
+
+// One row of the Exchanges-List enumeration (identity only — no hours/holidays here).
+export interface EodhdExchangeListItem {
+  name: string;
+  code: string;                         // EODHD exchange code (feed Exchange-Details by this)
+  operatingMIC?: string;
+  country?: string;
+  currency?: string;
+  countryISO2?: string;
+  countryISO3?: string;
 }
 
 export interface EodhdClientOptions {
@@ -223,6 +337,170 @@ export class EodhdClient {
       }
     }
     return out;
+  }
+
+  /**
+   * Technical-API series for one EODHD `SYMBOL.EXCHANGE`. `func` is the EODHD `function`
+   * (`rsi`/`macd`/`adx`/`atr`/`bbands`/`beta`/`volatility`/`stochastic`/…); `params` are passed
+   * through verbatim (e.g. `{ period: '14' }`, `{ from, to }`). Each date's value keys depend on
+   * the function — we keep them as a `Record<string, number>` (finite values only) so the caller
+   * reads the keys it requested without this client owning a per-indicator schema. **Display/
+   * supplement only** — factors stay computed in quant-core for live/replay parity. Empty on
+   * budget exhaustion / not-entitled / error.
+   */
+  async technical(eodhdSymbol: string, func: string, params: Record<string, string> = {}): Promise<EodhdTechnicalPoint[]> {
+    const rows = await this.get<Array<Record<string, unknown>>>(`/technical/${eodhdSymbol}`, {
+      ...params, function: func,
+    }, EODHD_COST.technical);
+    if (!Array.isArray(rows)) return [];
+    return rows
+      .map((r) => {
+        const values: Record<string, number> = {};
+        for (const [k, v] of Object.entries(r)) {
+          if (k === 'date') continue;
+          const n = Number(v);
+          if (Number.isFinite(n)) values[k] = n;
+        }
+        return { date: String(r.date ?? ''), values };
+      })
+      .filter((p) => p.date !== '' && Object.keys(p.values).length > 0);
+  }
+
+  /**
+   * Cash-dividend history for one EODHD `SYMBOL.EXCHANGE` between two 'YYYY-MM-DD' bounds
+   * (inclusive; both optional — omit for the full available history). `value` is per-share in the
+   * native unit (LSE = pence — the caller scales at the boundary). Point-in-time by ex-dividend
+   * date — the backfillable Value dividend-yield input. Empty on budget exhaustion / error.
+   */
+  async dividends(eodhdSymbol: string, fromIso?: string, toIso?: string): Promise<EodhdDividendEvent[]> {
+    const query: Record<string, string> = {};
+    if (fromIso) query.from = fromIso;
+    if (toIso) query.to = toIso;
+    const rows = await this.get<Array<Record<string, unknown>>>(`/div/${eodhdSymbol}`, query, EODHD_COST.dividends);
+    if (!Array.isArray(rows)) return [];
+    return rows
+      .map((r) => ({
+        date:  String(r.date ?? ''),
+        value: numOr(r.value, NaN),
+        ...pickStrings(r, {
+          currency: 'currency', declarationDate: 'declarationDate', recordDate: 'recordDate', paymentDate: 'paymentDate',
+        }),
+      }))
+      .filter((d): d is EodhdDividendEvent => d.date !== '' && Number.isFinite(d.value));
+  }
+
+  /**
+   * Stock-split history for one EODHD `SYMBOL.EXCHANGE` between two 'YYYY-MM-DD' bounds (inclusive;
+   * both optional). `ratio` is kept raw ('2/1'); `factor` is it parsed to a share-count multiplier
+   * (NaN if unparseable — the caller treats that as "don't auto-adjust"). Corporate-actions
+   * correctness for adjusted prices. Empty on budget exhaustion / error.
+   */
+  async splits(eodhdSymbol: string, fromIso?: string, toIso?: string): Promise<EodhdSplitEvent[]> {
+    const query: Record<string, string> = {};
+    if (fromIso) query.from = fromIso;
+    if (toIso) query.to = toIso;
+    const rows = await this.get<Array<Record<string, unknown>>>(`/splits/${eodhdSymbol}`, query, EODHD_COST.splits);
+    if (!Array.isArray(rows)) return [];
+    return rows
+      .map((r) => {
+        const ratio = String(r.split ?? r.ratio ?? '');
+        return { date: String(r.date ?? ''), ratio, factor: parseSplitFactor(ratio) };
+      })
+      .filter((s) => s.date !== '' && s.ratio !== '');
+  }
+
+  /**
+   * Recent news articles for one EODHD `SYMBOL.EXCHANGE`. `limit`/`offset` paginate (EODHD caps a
+   * page at 1000; we clamp to a sane default). `from`/`to` ('YYYY-MM-DD') narrow the window. Body
+   * text is dropped (title/link/date/symbols/tags only). `sentiment` is surfaced only when the
+   * tier returns it. Powers the Overview "Recent Events" panel + narrative/"Why?" context. Empty
+   * on budget exhaustion / error.
+   */
+  async news(
+    eodhdSymbol: string,
+    opts: { limit?: number; offset?: number; from?: string; to?: string } = {},
+  ): Promise<EodhdNewsArticle[]> {
+    const query: Record<string, string> = {
+      s: eodhdSymbol,
+      limit: String(Math.max(1, Math.min(1000, opts.limit ?? 50))),
+      offset: String(Math.max(0, opts.offset ?? 0)),
+    };
+    if (opts.from) query.from = opts.from;
+    if (opts.to) query.to = opts.to;
+    const rows = await this.get<Array<Record<string, unknown>>>('/news', query, EODHD_COST.news);
+    if (!Array.isArray(rows)) return [];
+    return rows
+      .map((r) => {
+        const s = r.sentiment as Record<string, unknown> | undefined;
+        const sentiment = s && typeof s === 'object'
+          ? { polarity: numOr(s.polarity, 0), neg: numOr(s.neg, 0), neu: numOr(s.neu, 0), pos: numOr(s.pos, 0) }
+          : undefined;
+        return {
+          date:    String(r.date ?? ''),
+          title:   String(r.title ?? ''),
+          link:    String(r.link ?? ''),
+          symbols: Array.isArray(r.symbols) ? r.symbols.map((x) => String(x)) : [],
+          tags:    Array.isArray(r.tags) ? r.tags.map((x) => String(x)) : [],
+          ...(sentiment ? { sentiment } : {}),
+        };
+      })
+      .filter((a) => a.title !== '' && a.date !== '');
+  }
+
+  /**
+   * Exchange metadata + holiday schedule for one EODHD exchange `code` (e.g. 'US', 'LSE'). Backs
+   * the live EODHD holiday provider that replaces the static US fallback in @trader/shared-calendar.
+   * Returns null on budget exhaustion / error (distinct from "loaded, no holidays" — the calendar
+   * provider must not mistake an outage for a holiday-free year). `holidays` defaults to [].
+   */
+  async exchangeDetails(code: string): Promise<EodhdExchangeDetails | null> {
+    const body = await this.get<Record<string, unknown>>(`/exchange-details/${code}`, {}, EODHD_COST.exchangeDetails);
+    if (!body || typeof body !== 'object') return null;
+    const th = body.TradingHours as Record<string, unknown> | undefined;
+    const tradingHours = th && typeof th === 'object'
+      ? pickStrings(th, { Open: 'open', Close: 'close', WorkingDays: 'workingDays', OpenUTC: 'openUTC', CloseUTC: 'closeUTC' })
+      : undefined;
+    // EODHD returns `ExchangeHolidays` as an object keyed by an opaque id; flatten to a list.
+    const rawHolidays = body.ExchangeHolidays;
+    const holidayRows = rawHolidays && typeof rawHolidays === 'object'
+      ? Object.values(rawHolidays as Record<string, unknown>)
+      : Array.isArray(rawHolidays) ? rawHolidays : [];
+    const holidays: EodhdExchangeHoliday[] = holidayRows
+      .map((h) => h as Record<string, unknown>)
+      .map((h) => ({
+        date: String(h.Date ?? h.date ?? ''),
+        name: String(h.Holiday ?? h.name ?? ''),
+        ...pickStrings(h, { Type: 'type' }),
+      }))
+      .filter((h) => h.date !== '');
+    return {
+      name: String(body.Name ?? ''),
+      code: String(body.Code ?? code),
+      ...pickStrings(body, {
+        OperatingMIC: 'operatingMIC', Country: 'country', Currency: 'currency', CountryISO2: 'countryISO2', CountryISO3: 'countryISO3',
+      }),
+      ...(tradingHours && Object.keys(tradingHours).length > 0 ? { tradingHours } : {}),
+      holidays,
+    };
+  }
+
+  /**
+   * Enumerate every EODHD exchange (identity only — no hours/holidays; feed each `code` to
+   * `exchangeDetails`). Backs the Exchange-Details lookup + a universe/scanner cross-check. Empty
+   * on budget exhaustion / error.
+   */
+  async exchangesList(): Promise<EodhdExchangeListItem[]> {
+    const rows = await this.get<Array<Record<string, unknown>>>('/exchanges-list/', {}, EODHD_COST.exchangesList);
+    if (!Array.isArray(rows)) return [];
+    return rows
+      .map((r) => ({
+        name: String(r.Name ?? ''),
+        code: String(r.Code ?? ''),
+        ...pickStrings(r, {
+          OperatingMIC: 'operatingMIC', Country: 'country', Currency: 'currency', CountryISO2: 'countryISO2', CountryISO3: 'countryISO3',
+        }),
+      }))
+      .filter((e) => e.code !== '');
   }
 }
 
