@@ -1,5 +1,5 @@
 'use client'
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 
 const STRATEGIES = ['factor_rank_v1', 'sector_momentum_v1', 'topology_v1', 'high_velocity_v1'] as const
 const OBJECTIVES = ['profit_factor', 'sharpe', 'cum_return', 'ic_mean'] as const
@@ -34,9 +34,13 @@ export function ValidationRunner({
   const [msg, setMsg] = useState<string | null>(null)
   const [err, setErr] = useState<string | null>(null)
 
-  // Clone-to-form: prefill from a routed-in job request.
-  useEffect(() => {
-    if (!initial) return
+  // Clone-to-form: prefill from a routed-in job request. `initial` is a fresh object per clone
+  // (ResearchView spreads job.request), so we adjust state during render keyed on its identity —
+  // the React-recommended alternative to a prop-sync effect. Only fields present in the request
+  // are overwritten, leaving the operator's other edits intact (matching the prior effect).
+  const [clonedFrom, setClonedFrom] = useState<Record<string, unknown> | null>(null)
+  if (initial && initial !== clonedFrom) {
+    setClonedFrom(initial)
     if (typeof initial.strategy_id === 'string' && (STRATEGIES as readonly string[]).includes(initial.strategy_id))
       setStrategy(initial.strategy_id as typeof STRATEGIES[number])
     const s = msToIso(initial.start_ms); if (s) setStart(s)
@@ -49,7 +53,7 @@ export function ValidationRunner({
     if (typeof initial.seed === 'number') setSeed(initial.seed)
     if (typeof initial.mcpt_early_stop === 'boolean') setEarlyStop(initial.mcpt_early_stop)
     if (typeof initial.survivorship_free === 'boolean') setSurvivorshipFree(initial.survivorship_free)
-  }, [initial])
+  }
 
   async function submit() {
     setBusy(true); setErr(null); setMsg(null)

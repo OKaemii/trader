@@ -121,7 +121,10 @@ export function WorldClock() {
   const [now, setNow] = useState<Date | null>(null)
 
   useEffect(() => {
-    setNow(new Date())
+    // `now` stays null on the server (effects don't run during SSR) so the markup matches on
+    // hydration; we then populate the real client clock. The first set is queued as a microtask
+    // so nothing sets state in the synchronous effect body; the interval keeps it ticking.
+    queueMicrotask(() => setNow(new Date()))
     const id = setInterval(() => setNow(new Date()), 30_000)
     return () => clearInterval(id)
   }, [])

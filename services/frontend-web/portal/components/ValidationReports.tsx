@@ -70,10 +70,11 @@ export function ValidationReports({ refreshKey, initial = null }: ValidationRepo
   }, [load])
 
   // Skip the initial load when SSR seeded us. Subsequent refreshKey bumps from the
-  // backtest runner still trigger refetches.
+  // backtest runner still trigger refetches. load()'s setState lands after the fetch await,
+  // not synchronously; queue it as a microtask so nothing sets state in the effect body.
   useEffect(() => {
     if (initial !== null && refreshKey === 0) return
-    load()
+    queueMicrotask(() => load())
   }, [load, refreshKey, initial])
 
   return (
