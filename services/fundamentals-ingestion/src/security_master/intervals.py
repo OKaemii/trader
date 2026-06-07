@@ -74,7 +74,13 @@ def _effective_upper_bounds(rows: list[IdentifierInterval]) -> dict[int, Optiona
 def resolve_interval(
     rows: list[IdentifierInterval], identifier_value: str, as_of_ms: int
 ) -> Optional[IdentifierInterval]:
-    """Return the interval of `identifier_value` that contains `as_of_ms`, or None.
+    """STRICT effective-dated match: the interval of `identifier_value` whose half-open window
+    contains `as_of_ms`, or None when the value itself was not in force at that instant.
+
+    "FB" @ 2019 → the FB interval; "META" @ 2019 → None (the string "META" wasn't the ticker yet).
+    This is the literal "what did this ticker string point at on this date?" answer; `resolve_symbol`
+    layers the headline "name-it-today, ask-about-its-past" fallback on top (see
+    `resolve_instrument_id`).
 
     `rows` are ALL intervals for the instrument(s) that ever carried `identifier_value` (so the
     successor of the queried value is present for read-time closure); the function filters to the
@@ -90,3 +96,35 @@ def resolve_interval(
             if best is None or row.effective_from > rows[best].effective_from:
                 best = idx
     return rows[best] if best is not None else None
+
+
+def resolve_instrument_id(
+    rows: list[IdentifierInterval], identifier_value: str, as_of_ms: int
+) -> Optional[int]:
+    """The instrument `identifier_value` IDENTIFIES, with the as-of fallback the QA headline needs.
+
+    The plan's headline guarantee is `resolve_symbol("META", "2019-01-01")` → the FB-era INSTRUMENT
+    (so its 2019 fundamentals can then be read): the caller names the instrument by the ticker it
+    carries TODAY and asks about its past. So:
+      1. If `identifier_value`'s own interval contains `as_of` (the strict match), use that interval's
+         instrument — `resolve_symbol("FB", 2019)` lands here.
+      2. Otherwise the value names an instrument by an identifier that wasn't in force at `as_of`
+         (the rename case: "META" asked about 2019). Fall back to the instrument that carries this
+         value in its MOST RECENT interval — `resolve_symbol("META", 2019)` lands here and returns the
+         same instrument FB resolves to. This is an identity hop (CIK/instrument are rename-invariant),
+         not a temporal claim that "META" was the 2019 ticker.
+
+    Both FB and META therefore resolve to the same instrument for a 2019 as-of; the FACTS read at that
+    instrument are still gated by `as_of` downstream. Returns None only when the value is unknown
+    entirely."""
+    strict = resolve_interval(rows, identifier_value, as_of_ms)
+    if strict is not None:
+        return strict.instrument_id
+    # Fallback: the instrument whose latest interval carries this value (present identity → past data).
+    latest: Optional[int] = None
+    for idx, row in enumerate(rows):
+        if row.identifier_value != identifier_value:
+            continue
+        if latest is None or row.effective_from > rows[latest].effective_from:
+            latest = idx
+    return rows[latest].instrument_id if latest is not None else None

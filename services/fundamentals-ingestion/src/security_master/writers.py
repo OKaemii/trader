@@ -239,6 +239,18 @@ class SecurityMasterWriter:
         than mutating a previously open-ended row, which it does not. Idempotent via
         `append_identifier` (re-running the same change is a no-op).
 
+        TWO INGESTION ORDERS, both resolve correctly:
+          * BACKFILL (the rename is historical fact): this method inserts the prior ticker *already
+            closed* at `changed_at_ms` and the new ticker open — the explicit `effective_to` is set on
+            the first and only write of the prior row.
+          * INCREMENTAL (the prior ticker was first appended OPEN while current, then the rename is
+            detected later): an open `(old_ticker, old_effective_from)` row already exists, so
+            `append_identifier`'s exact-interval idempotency returns it UNCHANGED (it is not mutated —
+            no UPDATE grant) and only the new ticker is appended. The prior interval is then closed
+            *on read* by the successor's `effective_from` (resolver.py / intervals.py) — so the FB→META
+            resolution is identical whether or not the explicit `effective_to` ever landed. Passing the
+            real `old_effective_from` is what lets the two writes line up on the same interval.
+
         `old_effective_from` defaults to 0 (epoch) so a backfilled history that only knows "this
         ticker existed before the change" still has a valid lower bound; pass the real first-seen
         instant when known."""

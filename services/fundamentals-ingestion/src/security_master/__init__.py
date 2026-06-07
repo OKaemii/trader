@@ -31,7 +31,7 @@ from .openfigi import (
     OpenFigiClient,
     parse_mapping_response,
 )
-from .intervals import IdentifierInterval, resolve_interval
+from .intervals import IdentifierInterval, resolve_instrument_id, resolve_interval
 from .pool import close_pool, get_pool, timescale_url
 from .rate_limiter import RateLimiter
 from .resolver import ResolvedInstrument, SecurityMasterResolver, pad_cik
@@ -72,6 +72,7 @@ __all__ = [
     "pad_cik",
     "IdentifierInterval",
     "resolve_interval",
+    "resolve_instrument_id",
     # EDGAR
     "EdgarSubmissionsClient",
     "TickerMapEntry",

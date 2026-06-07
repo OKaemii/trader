@@ -22,7 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from .intervals import IdentifierInterval, resolve_interval
+from .intervals import IdentifierInterval, resolve_instrument_id, resolve_interval
 from .writers import ID_FIGI, ID_TICKER
 
 
@@ -31,7 +31,14 @@ class ResolvedInstrument:
     """The instrument an identifier resolved to at an as-of instant, with the matched interval and
     the owning company's CIK (for the EDGAR fact join). `effective_to` is the row's STORED upper
     bound (NULL ⇒ it was open in storage; the read-time successor close is applied during matching
-    but not back-written, since the table is append-only)."""
+    but not back-written, since the table is append-only).
+
+    `valid_at_as_of` distinguishes the two resolution paths the headline needs: True when the queried
+    identifier string was itself in force at `as_of` (the strict interval match — `resolve_symbol("FB",
+    2019)`); False when the instrument was reached by its PRESENT identity for a past `as_of` at which
+    that string wasn't yet the ticker (`resolve_symbol("META", 2019)` → the FB-era instrument). Either
+    way `instrument_id`/`cik` are correct (they are rename-invariant); the flag just tells a caller
+    whether the matched_value was the literal as-of ticker."""
 
     instrument_id: int
     company_id: int
@@ -40,9 +47,10 @@ class ResolvedInstrument:
     matched_value: str
     effective_from: int
     effective_to: Optional[int]
+    valid_at_as_of: bool = True
 
 
-def _to_resolved(interval: IdentifierInterval) -> ResolvedInstrument:
+def _to_resolved(interval: IdentifierInterval, *, valid_at_as_of: bool) -> ResolvedInstrument:
     return ResolvedInstrument(
         instrument_id=interval.instrument_id,
         company_id=interval.company_id,
@@ -51,6 +59,7 @@ def _to_resolved(interval: IdentifierInterval) -> ResolvedInstrument:
         matched_value=interval.identifier_value,
         effective_from=interval.effective_from,
         effective_to=interval.effective_to,
+        valid_at_as_of=valid_at_as_of,
     )
 
 
@@ -106,14 +115,35 @@ class SecurityMasterResolver:
     async def _resolve_by_identifier(
         self, identifier_type: str, identifier_value: str, as_of_ms: int
     ) -> Optional[ResolvedInstrument]:
+        """Resolve `identifier_value` to its instrument with the headline as-of fallback:
+        strict in-interval match first (the string was the live identifier at `as_of`), else the
+        instrument named by this value's most-recent interval (present identity → past as_of)."""
         rows = await self._candidate_intervals(identifier_type, identifier_value)
-        interval = resolve_interval(rows, identifier_value, as_of_ms)
-        return _to_resolved(interval) if interval is not None else None
+        # Strict: was this exact value in force at as_of?
+        strict = resolve_interval(rows, identifier_value, as_of_ms)
+        if strict is not None:
+            return _to_resolved(strict, valid_at_as_of=True)
+        # Fallback: the instrument this value names today (or in its latest interval). Pull that
+        # interval out so the returned row still carries the instrument's join columns.
+        instrument_id = resolve_instrument_id(rows, identifier_value, as_of_ms)
+        if instrument_id is None:
+            return None
+        latest = max(
+            (r for r in rows if r.identifier_value == identifier_value),
+            key=lambda r: r.effective_from,
+            default=None,
+        )
+        return _to_resolved(latest, valid_at_as_of=False) if latest is not None else None
 
     async def resolve_symbol(self, ticker: str, as_of_ms: int) -> Optional[ResolvedInstrument]:
-        """Resolve a *ticker* as-of `as_of_ms` to the instrument it pointed at then. The FB→META
-        case: `resolve_symbol("FB", <2022-06-09)` and `resolve_symbol("META", >=2022-06-09)` both
-        return the same instrument; `resolve_symbol("FB", >=2022-06-09)` returns None."""
+        """Resolve a *ticker* to the instrument it identifies, honouring the headline FB→META case.
+
+        `resolve_symbol("FB", 2019)` and `resolve_symbol("META", 2019)` BOTH return the same FB-era
+        instrument (META reaches it via the present-identity fallback; the returned
+        `valid_at_as_of=False` flags that "META" wasn't the literal 2019 ticker); `resolve_symbol("FB",
+        2023)` ALSO returns it (FB names the instrument; valid_at_as_of=False since FB closed in 2022).
+        The instrument + CIK are rename-invariant, so the caller reads the right fundamentals as-of
+        whichever date — the whole point of the effective-dated security master."""
         return await self._resolve_by_identifier(ID_TICKER, ticker, as_of_ms)
 
     async def resolve_figi(self, figi: str, as_of_ms: int) -> Optional[ResolvedInstrument]:
