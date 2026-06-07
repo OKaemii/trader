@@ -45,6 +45,11 @@ export interface ISignalRepository {
   // List signals whose lifecycle is in `states`, oldest-first by timestamp. Used by the
   // portal "In transit" / "Failed" filter views.
   findByLifecycle(states: TradeSignal['lifecycle'][], limit: number): Promise<TradeSignal[]>;
+  // Every signal this ticker has ever emitted, newest-first by timestamp, ALL lifecycles
+  // (incl. failed/cancelled). The per-symbol Research Signals tab is a history view, not a
+  // tradeable feed, so the {executed, closed} failure-invariant filter does NOT apply here —
+  // the tab shows the full audit trail and each card carries its own lifecycle chip.
+  findByTicker(ticker: string, limit: number): Promise<TradeSignal[]>;
   // Bulk-cancel BUY signals currently in {pending, approved, queued} → failed with
   // the supplied reason. Used by the RiskEngine when the circuit breaker trips: stop
   // the bleed by killing the BUY pipeline (SELLs are typically risk-exits and stay).

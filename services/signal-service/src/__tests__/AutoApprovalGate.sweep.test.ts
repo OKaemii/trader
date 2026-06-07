@@ -55,6 +55,7 @@ class FakeRepo implements ISignalRepository {
     if (states.includes(SignalLifecycle.Pending)) return this.pending;
     return [];
   }
+  async findByTicker() { return []; }
 }
 
 describe("AutoApprovalGate.startSweeper", () => {

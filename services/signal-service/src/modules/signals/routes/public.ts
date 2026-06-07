@@ -197,12 +197,24 @@ export function createRouter(deps: Deps): Hono {
     return c.json({ ticker, strategies });
   });
 
+  // Per-symbol signal history — backs the Research workspace Signals tab (one symbol's signals,
+  // newest-first, ALL lifecycles incl. failed/cancelled — it's an audit trail, not a tradeable
+  // feed, so the {executed,closed} failure-invariant filter does NOT apply). Reads THIS service's
+  // own signals collection (no cross-service hop). Registered before the trailing `:id` route:
+  // `by-ticker` is a static segment, so Hono matches `/by-ticker/<t>` here ahead of `:id`.
+  router.get('/admin/api/signals/by-ticker/:ticker', async (c) => {
+    const ticker = c.req.param('ticker')!;
+    const limit = Math.min(parseInt(c.req.query('limit') ?? '50'), 200);
+    const signals = await deps.signalRepo.findByTicker(ticker, limit);
+    return c.json({ ticker, signals });
+  });
+
   // Single signal by id — backs the portal /signals/:id detail page (and the
   // notification-email "View full analysis →" deep link). Reads THIS service's own
   // signals collection via the repo, so there is no cross-service /internal/* hop and
   // no 403 trap. Registered after the literal /admin/api/signals/* routes so Hono's
-  // static segments (history, approve, retry, cancel, risk/*, …) keep priority over
-  // this `:id` param.
+  // static segments (history, approve, retry, cancel, risk/*, by-ticker, …) keep priority
+  // over this `:id` param.
   router.get('/admin/api/signals/:id', async (c) => {
     const signal = await deps.signalRepo.findById(c.req.param('id')!);
     if (!signal) return c.json({ error: 'not found' }, 404);

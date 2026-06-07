@@ -49,6 +49,7 @@ class StubRepo implements ISignalRepository {
   async retry(id: string) { this.retried.push(id); }
   async sweepStaleExecuting() { return 0; }
   async findByLifecycle() { return []; }
+  async findByTicker() { return []; }
 }
 
 function signal(id: string, lifecycle: SignalLifecycle): TradeSignal {

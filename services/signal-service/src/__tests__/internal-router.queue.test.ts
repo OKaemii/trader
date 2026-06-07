@@ -45,6 +45,7 @@ class StubRepo implements ISignalRepository {
   async retry() {}
   async sweepStaleExecuting(_ms: number) { return this.sweptCount; }
   async findByLifecycle() { return []; }
+  async findByTicker() { return []; }
 }
 
 class StubPublisher implements ISignalPublisher {

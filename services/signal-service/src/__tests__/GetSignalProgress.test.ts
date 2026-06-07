@@ -24,6 +24,7 @@ class StubRepo implements ISignalRepository {
   async retry() {}
   async sweepStaleExecuting() { return 0; }
   async findByLifecycle() { return []; }
+  async findByTicker() { return []; }
 }
 
 class StubPortfolio implements IPortfolioState {
