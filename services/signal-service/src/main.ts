@@ -41,6 +41,7 @@ async function main(): Promise<void> {
         findRecent:       deps.findRecent,
         approveSignal:    deps.approveSignal,
         getProgress:      deps.getProgress,
+        getStrategyImpact: deps.getStrategyImpact,
         autoApprovalGate: deps.autoApprovalGate,
         signalRepo:       deps.signalRepo,
         riskEngine:       deps.riskEngine,

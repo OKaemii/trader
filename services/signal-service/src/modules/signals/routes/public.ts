@@ -4,6 +4,7 @@ import { parseUserHeaders, parseAdminHeaders } from '@trader/shared-auth/middlew
 import { Signals as SignalsContracts } from '@trader/contracts';
 import type { ApproveSignalUseCase } from '../../approval/application/ApproveSignal.ts';
 import type { GetSignalProgressUseCase } from '../application/GetSignalProgress.ts';
+import type { GetStrategyImpactUseCase } from '../application/GetStrategyImpact.ts';
 import type { AutoApprovalGate } from '../../approval/application/AutoApprovalGate.ts';
 import type { ISignalRepository } from '../domain/ISignalRepository.ts';
 import type { RiskEngine } from '../../risk/application/RiskEngine.ts';
@@ -14,6 +15,7 @@ interface Deps {
   findRecent: { execute: (limit: number) => Promise<unknown[]> };
   approveSignal: ApproveSignalUseCase;
   getProgress: GetSignalProgressUseCase;
+  getStrategyImpact: GetStrategyImpactUseCase;
   autoApprovalGate: AutoApprovalGate;
   signalRepo: ISignalRepository;
   riskEngine: RiskEngine;
@@ -181,6 +183,18 @@ export function createRouter(deps: Deps): Hono {
     const trip = await deps.tripRecorder.findById(c.req.param('id')!);
     if (!trip) return c.json({ error: 'not found' }, 404);
     return c.json(trip);
+  });
+
+  // Strategy Impact — per-strategy view of where a ticker sits in the ranking, how often/long it's
+  // been held, and the realised P&L attributed to it. Computed from this service's own
+  // held_set_snapshots (rank/selected/holding age) + executed/closed signals (contribution), so
+  // there's no cross-service /internal hop. Registered before the literal-segment-vs-:id contest:
+  // `strategy-impact` is a static segment, so Hono matches it ahead of the trailing `:id` route.
+  router.get('/admin/api/signals/strategy-impact', async (c) => {
+    const ticker = c.req.query('ticker');
+    if (!ticker) return c.json({ error: 'ticker query param required' }, 400);
+    const strategies = await deps.getStrategyImpact.execute(ticker);
+    return c.json({ ticker, strategies });
   });
 
   // Single signal by id — backs the portal /signals/:id detail page (and the
