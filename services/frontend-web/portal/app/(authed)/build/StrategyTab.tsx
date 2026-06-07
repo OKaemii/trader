@@ -3,6 +3,8 @@ import { StrategyConfigEditor, type StrategyConfig } from '@/components/Strategy
 import { ActiveStrategySelector } from '@/components/ActiveStrategySelector'
 import { ForceRebalanceButton } from '@/components/ForceRebalanceButton'
 import { StrategyPipelinePanel, type PipelineData } from '@/components/StrategyPipelinePanel'
+import { Backlinks } from '@/components/Backlinks'
+import { fetchBacklinks } from '@/app/lib/research-notes'
 
 // SSR-seed the Strategy-Lab pipeline funnel for the active strategy (T37 §G). Degrades to empty
 // stages on any failure — the funnel renders its own empty-state, and a transient miss here must not
@@ -39,7 +41,12 @@ export async function StrategyTab() {
     active: string
   }
   const active = data.active ?? ''
-  const pipeline = await loadPipeline(active)
+  // Pipeline + the research notes that @-mention the active strategy (T34 §G backlinks) — both
+  // best-effort, fetched after the config so a miss in either never blanks the editor.
+  const [pipeline, backlinks] = await Promise.all([
+    loadPipeline(active),
+    active ? fetchBacklinks('strategy', active) : Promise.resolve([]),
+  ])
 
   return (
     <div className="space-y-6">
@@ -47,6 +54,7 @@ export async function StrategyTab() {
       <ForceRebalanceButton active={active} />
       <StrategyPipelinePanel initial={pipeline} />
       <StrategyConfigEditor initial={data.strategies ?? []} active={active} />
+      {active && <Backlinks kind="strategy" ref_={active} initial={backlinks} />}
     </div>
   )
 }
