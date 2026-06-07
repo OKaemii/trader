@@ -138,6 +138,27 @@ export const COLLECTIONS = {
   // Indexes (created by the writer task, NOT here): a backlink lookup over `links.ref`
   // ("notes referencing entity X").
   RESEARCH_NOTES:            'research_notes',
+  // Per-ticker corporate-actions store (cash dividends + stock splits) sourced from the EODHD
+  // Dividends/Splits feeds. Written by market-data-service's CorporateActionsStore via an
+  // INCREMENTAL sync — each pass fetches only the events newer than the last stored ex-date /
+  // split-effective date, so a re-sync with no new actions makes ZERO upstream EODHD calls
+  // (plan §I). One doc per ticker:
+  //   { _id: ticker,
+  //     dividends: [ { date,            // 'YYYY-MM-DD' ex-dividend date (point-in-time key)
+  //                    valuePerShare,   // gross dividend per share, BASE units (pence killed at
+  //                                     // the boundary — LSE pence ÷100 → GBP, like prices)
+  //                    currency? } ],   // EODHD-declared currency when present
+  //     splits:    [ { date,           // 'YYYY-MM-DD' split-effective date
+  //                    ratio,           // raw EODHD ratio string, e.g. '2/1'
+  //                    factor } ],      // ratio parsed to a share-count multiplier (NaN = don't auto-adjust)
+  //     lastDividendDate?,             // 'YYYY-MM-DD' max ex-date stored — the incremental `from` cursor
+  //     lastSplitDate?,                // 'YYYY-MM-DD' max split-date stored — the incremental `from` cursor
+  //     source, asOf, updatedAt }
+  // Read by the admin GET /admin/api/market-data/corporate-actions?ticker= (corporate-actions list
+  // on History) and by the internal GET /internal/api/dividend-yield (the point-in-time, backfillable
+  // Value dividend-yield leg the strategy factor host injects into HistoryView.fundamentals — §H;
+  // T9 factor host + T17 research-backfill consume it).
+  CORPORATE_ACTIONS:         'corporate_actions',
 } as const;
 
 export type CollectionName = typeof COLLECTIONS[keyof typeof COLLECTIONS];
