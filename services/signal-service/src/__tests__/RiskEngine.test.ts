@@ -21,6 +21,15 @@ function stubTradingClient(cash: CashResponse): TradingServiceClient {
     } as unknown as TradingServiceClient;
 }
 
+// Trading client whose getCash() throws — mirrors a trading-service /internal cash read
+// failing (T212 429 with no AccountCache snapshot, internal route unreachable, etc.).
+function stubThrowingTradingClient(message = 'T212 cash: 429'): TradingServiceClient {
+    return {
+        getCash:      async () => { throw new Error(message); },
+        getPositions: async (): Promise<PositionsResponse> => ({ positions: [] }),
+    } as unknown as TradingServiceClient;
+}
+
 // ── RISK_LIMITS — hard-limit values pinned as regression guards ───────────────
 describe('RISK_LIMITS hard limits', () => {
   it('volatilityTarget is 10%', () => {
@@ -276,5 +285,89 @@ describe('RiskEngine NAV — currency-aware via sumPositionsGBP', () => {
     const allow = await engine.canTrade();
     expect(allow.allowed).toBe(true);
     expect(allow.reason).toBeNull();
+  });
+
+  // ── Cash-fetch failure: last-good NAV fallback (Item 4 / card #49) ────────────
+  // The internal /internal/api/trading/cash read goes through trading-service's
+  // AccountCache; a sustained T212 429 or a pod restart before it warms makes getCash()
+  // throw. The fix degrades to the last-good NAV (cached in Redis from the prior complete
+  // reading) instead of reporting a phantom nav:0 on risk/status, while STILL marking the
+  // reading incomplete so the daily-loss/drawdown gates stay suppressed.
+
+  it('reports the last-good NAV (not 0) when the cash fetch fails after a clean reading', async () => {
+    const redis = makeRedis();   // shared store survives across the two engine reads
+    // First: a clean reading seeds risk:last_good_nav.
+    const good = new RiskEngine(
+      makeDb([]), redis, makeFx(1),
+      stubTradingClient(cashFixture(500, 6000)),
+      noopLogger,
+    );
+    const ok = await good.status();
+    expect(ok.nav).toBeCloseTo(6000, 4);
+
+    // Then: the cash fetch throws — status should fall back to the cached 6000, not 0.
+    const degraded = new RiskEngine(
+      makeDb([]), redis, makeFx(1),
+      stubThrowingTradingClient(),
+      noopLogger,
+    );
+    const status = await degraded.status();
+    expect(status.nav).toBeCloseTo(6000, 4);
+  });
+
+  it('keeps the gates suppressed (complete:false) on a cash-fetch failure despite the fallback NAV', async () => {
+    const redis = makeRedis();
+    // Seed a clean baseline of 6000 (also sets hwm + day_open_nav via canTrade).
+    const good = new RiskEngine(
+      makeDb([]), redis, makeFx(1),
+      stubTradingClient(cashFixture(500, 6000)),
+      noopLogger,
+    );
+    await good.canTrade();
+
+    // A cash-fetch failure must NOT trip the daily-loss/drawdown gates — even though the
+    // fallback NAV is reported, complete:false makes canTrade allow + skip the gates.
+    const degraded = new RiskEngine(
+      makeDb([]), redis, makeFx(1),
+      stubThrowingTradingClient(),
+      noopLogger,
+    );
+    const allow = await degraded.canTrade();
+    expect(allow.allowed).toBe(true);
+    expect(allow.reason).toBeNull();
+    // The circuit breaker must not have been opened by the degraded reading.
+    const status = await degraded.status();
+    expect(status.circuit_open).toBe(false);
+  });
+
+  it('reports nav 0 when the cash fetch fails with no prior good reading (no fallback available)', async () => {
+    const engine = new RiskEngine(
+      makeDb([]), makeRedis(), makeFx(1),
+      stubThrowingTradingClient(),
+      noopLogger,
+    );
+    const status = await engine.status();
+    expect(status.nav).toBe(0);
+  });
+
+  it('does not cache an incomplete reading as last-good (FX cross-check throw)', async () => {
+    const redis = makeRedis();
+    // FX throws → positionsOk=false → reading incomplete → must NOT write last_good_nav.
+    const throwingFx: FxConverter = { async toGBP() { throw new Error('fx down'); } };
+    const engine = new RiskEngine(
+      makeDb([{ ticker: 'AAPL_US_EQ', quantity: 5, currency: 'USD',
+                currentValue: { amount: 1000, currency: 'USD' } }]),
+      redis, throwingFx,
+      stubTradingClient(cashFixture(500, 2300)),
+      noopLogger,
+    );
+    await engine.status();
+    // A subsequent cash-fetch failure has nothing to fall back to → nav 0.
+    const degraded = new RiskEngine(
+      makeDb([]), redis, makeFx(1),
+      stubThrowingTradingClient(),
+      noopLogger,
+    );
+    expect((await degraded.status()).nav).toBe(0);
   });
 });
