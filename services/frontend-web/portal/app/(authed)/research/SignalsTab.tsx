@@ -5,6 +5,7 @@ import { RegimeWidget } from '@/components/RegimeWidget';
 import { StrategyHealthBanner } from '@/components/StrategyHealthBanner';
 import { QuantOnly } from '@/components/QuantOnly';
 import { authedFetch } from '@/app/lib/auth-fetch';
+import { getSystemHealth } from '@/app/lib/system-health';
 import type { StrategyOutput, SignalProgressDTO } from '@/types/trader';
 
 // Signals tab (IA-redesign Task 8 — was app/(authed)/signals/page.tsx, the list view;
@@ -19,19 +20,18 @@ async function fetchJsonOrNull<T>(path: string): Promise<T | null> {
   }
 }
 
-interface ServiceHealth { name: string; ok: boolean; status?: number }
-
 export async function SignalsTab() {
   // SSR every widget's seed data in parallel — the tab paints fully populated on
   // first byte. Strategy-engine's `strategy:latest_output` powers RegimeWidget,
   // FactorExposureChart, BettiCurveChart; signal-service exposes it via the
   // `/admin/api/signals/topology/snapshot` REST endpoint (and warm-replays it on the
   // WebSocket upgrade for live reconnects). SignalFeed seeds from
-  // `/api/signals/progress`; StrategyHealthBanner from `/api/admin/system/health`.
+  // `/api/signals/progress`; StrategyHealthBanner from the shared getSystemHealth() fan-out
+  // (server components can't fetch their own /portal-api/* route).
   const [snapshot, signalsBody, health] = await Promise.all([
     fetchJsonOrNull<{ data: StrategyOutput | null }>('/admin/api/signals/topology/snapshot'),
     fetchJsonOrNull<{ signals?: SignalProgressDTO[] }>('/api/signals/progress'),
-    fetchJsonOrNull<ServiceHealth[]>('/api/admin/system/health'),
+    getSystemHealth(),
   ]);
   const topo = snapshot?.data ?? null;
   const signals = signalsBody?.signals ?? [];
