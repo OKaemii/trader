@@ -90,6 +90,54 @@ export const COLLECTIONS = {
   // knowledge_ts, prior_hash, new_hash}. `prior_hash: null` marks the first-print —
   // useful for revision-rate dashboards. Powers GET /api/admin/market-data/revisions/:ticker.
   BAR_REVISIONS_LOG:         'bar_revisions_log',
+  // Append-only per-cycle research factor scores. One doc per (ticker, cycle): the canonical
+  // research-factor set (momentum/volatility/value/quality) computed over the active universe and
+  // persisted best-effort after compute_features (a store failure logs, never blocks emission).
+  // Written by strategy-engine's FactorStore (factor_store.py); read by the strategy-engine scores
+  // / factor-history endpoints (GET /admin/api/strategy/{scores,factor-history}) and, for the
+  // signal "Why?" panel, as-of the signal's knowledge time. Doc:
+  //   { ticker, observation_ts,            // cycle as_of_ms (knowledge time of these closes)
+  //     factors: {
+  //       momentum:   { raw, pct, source }, // pct = cross-sectional percentile (0..100)
+  //       volatility: { raw, pct, source },
+  //       value:      { raw, pct, source },
+  //       quality:    { raw, pct, source } } }
+  // Each factor stamps a `source` so a later point-in-time fundamentals warehouse can re-backfill
+  // and upgrade previously-`null` rows in place, matched by (ticker, observation_ts), guarded by
+  // the per-factor `source` (plan §H). `source` is one of:
+  //   'eod'                  — from our own EODHD-fed persisted daily series (price factors)
+  //   'div'                  — from the EODHD Dividends feed (value's dividend-yield component)
+  //   'yahoo-snapshot'       — forward-only Yahoo quoteSummary snapshot (quality; value earnings/book)
+  //   'pit-edgar'            — future US point-in-time EDGAR warehouse (out of scope this epic)
+  //   'pit-companies-house'  — future UK point-in-time Companies House warehouse (out of scope)
+  //   null                   — no source available (e.g. historical Quality pre-PIT-warehouse:
+  //                            { raw: null, pct: null, source: null } — never a fabricated value)
+  // Indexes (created by the writer task, NOT here): (ticker, observation_ts) and a partial
+  // "latest per ticker" lookup.
+  FACTOR_SCORES:             'factor_scores',
+  // Append-only per-cycle snapshot of the optimiser's held set. After the long-only optimiser
+  // produces the final weights each cycle, signal-service writes one doc per ranked name. Powers
+  // the Strategy Impact (GET /admin/api/signals/strategy-impact?ticker=) and Factor Evolution
+  // selected/holding context. Doc:
+  //   { strategy_id, observation_ts, ticker,
+  //     rank,              // from sorting composite_scores
+  //     selected,         // true = in the held set
+  //     weight,           // final long-only weight (0 when not selected)
+  //     holding_age_days } // days since the oldest open BUY for this ticker
+  // Indexes (created by the writer task, NOT here): (strategy_id, observation_ts) and
+  // (strategy_id, ticker, observation_ts) for per-name inclusion history.
+  HELD_SET_SNAPSHOTS:        'held_set_snapshots',
+  // Per-entity research notebook entry. signal-service's `research` module serves
+  // GET/PUT /admin/api/research/notes/:ticker. Body is operator-authored markdown; the `@`-links in
+  // the body are parsed into a backlink index so a strategy/signal/symbol view can list "notes
+  // referencing me". Doc:
+  //   { _id: <entity key, e.g. ticker>,
+  //     body,             // raw markdown
+  //     links: [ { kind: 'strategy' | 'signal' | 'symbol', ref } ],  // parsed @-links
+  //     updatedBy, updatedAt }
+  // Indexes (created by the writer task, NOT here): a backlink lookup over `links.ref`
+  // ("notes referencing entity X").
+  RESEARCH_NOTES:            'research_notes',
 } as const;
 
 export type CollectionName = typeof COLLECTIONS[keyof typeof COLLECTIONS];
