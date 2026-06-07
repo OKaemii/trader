@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import '@testing-library/jest-dom/vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { act } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -53,24 +53,28 @@ describe('ActiveStrategySelector', () => {
     expect(screen.getByText(/Currently running:/i)).toHaveTextContent('Currently running: high_velocity_v1')
   })
 
-  it('on a successful applied-live PUT, calls router.refresh() so the line re-seeds', async () => {
+  it('PUTs the newly-selected id (not the original active) and refreshes on an applied-live PUT', async () => {
+    // Render with factor_rank_v1 active, then drive a real dropdown change to a DIFFERENT strategy.
+    // This is the guard: the PUT body must carry the selection, not the original `active` — a
+    // regression that re-sends `active` would send factor_rank_v1 and fail here.
     const fetchMock = vi
       .fn()
       .mockResolvedValue(jsonResponse({ ok: true, selected: 'sector_momentum_v1', applied: 'sector_momentum_v1', appliedLive: true }))
     vi.stubGlobal('fetch', fetchMock)
 
-    render(<ActiveStrategySelector strategies={STRATEGIES} active="high_velocity_v1" />)
+    render(<ActiveStrategySelector strategies={STRATEGIES} active="factor_rank_v1" />)
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'sector_momentum_v1' } })
     await act(async () => {
       screen.getByRole('button', { name: /set active/i }).click()
     })
 
-    // PUT went to the portal-api proxy with the selected id.
+    // PUT went to the portal-api proxy with the newly-selected id, NOT the original active prop.
     expect(fetchMock).toHaveBeenCalledWith(
       '/portal-api/admin/strategy/active',
-      expect.objectContaining({ method: 'PUT', body: JSON.stringify({ strategy_id: 'high_velocity_v1' }) }),
+      expect.objectContaining({ method: 'PUT', body: JSON.stringify({ strategy_id: 'sector_momentum_v1' }) }),
     )
     await waitFor(() => expect(refreshMock).toHaveBeenCalledTimes(1))
-    expect(await screen.findByText(/Applied live/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Applied live — now running sector_momentum_v1/i)).toBeInTheDocument()
   })
 
   it('does not PUT or refresh when the confirm dialog is cancelled', async () => {
