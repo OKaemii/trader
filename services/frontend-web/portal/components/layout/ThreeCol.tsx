@@ -48,6 +48,14 @@ export function ThreeCol({
   // collapses (no `0fr` ghost gutter). The center is always present.
   const tracks = [left ? '1fr' : null, `${span}fr`, right ? '1fr' : null].filter(Boolean).join(' ')
 
+  // DOM order is ALWAYS left · center · right so it lines up 1:1 with the `tracks` list — at the xl
+  // breakpoint CSS-grid auto-placement fills the explicit columns in DOM order, so a mismatched DOM
+  // order would drop the (wide) center into a (narrow) rail track. The stacked (single-column)
+  // mobile order is decoupled via `order` utilities scoped to below-xl, which reset at xl so the
+  // grid honours DOM order again. Default: center first on mobile (focus paints first); railsFirst:
+  // natural source order (left rail leads).
+  const centerOrder = railsFirst ? '' : 'max-xl:order-first'
+
   const leftRail = left ? (
     <aside key="left" className="min-w-0 space-y-4">
       {left}
@@ -59,14 +67,10 @@ export function ThreeCol({
     </aside>
   ) : null
   const main = (
-    <section key="center" className="min-w-0 space-y-4">
+    <section key="center" className={`min-w-0 space-y-4 ${centerOrder}`.trim()}>
       {center}
     </section>
   )
-
-  // Stacked order: by default center first (focus paints first on mobile); railsFirst flips it so a
-  // page can lead the small-screen flow with its context rail.
-  const stacked = railsFirst ? [leftRail, main, rightRail] : [main, leftRail, rightRail]
 
   // grid-cols-1 holds below xl (single-column stack); at xl the arbitrary `grid-template-columns`
   // utility reads the runtime track list via a CSS var (Tailwind can't express a dynamic ratio).
@@ -76,7 +80,9 @@ export function ThreeCol({
       className={`grid grid-cols-1 gap-6 xl:[grid-template-columns:var(--three-col-tracks)] ${className}`.trim()}
       style={{ ['--three-col-tracks' as string]: tracks }}
     >
-      {stacked}
+      {leftRail}
+      {main}
+      {rightRail}
     </div>
   )
 }

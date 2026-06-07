@@ -19,7 +19,7 @@ describe('ThreeCol', () => {
     expect(screen.getByText('focus body')).toBeInTheDocument()
   })
 
-  it('renders both rails when provided, in left·center·right DOM order by default', () => {
+  it('renders DOM children in left·center·right order so they line up with the track list', () => {
     render(
       <ThreeCol
         left={<div>left rail</div>}
@@ -31,8 +31,28 @@ describe('ThreeCol', () => {
     const texts = within(grid)
       .getAllByText(/left rail|center body|right rail/)
       .map((n) => n.textContent)
-    // Default (railsFirst=false) stacks center first; both rails still present and ordered after.
-    expect(texts).toEqual(['center body', 'left rail', 'right rail'])
+    // DOM order MUST be left·center·right to match `tracks` (1fr 2fr 1fr) at xl — otherwise grid
+    // auto-placement would drop the wide center into a narrow rail track. The mobile stack order is
+    // decoupled below.
+    expect(texts).toEqual(['left rail', 'center body', 'right rail'])
+  })
+
+  it('stacks center first on mobile by default (focus paints first), via an order utility', () => {
+    render(
+      <ThreeCol left={<div>left rail</div>} center={<div>center body</div>} />,
+    )
+    // The center <section> carries the below-xl order override so it leads the single-column stack
+    // even though it sits second in the DOM (so the xl grid placement stays correct).
+    const center = screen.getByText('center body').parentElement
+    expect(center).toHaveClass('max-xl:order-first')
+  })
+
+  it('keeps natural source order on mobile when railsFirst is set (no order override)', () => {
+    render(
+      <ThreeCol railsFirst left={<div>left rail</div>} center={<div>center body</div>} />,
+    )
+    const center = screen.getByText('center body').parentElement
+    expect(center).not.toHaveClass('max-xl:order-first')
   })
 
   it('collapses an absent rail to no track (center + one rail only)', () => {
@@ -59,7 +79,7 @@ describe('ThreeCol', () => {
     expect(tracks(screen.getByTestId('three-col'))).toBe('1fr 1fr')
   })
 
-  it('renders rails before the center when railsFirst is set', () => {
+  it('keeps the left·center·right DOM order regardless of railsFirst (only mobile order differs)', () => {
     render(
       <ThreeCol
         railsFirst
@@ -72,6 +92,8 @@ describe('ThreeCol', () => {
     const texts = within(grid)
       .getAllByText(/left rail|center body|right rail/)
       .map((n) => n.textContent)
+    // DOM order is invariant (xl grid placement must stay correct); railsFirst only changes the
+    // below-xl stacking, asserted separately via the order utility.
     expect(texts).toEqual(['left rail', 'center body', 'right rail'])
   })
 })
