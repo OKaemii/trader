@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url'
 import react from '@vitejs/plugin-react'
 import { defineConfig } from 'vitest/config'
 
@@ -8,6 +9,13 @@ import { defineConfig } from 'vitest/config'
 // The react() plugin is wired so those component tests can render JSX with hooks.
 export default defineConfig({
   plugins: [react()],
+  // Mirror tsconfig's `@/*` → repo-root path mapping so component tests can render
+  // components that import via the `@/` alias (the codebase convention — e.g.
+  // CommandPalette → @/app/actions/auth). Pure-module tests still use relative
+  // imports; this only adds, never overrides, resolution.
+  resolve: {
+    alias: { '@': fileURLToPath(new URL('.', import.meta.url)) },
+  },
   test: {
     globals: true,
     environment: 'node',
