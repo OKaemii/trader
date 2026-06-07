@@ -24,11 +24,22 @@ COPY services/backtest-engine/src ./src
 COPY services/backtest-engine/conftest.py ./conftest.py
 COPY services/backtest-engine/tests ./tests
 
+# strategy-engine's PURE infrastructure suite (the FundamentalsAsOf PIT seam — no numpy, only
+# quant_core + httpx, both installed above). Isolated under ./strategy_engine so its `src.*`
+# package root doesn't collide with backtest-engine's `src` at /app, and run from that dir so
+# `python -m pytest` prepends it to sys.path and `import src.*` resolves (the same way the local
+# runner runs from services/strategy-engine). We gate ONLY the deps-light suites here
+# (test_fundamentals_as_of); the motor/respx-backed strategy-engine tests stay on the local dev
+# runner. Add more files here as they become deps-clean.
+COPY services/strategy-engine/src ./strategy_engine/src
+COPY services/strategy-engine/tests/test_fundamentals_as_of.py ./strategy_engine/tests/test_fundamentals_as_of.py
+
 # quant-core suite imports the installed package; backtest suite imports src.* (conftest puts
 # /app on the path). PYTHONDONTWRITEBYTECODE keeps the layer clean. -p no:cacheprovider avoids a
 # read-only-fs cache complaint. A non-zero exit here fails the build = the gate.
 ENV PYTHONDONTWRITEBYTECODE=1
 RUN python -m pytest quant_core_tests -q -p no:cacheprovider \
- && python -m pytest tests -q -p no:cacheprovider
+ && python -m pytest tests -q -p no:cacheprovider \
+ && (cd strategy_engine && python -m pytest tests -q -p no:cacheprovider)
 
 CMD ["true"]
