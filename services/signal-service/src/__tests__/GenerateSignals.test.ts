@@ -6,6 +6,7 @@ import type { ISignalPublisher } from '../modules/signals/domain/ISignalPublishe
 import type { IPortfolioState } from '../modules/risk/application/IPortfolioState.ts';
 import type { IPriceLookup } from '../modules/signals/domain/IPriceLookup.ts';
 import type { RiskEngine } from '../modules/risk/application/RiskEngine.ts';
+import type { HeldSetSnapshotDoc, IHeldSetSnapshotStore } from '../modules/signals/application/HeldSetSnapshot.ts';
 import { SignalLifecycle, type StrategyOutput } from '@trader/shared-types';
 import type { Logger } from '@trader/core';
 
@@ -59,6 +60,15 @@ class MockPriceLookup implements IPriceLookup {
     const out: Record<string, number | null> = {};
     for (const t of tickers) out[t] = this.prices[t] ?? null;
     return out;
+  }
+}
+
+class MockHeldSetSnapshotStore implements IHeldSetSnapshotStore {
+  written: HeldSetSnapshotDoc[][] = [];
+  constructor(private readonly throwOnWrite = false) {}
+  async write(docs: HeldSetSnapshotDoc[]) {
+    if (this.throwOnWrite) throw new Error('mongo down');
+    this.written.push(docs);
   }
 }
 
@@ -423,6 +433,66 @@ describe('GenerateSignalsUseCase', () => {
     for (const s of signals) {
       expect(s.features_snapshot?.report_cadence).toBeUndefined();
     }
+  });
+
+  // ── held_set_snapshots writer (Task 11) ───────────────────────────────────────
+
+  it('writes one held_set_snapshot doc per universe name after optimisation', async () => {
+    const store = new MockHeldSetSnapshotStore();
+    const uc = new GenerateSignalsUseCase(
+      repo, publisher, portfolioState, makeMockRiskEngine(), stubLogger, stubConfig,
+      undefined, undefined, undefined, undefined, undefined, store,
+    );
+    const features = baseFeatures();
+    await uc.execute(features);
+    expect(store.written).toHaveLength(1);
+    const docs = store.written[0];
+    expect(docs.map((d) => d.ticker).sort()).toEqual([...features.ticker_universe].sort());
+    // rank covers 1..N contiguously, AAPL (top score) is rank 1.
+    expect(docs.find((d) => d.ticker === 'AAPL')?.rank).toBe(1);
+    for (const d of docs) {
+      expect(d.strategy_id).toBe(features.strategy_id);
+      expect(d.observation_ts).toBe(features.timestamp);
+    }
+  });
+
+  it('held-set holding_age_days comes from the oldest open BUY of a currently-held name', async () => {
+    const store = new MockHeldSetSnapshotStore();
+    const held = new MockPortfolioState({ AAPL: 0.5 });
+    const fortyDaysAgo = Date.now() - 40 * 86_400_000;
+    repo.findOpenBuysByTicker = async (ticker: string) =>
+      ticker === 'AAPL'
+        ? [new TradeSignal({
+            id: 'buy-aapl', timestamp: fortyDaysAgo, ticker: 'AAPL', strategy_id: 'factor_rank_v1',
+            action: 'BUY', confidence: 0.8, targetWeight: 0.05, rationale: '{}',
+            lifecycle: SignalLifecycle.Executed, executedAt: fortyDaysAgo, executedQuantity: 10,
+          })]
+        : [];
+    const uc = new GenerateSignalsUseCase(
+      repo, publisher, held, makeMockRiskEngine(), stubLogger, stubConfig,
+      undefined, undefined, undefined, undefined, undefined, store,
+    );
+    await uc.execute(baseFeatures());
+    const aapl = store.written[0].find((d) => d.ticker === 'AAPL');
+    expect(aapl?.holding_age_days).toBe(40);
+    // Names that aren't held don't trigger an open-BUY lookup → age 0.
+    expect(store.written[0].find((d) => d.ticker === 'GOOG')?.holding_age_days).toBe(0);
+  });
+
+  it('a snapshot write failure logs but never blocks emission (best-effort contract)', async () => {
+    const store = new MockHeldSetSnapshotStore(true); // throws on write
+    const uc = new GenerateSignalsUseCase(
+      repo, publisher, portfolioState, makeMockRiskEngine(), stubLogger, stubConfig,
+      undefined, undefined, undefined, undefined, undefined, store,
+    );
+    const signals = await uc.execute(baseFeatures());
+    expect(signals.length).toBeGreaterThan(0);
+    expect(repo.saved).toHaveLength(signals.length);
+  });
+
+  it('emits normally when no snapshot store is wired (optional dependency)', async () => {
+    const signals = await useCase.execute(baseFeatures());
+    expect(signals.length).toBeGreaterThan(0);
   });
 });
 

@@ -11,6 +11,7 @@ import type { RiskEngine } from '../../risk/application/RiskEngine.ts';
 import type { StrategyDecayMonitor } from '../../approval/application/StrategyDecayMonitor.ts';
 import type { AutoApprovalGate } from '../../approval/application/AutoApprovalGate.ts';
 import type { PieManager } from '../../pie/application/PieManager.ts';
+import { buildHeldSetSnapshots, type IHeldSetSnapshotStore } from './HeldSetSnapshot.ts';
 import { randomUUID } from 'node:crypto';
 
 export interface GenerateSignalsConfig {
@@ -80,6 +81,7 @@ export class GenerateSignalsUseCase {
     private readonly priceLookup?: IPriceLookup,
     private readonly autoApprovalGate?: AutoApprovalGate,
     private readonly pieManager?: PieManager,
+    private readonly heldSetSnapshotStore?: IHeldSetSnapshotStore,
   ) {}
 
   async execute(features: StrategyOutput): Promise<TradeSignal[]> {
@@ -204,6 +206,12 @@ export class GenerateSignalsUseCase {
         this.logger.warn({ err }, 'pie sync failed (continuing without pie attribution)');
       }
     }
+
+    // held_set_snapshots (Task 11 §B). Now that the optimiser's final long-only `weights` are in
+    // hand, record one doc per ranked universe name (rank/selected/weight/holding-age) so Strategy
+    // Impact + Factor Evolution have a per-cycle inclusion history. Best-effort and awaited only
+    // for its internal error handling — the store swallows failures, so this never blocks emission.
+    await this.recordHeldSetSnapshot(features, weights, currentWeights);
 
     // Confidence normalisation: sign-aware, cross-sectional, scale-free. We compute p95
     // separately over positive and negative composite scores and pick the divisor matching
@@ -411,5 +419,42 @@ export class GenerateSignalsUseCase {
       });
     }
     return signals;
+  }
+
+  // Persist the per-cycle held_set_snapshot. Holding age comes from the oldest open BUY (the same
+  // executed-BUY lookup the FIFO/closure path uses, so failed orders never count). We only look up
+  // open BUYs for currently-held tickers — a name the optimiser newly selected but isn't held yet
+  // has no open BUY (age 0), and an un-held, un-selected name is age 0 by construction — so the
+  // lookup set is bounded by the position count, not the whole universe. Entirely best-effort: any
+  // failure logs and returns so the snapshot can never block signal emission.
+  private async recordHeldSetSnapshot(
+    features: StrategyOutput,
+    weights: number[],
+    currentWeights: Record<string, number>,
+  ): Promise<void> {
+    if (!this.heldSetSnapshotStore) return;
+    try {
+      const tickers = features.ticker_universe;
+      const heldTickers = tickers.filter((t) => (currentWeights[t] ?? 0) > 0);
+      const oldestOpenBuyAtByTicker: Record<string, number | undefined> = {};
+      await Promise.all(heldTickers.map(async (ticker) => {
+        const openBuys = await this.signalRepo.findOpenBuysByTicker(ticker);
+        // findOpenBuysByTicker returns executed BUYs oldest-first by executedAt; the first with a
+        // recorded executedAt is the FIFO entry leg whose age is the position's holding age.
+        const oldest = openBuys.find((b) => b.executedAt != null);
+        if (oldest?.executedAt != null) oldestOpenBuyAtByTicker[ticker] = oldest.executedAt;
+      }));
+      const docs = buildHeldSetSnapshots({
+        strategyId:    features.strategy_id,
+        observationTs: features.timestamp,
+        tickers,
+        weights,
+        scores:        tickers.map((t) => features.composite_scores[t] ?? 0),
+        oldestOpenBuyAtByTicker,
+      }, Date.now());
+      await this.heldSetSnapshotStore.write(docs);
+    } catch (err) {
+      this.logger.warn({ err }, 'held_set_snapshot capture failed (continuing — emission not blocked)');
+    }
   }
 }

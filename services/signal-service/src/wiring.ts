@@ -9,6 +9,7 @@ import type { SignalEnv } from "./env.ts";
 import { createSignalDataLayer } from "./shared/data.ts";
 import { PriceLookup } from "./shared/PriceLookup.ts";
 import { MongoSignalRepository } from "./modules/signals/infrastructure/MongoSignalRepository.ts";
+import { MongoHeldSetSnapshotStore } from "./modules/signals/infrastructure/MongoHeldSetSnapshotStore.ts";
 import { RedisSignalPublisher } from "./modules/signals/infrastructure/RedisSignalPublisher.ts";
 import { RedisStrategySubscriber } from "./modules/signals/infrastructure/RedisStrategySubscriber.ts";
 import { GenerateSignalsUseCase } from "./modules/signals/application/GenerateSignals.ts";
@@ -65,6 +66,7 @@ export async function wireDependencies(env: SignalEnv, logger: Logger) {
         alertRuleRepo, new LatestBarReader(db), redis as never, logger, env.ALERT_WATCH_INTERVAL_MS,
     );
     const publisher       = new RedisSignalPublisher(redis, logger);
+    const heldSetSnapshotStore = new MongoHeldSetSnapshotStore(db, logger);
     const generateSignals = new GenerateSignalsUseCase(
         signalRepo, publisher, portfolioState, riskEngine,
         logger,
@@ -74,7 +76,7 @@ export async function wireDependencies(env: SignalEnv, logger: Logger) {
             minPositivePeers:        env.MIN_POSITIVE_PEERS,
             minScoreEpsilon:         env.MIN_SCORE_EPSILON,
         },
-        undefined, decayMonitor, priceLookup, autoApprovalGate, pieManager,
+        undefined, decayMonitor, priceLookup, autoApprovalGate, pieManager, heldSetSnapshotStore,
     );
     const findRecent      = { execute: (limit: number) => signalRepo.findRecent(limit) };
     const getProgress     = new GetSignalProgressUseCase(signalRepo, portfolioState, priceLookup);
