@@ -44,6 +44,7 @@ import { closeAtOrBefore } from './modules/corporate-actions/application/price-a
 import { buildNewsStore } from './modules/news/wiring.ts';
 import { NewsRefreshScheduler } from './modules/news/application/NewsRefreshScheduler.ts';
 import { createNewsRouter } from './modules/news/routes.ts';
+import { createTechnicalRouter } from './modules/technical/routes.ts';
 import { createSectorsRouter } from './modules/sectors/routes.ts';
 import { startSectorEtfTracking } from './modules/sectors/tracking.ts';
 import { SwingScreener, startScreenerSchedule } from './modules/screener/SwingScreener.ts';
@@ -748,6 +749,13 @@ const newsRefresher = new NewsRefreshScheduler(
   { idleMs: env.NEWS_REFRESH_IDLE_MS, spacingMs: env.NEWS_REQUEST_SPACING_MS },
 );
 app.route('/', createNewsRouter(newsStore, newsRefresher));
+
+// Technical-indicator overlays — a thin, metered passthrough to EODHD's Technical API (Task 13's
+// eodhd-client.technical()) for the History page's supplemental overlays (T28, §H). No store: these
+// are a read-only research overlay (MACD/ADX/ATR/Bollinger/beta we don't compute client-side); the
+// trading factors stay in quant-core. Fetched on demand per overlay; degrades to [] on budget
+// exhaustion / not-entitled / error.
+app.route('/', createTechnicalRouter());
 
 // Sector-rotation heatmap — tracks the SPDR sector ETFs' daily bars (NOT in the tradeable
 // universe) and serves weekly sector-momentum. Tracking started in bootstrap() below.
