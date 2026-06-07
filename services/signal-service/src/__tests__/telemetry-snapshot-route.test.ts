@@ -35,6 +35,7 @@ const stubRepo: ISignalRepository = {
   retry: async () => {},
   sweepStaleExecuting: async () => 0,
   findByLifecycle: async () => [],
+  findByTicker: async () => [],
 };
 
 const stubPublisher: ISignalPublisher = { publish: async () => {} };

@@ -26,7 +26,7 @@ function adminHeaders() {
 }
 
 class StubRepo implements ISignalRepository {
-  constructor(private fixture: TradeSignal | null) {}
+  constructor(private fixture: TradeSignal | null, private byTicker: TradeSignal[] = []) {}
 
   async save() {}
   async findById(id: string) { return this.fixture && this.fixture.id === id ? this.fixture : null; }
@@ -44,6 +44,7 @@ class StubRepo implements ISignalRepository {
   async retry() {}
   async sweepStaleExecuting() { return 0; }
   async findByLifecycle() { return []; }
+  async findByTicker(ticker: string) { return this.byTicker.filter((s) => s.ticker === ticker); }
   async bulkCancelOpenBuys() { return []; }
 }
 
@@ -123,5 +124,53 @@ describe('GET /admin/api/signals/:id', () => {
     const body = await res.json();
     expect(body.failureReason).toBe(SignalFailureReason.MarketDrift);
     expect(body.failureDetail).toBe('price moved 1.4% since emission');
+  });
+});
+
+describe('GET /admin/api/signals/by-ticker/:ticker', () => {
+  function buy(id: string, ticker: string, lifecycle: SignalLifecycle): TradeSignal {
+    return new TradeSignal({
+      id, timestamp: 1_700_000_000_000, ticker, strategy_id: 'factor_rank_v1',
+      action: 'BUY', confidence: 0.4, targetWeight: 0.05, rationale: '{}', lifecycle,
+    });
+  }
+
+  it('401s without an admin token', async () => {
+    const app = buildApp(new StubRepo(null, [buy('s1', 'AAPL_US_EQ', SignalLifecycle.Executed)]));
+    const res = await app.request('/admin/api/signals/by-ticker/AAPL_US_EQ');
+    expect(res.status).toBe(401);
+  });
+
+  it('returns { ticker, signals } scoped to that symbol, including failed/cancelled rows', async () => {
+    // The per-symbol tab is an audit trail — a failed signal still belongs (unlike the
+    // tradeable-feed consumers that filter to {executed, closed}).
+    const fixtures = [
+      buy('a1', 'AAPL_US_EQ', SignalLifecycle.Executed),
+      buy('a2', 'AAPL_US_EQ', SignalLifecycle.Failed),
+      buy('b1', 'BP_l_EQ', SignalLifecycle.Executed),
+    ];
+    const res = await buildApp(new StubRepo(null, fixtures))
+      .request('/admin/api/signals/by-ticker/AAPL_US_EQ', { headers: adminHeaders() });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ticker).toBe('AAPL_US_EQ');
+    expect(body.signals.map((s: { id: string }) => s.id)).toEqual(['a1', 'a2']);
+    expect(body.signals.some((s: { lifecycle: number }) => s.lifecycle === SignalLifecycle.Failed)).toBe(true);
+  });
+
+  it('returns an empty list (200) for a symbol with no signals', async () => {
+    const res = await buildApp(new StubRepo(null, []))
+      .request('/admin/api/signals/by-ticker/TSLA_US_EQ', { headers: adminHeaders() });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ticker: 'TSLA_US_EQ', signals: [] });
+  });
+
+  it('does not get shadowed by the :id catch-all (static by-ticker segment wins)', async () => {
+    // If `:id` had priority, this would 404 (no signal with id "by-ticker"); instead the
+    // static by-ticker route claims it and returns the (empty) per-symbol list.
+    const res = await buildApp(new StubRepo(null, []))
+      .request('/admin/api/signals/by-ticker/MSFT_US_EQ', { headers: adminHeaders() });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ticker: 'MSFT_US_EQ', signals: [] });
   });
 });

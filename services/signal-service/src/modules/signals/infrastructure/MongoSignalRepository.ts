@@ -169,6 +169,17 @@ export class MongoSignalRepository implements ISignalRepository {
     });
   }
 
+  async findByTicker(ticker: string, limit: number): Promise<TradeSignal[]> {
+    // Newest-first, no lifecycle filter — the Research Signals tab is a per-symbol audit
+    // trail (every signal this name ever emitted), so failed/cancelled rows belong here.
+    return this.manager.findMany({
+      filter: { ticker },
+      sortBy: 'timestamp',
+      sortDir: 'desc',
+      limit,
+    });
+  }
+
   async bulkCancelOpenBuys(reason: SignalFailureReason, detail: string): Promise<string[]> {
     if (!this.collection) throw new Error('bulkCancelOpenBuys requires raw collection handle');
     // Snapshot the ids first so the trip post-mortem can list exactly which signals

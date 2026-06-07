@@ -43,6 +43,7 @@ class StubRepo implements ISignalRepository {
   async retry() {}
   async sweepStaleExecuting() { return 0; }
   async findByLifecycle() { return []; }   // No in-flight signals — clean slate
+  async findByTicker() { return []; }
 }
 class StubPublisher implements ISignalPublisher { async publish() {} }
 class StubPortfolioState implements IPortfolioState {

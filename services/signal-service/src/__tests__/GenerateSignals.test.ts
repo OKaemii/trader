@@ -40,6 +40,7 @@ class MockSignalRepository implements ISignalRepository {
   async retry(_id: string) {}
   async sweepStaleExecuting(_ms: number) { return 0; }
   async findByLifecycle() { return []; }
+  async findByTicker() { return []; }
 }
 
 class MockPublisher implements ISignalPublisher {
