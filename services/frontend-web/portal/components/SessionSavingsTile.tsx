@@ -38,7 +38,7 @@ export async function SessionSavingsTile() {
       <div className="flex items-start justify-between gap-2">
         <h2 className="text-sm font-medium text-gray-300">Yahoo calls saved by gate</h2>
         <Link
-          href="/research?tab=market-data"
+          href="/operations?tab=market-data"
           className="text-[11px] text-gray-400 underline-offset-2 hover:text-emerald-300 hover:underline"
         >
           calendar →

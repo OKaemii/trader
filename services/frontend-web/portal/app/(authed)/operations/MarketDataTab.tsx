@@ -4,7 +4,10 @@ import { SessionSavingsTile } from '@/components/SessionSavingsTile'
 import { authedFetch } from '@/app/lib/auth-fetch'
 import { MarketStateBadge, type MarketState } from '@/components/MarketStateBadge'
 
-// Market Data tab (IA-redesign Task 8). Composes three previously-separate surfaces:
+// Market Data tab (relocated to Operations — was app/(authed)/research/MarketDataTab.tsx).
+// This is the OPERATIONAL market-data admin (poll config / calendar / holiday feeds) — a
+// run-the-platform concern, not per-symbol research — so it lives beside Trade Audit /
+// Reconciliation / TCA. Company/price *data* stays in Research. Composes three surfaces:
 //  - the BAR_FREQUENCY / POLL_INTERVAL_MS / SIGNAL_ORDER_TYPE editor (was
 //    app/(authed)/market-data/page.tsx), still on the server-action data path
 //    (getMarketDataConfig/getMarketDataProviderInfo),
@@ -34,7 +37,11 @@ interface CalendarResponse {
 interface SourceHealthRow {
   market:         'US' | 'LSE'
   lastFetchedAt:  number | null
-  source:         'ical' | 'gov-uk' | 'cache' | 'static-fallback' | 'never'
+  // Mirror of HolidaySourceHealth['source'] (packages/shared-calendar/src/calendar.ts —
+  // the upstream union, + 'never' from HolidayCache when no table has been fetched). 'eodhd'
+  // is the EODHD Exchange-Details provider (Task 18), now the primary US source ahead of the
+  // static fallback. Keep this in sync with the upstream union.
+  source:         'eodhd' | 'ical' | 'gov-uk' | 'cache' | 'static-fallback' | 'never'
   ageMs:          number | null
 }
 

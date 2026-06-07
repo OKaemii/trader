@@ -61,14 +61,14 @@ export const COMMANDS: Command[] = [
     label: 'Research',
     group: GO_TO,
     href: '/research',
-    keywords: ['charts', 'market data', 'backtests', 'signals'],
+    keywords: ['history', 'charts', 'price', 'signals'],
   },
   {
     id: 'ws.build',
     label: 'Build',
     group: GO_TO,
     href: '/build',
-    keywords: ['strategy', 'console', 'operator', 'alerts'],
+    keywords: ['strategy', 'console', 'operator', 'alerts', 'backtests', 'validation'],
   },
   {
     id: 'ws.portfolio',
@@ -82,7 +82,7 @@ export const COMMANDS: Command[] = [
     label: 'Operations',
     group: GO_TO,
     href: '/operations',
-    keywords: ['trade audit', 'reconciliation', 'tca'],
+    keywords: ['trade audit', 'reconciliation', 'tca', 'market data', 'poll', 'calendar', 'holidays'],
   },
 
   // ── Discover tabs ─────────────────────────────────────────────────────────
@@ -92,15 +92,17 @@ export const COMMANDS: Command[] = [
   { id: 'ws.discover.calendar', label: 'Discover · Calendar', group: GO_TO, href: '/discover?tab=calendar', keywords: ['earnings', 'events'] },
 
   // ── Research tabs ─────────────────────────────────────────────────────────
-  { id: 'ws.research.charts', label: 'Research · Charts', group: GO_TO, href: '/research?tab=charts', keywords: ['candlestick', 'price', 'ohlc'] },
-  { id: 'ws.research.market-data', label: 'Research · Market Data', group: GO_TO, href: '/research?tab=market-data', keywords: ['bars', 'poll', 'sessions', 'holidays', 'calendar'] },
-  { id: 'ws.research.backtests', label: 'Research · Backtests', group: GO_TO, href: '/research?tab=backtests', keywords: ['validation', 'mcpt', 'pbo', 'walk forward'] },
+  // `history` is the price/candlestick view (the relocation kept it under this key as a
+  // placeholder; Task 23 grows it into the full per-symbol History tab). Market Data + Backtests
+  // relocated to Operations + Build respectively (Task 22).
+  { id: 'ws.research.history', label: 'Research · History', group: GO_TO, href: '/research?tab=history', keywords: ['charts', 'candlestick', 'price', 'ohlc', 'history'] },
   { id: 'ws.research.signals', label: 'Research · Signals', group: GO_TO, href: '/research?tab=signals', keywords: ['feed', 'regime', 'factor exposure', 'betti'] },
 
   // ── Build tabs ────────────────────────────────────────────────────────────
   { id: 'ws.build.strategy', label: 'Build · Strategy', group: GO_TO, href: '/build?tab=strategy', keywords: ['active strategy', 'params', 'config'] },
   { id: 'ws.build.console', label: 'Build · Console', group: GO_TO, href: '/build?tab=console', keywords: ['operator', 'panic', 'kill switch', 'flatten', 'pause'] },
   { id: 'ws.build.alerts', label: 'Build · Alerts', group: GO_TO, href: '/build?tab=alerts', keywords: ['notifications', 'webhook'] },
+  { id: 'ws.build.backtests', label: 'Build · Backtests', group: GO_TO, href: '/build?tab=backtests', keywords: ['validation', 'mcpt', 'pbo', 'walk forward', 'permutation'] },
 
   // ── Portfolio tabs ────────────────────────────────────────────────────────
   { id: 'ws.portfolio.positions', label: 'Portfolio · Positions', group: GO_TO, href: '/portfolio?tab=positions', keywords: ['holdings', 'open'] },
@@ -112,6 +114,7 @@ export const COMMANDS: Command[] = [
   { id: 'ws.operations.trade-audit', label: 'Operations · Trade Audit', group: GO_TO, href: '/operations?tab=trade-audit', keywords: ['fills', 'executions'] },
   { id: 'ws.operations.reconciliation', label: 'Operations · Reconciliation', group: GO_TO, href: '/operations?tab=reconciliation', keywords: ['recon', 'drift', 'mismatch'] },
   { id: 'ws.operations.tca', label: 'Operations · TCA', group: GO_TO, href: '/operations?tab=tca', keywords: ['transaction cost', 'slippage'] },
+  { id: 'ws.operations.market-data', label: 'Operations · Market Data', group: GO_TO, href: '/operations?tab=market-data', keywords: ['bars', 'poll', 'sessions', 'holidays', 'calendar', 'eodhd'] },
 
   // ── Global actions (no href — handled by id at the call site) ─────────────
   { id: 'act.toggle-mode', label: 'Toggle Beginner / Quant mode', group: ACTIONS, keywords: ['beginner', 'quant', 'complexity', 'simple', 'advanced'] },
