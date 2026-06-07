@@ -838,8 +838,10 @@ async def process_cycle(
 
         # The screen-survivor count for the funnel's first hard cut: high_velocity's QMJ+cap
         # eligibility (recorded in cross_sectional_stats) when present, else the history-filter pass
-        # count (bars-only strategies have no separate screen — eligible == ready).
-        _eligible = int((features.cross_sectional_stats.get("n_eligible") if features is not None else None) or _ready)
+        # count (bars-only strategies have no separate screen — eligible == ready). Explicit
+        # None-check (not `or _ready`) so a genuine zero-survivor screen reports 0, not _ready.
+        _n_eligible = features.cross_sectional_stats.get("n_eligible") if features is not None else None
+        _eligible = _ready if _n_eligible is None else int(_n_eligible)
 
         def _record_pipeline(scored: int, held: int, emitted: bool) -> None:
             # Snapshot the cycle's funnel counts for /admin/api/strategy/<id>/pipeline (T37 §G).
