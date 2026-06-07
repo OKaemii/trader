@@ -8,11 +8,21 @@ import { parseAdminHeaders, parseInternalHeaders } from '@trader/shared-auth/mid
 import type { FundamentalsCache } from './application/FundamentalsCache.ts';
 import type { FundamentalsRefreshScheduler } from './application/FundamentalsRefreshScheduler.ts';
 import type { UniverseManager } from '../universe/application/UniverseManager.ts';
+import type { YahooAnalystEstimates, AnalystEstimates } from './infrastructure/YahooAnalystEstimates.ts';
+
+// Best-effort analyst-estimates fetcher seam. The Research Fundamentals tab's analyst panel is
+// additive (§E/§H) — display-only, may trail — so the dependency is optional: when it isn't wired
+// (e.g. a future provider swap), the per-ticker endpoint simply omits the `analyst` block rather
+// than failing the whole read of the stored QMJ line items.
+export interface AnalystEstimatesFetcher {
+  fetch(ticker: string): Promise<AnalystEstimates | null>;
+}
 
 export function createFundamentalsRouter(
   cache: FundamentalsCache,
   universe: UniverseManager,
   refresher: FundamentalsRefreshScheduler,
+  analyst?: AnalystEstimatesFetcher | YahooAnalystEstimates,
 ): Hono {
   const r = new Hono();
 
@@ -48,6 +58,33 @@ export function createFundamentalsRouter(
     }
     refresher.triggerNow();
     return c.json({ ok: true, mode: 'background', started: true, universeSize: universe.activeTickers.length }, 202);
+  });
+
+  // Admin: the stored company_fundamentals (QMJ line items + ratios + market cap) for ONE ticker,
+  // plus best-effort Yahoo analyst estimates — the per-symbol Research Fundamentals tab. Registered
+  // AFTER the `coverage`/`refresh` literal paths so neither is captured by the `:ticker` param, and
+  // it additionally rejects those reserved words for defence in depth. `peek` reads the cached row
+  // only (no synchronous provider walk) — a missing row returns nulls (the tab shows "not yet
+  // fetched"), never a fabricated 0. The analyst block is additive: a Yahoo-session blip leaves it
+  // null and the stored line items still render.
+  r.get('/admin/api/market-data/fundamentals/:ticker', parseAdminHeaders, async (c) => {
+    const ticker = (c.req.param('ticker') ?? '').trim();
+    if (!ticker || ticker === 'coverage' || ticker === 'refresh') {
+      return c.json({ error: 'ticker path param required' }, 400);
+    }
+    const docs = await cache.peek([ticker]);
+    const doc = docs[ticker] ?? null;
+    const estimates = analyst ? await analyst.fetch(ticker).catch(() => null) : null;
+    return c.json({
+      ticker,
+      raw:          doc?.raw ?? null,
+      ratios:       doc?.ratios ?? null,
+      qualityPass:  doc?.qualityPass ?? null,   // null = fundamentals not yet fetched
+      marketCapGbp: doc?.marketCapGbp ?? null,
+      asOf:         doc?.asOf ?? null,
+      source:       doc?.source ?? null,
+      analyst:      estimates,                  // null = Yahoo estimates unavailable (additive, §H)
+    });
   });
 
   return r;
