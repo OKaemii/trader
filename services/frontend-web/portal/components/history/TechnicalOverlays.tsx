@@ -65,8 +65,11 @@ export function TechnicalOverlays({ symbol }: { symbol: string }) {
     }
   }
 
-  // The value keys to plot = the union of keys across points (EODHD names them per function).
-  const seriesKeys = points.length > 0 ? Object.keys(points[0]!.values) : []
+  // The value keys to plot = the UNION of keys across all points (EODHD names them per function).
+  // A union, not just points[0], because warm-up rows can omit a key that later rows carry (e.g.
+  // MACD's `signal` only appears once the slower EMA has enough history) — keying off the first row
+  // alone would silently drop that series.
+  const seriesKeys = Array.from(new Set(points.flatMap((p) => Object.keys(p.values))))
 
   return (
     <div className="space-y-3">

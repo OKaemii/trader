@@ -108,15 +108,14 @@ export function ReturnsDrawdownChart({ points }: { points: HistoryPoint[] }) {
 }
 
 function Toggle({
-  active, onClick, children, disabled,
-}: { active: boolean; onClick: () => void; children: React.ReactNode; disabled?: boolean }) {
+  active, onClick, children,
+}: { active: boolean; onClick: () => void; children: React.ReactNode }) {
   return (
     <button
       onClick={onClick}
-      disabled={disabled}
       className={`rounded px-2 py-1 text-sm ${
         active ? 'bg-gray-700 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
-      } ${disabled ? 'cursor-not-allowed opacity-50' : ''}`}
+      }`}
     >
       {children}
     </button>

@@ -56,7 +56,9 @@ export async function HistoryTab({ symbol }: { symbol: string }) {
   const enc = encodeURIComponent(symbol)
   // SSR every panel's seed in parallel so the tab paints fully populated on first byte.
   const [barsBody, caBody, factorBody, signalsBody] = await Promise.all([
-    fetchJson<{ bars?: RawBar[] }>(`/admin/api/market-data/bars/${enc}?interval=daily&range=2y`),
+    // 1y matches ChartsView's default range pill, so the seeded price chart and its control agree on
+    // load; the same daily series feeds Returns/Drawdowns. A longer window is one range-pill click away.
+    fetchJson<{ bars?: RawBar[] }>(`/admin/api/market-data/bars/${enc}?interval=daily&range=1y`),
     fetchJson<{ dividends?: StoredDividend[]; splits?: StoredSplit[] }>(
       `/admin/api/market-data/corporate-actions?ticker=${enc}`,
     ),
