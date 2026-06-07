@@ -91,7 +91,10 @@ export default async function WorkspacePage() {
       d ? !!d.enabled : null,
     ),
     fetchJsonOrNull<HoldingsInitial['positions']>('/admin/api/trading/positions'),
-    fetchJsonOrNull<HoldingsInitial['universe']>('/admin/api/universe/overrides'),
+    // Routed prefix is /admin/api/market-data/* (no bare /admin/api/universe/*). This is the same
+    // upstream the client poll + Discover's getUniverseOverrides() use; the response carries
+    // `sectorMap` (HoldingsInitial['universe']), so the Open-Positions sector pie SSR-seeds here.
+    fetchJsonOrNull<HoldingsInitial['universe']>('/admin/api/market-data/universe/overrides'),
     fetchJsonOrNull<CashInitial>('/admin/api/trading/cash'),
     fetchJsonOrNull<RiskStatusInitial>('/admin/api/signals/risk/status'),
     fetchJsonOrNull<{ signals?: SignalProgressDTO[] }>('/api/signals/progress'),
