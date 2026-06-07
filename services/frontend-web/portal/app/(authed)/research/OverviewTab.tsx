@@ -4,6 +4,8 @@ import { FactorBars, type FactorScores } from '@/components/FactorBars'
 import { MarketBadge } from '@/components/MarketBadge'
 import { marketOf } from '@/components/market'
 import { ResearchNotes } from '@/components/ResearchNotes'
+import { StrategyExposureTable, type StrategyExposureRow } from '@/components/StrategyExposureTable'
+import { ThreeCol } from '@/components/layout/ThreeCol'
 import { fetchResearchNote } from '@/app/lib/research-notes'
 import type { SignalProgressDTO } from '@/types/trader'
 import { SignalLifecycle } from '@/types/trader'
@@ -33,16 +35,6 @@ interface RawBar {
   low: number
   close: number
   volume: number
-}
-
-/** One per-strategy exposure row for a ticker (from /admin/api/signals/strategy-impact?ticker=). */
-interface StrategyImpactRow {
-  strategyId: string
-  currentRank: number | null
-  historicalInclusionPct: number
-  avgHoldingDays: number
-  contributionPct: number
-  selected: boolean
 }
 
 interface NewsArticle {
@@ -100,10 +92,10 @@ async function fetchSymbolSignals(symbol: string): Promise<SignalProgressDTO[]> 
 }
 
 /** Per-strategy exposure rows for the ticker. Best-effort — degrades to []. */
-async function fetchExposure(symbol: string): Promise<StrategyImpactRow[]> {
+async function fetchExposure(symbol: string): Promise<StrategyExposureRow[]> {
   const r = await authedFetch(`/admin/api/signals/strategy-impact?ticker=${encodeURIComponent(symbol)}`)
   if (!r.ok) return []
-  const data = (await r.json().catch(() => null)) as { strategies?: StrategyImpactRow[] } | null
+  const data = (await r.json().catch(() => null)) as { strategies?: StrategyExposureRow[] } | null
   return data?.strategies ?? []
 }
 
@@ -145,7 +137,7 @@ function ActiveSignals({ signals }: { signals: SignalProgressDTO[] }) {
                 {SignalLifecycle[lifecycle]?.toLowerCase() ?? 'pending'}
               </span>
             </div>
-            <div className="flex items-center gap-3 font-mono text-xs text-gray-300">
+            <div className="flex items-center gap-3 font-mono text-xs tabular-nums text-gray-300">
               <span title="target weight">{(s.targetWeight * 100).toFixed(1)}%</span>
               {/* P&L is genuinely unknown until there's a current price — show "—", never 0. */}
               <span className={s.pnlPct === null ? 'text-gray-500' : s.pnlPct >= 0 ? 'text-green-400' : 'text-red-400'}>
@@ -156,50 +148,6 @@ function ActiveSignals({ signals }: { signals: SignalProgressDTO[] }) {
         )
       })}
     </ul>
-  )
-}
-
-function StrategyExposure({ rows }: { rows: StrategyImpactRow[] }) {
-  if (rows.length === 0) {
-    return <p className="text-sm text-gray-400">No strategy has ranked or traded this symbol yet.</p>
-  }
-  return (
-    <div className="overflow-x-auto">
-      <table className="w-full text-left text-sm">
-        <thead>
-          <tr className="text-[10px] uppercase tracking-wide text-gray-500">
-            <th className="pb-2 pr-4 font-medium">Strategy</th>
-            <th className="pb-2 pr-4 font-medium">Rank</th>
-            <th className="pb-2 pr-4 font-medium">Held %</th>
-            <th className="pb-2 pr-4 font-medium">Avg hold</th>
-            <th className="pb-2 pr-4 font-medium">Contribution</th>
-            <th className="pb-2 font-medium">In book</th>
-          </tr>
-        </thead>
-        <tbody className="font-mono text-xs text-gray-300">
-          {rows.map((r) => (
-            <tr key={r.strategyId} className="border-t border-gray-800">
-              <td className="py-2 pr-4 font-sans text-gray-200">{r.strategyId}</td>
-              {/* currentRank null ⇒ ranked-never; show "—", not a placeholder rank. */}
-              <td className="py-2 pr-4">{r.currentRank === null ? '—' : r.currentRank}</td>
-              <td className="py-2 pr-4">{(r.historicalInclusionPct * 100).toFixed(0)}%</td>
-              <td className="py-2 pr-4">{r.avgHoldingDays > 0 ? `${r.avgHoldingDays.toFixed(0)}d` : '—'}</td>
-              <td className={`py-2 pr-4 ${r.contributionPct >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                {r.contributionPct >= 0 ? '+' : ''}
-                {(r.contributionPct * 100).toFixed(2)}%
-              </td>
-              <td className="py-2">
-                {r.selected ? (
-                  <span className="text-emerald-400">held</span>
-                ) : (
-                  <span className="text-gray-500">no</span>
-                )}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
   )
 }
 
@@ -260,6 +208,7 @@ export async function OverviewTab({ symbol }: { symbol: string }) {
 
   return (
     <div className="space-y-5">
+      {/* The price chart is the symbol's focus — it leads full-bleed above the analysis grid. */}
       {bars.length > 0 ? (
         <CandlestickChart bars={bars} />
       ) : (
@@ -268,30 +217,40 @@ export async function OverviewTab({ symbol }: { symbol: string }) {
         </div>
       )}
 
-      <div className="grid gap-5 lg:grid-cols-2">
-        <FactorBars ticker={symbol} initial={scores} />
-        <Panel title="Active signals">
-          <ActiveSignals signals={signals} />
-        </Panel>
-      </div>
-
-      <Panel title="Strategy exposure">
-        <StrategyExposure rows={exposure} />
-      </Panel>
-
-      <Panel title="Research notes">
-        {/* The notebook for this symbol — markdown editor/preview, server-seeded. @-mentions in the
-            body (e.g. @strategy:factor_rank_v1) become backlinks surfaced on those entities' views. */}
-        <ResearchNotes ticker={symbol} initial={note} />
-      </Panel>
-
-      <Panel title="Recent events">
-        <div className="mb-1 flex items-center gap-2">
-          <MarketBadge market={market} />
-          <span className="text-[10px] uppercase tracking-wide text-gray-500">EODHD news</span>
-        </div>
-        <RecentEvents articles={news} />
-      </Panel>
+      {/* Density (plan §C): the analytical core (factors · signals · strategy exposure) takes the
+          wide center; the context rail (notes + recent events) sits subordinate on the right. The
+          ThreeCol collapses the absent left track, so the center widens with no ghost gutter, and
+          stacks to one column below xl (context after the core on mobile). */}
+      <ThreeCol
+        centerSpan={2}
+        center={
+          <>
+            <FactorBars ticker={symbol} initial={scores} />
+            <Panel title="Active signals">
+              <ActiveSignals signals={signals} />
+            </Panel>
+            <Panel title="Strategy exposure">
+              <StrategyExposureTable rows={exposure} />
+            </Panel>
+          </>
+        }
+        right={
+          <>
+            <Panel title="Research notes">
+              {/* The notebook for this symbol — markdown editor/preview, server-seeded. @-mentions
+                  in the body (e.g. @strategy:factor_rank_v1) become backlinks on those entities. */}
+              <ResearchNotes ticker={symbol} initial={note} />
+            </Panel>
+            <Panel title="Recent events">
+              <div className="mb-1 flex items-center gap-2">
+                <MarketBadge market={market} />
+                <span className="text-[10px] uppercase tracking-wide text-gray-500">EODHD news</span>
+              </div>
+              <RecentEvents articles={news} />
+            </Panel>
+          </>
+        }
+      />
     </div>
   )
 }
