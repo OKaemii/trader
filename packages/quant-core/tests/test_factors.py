@@ -1,12 +1,17 @@
 """Factor Composite behaviour. Run in CI / a venv with the quant-core deps installed:
     pip install -e packages/quant-core[test] && pytest packages/quant-core
 """
+import math
+
 from quant_core.strategy.contract import HistoryView, StrategyParams
 from quant_core.strategy.factors import (
     CompositeFactor,
+    Factor,
     LowVolFactor,
     MomentumFactor,
+    QualityFactor,
     ReversalFactor,
+    ValueFactor,
 )
 from quant_core.strategy.collaborators.trend_filter import TrendFilter
 
@@ -19,12 +24,13 @@ CLOSES = {
 }
 
 
-def _history(closes=None) -> HistoryView:
+def _history(closes=None, fundamentals=None) -> HistoryView:
     closes = closes or CLOSES
     return HistoryView(
         closes=closes,
         volumes={t: [1.0] * len(c) for t, c in closes.items()},
         timestamps={t: list(range(len(c))) for t, c in closes.items()},
+        fundamentals=fundamentals or {},
     )
 
 
@@ -84,3 +90,129 @@ def test_trend_filter_excludes_downtrend_and_scales_exposure():
     assert set(held) == {"UP"}        # DOWN dropped (absolute momentum < 0)
     assert tel["breadth"] == 0.5
     assert exposure == 0.0            # breadth 0.5 < floor 0.6 → risk-off scalar
+
+
+# --- Continuous Quality + Value factors ------------------------------------------------------
+
+_P = StrategyParams(values={})
+
+# Four names spanning the quality spectrum: HQ is profitable, high-margin, low-leverage; JUNK is
+# the mirror image; MID/LOW sit between. Earnings stability tracks the same ordering.
+QUALITY_FUNDS = {
+    "HQ":   {"net_income": 30.0, "total_equity": 100.0, "gross_profit": 60.0,
+             "total_revenue": 100.0, "total_debt": 20.0,  "earnings_stability": 0.9},
+    "MID":  {"net_income": 12.0, "total_equity": 100.0, "gross_profit": 40.0,
+             "total_revenue": 100.0, "total_debt": 80.0,  "earnings_stability": 0.5},
+    "LOW":  {"net_income": 5.0,  "total_equity": 100.0, "gross_profit": 25.0,
+             "total_revenue": 100.0, "total_debt": 150.0, "earnings_stability": 0.3},
+    "JUNK": {"net_income": 2.0,  "total_equity": 100.0, "gross_profit": 10.0,
+             "total_revenue": 100.0, "total_debt": 260.0, "earnings_stability": 0.1},
+}
+
+# Value: cheap names (high yields, high book-to-market) vs expensive ones.
+VALUE_FUNDS = {
+    "CHEAP": {"net_income": 20.0, "market_cap_gbp": 100.0, "total_equity": 110.0,
+              "dividend_yield": 0.06},
+    "FAIR":  {"net_income": 12.0, "market_cap_gbp": 200.0, "total_equity": 130.0,
+              "dividend_yield": 0.03},
+    "RICH":  {"net_income": 8.0,  "market_cap_gbp": 500.0, "total_equity": 150.0,
+              "dividend_yield": 0.01},
+}
+
+
+def test_quality_factor_ranks_profitable_low_leverage_highest():
+    """The QMJ-style composite scores the profitable, high-margin, low-debt name highest."""
+    score = QualityFactor().score(_history(fundamentals=QUALITY_FUNDS), WINDOW, _P)
+    assert set(score) == set(QUALITY_FUNDS)
+    assert score["HQ"] > score["MID"] > score["LOW"] > score["JUNK"]
+
+
+def test_value_factor_ranks_cheap_highest():
+    """High earnings/book yields + dividend yield ⇒ the cheap name tops the cross-section."""
+    score = ValueFactor().score(_history(fundamentals=VALUE_FUNDS), WINDOW, _P)
+    assert set(score) == set(VALUE_FUNDS)
+    assert score["CHEAP"] > score["FAIR"] > score["RICH"]
+
+
+def test_quality_excludes_missing_and_zero_denominator_never_false_zero():
+    """A name with no usable fundamentals is dropped, not scored 0 (which would outrank JUNK)."""
+    funds = {
+        **QUALITY_FUNDS,
+        "BLANK": {},                                  # nothing to compute from
+        "ZERO_EQ": {"net_income": 9.0, "total_equity": 0.0, "total_debt": 5.0},  # zero denom
+        "NEG_EQ": {"net_income": 9.0, "total_equity": -50.0, "total_debt": 5.0}, # negative denom
+    }
+    score = QualityFactor().score(_history(fundamentals=funds), WINDOW, _P)
+    # Excluded entirely — never a 0.0 that the optimiser could rank above a real (negative) JUNK.
+    assert "BLANK" not in score
+    assert "ZERO_EQ" not in score
+    assert "NEG_EQ" not in score
+    assert set(score) == set(QUALITY_FUNDS)
+
+
+def test_quality_partial_components_still_scores():
+    """A name missing some components is still scored from the components it does have."""
+    funds = {
+        "FULL": QUALITY_FUNDS["HQ"],
+        "ROE_ONLY": {"net_income": 1.0, "total_equity": 100.0},   # only ROE computable
+        "MARGIN_ONLY": {"gross_profit": 90.0, "total_revenue": 100.0},  # only margin
+    }
+    score = QualityFactor().score(_history(fundamentals=funds), WINDOW, _P)
+    assert set(score) == {"FULL", "ROE_ONLY", "MARGIN_ONLY"}
+    assert all(math.isfinite(v) for v in score.values())
+
+
+def test_value_excludes_non_positive_market_cap():
+    """Non-positive market cap can't yield a real earnings/book ratio → name excluded."""
+    funds = {
+        **VALUE_FUNDS,
+        "NO_CAP": {"net_income": 10.0, "market_cap_gbp": 0.0, "total_equity": 50.0},
+    }
+    score = ValueFactor().score(_history(fundamentals=funds), WINDOW, _P)
+    assert "NO_CAP" not in score
+    assert set(score) == set(VALUE_FUNDS)
+
+
+def test_fundamentals_factors_empty_when_no_fundamentals():
+    """Bars-only HistoryView (fundamentals={}) ⇒ both factors emit nothing, never crash."""
+    assert QualityFactor().score(_history(), WINDOW, _P) == {}
+    assert ValueFactor().score(_history(), WINDOW, _P) == {}
+
+
+def test_fundamentals_factors_satisfy_factor_protocol():
+    """Both are structural `Factor`s (so they drop into CompositeFactor / breakdown)."""
+    assert isinstance(QualityFactor(), Factor)
+    assert isinstance(ValueFactor(), Factor)
+    assert QualityFactor().name == "quality"
+    assert ValueFactor().name == "value"
+
+
+def test_fundamentals_factors_compose_and_breakdown():
+    """QualityFactor + ValueFactor drop into CompositeFactor; breakdown carries both children."""
+    funds = {t: {**QUALITY_FUNDS.get(t, {}), **VALUE_FUNDS.get(t, {})}
+             for t in set(QUALITY_FUNDS) | set(VALUE_FUNDS)}
+    # Give every name both a quality and a value input so they share a common cross-section.
+    for t in funds:
+        funds[t].setdefault("market_cap_gbp", 200.0)
+        funds[t].setdefault("net_income", 10.0)
+        funds[t].setdefault("total_equity", 100.0)
+        funds[t].setdefault("dividend_yield", 0.02)
+    comp = CompositeFactor([QualityFactor(), ValueFactor()])
+    bd = comp.breakdown(_history(fundamentals=funds), WINDOW, _P)
+    assert bd  # non-empty common set
+    for row in bd.values():
+        assert set(row) == {"quality", "value", "composite"}
+        assert math.isclose(row["composite"], (row["quality"] + row["value"]) / 2.0, abs_tol=1e-9)
+
+
+def test_fundamentals_factor_score_is_pure_live_replay_parity():
+    """Same HistoryView ⇒ identical output across repeated calls (the live/replay invariant:
+    both code paths run this one pure `score`, so they can never diverge in shape or value)."""
+    hist = _history(fundamentals=QUALITY_FUNDS)
+    live = QualityFactor().score(hist, WINDOW, _P)
+    replay = QualityFactor().score(hist, WINDOW, _P)
+    assert live.keys() == replay.keys()
+    for t in live:
+        assert live[t] == replay[t]
+    vhist = _history(fundamentals=VALUE_FUNDS)
+    assert ValueFactor().score(vhist, WINDOW, _P) == ValueFactor().score(vhist, WINDOW, _P)
