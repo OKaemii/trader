@@ -1,6 +1,7 @@
-// eodhd-client — symbol/currency mapping, screener + bulk parsing, and the daily-history
-// adapter (fetchEodhdDailyHistory) that mirrors fetchYahooDailyHistory. The EODHD HTTP call is
-// mocked via globalThis.fetch so these run hermetically.
+// eodhd-client — symbol/currency mapping, screener + bulk parsing, the daily-history adapter
+// (fetchEodhdDailyHistory) that mirrors fetchYahooDailyHistory, and the thin feed methods
+// (technical/dividends/splits/news/exchangeDetails/exchangesList). The EODHD HTTP call is mocked
+// via globalThis.fetch so these run hermetically.
 
 import { describe, it, expect, afterEach } from 'vitest';
 import {
@@ -100,6 +101,165 @@ describe('eodhd-client', () => {
     configureEodhdClient({ apiKey: 'k', callsPerMinute: 1000, dailyCallLimit: 0 });
     const bars = await fetchEodhdDailyHistory('AAPL_US_EQ', Date.parse('2026-05-01T00:00:00Z'), Date.parse('2026-05-31T00:00:00Z'));
     expect(bars).toEqual([]);
+    expect(spy!.calls).toHaveLength(0);
+  });
+
+  // ── Thin feed methods (Task 13) ──────────────────────────────────────────────────
+  const newClient = () => new EodhdClient({ apiKey: 'k', callsPerMinute: 1000, dailyCallLimit: 1000 });
+
+  describe('technical', () => {
+    it('parses each date into a finite-only values map and passes function + params through', async () => {
+      spy = installFetch(() => [
+        { date: '2026-06-01', macd: 1.2, signal: 0.9, divergence: 0.3 },
+        { date: '2026-06-02', macd: 'NA', signal: 1.0, divergence: 'x' },   // drops non-finite keys
+        { date: '', macd: 5 },                                              // dropped: no date
+      ]);
+      const rows = await newClient().technical('AAPL.US', 'macd', { period: '14', from: '2026-06-01' });
+      expect(rows).toHaveLength(2);
+      expect(rows[0]).toEqual({ date: '2026-06-01', values: { macd: 1.2, signal: 0.9, divergence: 0.3 } });
+      expect(rows[1]!.values).toEqual({ signal: 1.0 });                     // NA + 'x' dropped
+      const q = paramsOf(spy!.calls[0]!.url);
+      expect(new URL(spy!.calls[0]!.url).pathname).toContain('/technical/AAPL.US');
+      expect(q.get('function')).toBe('macd');
+      expect(q.get('period')).toBe('14');
+      expect(q.get('from')).toBe('2026-06-01');
+    });
+    it('degrades to [] on a non-array body', async () => {
+      spy = installFetch(() => ({ error: 'nope' }));
+      expect(await newClient().technical('AAPL.US', 'rsi')).toEqual([]);
+    });
+  });
+
+  describe('dividends', () => {
+    it('parses per-share values, keeps optional dates, drops non-finite/dateless rows', async () => {
+      spy = installFetch(() => [
+        { date: '2026-02-10', value: 0.24, currency: 'USD', declarationDate: '2026-01-15', recordDate: '2026-02-11', paymentDate: '2026-02-20' },
+        { date: '2026-05-12', value: 0.25 },
+        { date: '2026-08-10', value: 'NA' },          // dropped: non-finite value
+        { date: '', value: 0.3 },                     // dropped: no date
+      ]);
+      const rows = await newClient().dividends('AAPL.US', '2026-01-01', '2026-12-31');
+      expect(rows).toHaveLength(2);
+      expect(rows[0]).toEqual({
+        date: '2026-02-10', value: 0.24, currency: 'USD',
+        declarationDate: '2026-01-15', recordDate: '2026-02-11', paymentDate: '2026-02-20',
+      });
+      expect(rows[1]).toEqual({ date: '2026-05-12', value: 0.25 });   // no optional keys when absent
+      const q = paramsOf(spy!.calls[0]!.url);
+      expect(new URL(spy!.calls[0]!.url).pathname).toContain('/div/AAPL.US');
+      expect(q.get('from')).toBe('2026-01-01');
+      expect(q.get('to')).toBe('2026-12-31');
+    });
+    it('omits from/to when not supplied', async () => {
+      spy = installFetch(() => []);
+      await newClient().dividends('AAPL.US');
+      const q = paramsOf(spy!.calls[0]!.url);
+      expect(q.has('from')).toBe(false);
+      expect(q.has('to')).toBe(false);
+    });
+  });
+
+  describe('splits', () => {
+    it('parses the ratio into a share-count factor (incl. reverse split) and keeps the raw string', async () => {
+      spy = installFetch(() => [
+        { date: '2020-08-31', split: '4/1' },
+        { date: '2022-06-06', split: '3/2' },
+        { date: '2024-01-01', split: '1/4' },      // reverse split → 0.25
+        { date: '2025-01-01', split: 'junk' },     // unparseable → factor NaN, still kept
+        { date: '', split: '2/1' },                // dropped: no date
+      ]);
+      const rows = await newClient().splits('AAPL.US');
+      expect(rows).toHaveLength(4);
+      expect(rows[0]).toEqual({ date: '2020-08-31', ratio: '4/1', factor: 4 });
+      expect(rows[1]!.factor).toBeCloseTo(1.5, 6);
+      expect(rows[2]!.factor).toBeCloseTo(0.25, 6);
+      expect(Number.isNaN(rows[3]!.factor)).toBe(true);
+      expect(rows[3]!.ratio).toBe('junk');
+      expect(new URL(spy!.calls[0]!.url).pathname).toContain('/splits/AAPL.US');
+    });
+  });
+
+  describe('news', () => {
+    it('keeps title/link/date/symbols/tags, surfaces sentiment only when present, clamps limit', async () => {
+      spy = installFetch(() => [
+        { date: '2026-06-01T12:00:00+00:00', title: 'Apple beats', link: 'https://x/1', symbols: ['AAPL.US'], tags: ['earnings'],
+          sentiment: { polarity: 0.8, neg: 0.05, neu: 0.15, pos: 0.8 } },
+        { date: '2026-06-02T09:00:00+00:00', title: 'No sentiment', link: 'https://x/2' },   // no symbols/tags/sentiment
+        { date: '2026-06-03T09:00:00+00:00', title: '', link: 'https://x/3' },               // dropped: no title
+      ]);
+      const rows = await newClient().news('AAPL.US', { limit: 5000, offset: 10, from: '2026-06-01' });
+      expect(rows).toHaveLength(2);
+      expect(rows[0]).toEqual({
+        date: '2026-06-01T12:00:00+00:00', title: 'Apple beats', link: 'https://x/1',
+        symbols: ['AAPL.US'], tags: ['earnings'], sentiment: { polarity: 0.8, neg: 0.05, neu: 0.15, pos: 0.8 },
+      });
+      expect(rows[1]).toEqual({ date: '2026-06-02T09:00:00+00:00', title: 'No sentiment', link: 'https://x/2', symbols: [], tags: [] });
+      const q = paramsOf(spy!.calls[0]!.url);
+      expect(q.get('s')).toBe('AAPL.US');
+      expect(q.get('limit')).toBe('1000');     // clamped from 5000
+      expect(q.get('offset')).toBe('10');
+      expect(q.get('from')).toBe('2026-06-01');
+    });
+  });
+
+  describe('exchangeDetails', () => {
+    it('parses identity, trading hours, and flattens the keyed holiday object', async () => {
+      spy = installFetch(() => ({
+        Name: 'London Exchange', Code: 'LSE', OperatingMIC: 'XLON', Country: 'UK', Currency: 'GBP',
+        CountryISO2: 'GB', CountryISO3: 'GBR',
+        TradingHours: { Open: '08:00:00', Close: '16:30:00', WorkingDays: 'Mon,Tue,Wed,Thu,Fri', OpenUTC: '08:00:00', CloseUTC: '16:30:00' },
+        ExchangeHolidays: {
+          '0': { Date: '2026-12-25', Holiday: 'Christmas Day', Type: 'holiday' },
+          '1': { Date: '2026-12-24', Holiday: 'Christmas Eve', Type: 'half-day' },
+          '2': { Date: '', Holiday: 'junk' },     // dropped: no date
+        },
+      }));
+      const d = await newClient().exchangeDetails('LSE');
+      expect(d).not.toBeNull();
+      expect(d!).toMatchObject({ name: 'London Exchange', code: 'LSE', operatingMIC: 'XLON', country: 'UK', currency: 'GBP' });
+      expect(d!.tradingHours).toEqual({ open: '08:00:00', close: '16:30:00', workingDays: 'Mon,Tue,Wed,Thu,Fri', openUTC: '08:00:00', closeUTC: '16:30:00' });
+      expect(d!.holidays).toHaveLength(2);
+      expect(d!.holidays[0]).toEqual({ date: '2026-12-25', name: 'Christmas Day', type: 'holiday' });
+      expect(d!.holidays[1]!.type).toBe('half-day');
+      expect(new URL(spy!.calls[0]!.url).pathname).toContain('/exchange-details/LSE');
+    });
+    it('returns null on an error body (distinct from loaded-with-no-holidays)', async () => {
+      spy = installFetch(() => 'not an object');
+      const d = await newClient().exchangeDetails('LSE');
+      expect(d).toBeNull();
+    });
+    it('returns [] holidays when the field is absent', async () => {
+      spy = installFetch(() => ({ Name: 'NYSE', Code: 'US' }));
+      const d = await newClient().exchangeDetails('US');
+      expect(d!.holidays).toEqual([]);
+      expect(d!.tradingHours).toBeUndefined();
+    });
+  });
+
+  describe('exchangesList', () => {
+    it('parses identity rows and drops codeless rows', async () => {
+      spy = installFetch(() => [
+        { Name: 'USA Stocks', Code: 'US', OperatingMIC: 'XNAS, XNYS', Country: 'USA', Currency: 'USD', CountryISO2: 'US', CountryISO3: 'USA' },
+        { Name: 'London', Code: 'LSE', Country: 'UK', Currency: 'GBP' },
+        { Name: 'junk', Code: '' },     // dropped
+      ]);
+      const rows = await newClient().exchangesList();
+      expect(rows).toHaveLength(2);
+      expect(rows[0]).toMatchObject({ name: 'USA Stocks', code: 'US', operatingMIC: 'XNAS, XNYS', currency: 'USD' });
+      expect(rows[1]).toEqual({ name: 'London', code: 'LSE', country: 'UK', currency: 'GBP' });
+      expect(new URL(spy!.calls[0]!.url).pathname).toContain('/exchanges-list/');
+    });
+  });
+
+  it('thin methods degrade to empty / null on budget exhaustion (no network call)', async () => {
+    spy = installFetch(() => [{ date: '2026-06-01', value: 1 }]);
+    const c = new EodhdClient({ apiKey: 'k', callsPerMinute: 1000, dailyCallLimit: 0 });
+    expect(await c.technical('AAPL.US', 'rsi')).toEqual([]);
+    expect(await c.dividends('AAPL.US')).toEqual([]);
+    expect(await c.splits('AAPL.US')).toEqual([]);
+    expect(await c.news('AAPL.US')).toEqual([]);
+    expect(await c.exchangeDetails('US')).toBeNull();
+    expect(await c.exchangesList()).toEqual([]);
     expect(spy!.calls).toHaveLength(0);
   });
 });
