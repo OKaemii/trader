@@ -1,0 +1,31 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: fundamentals-ingestion
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    kubernetes.io/ingress.class: nginx
+spec:
+  rules:
+    - host: trader.local
+      http:
+        paths:
+          # WRITE-SIDE admin prefix, deliberately distinct from the READ-SIDE service.
+          #
+          # Collision avoidance (see the epic plan's "AVOID INGRESS COLLISION" note):
+          #   - The future fundamentals-api (epic Task 11) owns the READ surface
+          #     `/admin/api/fundamentals` + `/internal/api/fundamentals`.
+          #   - `/internal/api/fundamentals` is ALSO already served today by market-data-service
+          #     (the Yahoo QMJ path strategy-engine reads) — this write-side service must not touch it.
+          # So ingestion claims `/admin/api/fundamentals-ingest` (and the aliased health below). nginx
+          # ingress uses longest-prefix matching, so once Task 11 mounts `/admin/api/fundamentals`,
+          # an `/admin/api/fundamentals-ingest` request still resolves HERE (the more specific prefix)
+          # — the two services coexist without a rewrite. Task 11 must only mount the bare
+          # `/admin/api/fundamentals` (+ `/internal/...`), never `/admin/api/fundamentals-ingest`.
+          - path: /admin/api/fundamentals-ingest
+            pathType: Prefix
+            backend:
+              service:
+                name: fundamentals-ingestion
+                port:
+                  number: 8010

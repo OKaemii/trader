@@ -44,12 +44,22 @@ COPY services/strategy-engine/tests/test_factor_store.py ./strategy_engine/tests
 COPY services/strategy-engine/tests/test_lru_cache.py ./strategy_engine/tests/test_lru_cache.py
 COPY services/strategy-engine/tests/test_pipeline.py ./strategy_engine/tests/test_pipeline.py
 
+# fundamentals-ingestion skeleton suite (PIT Fundamentals Warehouse write-side). Deps-clean: the app +
+# stage stubs import only fastapi/pydantic + the installed quant_core (TestClient needs httpx from the
+# [http] extra above) — no Mongo/Timescale connection. Isolated under ./fundamentals_ingestion so its
+# `src.*` package root doesn't collide with backtest-engine's `src` at /app, and run from that dir so
+# `import src.main` resolves via its own conftest (same approach as the strategy-engine suite above).
+COPY services/fundamentals-ingestion/src ./fundamentals_ingestion/src
+COPY services/fundamentals-ingestion/conftest.py ./fundamentals_ingestion/conftest.py
+COPY services/fundamentals-ingestion/tests ./fundamentals_ingestion/tests
+
 # quant-core suite imports the installed package; backtest suite imports src.* (conftest puts
 # /app on the path). PYTHONDONTWRITEBYTECODE keeps the layer clean. -p no:cacheprovider avoids a
 # read-only-fs cache complaint. A non-zero exit here fails the build = the gate.
 ENV PYTHONDONTWRITEBYTECODE=1
 RUN python -m pytest quant_core_tests -q -p no:cacheprovider \
  && python -m pytest tests -q -p no:cacheprovider \
- && (cd strategy_engine && python -m pytest tests -q -p no:cacheprovider)
+ && (cd strategy_engine && python -m pytest tests -q -p no:cacheprovider) \
+ && (cd fundamentals_ingestion && python -m pytest tests -q -p no:cacheprovider)
 
 CMD ["true"]

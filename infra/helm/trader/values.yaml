@@ -119,6 +119,11 @@ global:
     eodhdDailyCallLimit: "90000"
     # Fundamentals (QMJ: ROE / D-E / current ratio) source. yahoo (free quoteSummary) | eodhd (paid add-on).
     fundamentalsProvider: yahoo
+    # PIT Fundamentals Warehouse (fundamentals-ingestion write-side). SEC EDGAR mandates a descriptive
+    # User-Agent on every request — the EDGAR downloader (epic Task 5) fails closed without it. Set a
+    # real contact string (e.g. "trader-platform fundamentals-ingestion ops@example.com") before that
+    # downloader ships; the skeleton only reads/echoes it. Non-secret env, not a trader-secrets key.
+    edgarUserAgent: "trader-platform fundamentals-ingestion"
     # Earnings/dividend calendar source. yahoo (free calendarEvents) | eodhd (dormant — falls back to yahoo).
     earningsProvider: yahoo
     # Sector-rotation reference ETFs (comma-separated T212 tickers). Empty → built-in 11 SPDRs + SPY.
