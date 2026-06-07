@@ -61,10 +61,12 @@ describe('COMMANDS registry integrity', () => {
   // every real tab and catches drift if a future card renames a tab key.
   const WORKSPACE_TABS: Record<string, string[]> = {
     discover: ['universe', 'screener', 'sectors', 'calendar'],
-    research: ['charts', 'market-data', 'backtests', 'signals'],
-    build: ['strategy', 'console', 'alerts'],
+    // Relocation (Task 22): Market Data → Operations, Backtests → Build; charts repurposed as
+    // the `history` placeholder (Task 23 grows the per-symbol History tab + the rest).
+    research: ['history', 'signals'],
+    build: ['strategy', 'console', 'alerts', 'backtests'],
     portfolio: ['positions', 'performance', 'risk-limits', 'trips'],
-    operations: ['trade-audit', 'reconciliation', 'tca'],
+    operations: ['trade-audit', 'reconciliation', 'tca', 'market-data'],
   }
 
   it('exposes a deep-linked entry for every workspace tab pointing at the real route', () => {

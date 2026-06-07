@@ -3,10 +3,11 @@ import { FeatureAuditPanel } from '@/components/FeatureAuditPanel'
 import { authedFetch } from '@/app/lib/auth-fetch'
 import { QuantOnly } from '@/components/QuantOnly'
 
-// Backtests tab (IA-redesign Task 8 — was app/(authed)/research/page.tsx, the
-// route this workspace now replaces). SSR-seed the validation-reports table so it
-// renders 10 rows on first paint instead of waiting for client hydration + a backtest
-// results round-trip.
+// Backtests tab (relocated to Build — was app/(authed)/research/BacktestsTab.tsx).
+// Backtests are a build-the-strategy concern, not a per-symbol research question, so
+// the validation runners live alongside Strategy/Console/Alerts. SSR-seed the
+// validation-reports table so it renders 10 rows on first paint instead of waiting
+// for client hydration + a backtest results round-trip.
 async function fetchInitialReports(): Promise<Array<Record<string, unknown>> | null> {
   try {
     const r = await authedFetch('/admin/api/backtest/results?limit=10')

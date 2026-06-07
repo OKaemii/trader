@@ -142,6 +142,11 @@ describe('QA-checklist redirect matrix matches the stubs on disk', () => {
     'operations/console': '/build?tab=console',
     'risk/trips': '/portfolio?tab=trips',
     scanner: '/discover?tab=universe',
+    // Relocation (Task 22): the operational Market Data admin moved to Operations and
+    // the standalone Charts/price view folded into Research's `history` placeholder.
+    charts: '/research?tab=history',
+    'market-data': '/operations?tab=market-data',
+    'market-data/calendar': '/operations?tab=market-data',
   }
 
   it.each(Object.entries(MATRIX))('/%s redirects to %s', (stub, target) => {

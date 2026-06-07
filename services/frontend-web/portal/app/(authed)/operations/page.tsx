@@ -3,16 +3,20 @@ import { resolveTab } from '@/app/lib/tabs'
 import { TradeAuditTab } from './TradeAuditTab'
 import { ReconciliationTab } from './ReconciliationTab'
 import { TcaTab } from './TcaTab'
+import { MarketDataTab } from './MarketDataTab'
 
 // Operations workspace (Task 11): the forensic post-trade surfaces — what actually executed
 // (Trade Audit), whether system/broker/ledger agree (Reconciliation), and how much execution cost
 // (TCA). One tab = one server component = one authedFetch (only the active tab's fetch runs). The
 // three old routes (/operations/{trade-audit,reconciliation,tca}) now redirect here with the
-// matching ?tab=. /operations/console is a separate workspace (Build) and stays its own route.
+// matching ?tab=. /operations/console is a separate workspace (Build) and stays its own route. The
+// Market Data tab (relocated here from Research) is the OPERATIONAL poll-config / session-calendar /
+// holiday-feed admin — a run-the-platform concern; /market-data + /market-data/calendar redirect here.
 const TABS = [
   { key: 'trade-audit', label: 'Trade Audit' },
   { key: 'reconciliation', label: 'Reconciliation' },
   { key: 'tca', label: 'TCA' },
+  { key: 'market-data', label: 'Market Data' },
 ] as const
 
 export default async function OperationsPage(
@@ -25,6 +29,7 @@ export default async function OperationsPage(
       {active === 'trade-audit' && <TradeAuditTab />}
       {active === 'reconciliation' && <ReconciliationTab />}
       {active === 'tca' && <TcaTab />}
+      {active === 'market-data' && <MarketDataTab />}
     </WorkspaceShell>
   )
 }
