@@ -19,6 +19,7 @@ from .infrastructure import strategy_config
 from .infrastructure.factor_store import FactorStore, factor_history_points, persist_research_cycle
 from .infrastructure.fundamentals_as_of import YahooFundamentalsAsOf
 from .infrastructure.lru_cache import TTLCache, scores_cache_key
+from .pipeline import build_pipeline_stages, snapshot_from_state
 
 # Live decide() takes default params + an empty portfolio (none of the current strategies'
 # decide() reads portfolio — sizing happens in signal-service). Phase 1 wires a real
@@ -116,6 +117,10 @@ _engine_state: dict = {
     "active_universe":  [],   # tickers that arrived on the stream this cycle
     "ready_tickers":    [],   # tickers with >= rolling_window bars in Mongo this cycle
     "last_signal":      None,
+    # Per-cycle pipeline-funnel counts (Universe → filter → scoring → Top-K → Rebalance), recorded
+    # at cycle end for the Strategy-Lab funnel (/admin/api/strategy/<id>/pipeline). PipelineSnapshot
+    # shape; empty until the first cycle, where the endpoint degrades to labelled zero-count stages.
+    "last_pipeline":    {},
 }
 
 
@@ -360,6 +365,32 @@ async def strategy_factor_history(ticker: str = "", limit: int = _FACTOR_HISTORY
     capped = max(1, min(int(limit), _FACTOR_HISTORY_MAX))
     rows = await _factor_store.history(ticker, limit=capped)
     return {"ticker": ticker, "points": factor_history_points(rows)}
+
+
+@app.get("/admin/api/strategy/{strategy_id}/pipeline")
+def strategy_pipeline(strategy_id: str):
+    """Strategy-Lab pipeline funnel (T37 §G) — declarative stages + LIVE counts for one strategy.
+
+    Returns ``{ strategy_id, active, stages: [{ key, label, count }, …] }`` widest→narrowest
+    (Universe → filter(s) → Factor scoring → Top-K → Rebalance), the exact shape the portal
+    ``PipelineFunnel`` consumes. Stages are the strategy's *known* shape (declarative); counts come
+    from the last cycle's snapshot recorded in ``_engine_state['last_pipeline']``.
+
+    ``strategy_id`` is informational — the live engine runs ONE strategy at a time, so the counts are
+    always the active strategy's most recent cycle. ``active`` echoes the running strategy so the UI
+    can flag a mismatch (e.g. a funnel requested for a non-active strategy shows the active engine's
+    counts, not a stale per-strategy cache). Degrades gracefully: no cycle yet ⇒ the labelled stages
+    at count 0 (best-effort), never a 404/500 — the funnel always renders its shape."""
+    snap = snapshot_from_state(_engine_state)
+    # The funnel reflects the ENGINE's last cycle, which is always the active strategy. We still
+    # build stages for the *requested* id's shape so a future per-strategy view reads sensibly; for
+    # the active id (the live case) the shape + counts line up exactly.
+    sid = strategy_id or ACTIVE_STRATEGY
+    return {
+        "strategy_id": sid,
+        "active": ACTIVE_STRATEGY,
+        "stages": build_pipeline_stages(sid, snap),
+    }
 
 
 @app.get("/metrics", response_class=PlainTextResponse)
@@ -805,6 +836,20 @@ async def process_cycle(
 
         _bars_processed.labels(strategy_id=ACTIVE_STRATEGY).inc(len(bars))
 
+        # The screen-survivor count for the funnel's first hard cut: high_velocity's QMJ+cap
+        # eligibility (recorded in cross_sectional_stats) when present, else the history-filter pass
+        # count (bars-only strategies have no separate screen — eligible == ready). Explicit
+        # None-check (not `or _ready`) so a genuine zero-survivor screen reports 0, not _ready.
+        _n_eligible = features.cross_sectional_stats.get("n_eligible") if features is not None else None
+        _eligible = _ready if _n_eligible is None else int(_n_eligible)
+
+        def _record_pipeline(scored: int, held: int, emitted: bool) -> None:
+            # Snapshot the cycle's funnel counts for /admin/api/strategy/<id>/pipeline (T37 §G).
+            _engine_state["last_pipeline"] = {
+                "universe": _total, "ready": _ready, "eligible": _eligible,
+                "scored": scored, "top_k": _strategy.config.top_k, "held": held, "emitted": emitted,
+            }
+
         if output is None:
             reason = "unknown"
             if _ready < _strategy.config.min_universe_size:
@@ -813,6 +858,8 @@ async def process_cycle(
                 reason = "no bars on the stream"
             else:
                 reason = "strategy returned None (regime gate or all HOLD)"
+            # HOLD / no-emit cycle: universe + history narrow, but nothing was scored/held this cycle.
+            _record_pipeline(scored=0, held=0, emitted=False)
             print(f"[strategy-engine] cycle {cycle_n} NO SIGNAL "
                   f"strategy_update={_update_ms}ms — {reason}", flush=True)
             return {
@@ -832,6 +879,9 @@ async def process_cycle(
             _engine_state["signals_emitted"] += 1
             _engine_state["last_signal"] = _engine_state["last_cycle_ts"]
         _nonzero = sum(1 for v in (output.composite_scores or {}).values() if v != 0)
+        # Funnel snapshot for an emit cycle: `scored` = names with a usable composite score, `held`
+        # = the emitted held set (output.ticker_universe). emitted reflects whether we published.
+        _record_pipeline(scored=_nonzero, held=len(output.ticker_universe), emitted=publish)
         print(f"[strategy-engine] cycle {cycle_n} SIGNAL "
               f"{'EMITTED' if publish else 'COMPUTED (dry_run)'} "
               f"strategy_update={_update_ms}ms ready={_ready}/{_total} "

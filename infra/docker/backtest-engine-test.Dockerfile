@@ -33,13 +33,16 @@ COPY services/backtest-engine/tests ./tests
 #   - test_factor_store (the factor_scores writer/reader + history + source stamping + best-effort
 #     guard — motor is installed via backtest-engine's requirements, so the store imports cleanly),
 #   - test_lru_cache (the in-process TTL+LRU fronting the factor_scores scores endpoint — pure
-#     stdlib, no Mongo/numpy: hit/expire/LRU/herd-coalesce + the (ticker, asOf-bucket) key).
+#     stdlib, no Mongo/numpy: hit/expire/LRU/herd-coalesce + the (ticker, asOf-bucket) key),
+#   - test_pipeline (the Strategy-Lab funnel helper — pure stdlib: declarative stage shape + the
+#     narrowing invariant + degrade-gracefully when no cycle has run).
 # The respx-backed strategy-engine tests stay on the local dev runner. Add more files as they
 # become deps-clean.
 COPY services/strategy-engine/src ./strategy_engine/src
 COPY services/strategy-engine/tests/test_fundamentals_as_of.py ./strategy_engine/tests/test_fundamentals_as_of.py
 COPY services/strategy-engine/tests/test_factor_store.py ./strategy_engine/tests/test_factor_store.py
 COPY services/strategy-engine/tests/test_lru_cache.py ./strategy_engine/tests/test_lru_cache.py
+COPY services/strategy-engine/tests/test_pipeline.py ./strategy_engine/tests/test_pipeline.py
 
 # quant-core suite imports the installed package; backtest suite imports src.* (conftest puts
 # /app on the path). PYTHONDONTWRITEBYTECODE keeps the layer clean. -p no:cacheprovider avoids a
