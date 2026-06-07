@@ -73,6 +73,14 @@ export function buildApp(deps: AppDeps): Hono {
     app.get("/internal/api/trading/cash",
         parseInternalHeaders("portfolio-service", "signal-service"),
         async (c) => {
+            // Paper-mode parity with the admin route (~195): no broker call, return a real
+            // GBP zero. Without this, a Paper deployment would attempt a live T212 getCash
+            // here while the admin route the portal reads returns £0 — the two cash views
+            // would disagree, and RiskEngine would read a non-zero broker figure in a mode
+            // that places no orders.
+            if (tradingMode === TradingMode.Paper) {
+                return c.json({ free: money(0, BASE_CURRENCY), total: money(0, BASE_CURRENCY) });
+            }
             if (deps.accountCache) {
                 const snap = await deps.accountCache.get();
                 return c.json({ free: snap.free, total: snap.total });
