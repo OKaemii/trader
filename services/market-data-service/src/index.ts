@@ -20,7 +20,7 @@ import { TwelveDataProvider } from './modules/bars/infrastructure/providers/twel
 import { configureEodhdClient } from './modules/bars/infrastructure/providers/eodhd-client.ts';
 import type { MarketDataProvider } from './modules/bars/infrastructure/providers/market-data-provider.ts';
 import { FxClient, TwelveDataFxProvider } from '@trader/shared-fx';
-import { aggregateBars, invalidateBarsBulk } from '@trader/shared-bars';
+import { aggregateBars, invalidateBarsBulk, getBars } from '@trader/shared-bars';
 import {
   HolidayCache, NyseIcalProvider, UkGovBankHolidayProvider, StaticFallbackProvider, STATIC_FALLBACK,
   nyseCalendar, lseCalendar, marketStateOf, shouldPollMarket, partitionByMarket,
@@ -36,6 +36,10 @@ import { createFundamentalsRouter } from './modules/fundamentals/routes.ts';
 import { buildEarningsStore } from './modules/earnings/wiring.ts';
 import { EarningsRefreshScheduler } from './modules/earnings/application/EarningsRefreshScheduler.ts';
 import { createEarningsRouter } from './modules/earnings/routes.ts';
+import { buildCorporateActionsStore } from './modules/corporate-actions/wiring.ts';
+import { CorporateActionsRefreshScheduler } from './modules/corporate-actions/application/CorporateActionsRefreshScheduler.ts';
+import { createCorporateActionsRouter } from './modules/corporate-actions/routes.ts';
+import { closeAtOrBefore } from './modules/corporate-actions/application/price-at.ts';
 import { createSectorsRouter } from './modules/sectors/routes.ts';
 import { startSectorEtfTracking } from './modules/sectors/tracking.ts';
 import { SwingScreener, startScreenerSchedule } from './modules/screener/SwingScreener.ts';
@@ -704,6 +708,26 @@ const earningsRefresher = new EarningsRefreshScheduler(
 );
 app.route('/', createEarningsRouter(earningsStore, earningsRefresher));
 
+// Corporate actions — corporate_actions store (EODHD Dividends + Splits, incremental sync §I) +
+// the admin corporate-actions list (History page) and the INTERNAL dividend-yield leg the strategy
+// factor host injects into HistoryView.fundamentals (the point-in-time, backfillable Value div-yield
+// component — §H). The yield denominator is the persisted daily close at/<= asOf, read via getBars
+// over a wide range so a backfill replay finds an old enough bar. Refresher started in bootstrap().
+const corporateActionsStore = buildCorporateActionsStore({ syncTtlMs: env.CORPORATE_ACTIONS_SYNC_TTL_MS });
+const corporateActionsRefresher = new CorporateActionsRefreshScheduler(
+  corporateActionsStore,
+  () => universeManager.activeTickers,
+  { idleMs: env.CORPORATE_ACTIONS_REFRESH_IDLE_MS, spacingMs: env.CORPORATE_ACTIONS_REQUEST_SPACING_MS },
+);
+app.route('/', createCorporateActionsRouter(corporateActionsStore, corporateActionsRefresher, async (ticker, asOfMs) => {
+  const redis = await getRedisClient();
+  const db = await getMongoDb();
+  // 'max' so a historical backfill as-of date still has a daily bar to price against; the read is
+  // bi-temporal (asOf bounds the knowledge_ts), so no future close leaks in.
+  const bars = await getBars(redis as never, db, ticker, 'daily', 'max', { asOf: asOfMs });
+  return closeAtOrBefore(bars, asOfMs);
+}));
+
 // Sector-rotation heatmap — tracks the SPDR sector ETFs' daily bars (NOT in the tradeable
 // universe) and serves weekly sector-momentum. Tracking started in bootstrap() below.
 app.route('/', createSectorsRouter());
@@ -808,6 +832,7 @@ async function bootstrap(): Promise<void> {
   // populating any missing fundamentals, then self-paces). Independent of the bar poll cadence.
   fundamentalsRefresher.start();
   earningsRefresher.start();
+  corporateActionsRefresher.start();
   startSectorEtfTracking(env.SECTOR_ETF_REFRESH_MS);
   startScreenerSchedule(swingScreener, env.SCREENER_INTERVAL_MS);
 

@@ -87,6 +87,14 @@ const EnvSchema = z.object({
     EARNINGS_REQUEST_SPACING_MS:     z.coerce.number().int().nonnegative().default(500),
     EARNINGS_REFRESH_IDLE_MS:        z.coerce.number().int().positive().default(24 * 60 * 60_000),
 
+    // Corporate-actions (EODHD Dividends + Splits) incremental sync. The store re-checks a ticker no
+    // more often than the TTL and fetches only events past its stored cursor (§I), so a current
+    // universe spends ~no credits. The idle interval paces full passes; spacing throttles per-ticker
+    // EODHD calls under the rate budget.
+    CORPORATE_ACTIONS_SYNC_TTL_MS:        z.coerce.number().int().positive().default(24 * 60 * 60_000),
+    CORPORATE_ACTIONS_REFRESH_IDLE_MS:    z.coerce.number().int().positive().default(24 * 60 * 60_000),
+    CORPORATE_ACTIONS_REQUEST_SPACING_MS: z.coerce.number().int().nonnegative().default(250),
+
     // Sector-rotation reference ETFs (comma-separated; default the 11 SPDRs + SPY, read in
     // sector-etfs.ts). Tracked for the heatmap only — never added to the tradeable universe.
     SECTOR_ETF_TICKERS:              z.string().optional(),
