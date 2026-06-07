@@ -126,16 +126,27 @@ describe('closeAtOrBefore', () => {
     ticker: 'X', observation_ts: ms(iso), open: close, high: close, low: close, close, volume: 1, interval: 'daily',
   });
 
-  it('returns the latest close at/<= asOf, ignoring future bars', () => {
+  it('returns the latest price at/<= asOf, ignoring future bars', () => {
     const bars = [bar('2025-01-01', 10), bar('2025-06-01', 20), bar('2025-12-01', 30)];
     expect(closeAtOrBefore(bars, ms('2025-06-15'))).toBe(20);
+  });
+
+  it('prefers rawClose (unadjusted) over the adjusted close — the yield denominator', () => {
+    // Daily bars carry an ADJUSTED close + the unadjusted rawClose. The yield must divide the raw
+    // dividend by the raw price, so the lookup returns rawClose when present.
+    const b = { ...bar('2025-06-01', 18), rawClose: 20 };   // adjusted 18, traded 20
+    expect(closeAtOrBefore([b], ms('2025-12-01'))).toBe(20);
+  });
+
+  it('falls back to close when rawClose is absent (legacy / 5m-aggregation rows)', () => {
+    expect(closeAtOrBefore([bar('2025-06-01', 18)], ms('2025-12-01'))).toBe(18);
   });
 
   it('returns null when every bar is in the future', () => {
     expect(closeAtOrBefore([bar('2025-12-01', 30)], ms('2025-01-01'))).toBeNull();
   });
 
-  it('skips non-finite / non-positive closes', () => {
+  it('skips non-finite / non-positive prices', () => {
     const bars = [bar('2025-01-01', 10), { ...bar('2025-06-01', 0), close: 0 }];
     expect(closeAtOrBefore(bars, ms('2025-12-01'))).toBe(10);
   });

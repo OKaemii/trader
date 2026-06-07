@@ -37,19 +37,19 @@ export function createCorporateActionsRouter(
     const asOfMs = Number.isFinite(asOfRaw) && asOfRaw > 0 ? asOfRaw : Date.now();
 
     const dividendsByTicker = await store.dividendsForMany(tickers);
-    const out: Record<string, { dividendYield: number | null }> = {};
-    for (const ticker of tickers) {
+    // Price lookups are independent read-through (Redis-cached) bar reads — resolve them in parallel
+    // rather than serializing the whole universe per cycle.
+    const entries = await Promise.all(tickers.map(async (ticker) => {
       const divs: StoredDividend[] = dividendsByTicker[ticker] ?? [];
       const price = await priceAsOf(ticker, asOfMs);
-      out[ticker] = { dividendYield: dividendYieldAsOf(divs, price, asOfMs) };
-    }
-    return c.json({ asOf: asOfMs, dividendYields: out });
+      return [ticker, { dividendYield: dividendYieldAsOf(divs, price, asOfMs) }] as const;
+    }));
+    return c.json({ asOf: asOfMs, dividendYields: Object.fromEntries(entries) });
   });
 
   r.use('/admin/api/market-data/corporate-actions/*', parseAdminHeaders);
 
-  // Admin: coverage summary for the feed-health panel. (Registered before the param-less GET so the
-  // '/coverage' suffix isn't shadowed.)
+  // Admin: coverage summary for the feed-health panel. (Auth already applied by the /* use above.)
   r.get('/admin/api/market-data/corporate-actions/coverage', async (c) => c.json(await store.coverage()));
 
   // Admin: force an incremental re-sync of the active universe (the portal "Refresh" button). The

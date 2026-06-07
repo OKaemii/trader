@@ -11,8 +11,9 @@
 //
 // Units invariant: the store keeps dividend `valuePerShare` already scaled to BASE units (LSE pence
 // killed at the boundary, like prices — see CorporateActionsStore). The price passed here is the
-// persisted daily `close`, which is in the SAME base units (the daily-history writer kills pence
-// too). So the ratio is unit-consistent — a dimensionless yield — with no FX/scale fix-up needed.
+// UNADJUSTED daily close (rawClose) in the SAME base units (the daily-history writer kills pence
+// too) — raw, not the total-return adjusted close, so a raw dividend over a raw price is a true,
+// unit-consistent yield (see price-at.ts for why rawClose). No FX/scale fix-up needed.
 
 const TRAILING_WINDOW_MS = 365 * 24 * 60 * 60 * 1000;
 
