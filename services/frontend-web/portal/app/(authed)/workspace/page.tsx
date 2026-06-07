@@ -1,7 +1,11 @@
 import { authedFetch } from '@/app/lib/auth-fetch'
 import { getSystemHealth } from '@/app/lib/system-health'
 import { summariseRecentResearch, type ResearchResultRow } from '@/app/lib/research-summary'
-import { PortfolioHero } from '@/components/PortfolioHero'
+import { ThreeCol } from '@/components/layout/ThreeCol'
+import {
+  PortfolioOverviewHero,
+  type EquityHeroPayload,
+} from '@/components/layout/PortfolioOverviewHero'
 import { EarningsWarning } from '@/components/EarningsWarning'
 import { HoldingsPanel, type HoldingsInitial } from '@/components/HoldingsPanel'
 import { SignalFeed } from '@/components/SignalFeed'
@@ -12,16 +16,27 @@ import { MarketStateBadge, type MarketState } from '@/components/MarketStateBadg
 import type { SignalProgressDTO } from '@/types/trader'
 
 // Workspace home — the command center. This is the post-login landing page (the old /dashboard,
-// which now redirects here). It is a sectioned grid of the existing dashboard cards, NOT a tabbed
-// workspace (the ?tab= WorkspaceShell pattern is for the other five workspaces). It SSR-seeds every
-// panel exactly as dashboard/page.tsx did so the page paints fully populated on first byte:
-//   Portfolio Summary  → PortfolioHero          (/admin/api/trading/cash)
-//   Open Positions     → HoldingsPanel          (positions + universe overrides + signals progress)
-//   Active Signals     → SignalFeed snapshot     (/api/signals/progress)
-//   Today's Events     → EarningsWarning         (self-fetching; renders nothing when clear)
-//   Recent Research    → RecentResearchCard      (/admin/api/backtest/results?limit=5)
+// which now redirects here). It is NOT a tabbed workspace (the ?tab= WorkspaceShell pattern is for
+// the other five workspaces); it leads with ONE Portfolio-Overview hero and demotes the rest into a
+// clearly subordinate rail (Task 19, plan §C). Hierarchy is by size · contrast · depth: the hero is
+// the largest, most-elevated block; the supporting cards sit in the flat ThreeCol rail beneath it.
+// It SSR-seeds every panel so the page paints fully populated on first byte:
+//   Portfolio Overview → PortfolioOverviewHero    (/admin/api/trading/cash + /admin/api/trading/equity)
+//   Open Positions     → HoldingsPanel            (positions + universe overrides + signals progress)
+//   Active Signals     → SignalFeed snapshot      (/api/signals/progress)
+//   Today's Events     → EarningsWarning          (self-fetching; renders nothing when clear)
+//   Recent Research    → RecentResearchCard       (/admin/api/backtest/results?limit=5)
 //   Always-on ops      → CircuitBreakerCard + AutoApproveToggle + MarketStateBadge (+ system health)
 // (No Watchlists section — research found no backend for it and this epic is frontend-only.)
+//
+// SAFETY (AGENTS.md hard rule): the hero P&L, positions, circuit breaker, kill/pause controls, and
+// system health stay visible in BOTH Beginner and Quant modes — nothing on this page is gated by
+// <QuantOnly>. Only advanced/quant-only panels elsewhere are.
+//
+// LAYOUT SEAM (T31): the ThreeCol below leaves its LEFT rail open. T31 mounts <MarketNarrative> as
+// the `left` rail of this ThreeCol (market-context prose beside the hero/positions) — the layout
+// already collapses the empty left track today, so adding it is a one-prop change with no reflow of
+// the center/right columns.
 
 // Subset of market-data /health used by the top-bar session badges.
 interface MarketDataHealth {
@@ -76,6 +91,7 @@ export default async function WorkspacePage() {
     positions,
     universe,
     cash,
+    equity,
     riskStatus,
     signalsBody,
     health,
@@ -91,6 +107,9 @@ export default async function WorkspacePage() {
     // `sectorMap` (HoldingsInitial['universe']), so the Open-Positions sector pie SSR-seeds here.
     fetchJsonOrNull<HoldingsInitial['universe']>('/admin/api/market-data/universe/overrides'),
     fetchJsonOrNull<CashInitial>('/admin/api/trading/cash'),
+    // Equity curve + realised KPIs for the hero. Demo/live only — paper mode 400s upstream, so this
+    // resolves null and the hero drops to a cash-only view (no fabricated curve).
+    fetchJsonOrNull<EquityHeroPayload>('/admin/api/trading/equity?days=90'),
     fetchJsonOrNull<RiskStatusInitial>('/admin/api/signals/risk/status'),
     fetchJsonOrNull<{ signals?: SignalProgressDTO[] }>('/api/signals/progress'),
     // Server components can't fetch their own /portal-api/* route (no origin) — call the
@@ -124,61 +143,71 @@ export default async function WorkspacePage() {
       </div>
 
       {/* Today's Events — surfaces any open position reporting earnings within 10 days (the swing-
-          trade landmine). Renders nothing when clear, so it sits above the grid without reserving space. */}
+          trade landmine). Renders nothing when clear, so it sits above the hero without reserving space. */}
       <EarningsWarning />
 
-      {/* Portfolio Summary first (Trading212-style): lead with value, not ops controls. */}
-      <PortfolioHero initial={cash as never} />
+      {/* THE hero — equity curve + P&L + exposure. Leads the page; everything below is subordinate. */}
+      <PortfolioOverviewHero cash={cash as never} equity={equity} />
 
-      {/* Primary grid: Open Positions beside the at-a-glance ops controls. */}
-      <div className="grid grid-cols-1 gap-6 xl:grid-cols-3">
-        <section className="space-y-3 xl:col-span-2">
-          <h2 className="text-xs font-semibold uppercase tracking-wide text-gray-500">Open Positions</h2>
-          <HoldingsPanel initial={holdings} />
-        </section>
+      {/* Subordinate rail: positions take the center (the most-watched supporting surface); the
+          right rail stacks the at-a-glance ops controls, active signals, and recent research as
+          flat, lower-contrast cards. The LEFT rail is the T31 MarketNarrative seam (see header). */}
+      <ThreeCol
+        centerSpan={2}
+        center={
+          <section className="space-y-3">
+            <h2 className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+              Open Positions
+            </h2>
+            <HoldingsPanel initial={holdings} />
 
-        {/* Always-visible operations — the command center's standing controls. */}
-        <section className="space-y-3">
-          <h2 className="text-xs font-semibold uppercase tracking-wide text-gray-500">Operations</h2>
-          <CircuitBreakerCard initial={riskStatus} />
-          <AutoApproveToggle initialEnabled={autoApprove} />
-          <div className="rounded border border-gray-800 bg-gray-900 p-4">
-            <h2 className="mb-2 text-sm font-medium text-gray-300">System health</h2>
-            {healthDown.length === 0 ? (
-              <div className="flex items-center gap-2 text-sm text-emerald-400">
-                <span>●</span> All {health.length} services healthy
+            <h2 className="pt-2 text-xs font-semibold uppercase tracking-wide text-gray-500">
+              Active Signals
+            </h2>
+            <SignalFeed initial={signals} />
+          </section>
+        }
+        right={
+          <div className="space-y-6">
+            {/* Always-visible operations — the command center's standing safety controls. Never
+                gated by mode. */}
+            <section className="space-y-3">
+              <h2 className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+                Operations
+              </h2>
+              <CircuitBreakerCard initial={riskStatus} />
+              <AutoApproveToggle initialEnabled={autoApprove} />
+              <div className="rounded border border-gray-800 bg-gray-900 p-4">
+                <h2 className="mb-2 text-sm font-medium text-gray-300">System health</h2>
+                {healthDown.length === 0 ? (
+                  <div className="flex items-center gap-2 text-sm text-emerald-400">
+                    <span>●</span> All {health.length} services healthy
+                  </div>
+                ) : (
+                  <ul className="space-y-1">
+                    {healthDown.map((s) => (
+                      <li
+                        key={s.name}
+                        className="flex items-center justify-between rounded bg-gray-950 px-3 py-1.5 text-sm"
+                      >
+                        <span className="text-gray-300">{s.name}</span>
+                        <span className="text-red-400">down{s.status ? ` (${s.status})` : ''}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
               </div>
-            ) : (
-              <ul className="space-y-1">
-                {healthDown.map((s) => (
-                  <li
-                    key={s.name}
-                    className="flex items-center justify-between rounded bg-gray-950 px-3 py-1.5 text-sm"
-                  >
-                    <span className="text-gray-300">{s.name}</span>
-                    <span className="text-red-400">down{s.status ? ` (${s.status})` : ''}</span>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-        </section>
-      </div>
+            </section>
 
-      {/* Secondary grid: Active Signals beside Recent Research. */}
-      <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
-        <section className="space-y-3">
-          <div className="flex items-center justify-between">
-            <h2 className="text-xs font-semibold uppercase tracking-wide text-gray-500">Active Signals</h2>
+            <section className="space-y-3">
+              <h2 className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+                Research
+              </h2>
+              <RecentResearchCard rows={research} />
+            </section>
           </div>
-          <SignalFeed initial={signals} />
-        </section>
-
-        <section className="space-y-3">
-          <h2 className="text-xs font-semibold uppercase tracking-wide text-gray-500">Research</h2>
-          <RecentResearchCard rows={research} />
-        </section>
-      </div>
+        }
+      />
     </div>
   )
 }
