@@ -11,10 +11,13 @@ from prometheus_client import Counter, Gauge, generate_latest, CONTENT_TYPE_LATE
 # only on the `Strategy` Protocol + `make_strategy` factory, never on a concrete strategy.
 from quant_core.strategy.factory import make_strategy, known_strategies
 from quant_core.strategy.contract import HistoryView, PortfolioState, StrategyParams
+from quant_core.research_factors import compute_research_factors
 from quant_core.wiring import build_feature_store
 from .domain.dataclasses import OHLCVBar
 from .infrastructure.market_data_client import MarketDataClient, range_for_bars
 from .infrastructure import strategy_config
+from .infrastructure.factor_store import FactorStore, persist_research_cycle
+from .infrastructure.fundamentals_as_of import YahooFundamentalsAsOf
 
 # Live decide() takes default params + an empty portfolio (none of the current strategies'
 # decide() reads portfolio — sizing happens in signal-service). Phase 1 wires a real
@@ -83,6 +86,9 @@ _redis = None             # type: ignore[var-annotated]
 _feature_store = None     # type: ignore[var-annotated]  # FeatureStore (Timescale or Null)
 _pg_pool = None           # type: ignore[var-annotated]  # asyncpg pool, or None
 _feature_persist_logged = False  # one-shot "first feature row written" log
+_factor_store = None      # type: ignore[var-annotated]  # FactorStore (Mongo factor_scores writer)
+_fundamentals_provider = None  # type: ignore[var-annotated]  # FundamentalsAsOf seam (PIT socket)
+_factor_persist_logged = False   # one-shot "first factor_scores row written" log
 _history_interval: str = "daily"
 _history_range:    str = "30d"
 _needed:           int = 20
@@ -327,6 +333,88 @@ def _history_view(closes_of, tickers: list[str], ts_of=None, fundamentals=None) 
     return HistoryView(closes=closes, volumes={}, timestamps=timestamps, fundamentals=fundamentals or {})
 
 
+async def _persist_research_factors(
+    active_tickers: list[str],
+    history_map: dict,
+    as_of_ms: int,
+    cycle_n: int,
+) -> None:
+    """Compute the strategy-independent research factor set over the FULL active universe and persist
+    one factor_scores doc per ticker for this cycle (the linchpin store the Research UI reads).
+
+    ENTIRELY best-effort — this is wrapped in a single guard so NOTHING here (compute, the
+    cross-service dividend-yield call, the Mongo write) can raise into process_cycle and block signal
+    emission. That is the most important invariant (same contract as the feature-store persist).
+
+    Fundamentals reach the compute only via HistoryView.fundamentals, filled from two PIT-honest
+    legs:
+      - the FundamentalsAsOf seam (Quality + the forward-only earnings/book leg of Value), stamped
+        with the provider's source (yahoo-snapshot today);
+      - the cross-service dividend-yield leg (the only backfillable Value component), merged in as
+        `dividend_yield` and stamped `div`. Its fetch degrades INDEPENDENTLY: a failure leaves the
+        leg None for all names (value source then falls back to the provider source) — it never
+        aborts the persist.
+    """
+    if _factor_store is None or _fundamentals_provider is None:
+        return
+    global _factor_persist_logged
+    try:
+        # Quality + forward-only Value legs via the PIT seam (one round-trip for the whole universe).
+        fundamentals: dict[str, dict[str, float]] = await _fundamentals_provider.fetch_many(
+            active_tickers, as_of_ms,
+        )
+
+        # Cross-service dividend-yield leg (Task 14). Degrades on its own: a failure → no leg, never
+        # an abort. market-data-service authorizes 'strategy-engine' on this route, so no 403 trap.
+        div_yields: dict[str, float] = {}
+        try:
+            div_yields = await _bars_client.fetch_dividend_yields(active_tickers, as_of_ms=as_of_ms)
+        except Exception as exc:  # noqa: BLE001 — div-yield leg is independently best-effort
+            print(f"[strategy-engine] cycle {cycle_n} dividend-yield fetch failed (value div leg None): {exc!r}", flush=True)
+
+        # Merge the dividend-yield leg into each name's fundamentals dict (the ValueFactor reads
+        # `dividend_yield` off HistoryView.fundamentals[t]). A name with a finite yield gets the leg;
+        # absent ⇒ ValueFactor NaN-excludes it (never a fabricated 0). div_yield_tickers drives the
+        # per-name `div` value-source stamp.
+        div_yield_tickers: set[str] = set()
+        for t, dy in div_yields.items():
+            fundamentals.setdefault(t, {})["dividend_yield"] = float(dy)
+            div_yield_tickers.add(t)
+
+        # Closes come from the cycle's already-fetched history_map — no extra fetch. Price factors
+        # (momentum, volatility) read these; quality/value read the fundamentals above.
+        def _closes(t: str, _m=history_map) -> list[float]:
+            return [b.close for b in _m.get(t, [])]
+        history = _history_view(_closes, active_tickers, fundamentals=fundamentals)
+
+        # window=_needed matches the cycle's rolling window (the price-factor lookback the host sized
+        # the daily fetch to). compute_research_factors returns native float|None cells (no numpy
+        # types leak) → safe for Mongo verbatim.
+        factor_rows = compute_research_factors(history, window=_needed)
+        if not factor_rows:
+            return
+
+        # persist_research_cycle is itself best-effort (swallows store failures) — the inner write
+        # guard, complementing this function's outer compute/cross-service guard.
+        written = await persist_research_cycle(
+            _factor_store,
+            factor_rows,
+            observation_ts=as_of_ms,
+            fundamentals_source_for=_fundamentals_provider.source_for,
+            div_yield_tickers=div_yield_tickers,
+        )
+        # One-shot success log — only when rows actually landed. A swallowed store failure returns
+        # written=0 (persist_research_cycle already logged it); don't latch the flag or print a
+        # misleading "OK" then, so the genuine first-write still gets logged on a later good cycle.
+        if written > 0 and not _factor_persist_logged:
+            print(f"[strategy-engine] factor_scores persist OK — first cycle written "
+                  f"(observation_ts={as_of_ms} tickers={written} "
+                  f"div_yield_legs={len(div_yield_tickers)} fundamentals_names={len(fundamentals)})", flush=True)
+            _factor_persist_logged = True
+    except Exception as exc:  # noqa: BLE001 — persistence is never on the emission path
+        print(f"[strategy-engine] cycle {cycle_n} factor_scores persist failed (continuing): {exc!r}", flush=True)
+
+
 def _pick_prewarm_range(calendar_days: int) -> str:
     """Smallest RangeKey that covers `calendar_days`. Matches shared-bars enum."""
     if calendar_days <= 30:  return "30d"
@@ -440,7 +528,7 @@ async def _init_engine_singletons() -> None:
     dependent config. Idempotent: safe to no-op if called twice.
     """
     global _strategy, _bars_client, _redis, _history_interval, _history_range, _needed
-    global _feature_store, _pg_pool, ACTIVE_STRATEGY
+    global _feature_store, _pg_pool, ACTIVE_STRATEGY, _factor_store, _fundamentals_provider
     if _strategy is not None:
         return
     _redis = await aioredis.from_url(REDIS_URL)
@@ -475,6 +563,18 @@ async def _init_engine_singletons() -> None:
 
     # Single client across the engine — its per-cycle cache clears on start_cycle.
     _bars_client = MarketDataClient()
+
+    # Research factor_scores store + the point-in-time fundamentals seam the host fills
+    # HistoryView.fundamentals from. Both best-effort: the persist mirrors the feature store (a
+    # Mongo blip logs but never blocks emission), and the seam reuses _bars_client's internal Yahoo
+    # path (no new infra). ensure_indexes is idempotent — a failure just leaves the read slower.
+    _factor_store = FactorStore()
+    _fundamentals_provider = YahooFundamentalsAsOf(_bars_client)
+    try:
+        await _factor_store.ensure_indexes()
+        print("[strategy-engine] factor_scores store: indexes ensured — research factors will persist per cycle", flush=True)
+    except Exception as exc:  # noqa: BLE001 — best-effort; persistence is never on the emission path
+        print(f"[strategy-engine] factor_scores index ensure failed (continuing): {exc!r}", flush=True)
 
     print(f"[strategy-engine] singletons ready — strategy={ACTIVE_STRATEGY} bar_freq={BAR_FREQUENCY} "
           f"rolling_window={ROLLING_WINDOW_BARS} history_range={_history_range} history_interval={_history_interval} "
@@ -624,6 +724,16 @@ async def process_cycle(
                     _feature_persist_logged = True
             except Exception as exc:  # noqa: BLE001
                 print(f"[strategy-engine] cycle {cycle_n} feature persist failed: {exc!r}", flush=True)
+
+        # Research factor_scores persist (the linchpin store every Research UI card reads). Computed
+        # over the FULL active universe (not just the held set) so Research is honest for any symbol,
+        # and runs regardless of the active strategy. ENTIRELY best-effort: this whole block —
+        # compute, the cross-service div-yield call, and the Mongo write — is wrapped in one guard
+        # that logs and continues, NEVER blocking the decide()/publish below (same contract as the
+        # feature store). The div-yield leg degrades independently: a failure leaves it None for all
+        # names (value source falls back to yahoo-snapshot), it never crashes the cycle.
+        await _persist_research_factors(active_tickers, history_map, as_of_ms, cycle_n)
+
         output = _strategy.decide(features, _EMPTY_PORTFOLIO) if features is not None else None
         _update_ms = int((_t.time() - _update_start) * 1000)
 

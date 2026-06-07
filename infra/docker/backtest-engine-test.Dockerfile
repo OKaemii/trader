@@ -24,15 +24,19 @@ COPY services/backtest-engine/src ./src
 COPY services/backtest-engine/conftest.py ./conftest.py
 COPY services/backtest-engine/tests ./tests
 
-# strategy-engine's PURE infrastructure suite (the FundamentalsAsOf PIT seam — no numpy, only
-# quant_core + httpx, both installed above). Isolated under ./strategy_engine so its `src.*`
-# package root doesn't collide with backtest-engine's `src` at /app, and run from that dir so
-# `python -m pytest` prepends it to sys.path and `import src.*` resolves (the same way the local
-# runner runs from services/strategy-engine). We gate ONLY the deps-light suites here
-# (test_fundamentals_as_of); the motor/respx-backed strategy-engine tests stay on the local dev
-# runner. Add more files here as they become deps-clean.
+# strategy-engine's PURE infrastructure suites (deps-light — only quant_core + httpx + motor, all
+# installed above; no numpy needed in the test itself). Isolated under ./strategy_engine so its
+# `src.*` package root doesn't collide with backtest-engine's `src` at /app, and run from that dir
+# so `python -m pytest` prepends it to sys.path and `import src.*` resolves (the same way the local
+# runner runs from services/strategy-engine). We gate the deps-clean suites here:
+#   - test_fundamentals_as_of (the PIT seam),
+#   - test_factor_store (the factor_scores writer/reader + source stamping + best-effort guard —
+#     motor is installed via backtest-engine's requirements, so the store imports cleanly here).
+# The respx-backed strategy-engine tests stay on the local dev runner. Add more files as they
+# become deps-clean.
 COPY services/strategy-engine/src ./strategy_engine/src
 COPY services/strategy-engine/tests/test_fundamentals_as_of.py ./strategy_engine/tests/test_fundamentals_as_of.py
+COPY services/strategy-engine/tests/test_factor_store.py ./strategy_engine/tests/test_factor_store.py
 
 # quant-core suite imports the installed package; backtest suite imports src.* (conftest puts
 # /app on the path). PYTHONDONTWRITEBYTECODE keeps the layer clean. -p no:cacheprovider avoids a
