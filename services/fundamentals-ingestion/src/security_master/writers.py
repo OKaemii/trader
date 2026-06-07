@@ -123,9 +123,11 @@ class SecurityMasterWriter:
     async def upsert_company(self, company: CompanyRecord) -> int:
         """Find-or-insert a company; return its `company_id`. Idempotent by CIK (preferred) or name.
 
-        A re-run of the backfill must reuse the existing row rather than append a duplicate issuer —
-        the schema has no UNIQUE on companies, so the find-then-insert runs inside one transaction so
-        two concurrent first-inserts can't both miss the SELECT and both insert."""
+        A SEQUENTIAL backfill re-run reuses the existing row rather than appending a duplicate issuer
+        (the actual requirement — the ingest worker is single-replica and processes one company at a
+        time). The schema has no UNIQUE on `companies`, so this does NOT defend against two genuinely
+        concurrent first-inserts of the same CIK under READ COMMITTED (both could miss the SELECT and
+        insert); add a UNIQUE/ON CONFLICT if a future writer becomes multi-replica."""
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 if company.cik:
@@ -156,7 +158,9 @@ class SecurityMasterWriter:
     async def upsert_instrument(self, instrument: InstrumentRecord) -> int:
         """Find-or-insert an instrument under a company; return its `instrument_id`. Idempotent by
         `(company_id, t212_ticker)` when a t212 symbol is set, else `(company_id, instrument_type,
-        exchange)` (one common line per exchange for a company)."""
+        exchange)` (one common line per exchange for a company). Idempotency holds for a sequential
+        re-run; like `upsert_company`, it does not guard a concurrent double-insert (no UNIQUE in the
+        schema) — fine for the single-replica ingest worker."""
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 if instrument.t212_ticker:

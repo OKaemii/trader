@@ -22,9 +22,15 @@ from typing import Optional
 # module-import smoke test does) needs no driver socket and no event loop — only the actual
 # pool open requires asyncpg, which is installed in the service image.
 
+import asyncio
+
 DEFAULT_TIMESCALE_URL = "postgresql://localhost:5432/trader_ts"
 
 _pool = None  # process-wide asyncpg.Pool singleton, created on first use.
+# Guards the lazy create against an async check-then-act race: without it, two coroutines that both
+# see `_pool is None` would each `await create_pool()` and the second assignment would orphan the
+# first pool's open connections (a connection leak). The lock makes first-init exactly-once.
+_pool_lock = asyncio.Lock()
 
 
 def timescale_url() -> str:
@@ -33,18 +39,22 @@ def timescale_url() -> str:
 
 
 async def get_pool(dsn: Optional[str] = None, *, min_size: int = 1, max_size: int = 4):
-    """Return the process-wide asyncpg pool, creating it on first call.
+    """Return the process-wide asyncpg pool, creating it on first call (exactly-once under the lock).
 
     Small bounds (1–4): the security-master write path is low-QPS (a few upserts per company during
     a backfill), not the hot bars read path, so a wide pool would just hold idle connections.
     """
     global _pool
-    if _pool is None:
-        import asyncpg  # local import: no driver needed to import/unit-test the module
+    if _pool is not None:
+        return _pool
+    async with _pool_lock:
+        # Re-check inside the lock: a racing caller may have created it while we waited.
+        if _pool is None:
+            import asyncpg  # local import: no driver needed to import/unit-test the module
 
-        _pool = await asyncpg.create_pool(
-            dsn or timescale_url(), min_size=min_size, max_size=max_size
-        )
+            _pool = await asyncpg.create_pool(
+                dsn or timescale_url(), min_size=min_size, max_size=max_size
+            )
     return _pool
 
 
