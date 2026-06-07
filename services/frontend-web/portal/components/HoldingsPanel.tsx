@@ -69,8 +69,11 @@ export function HoldingsPanel({ initial = null }: { initial?: HoldingsInitial | 
     return () => { cancelled = true; clearInterval(id) }
   }, [initial])
 
-  const sectorMap = universe?.sectorMap ?? {}
-  const positions = pos?.positions ?? []
+  // Wrap the fallback expressions in useMemo so their identities only change when the
+  // underlying source does — otherwise the `??` makes a fresh {} / [] every render and the
+  // sectorBreakdown memo below (which depends on them) would recompute on every render.
+  const sectorMap = useMemo(() => universe?.sectorMap ?? {}, [universe])
+  const positions = useMemo(() => pos?.positions ?? [], [pos])
 
   // Aggregate sector exposure weighted by position value. For positions on tickers absent
   // from the sectorMap (e.g. instruments held but no longer in the active universe) we

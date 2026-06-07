@@ -55,7 +55,10 @@ export function ValidationJobsTable({
   // Poll faster while any job is running (responsive progress/ETA), slower when idle.
   const anyRunning = jobs.some((j) => j.status === 'running')
   useEffect(() => {
-    void load()
+    // load() is async (its setState lands after the fetch await, not synchronously), and the
+    // interval-driven refetch is a legitimate external-sync subscription. The immediate fetch is
+    // queued as a microtask so nothing sets state inside the synchronous effect body.
+    queueMicrotask(() => void load())
     const t = setInterval(() => void load(), anyRunning ? 5000 : 10000)
     return () => clearInterval(t)
   }, [load, refreshKey, anyRunning])

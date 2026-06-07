@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, useTransition } from 'react'
+import { useState, useTransition } from 'react'
 import {
   saveMarketDataConfig,
   backfillMarketData,
@@ -67,18 +67,18 @@ export function MarketDataEditor({
   const [execTouched, setExecTouched] = useState(false)
 
   // Auto-suggest: intraday pairs with Market orders (no time to wait on limit fills).
-  // Daily pairs with Limit (cheaper on the spread). We only nudge when the operator
-  // hasn't explicitly touched the execution radio.
-  useEffect(() => {
+  // Daily pairs with Limit (cheaper on the spread). The pairing is a user-event transition
+  // (selecting a bar frequency), so it lives in the bar-radio handler rather than a reactive
+  // effect — we only nudge when the operator hasn't explicitly touched the execution radio.
+  function selectBar(opt: 'default' | BarFreq) {
+    setBarChoice(opt)
     if (execTouched) return
-    if (barChoice === 'intraday' && execChoice !== OrderType.Market) {
-      setExecChoice(OrderType.Market)
-    } else if (barChoice === 'daily' && execChoice === OrderType.Market) {
-      setExecChoice(OrderType.Limit)
-    } else if (barChoice === 'default' && execChoice !== 'default') {
-      setExecChoice('default')
-    }
-  }, [barChoice, execChoice, execTouched])
+    // Mirror the prior effect's conditions exactly: intraday nudges away from non-Market;
+    // daily only un-does a Market pick; default clears any explicit pick.
+    if (opt === 'intraday' && execChoice !== OrderType.Market) setExecChoice(OrderType.Market)
+    else if (opt === 'daily' && execChoice === OrderType.Market) setExecChoice(OrderType.Limit)
+    else if (opt === 'default' && execChoice !== 'default') setExecChoice('default')
+  }
 
   function onSave() {
     const sizeOverride = sizeUseDefault ? null : universeMaxSize
@@ -190,7 +190,7 @@ export function MarketDataEditor({
                   type="radio"
                   name="bar"
                   checked={barChoice === opt}
-                  onChange={() => setBarChoice(opt)}
+                  onChange={() => selectBar(opt)}
                 />
                 {opt === 'default' ? 'Use Helm default' : opt}
               </label>
@@ -220,13 +220,13 @@ export function MarketDataEditor({
             ))}
           </div>
           <p className="mt-1 text-[11px] text-gray-500">
-            <strong>Limit</strong> = priced at last close, kinder on T212's rate limit, can sit unfilled while price drifts.
+            <strong>Limit</strong> = priced at last close, kinder on T212&apos;s rate limit, can sit unfilled while price drifts.
             <strong> Market</strong> = crosses the spread immediately, no fill delay.
             Risk-exits always use Market regardless of this setting. Trading-service reads this live (15s cache; portal save invalidates immediately).
           </p>
           {intradayNeedsMarket && (
             <div className="mt-2 rounded border border-amber-900 bg-amber-950 px-3 py-2 text-xs text-amber-300">
-              Intraday bar frequency pairs with Market orders — signals firing every 15m can't wait
+              Intraday bar frequency pairs with Market orders — signals firing every 15m can&apos;t wait
               on limit fills. The current selection still uses Limit; consider switching above.
             </div>
           )}
