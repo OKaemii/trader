@@ -1,6 +1,13 @@
 import { describe, it, expect } from "vitest";
 import { NyseIcalProvider } from '../providers/ical-provider.ts';
 import { UkGovBankHolidayProvider } from '../providers/uk-gov-provider.ts';
+import {
+  EodhdExchangeHolidayProvider,
+  type ExchangeDetails,
+  type ExchangeDetailsClient,
+} from '../providers/eodhd-exchange-provider.ts';
+import type { HolidayProvider } from '../holiday-cache.ts';
+import type { HolidayTable } from '../calendar.ts';
 import { StaticFallbackProvider, STATIC_FALLBACK } from '../providers/static-fallback.ts';
 
 // Captured NYSE iCal fixture covering 2026 holidays + half-days. Matches the real
@@ -232,5 +239,117 @@ describe('StaticFallbackProvider', () => {
     } finally {
       console.warn = origWarn;
     }
+  });
+});
+
+// A stub eodhd-client exposing only the `exchangeDetails` capability the provider needs.
+class StubExchangeClient implements ExchangeDetailsClient {
+  calls = 0;
+  constructor(private readonly result: ExchangeDetails | null) {}
+  async exchangeDetails(code: string): Promise<ExchangeDetails | null> {
+    this.calls++;
+    return this.result === null ? null : { ...this.result, code };
+  }
+}
+
+// A minimal recorder for the chained `next` provider, so we can prove EODHD-outage
+// delegation hits NYSE iCal before the cache's static fallback.
+class RecordingProvider implements HolidayProvider {
+  calls = 0;
+  constructor(public readonly market: 'US' | 'LSE', private readonly table: HolidayTable) {}
+  async fetchYear(_year: number): Promise<HolidayTable> {
+    this.calls++;
+    return this.table;
+  }
+}
+
+const EODHD_US_2026: ExchangeDetails = {
+  code: 'US',
+  holidays: [
+    { date: '2026-01-01', name: "New Year's Day", type: 'holiday' },
+    { date: '2026-12-25', name: 'Christmas Day' },                 // no type ⇒ full closure
+    { date: '2026-11-27', name: 'Black Friday', type: 'half-day' },// early close
+    // Out-of-year row — filtered.
+    { date: '2027-01-01', name: "New Year's Day", type: 'holiday' },
+  ],
+};
+
+describe('EodhdExchangeHolidayProvider', () => {
+  it('maps EODHD holidays into full closures + half-days for the requested year only', async () => {
+    const client = new StubExchangeClient(EODHD_US_2026);
+    const provider = new EodhdExchangeHolidayProvider('US', client);
+    const table = await provider.fetchYear(2026);
+    expect(table.market).toBe('US');
+    expect(table.year).toBe(2026);
+    expect(table.source).toBe('eodhd');
+    // Full closures sorted; half-day ('half-day' type) split off; 2027 row filtered.
+    expect(table.fullClosures).toEqual(['2026-01-01', '2026-12-25']);
+    expect(table.halfDays).toEqual([{ date: '2026-11-27', closeLocal: '13:00' }]);
+    expect(table.fullClosures).not.toContain('2027-01-01');
+  });
+
+  it('classifies early/half-close types case-insensitively and uses the LSE early close', async () => {
+    const client = new StubExchangeClient({
+      code: 'LSE',
+      holidays: [
+        { date: '2026-12-24', name: 'Christmas Eve', type: 'Half Day' },
+        { date: '2026-12-31', name: "New Year's Eve", type: 'EARLY-CLOSE' },
+        { date: '2026-12-25', name: 'Christmas Day', type: 'Holiday' },
+      ],
+    });
+    const provider = new EodhdExchangeHolidayProvider('LSE', client);
+    const table = await provider.fetchYear(2026);
+    expect(table.fullClosures).toEqual(['2026-12-25']);
+    expect(table.halfDays).toEqual([
+      { date: '2026-12-24', closeLocal: '12:30' },
+      { date: '2026-12-31', closeLocal: '12:30' },
+    ]);
+  });
+
+  it('trusts a successful read with zero holidays (source=eodhd, not an outage)', async () => {
+    const client = new StubExchangeClient({ code: 'US', holidays: [] });
+    const provider = new EodhdExchangeHolidayProvider('US', client);
+    const table = await provider.fetchYear(2026);
+    expect(table.source).toBe('eodhd');
+    expect(table.fullClosures).toEqual([]);
+    expect(table.halfDays).toEqual([]);
+  });
+
+  it('throws on EODHD outage (null) when no chained provider is given', async () => {
+    const client = new StubExchangeClient(null);
+    const provider = new EodhdExchangeHolidayProvider('US', client);
+    await expect(provider.fetchYear(2026)).rejects.toThrow('outage or budget exhaustion');
+  });
+
+  it('delegates to the chained provider on EODHD outage (NYSE iCal stays intact)', async () => {
+    const nyseTable: HolidayTable = {
+      market: 'US', year: 2026, fullClosures: ['2026-07-03'], halfDays: [],
+      fetchedAt: Date.now(), source: 'ical',
+    };
+    const next = new RecordingProvider('US', nyseTable);
+    const client = new StubExchangeClient(null);
+    const provider = new EodhdExchangeHolidayProvider('US', client, next);
+    const origWarn = console.warn;
+    console.warn = () => {};
+    try {
+      const table = await provider.fetchYear(2026);
+      expect(client.calls).toBe(1);          // EODHD tried first
+      expect(next.calls).toBe(1);            // then delegated
+      expect(table.source).toBe('ical');     // got the NYSE iCal table, ahead of static fallback
+      expect(table.fullClosures).toEqual(['2026-07-03']);
+    } finally {
+      console.warn = origWarn;
+    }
+  });
+
+  it('does not call the chained provider when EODHD succeeds', async () => {
+    const next = new RecordingProvider('US', {
+      market: 'US', year: 2026, fullClosures: [], halfDays: [], fetchedAt: 0, source: 'ical',
+    });
+    const client = new StubExchangeClient(EODHD_US_2026);
+    const provider = new EodhdExchangeHolidayProvider('US', client, next);
+    const table = await provider.fetchYear(2026);
+    expect(table.source).toBe('eodhd');
+    expect(next.calls).toBe(0);
   });
 });
