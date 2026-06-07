@@ -1,4 +1,5 @@
 import { authedFetch } from '@/app/lib/auth-fetch'
+import { getSystemHealth } from '@/app/lib/system-health'
 import { summariseRecentResearch, type ResearchResultRow } from '@/app/lib/research-summary'
 import { PortfolioHero } from '@/components/PortfolioHero'
 import { EarningsWarning } from '@/components/EarningsWarning'
@@ -26,12 +27,6 @@ import type { SignalProgressDTO } from '@/types/trader'
 interface MarketDataHealth {
   session_states?: Partial<Record<'US' | 'LSE', MarketState>>
   next_session_open_ts?: number | null
-}
-
-interface HealthRow {
-  name: string
-  ok: boolean
-  status?: number
 }
 
 interface RiskStatusInitial {
@@ -98,7 +93,9 @@ export default async function WorkspacePage() {
     fetchJsonOrNull<CashInitial>('/admin/api/trading/cash'),
     fetchJsonOrNull<RiskStatusInitial>('/admin/api/signals/risk/status'),
     fetchJsonOrNull<{ signals?: SignalProgressDTO[] }>('/api/signals/progress'),
-    fetchJsonOrNull<HealthRow[]>('/api/admin/system/health'),
+    // Server components can't fetch their own /portal-api/* route (no origin) — call the
+    // shared fan-out directly. Always resolves to HealthRow[] (down service ⇒ ok:false row).
+    getSystemHealth(),
     fetchRecentResearch(),
   ])
 
@@ -109,7 +106,7 @@ export default async function WorkspacePage() {
   const nextOpen = mdHealth?.next_session_open_ts
     ? new Date(mdHealth.next_session_open_ts).toUTCString()
     : null
-  const healthDown = (health ?? []).filter((s) => !s.ok)
+  const healthDown = health.filter((s) => !s.ok)
 
   return (
     <div className="space-y-6 p-6">
@@ -147,9 +144,7 @@ export default async function WorkspacePage() {
           <AutoApproveToggle initialEnabled={autoApprove} />
           <div className="rounded border border-gray-800 bg-gray-900 p-4">
             <h2 className="mb-2 text-sm font-medium text-gray-300">System health</h2>
-            {health === null ? (
-              <div className="text-sm text-gray-500">Health endpoint unavailable (admin role required).</div>
-            ) : healthDown.length === 0 ? (
+            {healthDown.length === 0 ? (
               <div className="flex items-center gap-2 text-sm text-emerald-400">
                 <span>●</span> All {health.length} services healthy
               </div>

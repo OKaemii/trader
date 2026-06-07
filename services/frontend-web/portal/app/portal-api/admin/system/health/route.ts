@@ -1,28 +1,9 @@
 import { NextResponse } from 'next/server'
-import { authedFetch } from '@/app/lib/auth-fetch'
+import { getSystemHealth } from '@/app/lib/system-health'
 
-// Fan-out aggregator. Replaces the deleted api-gateway's /api/admin/system/health.
-// Each service is probed directly through nginx-ingress — /health endpoints are
-// unauthenticated, but we still send the user JWT (services ignore it for /health).
-const SERVICES: ReadonlyArray<readonly [string, string]> = [
-  ['auth',          '/api/auth/health'],
-  ['signals',       '/api/signals/health'],
-  ['portfolio',     '/api/portfolio/health'],
-  ['notifications', '/api/notifications/health'],
-  ['trading',       '/admin/api/trading/health'],
-  ['market-data',   '/admin/api/market-data/health'],
-  ['strategy',      '/admin/api/strategy/status'],
-  ['backtest',      '/admin/api/backtest/health'],
-]
-
+// Browser-reachable proxy for the client StrategyHealthBanner poll. The fan-out itself
+// lives in @/app/lib/system-health (shared with the server-component callers); this route
+// just JSON-wraps it so /portal-api/admin/system/health stays a fetchable endpoint.
 export async function GET() {
-  const results = await Promise.allSettled(
-    SERVICES.map(async ([name, path]) => {
-      const r = await authedFetch(path)
-      return { name, ok: r.ok, status: r.status }
-    }),
-  )
-  return NextResponse.json(
-    results.map((r, i) => r.status === 'fulfilled' ? r.value : { name: SERVICES[i]![0], ok: false, status: 0 }),
-  )
+  return NextResponse.json(await getSystemHealth())
 }

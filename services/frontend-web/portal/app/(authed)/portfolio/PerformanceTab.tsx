@@ -1,18 +1,18 @@
 import { authedFetch } from '@/app/lib/auth-fetch'
+import { getSystemHealth } from '@/app/lib/system-health'
 import { EquityView, type EquityPayload } from '@/components/EquityView'
-
-interface ServiceHealth { name: string; ok: boolean; status: number }
 
 // Performance tab (Portfolio workspace) — the body of the old /operations/performance page
 // verbatim: equity curve + realised KPIs from the NAV ledger (nav_history, demo/live), plus a
 // live service-health strip (G2). SSR-seeds both; the equity view re-fetches on range change.
+// Service health comes from the shared getSystemHealth() fan-out (server components can't fetch
+// their own /portal-api/* route); it always resolves to a full HealthRow[].
 export async function PerformanceTab() {
-  const [eqRes, healthRes] = await Promise.all([
+  const [eqRes, health] = await Promise.all([
     authedFetch('/admin/api/trading/equity?days=90'),
-    authedFetch('/admin/api/system/health'),
+    getSystemHealth(),
   ])
   const equity: EquityPayload | null = eqRes.ok ? await eqRes.json().catch(() => null) : null
-  const health: ServiceHealth[] = healthRes.ok ? await healthRes.json().catch(() => []) : []
 
   return (
     <div className="space-y-4">
