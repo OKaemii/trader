@@ -117,6 +117,10 @@ class IngestRunStore:
         self._runs: dict[str, RunRecord] = {}
         self._latest_id: Optional[str] = None
         self._running_id: Optional[str] = None
+        # Strong reference to the in-flight background task. asyncio only holds a WEAK reference to a
+        # bare create_task() result, so a task whose handle isn't retained can be GC'd mid-run and
+        # silently cancelled (a documented footgun); keep it here for the run's lifetime.
+        self._task: Optional[asyncio.Task] = None
         # Guards the check-then-set of the single-flight flag against two concurrent triggers racing
         # between the "is one running?" read and the task creation.
         self._lock = asyncio.Lock()
@@ -141,7 +145,9 @@ class IngestRunStore:
             should treat this as a no-op accept, not an error — the heavy backfill is not duplicated).
 
         `tickers` (bare US symbols, or None for the full coverage set) scopes the run; `cap` overrides
-        the coverage cap for this run (None ⇒ the config/env cap)."""
+        the coverage cap for THIS run (None ⇒ the EFFECTIVE config cap — `portal_fundamentals_config`'s
+        `coverageCap` override > env, the resolved value the operator set, so a portal cap actually
+        bounds a force-ingest run)."""
         async with self._lock:
             if self._running_id is not None:
                 in_flight = self._runs[self._running_id]
@@ -152,6 +158,10 @@ class IngestRunStore:
             ua = effective_user_agent(cfg)
             scope = "subset" if tickers else "all"
             run_id = uuid.uuid4().hex
+            # No explicit per-call cap ⇒ use the effective config cap (override > env). The coverage
+            # resolver treats None as uncapped, so falling through to the config value (which is itself
+            # None when the operator opted into uncapped) is what makes the portal cap authoritative.
+            effective_cap = cap if cap is not None else cfg.coverage_cap
 
             if ua is None:
                 # Fail closed — record a terminal failed run, spawn nothing (SEC must never see an
@@ -174,8 +184,9 @@ class IngestRunStore:
             self._latest_id = run_id
             self._running_id = run_id
             # Spawn the orchestrator OFF the request path. The task owns clearing _running_id (in its
-            # finally) so a crashed run still releases the single-flight gate.
-            asyncio.create_task(self._run(record, ua=ua, tickers=tickers, cap=cap))
+            # finally) so a crashed run still releases the single-flight gate. Retain the handle so the
+            # task isn't GC-cancelled (asyncio holds only a weak ref to a bare create_task result).
+            self._task = asyncio.create_task(self._run(record, ua=ua, tickers=tickers, cap=effective_cap))
             log.info("[run_store] force-ingest started run %s (scope=%s)", run_id, scope)
             return record, True
 

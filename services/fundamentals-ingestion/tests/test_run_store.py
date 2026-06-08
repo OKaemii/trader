@@ -69,11 +69,13 @@ def _config(ua: str = "trader-platform/1.0 (ops@example.com)", *, source: str = 
     return _P()
 
 
-def _store(orchestrator: _FakeOrchestrator, *, symbols=("AAPL", "MSFT"), config=None) -> IngestRunStore:
+def _store(orchestrator: _FakeOrchestrator, *, symbols=("AAPL", "MSFT"), config=None, cap_sink=None):
     async def _factory(_ua):
         return orchestrator
 
-    async def _coverage(tickers, _cap):
+    async def _coverage(tickers, cap):
+        if cap_sink is not None:
+            cap_sink.append(cap)
         return list(tickers) if tickers else list(symbols)
 
     return IngestRunStore(
@@ -81,6 +83,19 @@ def _store(orchestrator: _FakeOrchestrator, *, symbols=("AAPL", "MSFT"), config=
         coverage_resolver=_coverage,
         config_provider=config if config is not None else _config(),
     )
+
+
+def _config_with_cap(cap):
+    cfg = FundamentalsConfig(
+        edgar_user_agent="ua a@b.com", coverage_cap=cap, ingest_enabled=True,
+        edgar_user_agent_source="override",
+    )
+
+    class _P:
+        async def get(self, *, force_refresh: bool = False):  # noqa: ARG002
+            return cfg
+
+    return _P()
 
 
 # ── tests ───────────────────────────────────────────────────────────────────────
@@ -190,6 +205,35 @@ async def test_no_coverage_symbols_marks_done_with_reason() -> None:
     assert done.state == STATE_DONE
     assert done.reason == "no_coverage_symbols"
     assert orch.ran_with is None  # orchestrator not run when there are no symbols
+
+
+@pytest.mark.asyncio
+async def test_effective_config_cap_threads_into_coverage_when_no_explicit_cap() -> None:
+    # No per-call cap ⇒ the EFFECTIVE config cap (override > env) bounds the run — the portal cap is
+    # authoritative for a force-ingest run (not silently uncapped).
+    cap_sink: list = []
+    orch = _FakeOrchestrator(_Summary())
+    store = _store(orch, config=_config_with_cap(12), cap_sink=cap_sink)
+    record, started = await store.start()
+    assert started is True
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if store.get(record.run_id).state != STATE_RUNNING:
+            break
+    assert cap_sink == [12]
+
+
+@pytest.mark.asyncio
+async def test_explicit_cap_overrides_config_cap() -> None:
+    cap_sink: list = []
+    orch = _FakeOrchestrator(_Summary())
+    store = _store(orch, config=_config_with_cap(12), cap_sink=cap_sink)
+    record, _ = await store.start(cap=5)
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if store.get(record.run_id).state != STATE_RUNNING:
+            break
+    assert cap_sink == [5]  # the explicit per-call cap wins over the config cap
 
 
 @pytest.mark.asyncio
