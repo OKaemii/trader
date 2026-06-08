@@ -105,7 +105,7 @@ ORDER BY metric, observation_ts DESC
 _SELECT_CLOSE_AS_OF = """
 SELECT close
 FROM (
-  SELECT close, ROW_NUMBER() OVER (
+  SELECT close, observation_ts, ROW_NUMBER() OVER (
            PARTITION BY observation_ts ORDER BY knowledge_ts DESC
          ) AS rn
   FROM bars
@@ -202,7 +202,15 @@ class WarehousePitFundamentals:
     def _fundamentals_for(self, instrument_id: int, as_of_ms: int) -> dict[str, float]:
         """Pivot the as-of facts for one instrument into the snake_case line-item dict, latest annual
         observation per metric, plus the prior-year value under `<key>_prev` for the YoY legs."""
-        rows = self._con.execute(_SELECT_AS_OF, [instrument_id, as_of_ms]).fetchall()
+        # Degrade to {} if the `fundamentals` view is missing/stub-typed (a never-backfilled warehouse
+        # registers an empty placeholder view with no fact columns, so the as-of SELECT can't bind).
+        # The forward-only degrade is the contract: an uncovered name arrives `{}` to the strategy,
+        # never a fabricated value. Mirrors the bars-read guard in `_adjusted_close_as_of` below.
+        try:
+            rows = self._con.execute(_SELECT_AS_OF, [instrument_id, as_of_ms]).fetchall()
+        except Exception as exc:  # noqa: BLE001 — a missing/empty fundamentals view must not break replay
+            log.warning("warehouse fundamentals read failed for instrument %s: %r", instrument_id, exc)
+            return {}
         # rows arrive ordered (metric, observation_ts DESC) → newest-first within each metric.
         latest: dict[str, float] = {}
         prev: dict[str, float] = {}
