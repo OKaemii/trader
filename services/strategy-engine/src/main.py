@@ -17,7 +17,7 @@ from .domain.dataclasses import OHLCVBar
 from .infrastructure.market_data_client import MarketDataClient, range_for_bars
 from .infrastructure import strategy_config
 from .infrastructure.factor_store import FactorStore, factor_history_points, persist_research_cycle
-from .infrastructure.fundamentals_as_of import build_fundamentals_provider
+from .infrastructure.fundamentals_as_of import build_fundamentals_provider, resolve_provider_mode
 from .infrastructure.lru_cache import TTLCache, scores_cache_key
 from .pipeline import build_pipeline_stages, snapshot_from_state
 
@@ -214,6 +214,78 @@ def status():
         "warming_up":      len(warming),
         "warming_detail":  warming,
     }
+
+
+async def build_fundamentals_source_response(
+    factor_store: FactorStore | None,
+    *,
+    provider_mode: str,
+    last_cycle_ts: str | None,
+) -> dict:
+    """Pure builder for ``GET /admin/api/strategy/fundamentals-source`` — the LIVE strategy
+    fundamentals-source observability shape (epic §F). Reports the configured provider mode plus,
+    per ticker, the source the LIVE cycle actually built each name's factors from + when.
+
+    Provenance comes from the same ``factor_scores`` store the Research surface reads (T9): for each
+    ticker, ``factors.quality.source`` is the FundamentalsAsOf provider's ``source_for`` stamp at
+    build time (``pit-edgar`` / ``pit-companies-house`` for a PIT-served name, ``yahoo-snapshot`` for
+    a Yahoo-served/fallback name, or ``null`` when quality couldn't be computed that cycle). That is
+    honest per-name provenance — a Yahoo-fallback name is never mislabelled ``pit-*`` (see
+    ``RoutingFundamentalsAsOf.source_for``).
+
+    Two clocks are deliberately distinct across the epic (§J): ``built_at`` here = the row's
+    ``observation_ts`` = the cycle's ``as_of_ms`` = when the strategy READ fundamentals and BUILT this
+    name's factors (the *consume* clock). The ingest *store* clock (``last_stored_at`` /
+    ``last_ingest_run``) lives on the fundamentals-ingestion ``/freshness`` endpoint (Task 4) — a
+    different instant, surfaced beside this one in the Operations table (Task 9).
+
+    Returns ``{provider, sources:{<source>:count}, by_ticker:{ticker:{source, built_at}}, pit_served,
+    last_cycle_ts}``. A ``null`` source key counts the names whose quality factor had no source this
+    cycle; ``pit_served`` sums every ``pit-*`` source so the portal can show "N names PIT-served".
+    Empty/pre-backfill store (or an unwired ``FactorStore``) ⇒ ``sources:{}``, ``by_ticker:{}`` (a
+    cold warehouse never 500s — same degrade contract as the ``scores`` reads). Cards #149 (Operations
+    per-ticker table) and #150 (per-ticker source badge) consume ``by_ticker[ticker].{source,
+    built_at}``: ``source`` is the raw stamp (may be ``null``); ``built_at`` is epoch-ms (may be
+    ``null`` if a row lacks ``observation_ts``)."""
+    sources: dict[str, int] = {}
+    by_ticker: dict[str, dict] = {}
+    if factor_store is not None:
+        latest = await factor_store.latest_all()  # { ticker: {observation_ts, factors} }
+        for ticker, row in latest.items():
+            src = ((row.get("factors") or {}).get("quality") or {}).get("source")
+            # null/absent source → the explicit "null" bucket (a name whose quality factor had no
+            # source this cycle); a real stamp keys itself. Honest provenance, never a fabricated PIT.
+            key = src if src else "null"
+            sources[key] = sources.get(key, 0) + 1
+            # built_at = the cycle's as_of_ms (observation_ts) = when the strategy read PIT + built
+            # this name's factors. Distinct from the ingest store-clock (Task 4); kept raw for #149/#150.
+            by_ticker[ticker] = {"source": src, "built_at": row.get("observation_ts")}
+    return {
+        "provider":      provider_mode,
+        "sources":       sources,
+        "by_ticker":     by_ticker,
+        # pit_served = names served from a PIT jurisdiction this cycle (pit-edgar / pit-companies-house).
+        "pit_served":    sum(n for k, n in sources.items() if k.startswith("pit-")),
+        "last_cycle_ts": last_cycle_ts,
+    }
+
+
+@app.get("/admin/api/strategy/fundamentals-source")
+async def strategy_fundamentals_source():
+    """LIVE strategy fundamentals-source — the configured provider mode + per-ticker provenance of the
+    last factor build (which source fed each name's QMJ/quality factor, and when). Backs the portal's
+    Operations per-ticker source table (#149) + the reusable per-ticker source badge (#150).
+
+    ``provider`` is ``resolve_provider_mode()`` (the single source of truth shared with the startup
+    wiring, so this can't disagree with what the host actually runs). The per-ticker provenance comes
+    from the ``factor_scores`` store (``_factor_store.latest_all()``); ``/status`` is left untouched —
+    this is a dedicated observability surface. Degrades to ``sources:{}``/``by_ticker:{}`` on an
+    empty/pre-backfill store (never 500)."""
+    return await build_fundamentals_source_response(
+        _factor_store,
+        provider_mode=resolve_provider_mode(),
+        last_cycle_ts=_engine_state.get("last_cycle_ts"),
+    )
 
 
 @app.get("/admin/api/strategy/config")

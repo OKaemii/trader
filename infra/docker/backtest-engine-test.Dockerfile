@@ -35,7 +35,11 @@ COPY services/backtest-engine/tests ./tests
 #   - test_lru_cache (the in-process TTL+LRU fronting the factor_scores scores endpoint — pure
 #     stdlib, no Mongo/numpy: hit/expire/LRU/herd-coalesce + the (ticker, asOf-bucket) key),
 #   - test_pipeline (the Strategy-Lab funnel helper — pure stdlib: declarative stage shape + the
-#     narrowing invariant + degrade-gracefully when no cycle has run).
+#     narrowing invariant + degrade-gracefully when no cycle has run),
+#   - test_fundamentals_source_endpoint (the live fundamentals-source surface: resolve_provider_mode
+#     resolution + the build_fundamentals_source_response source-count/by_ticker builder over a fake
+#     factor store — it imports the FastAPI host src.main, whose deps fastapi/redis/motor/
+#     prometheus_client + quant_core are all installed above, so it resolves in the gate).
 # test_pit_fundamentals_http (the PIT seam's HTTP client) is respx-backed; respx is a tiny pure-python
 # lib over the already-installed httpx, so we install it here and gate that suite too (the live seam's
 # degrade-to-{} safety + URL/JWT shape are load-bearing — worth the deps-clean gate, not just local).
@@ -47,6 +51,7 @@ COPY services/strategy-engine/tests/test_pit_fundamentals_http.py ./strategy_eng
 COPY services/strategy-engine/tests/test_factor_store.py ./strategy_engine/tests/test_factor_store.py
 COPY services/strategy-engine/tests/test_lru_cache.py ./strategy_engine/tests/test_lru_cache.py
 COPY services/strategy-engine/tests/test_pipeline.py ./strategy_engine/tests/test_pipeline.py
+COPY services/strategy-engine/tests/test_fundamentals_source_endpoint.py ./strategy_engine/tests/test_fundamentals_source_endpoint.py
 
 # fundamentals-ingestion skeleton suite (PIT Fundamentals Warehouse write-side). Deps-clean: the app +
 # stage stubs import only fastapi/pydantic + the installed quant_core (TestClient needs httpx from the
