@@ -17,6 +17,11 @@ pymongo==4.7.0
 # EDGAR / Companies House HTTP downloaders (epic Tasks 5/18). Same pin as quant-core's [http] extra.
 httpx==0.27.2
 
+# Redis — best-effort `config:invalidated` cross-pod publish on a portal_fundamentals_config PUT
+# (mirrors market-data-service's live-config write). redis-py's async client; the same pin
+# fundamentals-api uses. The publish degrades to a no-op if Redis is unavailable.
+redis==5.0.7
+
 # Prometheus /metrics exposition (epic Task 20) — the ServiceMonitor scrapes it. Same pin as
 # strategy-engine, the platform's other prometheus_client service.
 prometheus-client==0.20.0
