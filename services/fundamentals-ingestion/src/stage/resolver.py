@@ -298,8 +298,17 @@ def resolve_metrics(
             # candidate tag for this same (period, dim). A disagreement suppresses the CONSOLIDATED
             # emission (a segment bucket is already isolated, so the guard there only protects against a
             # mis-tagged duplicate within the same segment). Surface the first conflicting pair.
+            #
+            # The comparison is FRAME-MATCHED: only other-tag facts sharing the chosen fact's
+            # `period_start` are compared, so two tags whose flow-frame selection landed on DIFFERENT
+            # periods (e.g. tag A reported the QTD while tag B only reported the YTD cumulative for the
+            # same period_end) are NOT cross-checked — a 90-day value vs a 273-day value is a different
+            # period, not a disagreement, and must not falsely suppress a valid fact. (Instants all
+            # share period_start=None, so this is a no-op for balance-sheet metrics.)
             conflict: Optional[ValueConflict] = None
             for other_tag, other in present[1:]:
+                if other.period_start != chosen.period_start:
+                    continue  # different period (QTD vs YTD frame) — not comparable, not a conflict
                 if not _values_agree(chosen.value, other.value):
                     conflict = ValueConflict(
                         metric=metric, cik=str(cik),

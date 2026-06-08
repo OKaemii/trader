@@ -89,13 +89,14 @@ class MetricRegistry:
         return tuple(self._candidates.keys())
 
     def metrics_for_tag(self, raw_tag: str, sector: Optional[str] = None) -> tuple[str, ...]:
-        """The canonical metric(s) `raw_tag` is a candidate for under `sector` — the reverse index that
-        lets the resolver bucket each raw fact by metric in one pass.
+        """The canonical metric(s) `raw_tag` is a candidate for under `sector` — a reverse lookup over
+        the registry (which canonical metric does this us-gaap/dei tag feed?).
 
         A single us-gaap tag CAN feed more than one canonical metric across the registry (rare, but the
         contract allows it); all matches are returned so none is dropped. Sector-scoped so a bank's
-        `Revenues` is bucketed to `total_revenue` (its bank override) while a manufacturer's is not (its
-        default prefers the contract-revenue tag) — the resolver respects each filer's template."""
+        `Revenues` maps to `total_revenue` (its bank override) while a manufacturer's does not (its
+        default prefers the contract-revenue tag) — the lookup respects each filer's template. Provided
+        for consumers/QA that want tag→metric attribution; the resolver itself scans per-metric."""
         out: list[str] = []
         for metric in self._candidates:
             if raw_tag in self.candidates(metric, sector):

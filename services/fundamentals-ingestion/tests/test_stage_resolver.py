@@ -201,6 +201,31 @@ def test_value_agreement_within_tolerance_does_not_conflict() -> None:
     assert not res.conflicts
 
 
+def test_value_agreement_guard_is_frame_matched_not_qtd_vs_ytd() -> None:
+    # The guard must compare like-for-like PERIODS. Here the preferred tag reports the QTD (~90d) for
+    # the period_end, while the fallback tag reports ONLY the YTD cumulative (~273d) for the same
+    # period_end. Their VALUES differ (a quarter vs a 3-quarter cumulative) but they are DIFFERENT
+    # periods — not a disagreement. The guard skips the cross-frame pair, so the QTD value emits
+    # cleanly and no spurious conflict is raised.
+    payload = _facts({
+        "RevenueFromContractWithCustomerExcludingAssessedTax": {"units": {"USD": [
+            {"start": "2021-06-27", "end": "2021-09-25", "val": 30000000000,   # QTD ~90d
+             "accn": "q3-21", "fy": 2021, "fp": "Q3", "form": "10-Q"},
+        ]}},
+        "Revenues": {"units": {"USD": [
+            {"start": "2020-12-27", "end": "2021-09-25", "val": 90000000000,   # YTD ~272d (different period)
+             "accn": "q3-21", "fy": 2021, "fp": "Q3", "form": "10-Q"},
+        ]}},
+    })
+    res = resolve_metrics(parse_company_facts(payload), cik="320193")
+    rev = [f for f in res.facts if f.metric == "total_revenue"
+           and f.period_end == _ms("2021-09-25")]
+    assert len(rev) == 1
+    assert rev[0].raw_tag == "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax"
+    assert rev[0].value == 30000000000.0 and rev[0].period_start == _ms("2021-06-27")
+    assert not res.conflicts            # no spurious cross-frame conflict
+
+
 # ── Rule 2: instant vs duration kept separate ─────────────────────────────────
 def test_instant_metric_ignores_duration_fact_of_same_tag() -> None:
     # A balance-sheet metric (total_equity, instant) must not pick up a duration fact even if one
