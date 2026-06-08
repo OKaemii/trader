@@ -281,7 +281,82 @@ class FakeTimescale:
                 and not r["is_superseded"]
             ]
 
+        # QA engine (Task 8) outlier baseline: the latest CURRENT consolidated value per metric at an
+        # observation STRICTLY EARLIER than $3, for instrument $1, over the metric set $2. DISTINCT ON
+        # (metric) ORDER BY observation_ts DESC → one row per metric, the most recent prior. Reproduce
+        # the SELECT in qa/engine._SELECT_PRIOR_VALUE.
+        if "select distinct on (metric) metric, value" in q and "observation_ts < $3" in q:
+            inst, metrics, before = args
+            metric_set = set(metrics)
+            by_metric: dict[str, dict[str, Any]] = {}
+            for r in self.fundamentals:
+                if (r["instrument_id"] != inst or r["metric"] not in metric_set
+                        or r["dim_signature"] != "" or r["is_superseded"]
+                        or r["value"] is None or r["observation_ts"] >= before):
+                    continue
+                cur = by_metric.get(r["metric"])
+                if cur is None or r["observation_ts"] > cur["observation_ts"]:
+                    by_metric[r["metric"]] = r
+            return [{"metric": m, "value": r["value"]} for m, r in by_metric.items()]
+
+        # QA report (Task 8) — by-reason counts over the optional occurred_at window ($1). Reproduce
+        # qa/report._COUNT_BY_REASON.
+        if "from fundamentals_quarantine" in q and "group by reason" in q:
+            since = args[0]
+            counts: dict[str, int] = {}
+            for r in self.fundamentals_quarantine:
+                if not self._after(r, since):
+                    continue
+                counts[r["reason"]] = counts.get(r["reason"], 0) + 1
+            return [{"reason": reason, "n": n} for reason, n in
+                    sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+        # QA report — by-sector counts (LEFT JOIN quarantine → instruments → companies on instrument_id,
+        # group by company sector; NULL sector groups under None). Reproduce qa/report._COUNT_BY_SECTOR.
+        if "from fundamentals_quarantine q" in q and "group by c.sector" in q:
+            since = args[0]
+            counts: dict[Any, int] = {}
+            for r in self.fundamentals_quarantine:
+                if not self._after(r, since):
+                    continue
+                inst = self._instrument(r["instrument_id"]) if r["instrument_id"] is not None else None
+                comp = self._company(inst["company_id"]) if inst else None
+                sector = comp["sector"] if comp else None
+                counts[sector] = counts.get(sector, 0) + 1
+            return [{"sector": sector, "n": n} for sector, n in
+                    sorted(counts.items(), key=lambda kv: -kv[1])]
+
+        # QA report — recent sample (newest first, bounded by $2). Reproduce qa/report._RECENT_SAMPLE.
+        if "from fundamentals_quarantine" in q and "order by occurred_at desc" in q:
+            since, limit = args
+            rows = [r for r in self.fundamentals_quarantine if self._after(r, since)]
+            rows.sort(key=lambda r: (r.get("occurred_at") or 0, r["event_id"]), reverse=True)
+            return [
+                {
+                    "event_id": r["event_id"],
+                    "occurred_at": r.get("occurred_at"),
+                    "instrument_id": r["instrument_id"],
+                    "filing_id": r["filing_id"],
+                    "reason": r["reason"],
+                    "payload": r["payload"],
+                }
+                for r in rows[:limit]
+            ]
+
         raise AssertionError(f"FakeTimescale.run_fetch: unrecognised query: {q}")
+
+    @staticmethod
+    def _after(row: dict[str, Any], since: Any) -> bool:
+        """Window predicate for the QA-report queries: `since` None ⇒ all rows; otherwise compare the
+        row's `occurred_at` (which the fake leaves unset unless a test sets it). A row with no
+        `occurred_at` is treated as 'now' (always inside a bounded window) — the unit tests assert on
+        counts with `since=None`, so this only matters if a test exercises the windowed path."""
+        if since is None:
+            return True
+        occurred = row.get("occurred_at")
+        if occurred is None:
+            return True
+        return occurred >= since
 
     def run_execute(self, query: str, args: tuple) -> None:
         q = self._norm(query)
@@ -310,12 +385,16 @@ class FakeTimescale:
             self.fundamentals_revisions_log.append(row)
             return
 
-        # quarantine append (value-agreement conflicts handed off to Task 8's review queue). BIGSERIAL
-        # event_id; payload arrives as a JSON string ($4::jsonb) — decode it so tests can assert shape.
+        # quarantine append (value-agreement conflicts from the writer + identity_break/outlier/
+        # missing_data from the QA engine). BIGSERIAL event_id; payload arrives as a JSON string
+        # ($4::jsonb) — kept as the string the code passes (tests json.loads it). `occurred_at` mirrors
+        # the table DEFAULT NOW(); a monotonically-increasing counter stands in so the report sample's
+        # newest-first ordering is deterministic without a real clock.
         if q.startswith("insert into fundamentals_quarantine"):
             instrument_id, filing_id, reason, payload = args
             self.fundamentals_quarantine.append({
                 "event_id": self._next("quarantine"),
+                "occurred_at": self._seq["quarantine"],  # surrogate monotonic clock (== event_id)
                 "instrument_id": instrument_id, "filing_id": filing_id, "reason": reason,
                 "payload": payload,
             })

@@ -15,8 +15,9 @@ multi-minute pipeline inside the handler.
 """
 import os
 from datetime import datetime, timezone
+from typing import Optional
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -83,3 +84,38 @@ async def trigger_ingest(req: IngestRequest) -> dict:
         "received_at": datetime.now(timezone.utc).isoformat(),
         "note": "ingestion pipeline not yet wired — skeleton accepts the trigger only",
     }
+
+
+@app.get("/admin/api/fundamentals-ingest/quarantine")
+async def quarantine_report(
+    since_ms: Optional[int] = Query(
+        default=None,
+        description="Only count quarantine events at/after this UTC-ms instant (omit = all time).",
+    ),
+    limit: int = Query(
+        default=50, ge=1, le=500,
+        description="Max recent quarantine rows to sample (the counts are unbounded over the window).",
+    ),
+) -> JSONResponse:
+    """QA report — summarize `fundamentals_quarantine` by reason + sector + a recent sample (epic Task 8).
+
+    The operator-facing read surface for the quarantine review queue: how many facts/filings the QA
+    engine (identity_break / outlier / missing_data) and the Task-7 writer (value_disagreement) held out
+    of the canonical PIT table, grouped so the financials-are-the-hotspot pattern is visible. Reuses the
+    Task-3 `/admin/api/fundamentals-ingest` ingress prefix (no new ingress). On a Timescale-unreachable
+    error this answers 503 with JSON (the report is a read over a possibly-cold warehouse — a DB blip
+    must not surface as an unhandled 500), so `/health` stays independent of the warehouse being up."""
+    # Local imports keep the module-import smoke test driver-free (asyncpg/qa are only needed to serve
+    # this endpoint, not to import the app).
+    try:
+        from src.qa.report import quarantine_summary
+        from src.security_master.pool import get_pool
+
+        pool = await get_pool()
+        summary = await quarantine_summary(pool, since_ms=since_ms, sample_limit=limit)
+        return JSONResponse(content=summary)
+    except Exception as exc:  # noqa: BLE001 — degrade a warehouse outage to a 503, never a bare 500
+        return JSONResponse(
+            status_code=503,
+            content={"detail": f"quarantine report unavailable: {type(exc).__name__}: {exc}"},
+        )
