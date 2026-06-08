@@ -9,9 +9,10 @@ import type { Db } from 'mongodb';
 import { buildEodhdFeedBars, runEodhdDailyFeed, type CorporateActionsSync } from '../modules/bars/infrastructure/eodhd-daily-feed.ts';
 import { EodhdClient, _setEodhdClientForTest, type EodhdBulkRow } from '../modules/bars/infrastructure/providers/eodhd-client.ts';
 import { invalidateBars } from '@trader/shared-bars';
+import type * as SharedBars from '@trader/shared-bars';
 
 vi.mock('@trader/shared-bars', async () => {
-  const actual = await vi.importActual<typeof import('@trader/shared-bars')>('@trader/shared-bars');
+  const actual = await vi.importActual<typeof SharedBars>('@trader/shared-bars');
   return { ...actual, invalidateBars: vi.fn(async () => {}) };
 });
 

@@ -64,7 +64,6 @@ const { CorporateActionsWatcher } = await import('../modules/corporate-actions/a
 import type { CorporateActionsProvider, ProviderDividend, ProviderSplit } from '../modules/corporate-actions/infrastructure/CorporateActionsProvider.ts';
 
 const ms = (iso: string) => Date.parse(iso);
-const MS_DAY = 24 * 60 * 60 * 1000;
 
 // A provider returning scripted events (the store turns these into "new" actions on first sight).
 class FakeProvider implements CorporateActionsProvider {
