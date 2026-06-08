@@ -21,7 +21,7 @@ import pytest
 
 from src.resolver import FundamentalsResolver
 from src.security_master import SecurityMasterResolver
-from tests.fakes import FakeRedis, FakeTimescale
+from tests.fakes import FakeMarketDataReader, FakeRedis, FakeTimescale
 
 # Fixed knowledge-time instants (UTC ms) for readability.
 _T2018 = 1_500_000_000_000   # ~2017-07 — an early period
@@ -219,3 +219,121 @@ async def test_cache_failure_falls_through_to_db() -> None:
     # A broken cache must NOT block the request — it falls through to Postgres.
     out = await _resolver(db, redis=_BrokenRedis()).get_pit_fundamentals(["AAPL_US_EQ"], _AS_OF_MID)
     assert out["AAPL_US_EQ"].line_items["net_income"] == 100.0
+
+
+# ── Gap-2: market-cap override + dividend-yield leg wired into the resolved payload ───────────────
+def _resolver_md(db: FakeTimescale, market_data, redis=None) -> FundamentalsResolver:
+    return FundamentalsResolver(db, SecurityMasterResolver(db), redis=redis, market_data=market_data)
+
+
+@pytest.mark.asyncio
+async def test_market_cap_computed_from_price_shares_fx_overrides_provider() -> None:
+    """The resolver overrides market_cap_gbp with the computed PIT value (price×shares×fx) — even if a
+    provider scalar somehow landed in the warehouse, AND wires the dividend_yield leg, all at one as_of."""
+    db = FakeTimescale()
+    db.add_instrument(instrument_id=10, t212_ticker="AAPL_US_EQ")
+    db.add_fact(instrument_id=10, metric="shares_outstanding", observation_ts=_T2018,
+                knowledge_ts=_KNOW_ORIG, value=16_000_000_000.0)
+    db.add_fact(instrument_id=10, metric="net_income", observation_ts=_T2018,
+                knowledge_ts=_KNOW_ORIG, value=100_000_000_000.0)
+    # A stray provider market-cap scalar in the warehouse — must be OVERRIDDEN, never surfaced.
+    db.add_fact(instrument_id=10, metric="market_cap_gbp", observation_ts=_T2018,
+                knowledge_ts=_KNOW_ORIG, value=999_999.0)
+
+    md = FakeMarketDataReader()
+    md.set_close("AAPL_US_EQ", _AS_OF_MID, 150.0)       # as-of adjusted close (same series momentum uses)
+    md.set_fx("USD", 0.79)                              # the platform's published GBP/USD
+    md.set_dividend_yield("AAPL_US_EQ", 0.0055)
+
+    out = await _resolver_md(db, md).get_pit_fundamentals(["AAPL_US_EQ"], _AS_OF_MID)
+    li = out["AAPL_US_EQ"].line_items
+    # market_cap_gbp is the COMPUTED value, NOT the warehouse scalar.
+    assert li["market_cap_gbp"] == 150.0 * 16_000_000_000.0 * 0.79
+    assert li["market_cap_gbp"] != 999_999.0
+    # dividend_yield leg wired in at the same as_of.
+    assert li["dividend_yield"] == 0.0055
+    # the dividend-yield read was ONE batch round-trip at this as_of.
+    assert md.dividend_calls == [(("AAPL_US_EQ",), _AS_OF_MID)]
+
+
+@pytest.mark.asyncio
+async def test_market_cap_absent_when_shares_missing() -> None:
+    """No shares_outstanding fact ≤ asOf → market_cap_gbp is ABSENT (NaN-excluded), never fabricated."""
+    db = FakeTimescale()
+    db.add_instrument(instrument_id=10, t212_ticker="AAPL_US_EQ")
+    db.add_fact(instrument_id=10, metric="net_income", observation_ts=_T2018,
+                knowledge_ts=_KNOW_ORIG, value=100.0)
+    md = FakeMarketDataReader()
+    md.set_close("AAPL_US_EQ", _AS_OF_MID, 150.0)
+    md.set_fx("USD", 0.79)
+    out = await _resolver_md(db, md).get_pit_fundamentals(["AAPL_US_EQ"], _AS_OF_MID)
+    assert "market_cap_gbp" not in out["AAPL_US_EQ"].line_items
+    assert out["AAPL_US_EQ"].line_items["net_income"] == 100.0  # the rest is intact
+
+
+@pytest.mark.asyncio
+async def test_market_cap_absent_when_price_missing() -> None:
+    """No as-of close (unseeded bar / nothing ≤ asOf) → market_cap_gbp absent, never fabricated."""
+    db = FakeTimescale()
+    db.add_instrument(instrument_id=10, t212_ticker="AAPL_US_EQ")
+    db.add_fact(instrument_id=10, metric="shares_outstanding", observation_ts=_T2018,
+                knowledge_ts=_KNOW_ORIG, value=16e9)
+    md = FakeMarketDataReader()  # no close seeded → adjusted_close_as_of returns None
+    md.set_fx("USD", 0.79)
+    out = await _resolver_md(db, md).get_pit_fundamentals(["AAPL_US_EQ"], _AS_OF_MID)
+    assert "market_cap_gbp" not in out["AAPL_US_EQ"].line_items
+
+
+@pytest.mark.asyncio
+async def test_dividend_yield_null_omitted() -> None:
+    """A name with no dividend-yield (no price as-of upstream → not in the batch) has no dividend_yield
+    leg — never a fabricated 0."""
+    db = FakeTimescale()
+    db.add_instrument(instrument_id=10, t212_ticker="AAPL_US_EQ")
+    db.add_fact(instrument_id=10, metric="net_income", observation_ts=_T2018,
+                knowledge_ts=_KNOW_ORIG, value=100.0)
+    md = FakeMarketDataReader()  # no dividend yield seeded for this ticker
+    out = await _resolver_md(db, md).get_pit_fundamentals(["AAPL_US_EQ"], _AS_OF_MID)
+    assert "dividend_yield" not in out["AAPL_US_EQ"].line_items
+
+
+@pytest.mark.asyncio
+async def test_unresolved_name_not_market_data_queried() -> None:
+    """An unresolved name (no facts) is passed through untouched — there's nothing to value, and we don't
+    fabricate a market cap from a price alone."""
+    db = FakeTimescale()  # no instruments
+    md = FakeMarketDataReader()
+    md.set_close("NOPE_US_EQ", _AS_OF_MID, 150.0)
+    md.set_fx("USD", 0.79)
+    out = await _resolver_md(db, md).get_pit_fundamentals(["NOPE_US_EQ"], _AS_OF_MID)
+    assert out["NOPE_US_EQ"].line_items == {}
+    # No per-name close read for an unresolved name (we short-circuit before the market-data hop).
+    assert md.close_calls == []
+
+
+@pytest.mark.asyncio
+async def test_no_market_data_reader_leaves_pivot_untouched() -> None:
+    """Without a MarketDataReader (the default), the resolver returns the raw warehouse pivot — no market
+    cap is fabricated (the writer never lands market_cap_gbp, so the key is simply absent)."""
+    db = FakeTimescale()
+    db.add_instrument(instrument_id=10, t212_ticker="AAPL_US_EQ")
+    db.add_fact(instrument_id=10, metric="net_income", observation_ts=_T2018,
+                knowledge_ts=_KNOW_ORIG, value=100.0)
+    db.add_fact(instrument_id=10, metric="shares_outstanding", observation_ts=_T2018,
+                knowledge_ts=_KNOW_ORIG, value=16e9)
+    out = await _resolver(db).get_pit_fundamentals(["AAPL_US_EQ"], _AS_OF_MID)
+    assert "market_cap_gbp" not in out["AAPL_US_EQ"].line_items
+    assert out["AAPL_US_EQ"].line_items["net_income"] == 100.0
+
+
+@pytest.mark.asyncio
+async def test_gbp_name_market_cap_uses_identity_fx() -> None:
+    """An LSE (GBP) name's market cap uses FX identity (1.0) — the stored close is already GBP."""
+    db = FakeTimescale()
+    db.add_instrument(instrument_id=20, t212_ticker="VODl_EQ")
+    db.add_fact(instrument_id=20, metric="shares_outstanding", observation_ts=_T2018,
+                knowledge_ts=_KNOW_ORIG, value=2_000_000_000.0)
+    md = FakeMarketDataReader()  # FakeMarketDataReader seeds GBP→1.0 by default
+    md.set_close("VODl_EQ", _AS_OF_MID, 12.5)
+    out = await _resolver_md(db, md).get_pit_fundamentals(["VODl_EQ"], _AS_OF_MID)
+    assert out["VODl_EQ"].line_items["market_cap_gbp"] == 12.5 * 2_000_000_000.0

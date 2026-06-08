@@ -16,7 +16,7 @@ import src.main as main
 from src.main import SERVICE_NAME, app
 from src.resolver import FundamentalsResolver
 from src.security_master import SecurityMasterResolver
-from tests.fakes import FakeTimescale
+from tests.fakes import FakeMarketDataReader, FakeTimescale
 
 client = TestClient(app)
 
@@ -25,12 +25,14 @@ _KNOW = 1_580_000_000_000
 _AS_OF = 1_600_000_000_000
 
 
-def _patch_resolver(monkeypatch, db: FakeTimescale) -> None:
+def _patch_resolver(monkeypatch, db: FakeTimescale, market_data=None) -> None:
     """Patch the app's resolver factory to hand handlers a resolver over the in-memory db (no real
-    Timescale/Redis); cache disabled (redis=None)."""
+    Timescale/Redis); cache disabled (redis=None). `market_data` optionally injects the Gap-2
+    market-cap/dividend reader (a FakeMarketDataReader) so the enrichment path is exercised through the
+    app with no HTTP."""
 
     async def _fake_build():
-        return FundamentalsResolver(db, SecurityMasterResolver(db), redis=None)
+        return FundamentalsResolver(db, SecurityMasterResolver(db), redis=None, market_data=market_data)
 
     monkeypatch.setattr(main, "_build_resolver", _fake_build)
 
@@ -170,3 +172,69 @@ def test_coverage_degrades_to_503_on_db_error(monkeypatch) -> None:
     res = client.get("/admin/api/fundamentals-pit/coverage")
     assert res.status_code == 503
     assert "detail" in res.json()
+
+
+# ── Gap-2: market cap surfaced in the seam payload + the /factors endpoint ──────────
+def _seeded_db_md():
+    """A db + market-data reader seeding one US name with the facts a PIT market cap + factors need."""
+    db = FakeTimescale()
+    db.add_instrument(instrument_id=10, t212_ticker="AAPL_US_EQ")
+    db.add_fact(instrument_id=10, metric="net_income", observation_ts=_T2018, knowledge_ts=_KNOW, value=100.0)
+    db.add_fact(instrument_id=10, metric="total_equity", observation_ts=_T2018, knowledge_ts=_KNOW, value=500.0)
+    db.add_fact(instrument_id=10, metric="shares_outstanding", observation_ts=_T2018,
+                knowledge_ts=_KNOW, value=16.0)
+    md = FakeMarketDataReader()
+    md.set_close("AAPL_US_EQ", _AS_OF, 150.0)
+    md.set_fx("USD", 0.79)
+    md.set_dividend_yield("AAPL_US_EQ", 0.0055)
+    return db, md
+
+
+def test_internal_seam_payload_includes_computed_market_cap(monkeypatch) -> None:
+    db, md = _seeded_db_md()
+    _patch_resolver(monkeypatch, db, market_data=md)
+    res = client.get(f"/internal/api/fundamentals-pit?tickers=AAPL_US_EQ&asOf={_AS_OF}")
+    assert res.status_code == 200
+    aapl = res.json()["fundamentals"]["AAPL_US_EQ"]
+    # market_cap_gbp is the computed PIT value (price×shares×fx), and the dividend_yield leg is present.
+    assert aapl["market_cap_gbp"] == 150.0 * 16.0 * 0.79
+    assert aapl["dividend_yield"] == 0.0055
+
+
+def test_factors_endpoint_returns_value_quality_legs(monkeypatch) -> None:
+    db, md = _seeded_db_md()
+    _patch_resolver(monkeypatch, db, market_data=md)
+    res = client.get(f"/admin/api/fundamentals-pit/factors?universe=AAPL_US_EQ&as_of={_AS_OF}")
+    assert res.status_code == 200
+    body = res.json()
+    entry = body["factors"]["AAPL_US_EQ"]
+    f = entry["factors"]
+    market_cap = 150.0 * 16.0 * 0.79
+    # Value legs computed on the COMPUTED PIT market cap; ROE on equity. Matches the live factor math.
+    assert f["earnings_yield"] == 100.0 / market_cap
+    assert f["book_to_market"] == 500.0 / market_cap
+    assert f["roe"] == 100.0 / 500.0
+    assert f["dividend_yield"] == 0.0055
+    assert entry["source"] == "pit-edgar"
+    assert body["count"] == 1
+
+
+def test_factors_endpoint_empty_but_200_live(monkeypatch) -> None:
+    # No rows seeded (the pre-backfill cluster state) → 200 with the name's factors all null, not a 500.
+    db = FakeTimescale()
+    db.add_instrument(instrument_id=10, t212_ticker="AAPL_US_EQ")
+    md = FakeMarketDataReader()
+    _patch_resolver(monkeypatch, db, market_data=md)
+    res = client.get("/admin/api/fundamentals-pit/factors?universe=AAPL_US_EQ")  # no as_of ⇒ live
+    assert res.status_code == 200
+    f = res.json()["factors"]["AAPL_US_EQ"]["factors"]
+    assert f["roe"] is None
+    assert f["earnings_yield"] is None
+
+
+def test_factors_endpoint_no_universe_is_empty(monkeypatch) -> None:
+    db = FakeTimescale()
+    _patch_resolver(monkeypatch, db, market_data=FakeMarketDataReader())
+    res = client.get("/admin/api/fundamentals-pit/factors")
+    assert res.status_code == 200
+    assert res.json()["factors"] == {}

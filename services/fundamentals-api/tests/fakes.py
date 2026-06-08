@@ -260,3 +260,44 @@ class FakeRedis:
     async def set(self, key: str, value: str, ex: Optional[int] = None) -> None:
         self.set_calls += 1
         self.store[key] = value
+
+
+class FakeMarketDataReader:
+    """An in-memory stand-in for `src.market_cap.MarketDataReader` — the Gap-2 enrichment edge — so the
+    resolver's market-cap/dividend wiring is tested with NO HTTP and NO Redis. Seed the as-of adjusted
+    close per (ticker, asOf), the FX→GBP multiplier per currency, and the dividend yield per ticker; the
+    resolver calls exactly these three methods.
+
+    The async signatures match the real reader so it is a faithful injection. A ticker/asOf with no
+    seeded close → None (the real reader's 'no bar at/<= as_of'); a currency with no seeded rate → None
+    (the real reader's 'no FX basis'); a ticker with no seeded yield is simply absent from the batch."""
+
+    def __init__(self) -> None:
+        self.closes: dict[tuple[str, Optional[int]], Optional[float]] = {}
+        self.fx: dict[Optional[str], Optional[float]] = {"GBP": 1.0}
+        self.dividend_yields: dict[str, float] = {}
+        # Call recorders so a test can assert the batch dividend-yield round-trip + per-name close reads.
+        self.close_calls: list[tuple[str, Optional[int]]] = []
+        self.dividend_calls: list[tuple[tuple[str, ...], Optional[int]]] = []
+
+    def set_close(self, ticker: str, as_of_ms: Optional[int], close: Optional[float]) -> None:
+        self.closes[(ticker, as_of_ms)] = close
+
+    def set_fx(self, currency: Optional[str], rate: Optional[float]) -> None:
+        self.fx[currency] = rate
+
+    def set_dividend_yield(self, ticker: str, yield_: float) -> None:
+        self.dividend_yields[ticker] = yield_
+
+    async def adjusted_close_as_of(self, ticker: str, as_of_ms: Optional[int]) -> Optional[float]:
+        self.close_calls.append((ticker, as_of_ms))
+        return self.closes.get((ticker, as_of_ms))
+
+    async def fx_to_gbp(self, currency: Optional[str]) -> Optional[float]:
+        return self.fx.get(currency)
+
+    async def dividend_yields_as_of(
+        self, tickers: list[str], as_of_ms: Optional[int]
+    ) -> dict[str, float]:
+        self.dividend_calls.append((tuple(tickers), as_of_ms))
+        return {t: self.dividend_yields[t] for t in tickers if t in self.dividend_yields}
