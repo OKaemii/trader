@@ -400,6 +400,17 @@ class FakeTimescale:
             })
             return
 
+        # companies sector backfill (Task 2): the ONE column-level UPDATE secmaster_writer is granted
+        # (0010, mirroring the supersede grants). `UPDATE companies SET sector=$1 WHERE company_id=$2
+        # AND sector IS DISTINCT FROM $1` — reproduce the IS DISTINCT FROM (NULL-safe) predicate so an
+        # unchanged re-ingest is a genuine no-op in the fake too. Args: (sector, company_id).
+        if q.startswith("update security_master.companies set sector=$1"):
+            sector, company_id = args
+            for c in self.companies:
+                if c["company_id"] == company_id and c["sector"] != sector:
+                    c["sector"] = sector
+            return
+
         # Any OTHER UPDATE/DELETE is an append-only violation (the security-master writers issue none).
         if q.startswith("update") or q.startswith("delete"):
             raise AssertionError(f"append-only violation: writer issued {q.split()[0].upper()}")

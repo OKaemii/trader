@@ -6,13 +6,18 @@ columns are fixed by `packages/shared-pg/sql/0008_security_master.sql` (epic Tas
 writes those columns and nothing else.
 
 APPEND-ONLY IS THE CONTRACT, NOT A SUGGESTION. The `secmaster_writer` role granted in 0008 holds
-INSERT+SELECT and the BIGSERIAL sequence USAGE — and, unlike `fundamentals_writer`/`bars_writer`,
-it is granted **no UPDATE at all** (not even a column-level one). That is deliberate: the security
-master is a pure append log, and the temporal dimension lives entirely in the effective-dated
-`identifiers` interval. So:
+INSERT+SELECT and the BIGSERIAL sequence USAGE; its ONLY mutation is the single column-level
+`UPDATE (sector) ON companies` granted in 0010 (the supersede-style narrow grant `bars_writer`/
+`fundamentals_writer` also use). That one exception is deliberate: `companies.sector` is the SIC→QA
+template (general/bank/insurance/reit/utility — a mutable classification, not the temporal dimension),
+refreshed in place on the find-or-insert FOUND path so quarantine `by_sector` buckets a filer instead
+of reading `(unknown)`. Everything else stays a pure append log; the temporal dimension lives entirely
+in the effective-dated `identifiers` interval. So:
 
   * `companies`/`instruments` upserts are find-or-insert (idempotent by natural key) — never an
-    in-place column rewrite.
+    in-place rewrite of identity columns. The `sector` column is the lone exception (backfilled on the
+    found path, `IS DISTINCT FROM`-gated + non-null only, so a re-ingest of the same template is a
+    no-op and a sector-less caller never clobbers a stored value with NULL).
   * a ticker change does NOT `UPDATE identifiers SET effective_to=…` on the prior row. Instead the
     new identifier is appended with its `effective_from` at the change instant, and the prior
     interval is closed **on read** by the resolver (resolver.py) from the ordering of `effective_from`
@@ -142,7 +147,23 @@ class SecurityMasterWriter:
                         company.name,
                     )
                 if existing is not None:
-                    return int(existing)
+                    company_id = int(existing)
+                    # Retroactive sector backfill on the FOUND path. `sector` is the SIC→QA template
+                    # (general/bank/insurance/reit/utility) — a mutable classification, not part of the
+                    # effective-dated identifier history — so refreshing it in place is correct (and is
+                    # the one column-level UPDATE this writer issues; see the module docstring). The
+                    # `IS DISTINCT FROM` predicate makes a re-ingest of the SAME template a no-op
+                    # (NULL-safe: also skips when both sides are NULL), and the non-null guard means a
+                    # caller that doesn't know the sector never clobbers a stored value with NULL. This
+                    # is what lets the ~21 pre-existing rows (inserted before sector was populated) gain
+                    # a sector so the quarantine `by_sector` JOIN buckets them at query time.
+                    if company.sector is not None:
+                        await conn.execute(
+                            "UPDATE security_master.companies SET sector=$1 "
+                            "WHERE company_id=$2 AND sector IS DISTINCT FROM $1",
+                            company.sector, company_id,
+                        )
+                    return company_id
                 return int(
                     await conn.fetchval(
                         """INSERT INTO security_master.companies

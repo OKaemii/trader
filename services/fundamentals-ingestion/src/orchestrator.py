@@ -234,18 +234,23 @@ class IngestionOrchestrator:
         if submissions is None:
             return TickerResult(ticker=sym, cik=cik, skipped_reason="no_submissions")
 
+        # SIC → sector template (general/bank/insurance/reit/utility — the SIC→QA routing bucket, NOT a
+        # GICS sector). Computed BEFORE the entity upsert so `companies.sector` is populated on the
+        # find-or-insert, and reused as the staging candidate-tag override below (step 6 — same value).
+        sector = template_for_sic(submissions.sic)
+
         facts = await self._facts.fetch_company_facts(cik)
         if not facts:
             # No facts to write, but we still want the entity in the security master (it resolves
             # to an instrument for a later run / the read API). Upsert it, then skip the fact write.
-            instrument_id = await self._upsert_entity(sym, submissions)
+            instrument_id = await self._upsert_entity(sym, submissions, sector=sector)
             return TickerResult(
                 ticker=sym, cik=cik, instrument_id=instrument_id,
-                sector=template_for_sic(submissions.sic), skipped_reason="no_facts",
+                sector=sector, skipped_reason="no_facts",
             )
 
         # Steps 3: company → instrument → ticker identifier → instrument_id.
-        instrument_id = await self._upsert_entity(sym, submissions)
+        instrument_id = await self._upsert_entity(sym, submissions, sector=sector)
 
         # Step 4: upsert filings → lineage_by_accession (accn → (filing_id, accepted_ts)).
         lineage = await self._upsert_filings(submissions, instrument_id=instrument_id)
@@ -253,8 +258,7 @@ class IngestionOrchestrator:
         # Step 5: raw zone (full preservation, hash-gated, per-accession lineage).
         raw_written = await self._raw.write_company_facts(facts, lineage_by_accession=lineage)
 
-        # Step 6: SIC → sector template (drives the staging candidate-tag overrides).
-        sector = template_for_sic(submissions.sic)
+        # Step 6: the SIC→sector template (computed above) drives the staging candidate-tag overrides.
 
         # Step 7: per filing — stage → write → QA in-line.
         canon_inserted = canon_revisions = canon_skipped = quarantined = filings_with_facts = 0
@@ -294,18 +298,25 @@ class IngestionOrchestrator:
             canonical_skipped=canon_skipped, quarantined=quarantined,
         )
 
-    async def _upsert_entity(self, symbol: str, submissions: CompanySubmissions) -> int:
+    async def _upsert_entity(self, symbol: str, submissions: CompanySubmissions, *, sector: str) -> int:
         """Upsert the company + instrument + current-ticker identifier; return the instrument_id.
 
         Idempotent (find-or-insert by CIK / by (company, t212_ticker) / by exact identifier interval).
         The `t212_ticker` is the reconstructed `<SYMBOL>_US_EQ` join key the live universe speaks; the
         current display ticker is appended as an effective-dated `ticker` identifier (open-ended) so the
         as-of resolver can place it — a later run that observes a rename appends the successor and the
-        prior interval closes on read (the append-only contract; never an UPDATE)."""
+        prior interval closes on read (the append-only contract; never an UPDATE).
+
+        `sector` is the SIC→QA template (`template_for_sic` — general/bank/insurance/reit/utility, a
+        coarse routing bucket, NOT a GICS sector), recorded on `companies.sector` so the quarantine
+        `by_sector` JOIN buckets a filer's findings rather than reading `(unknown)`. Unlike the
+        append-only identifiers this is a MUTABLE classification: `upsert_company` writes it on insert
+        and backfills it on the find-or-insert FOUND path (so the ~21 pre-existing rows gain a sector)."""
         company_id = await self._secmaster.upsert_company(
             CompanyRecord(
                 name=submissions.name or symbol,
                 country=country_for_ticker(f"{symbol}{_US_EQ_SUFFIX}"),
+                sector=sector,
                 cik=submissions.cik,
             )
         )

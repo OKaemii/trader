@@ -268,6 +268,50 @@ async def test_bank_sic_selects_bank_template() -> None:
 
 
 @pytest.mark.asyncio
+async def test_full_pipeline_populates_company_sector() -> None:
+    # The SIC→QA template must land on companies.sector (not just the TickerResult) so the quarantine
+    # by_sector JOIN can bucket the filer. AAPL's SIC 3571 → 'general'.
+    db = FakeTimescale()
+    orch = _orchestrator(db)
+    await orch.run(["AAPL"])
+    assert len(db.companies) == 1
+    assert db.companies[0]["sector"] == "general"
+
+
+@pytest.mark.asyncio
+async def test_bank_sic_populates_bank_sector_on_company_row() -> None:
+    # The selected non-general template reaches the row too: a bank SIC writes 'bank' to companies.sector.
+    bank_subs = dict(_AAPL_SUBMISSIONS, sic="6022")  # state commercial bank
+    db = FakeTimescale()
+    orch = _orchestrator(db, subs={"0000320193": bank_subs})
+    await orch.run(["AAPL"])
+    assert db.companies[0]["sector"] == "bank"
+
+
+@pytest.mark.asyncio
+async def test_no_facts_path_populates_company_sector() -> None:
+    # The no-facts skip still records the entity AND its sector (sector is computed before the upsert and
+    # passed on both call sites), so a filer we can't yet ingest facts for still buckets in by_sector.
+    db = FakeTimescale()
+    orch = _orchestrator(db, facts={})  # empty facts map → fetch_company_facts returns []
+    summary = await orch.run(["AAPL"])
+    assert summary.results[0].skipped_reason == "no_facts"
+    assert db.companies[0]["sector"] == "general"       # SIC 3571 → general, still populated
+
+
+@pytest.mark.asyncio
+async def test_rerun_preserves_company_sector() -> None:
+    # Idempotency extends to sector: a second run over the same fixtures re-asserts the same template via
+    # the IS DISTINCT FROM-gated UPDATE (a no-op), never duplicating the issuer or nulling the sector.
+    db = FakeTimescale()
+    orch = _orchestrator(db)
+    await orch.run(["AAPL"])
+    await orch.run(["AAPL"])
+    assert len(db.companies) == 1
+    assert db.companies[0]["sector"] == "general"
+
+
+@pytest.mark.asyncio
 async def test_filing_without_accepted_ts_is_skipped_for_facts() -> None:
     # A filing whose accepted_ts SEC omitted has no honest knowledge_ts to stamp → its facts are not
     # written canonically (the bi-temporal contract). Here the FY2020 filing loses its accept time, so

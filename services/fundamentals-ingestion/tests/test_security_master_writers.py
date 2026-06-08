@@ -47,6 +47,61 @@ async def test_upsert_company_distinguishes_by_name_when_no_cik() -> None:
 
 
 @pytest.mark.asyncio
+async def test_upsert_company_writes_sector_on_insert() -> None:
+    # A fresh company carries the SIC→QA template (general/bank/insurance/reit/utility) into the row on
+    # the INSERT path, so quarantine by_sector buckets it immediately.
+    db = FakeTimescale()
+    w = SecurityMasterWriter(db)
+    cid = await w.upsert_company(CompanyRecord(name="Bank Co", cik="9", sector="bank"))
+    assert db.companies[0]["company_id"] == cid
+    assert db.companies[0]["sector"] == "bank"
+
+
+@pytest.mark.asyncio
+async def test_upsert_company_backfills_sector_on_found_path() -> None:
+    # The retroactive backfill: a row first inserted WITHOUT a sector (the ~21 pre-existing rows) gains
+    # one on a later re-ingest that supplies it — find-or-insert returns the SAME id, and the UPDATE
+    # populates sector in place (the lone column-level mutation; never a duplicate row).
+    db = FakeTimescale()
+    w = SecurityMasterWriter(db)
+    first = await w.upsert_company(CompanyRecord(name="Apple Inc.", cik="0000320193"))
+    assert db.companies[0]["sector"] is None  # inserted sector-less
+    again = await w.upsert_company(CompanyRecord(name="Apple Inc.", cik="0000320193", sector="general"))
+    assert first == again
+    assert len(db.companies) == 1                       # no duplicate issuer
+    assert db.companies[0]["sector"] == "general"       # backfilled in place
+
+
+@pytest.mark.asyncio
+async def test_upsert_company_found_path_none_sector_leaves_row_unchanged() -> None:
+    # A sector-less re-ingest must NOT clobber a stored sector with NULL — the non-null guard skips the
+    # UPDATE entirely (so a caller that doesn't know the sector is harmless).
+    db = FakeTimescale()
+    w = SecurityMasterWriter(db)
+    cid = await w.upsert_company(CompanyRecord(name="Reit Co", cik="42", sector="reit"))
+    again = await w.upsert_company(CompanyRecord(name="Reit Co", cik="42"))  # no sector
+    assert cid == again
+    assert db.companies[0]["sector"] == "reit"          # preserved, not nulled
+
+
+@pytest.mark.asyncio
+async def test_upsert_company_found_path_refreshes_changed_sector() -> None:
+    # A reclassification (a filer's SIC band changed → a different template) is refreshed in place; the
+    # IS DISTINCT FROM predicate means an UNCHANGED re-ingest is a no-op, but a genuine change lands.
+    db = FakeTimescale()
+    w = SecurityMasterWriter(db)
+    cid = await w.upsert_company(CompanyRecord(name="Co", cik="7", sector="general"))
+    # Same sector again → no-op (the fake's IS DISTINCT FROM check leaves the value as-is).
+    await w.upsert_company(CompanyRecord(name="Co", cik="7", sector="general"))
+    assert db.companies[0]["sector"] == "general"
+    # Changed sector → refreshed in place, still one row, same id.
+    again = await w.upsert_company(CompanyRecord(name="Co", cik="7", sector="utility"))
+    assert cid == again
+    assert len(db.companies) == 1
+    assert db.companies[0]["sector"] == "utility"
+
+
+@pytest.mark.asyncio
 async def test_upsert_instrument_idempotent_by_company_and_t212() -> None:
     db = FakeTimescale()
     w = SecurityMasterWriter(db)
