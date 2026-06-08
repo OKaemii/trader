@@ -17,10 +17,13 @@ from src.infrastructure.factor_store import (
     build_docs,
     factor_history_points,
     persist_research_cycle,
+    rebackfill_factor_sources,
     stamp_factor_sources,
+    upgrade_null_cells,
 )
 
 SOURCE_YAHOO = "yahoo-snapshot"
+SOURCE_PIT_EDGAR = "pit-edgar"
 
 
 def _op_filter(op) -> dict:
@@ -162,6 +165,20 @@ class _FakeCollection:
             else:
                 self.docs.append(dict(update))
 
+    async def update_one(self, flt, update):
+        """Minimal $set update_one over the in-memory docs — mirrors the slice rebackfill_row uses.
+        Returns a tiny result carrying modified_count (1 iff a matched doc actually changed)."""
+        class _Res:
+            def __init__(self, modified_count: int) -> None:
+                self.modified_count = modified_count
+
+        matched = next((d for d in self.docs if self._match(d, flt)), None)
+        if matched is None:
+            return _Res(0)
+        before = dict(matched)
+        matched.update(update.get("$set", {}))
+        return _Res(1 if matched != before else 0)
+
     async def find_one(self, query, *, sort=None, projection=None):
         matches = [d for d in self.docs if self._match(d, query)]
         if sort:
@@ -189,15 +206,32 @@ class _FakeCollection:
             rows.append(doc)
         return _FakeCursor(rows)
 
-    @staticmethod
-    def _match(doc, query) -> bool:
+    @classmethod
+    def _match(cls, doc, query) -> bool:
         for k, v in query.items():
-            if isinstance(v, dict) and "$lte" in v:
-                if not (doc.get(k) is not None and doc[k] <= v["$lte"]):
+            if k == "$or":
+                if not any(cls._match(doc, clause) for clause in v):
                     return False
-            elif doc.get(k) != v:
+                continue
+            actual = cls._dotted(doc, k)
+            if isinstance(v, dict) and "$lte" in v:
+                if not (actual is not None and actual <= v["$lte"]):
+                    return False
+            elif actual != v:
                 return False
         return True
+
+    @staticmethod
+    def _dotted(doc, key):
+        """Resolve a dotted key (e.g. 'factors.quality.source') against a nested doc — Mongo's dot
+        notation. A missing path resolves to None (matching Mongo's `field: null` semantics, which is
+        exactly the no-source-cell predicate rows_needing_rebackfill uses)."""
+        cur = doc
+        for part in key.split("."):
+            if not isinstance(cur, dict):
+                return None
+            cur = cur.get(part)
+        return cur
 
 
 class _FakeDb:
@@ -348,3 +382,220 @@ async def test_persist_research_cycle_writes_through_on_success():
     )
     assert written == 2
     assert len(coll.docs) == 2
+
+
+# ── PIT re-backfill: upgrade ONLY previously-None (no-source) cells, guarded by source ────────────
+def _cell(raw, pct, source):
+    return {"raw": raw, "pct": pct, "source": source}
+
+
+def _null_cell():
+    return {"raw": None, "pct": None, "source": None}
+
+
+# ── The pure guard (upgrade_null_cells) ──────────────────────────────────────────────────────────
+def test_upgrade_null_cells_upgrades_only_no_source_cells():
+    """A no-source quality cell is upgraded to the fresh PIT value; the eod momentum + div value cells
+    (genuine sources) are left untouched."""
+    stored = {
+        "momentum":   _cell(1.83, 92.0, SOURCE_EOD),       # genuine → immutable
+        "quality":    _null_cell(),                         # no-source → upgradeable
+        "value":      _cell(-0.40, 31.0, SOURCE_DIV),       # genuine → immutable
+        "volatility": _cell(-0.20, 61.0, SOURCE_EOD),       # genuine → immutable
+    }
+    fresh = {
+        "momentum":   _cell(0.0, 0.0, SOURCE_EOD),          # would-be change, but stored is genuine
+        "quality":    _cell(0.70, 84.0, SOURCE_PIT_EDGAR),  # the PIT recompute
+        "value":      _cell(9.9, 99.0, SOURCE_PIT_EDGAR),   # would-be change, but stored is genuine
+    }
+    merged, upgraded = upgrade_null_cells(stored, fresh)
+    assert upgraded == 1
+    assert merged["quality"] == _cell(0.70, 84.0, SOURCE_PIT_EDGAR)   # upgraded
+    assert merged["momentum"] == _cell(1.83, 92.0, SOURCE_EOD)        # untouched
+    assert merged["value"] == _cell(-0.40, 31.0, SOURCE_DIV)          # untouched (genuine div leg)
+    assert merged["volatility"] == _cell(-0.20, 61.0, SOURCE_EOD)
+
+
+def test_upgrade_null_cells_never_overwrites_genuine_value():
+    """A genuine (sourced) cell is NEVER overwritten — even a stored yahoo-snapshot quality stays put
+    (it is a real value, not the no-source gap the re-backfill targets)."""
+    stored = {"quality": _cell(0.5, 70.0, SOURCE_YAHOO)}
+    fresh = {"quality": _cell(0.70, 84.0, SOURCE_PIT_EDGAR)}
+    merged, upgraded = upgrade_null_cells(stored, fresh)
+    assert upgraded == 0
+    assert merged["quality"] == _cell(0.5, 70.0, SOURCE_YAHOO)   # immutable history
+
+
+def test_upgrade_null_cells_skips_when_fresh_still_empty():
+    """A no-source cell stays the honest gap when PIT still has nothing (fresh cell is null / has no
+    finite value) — never fabricates a value just to fill the gap."""
+    stored = {"quality": _null_cell()}
+    # fresh has no quality, or a null quality → no upgrade either way.
+    merged, upgraded = upgrade_null_cells(stored, {"quality": _null_cell()})
+    assert upgraded == 0 and merged["quality"] == _null_cell()
+    merged2, upgraded2 = upgrade_null_cells(stored, {})
+    assert upgraded2 == 0 and merged2["quality"] == _null_cell()
+
+
+def test_upgrade_null_cells_ignores_non_genuine_fresh_source():
+    """The fresh cell must itself carry a genuine source to be an upgrade — a fresh cell with a
+    null/garbage source is not written (defends against feeding a no-source recompute back in)."""
+    stored = {"quality": _null_cell()}
+    merged, upgraded = upgrade_null_cells(stored, {"quality": {"raw": 0.7, "pct": 84.0, "source": None}})
+    assert upgraded == 0 and merged["quality"] == _null_cell()
+
+
+# ── The store candidate query + matched in-place upgrade ─────────────────────────────────────────
+def _row(ticker, ts, *, quality_source, value_source=SOURCE_DIV):
+    """A persisted factor_scores doc with a controllable quality/value source (None = the no-source
+    cell, the re-backfill target)."""
+    return {
+        "ticker": ticker,
+        "observation_ts": ts,
+        "factors": {
+            "momentum":   _cell(1.0, 50.0, SOURCE_EOD),
+            "quality":    _cell(0.7, 84.0, quality_source) if quality_source else _null_cell(),
+            "value":      _cell(-0.4, 31.0, value_source) if value_source else _null_cell(),
+            "volatility": _cell(-0.2, 61.0, SOURCE_EOD),
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_rows_needing_rebackfill_matches_only_null_source_cells():
+    """The candidate query returns ONLY rows with a no-source quality or value cell; a fully-sourced
+    row is excluded. Oldest → newest."""
+    coll = _FakeCollection()
+    store = FactorStore(db=_FakeDb(coll))
+    coll.docs = [
+        _row("AAPL_US_EQ", 3000, quality_source=None),                       # null quality → candidate
+        _row("MSFT_US_EQ", 1000, quality_source=SOURCE_YAHOO, value_source=None),  # null value → candidate
+        _row("BP_US_EQ", 2000, quality_source=SOURCE_YAHOO, value_source=SOURCE_DIV),  # fully sourced → NOT
+    ]
+    candidates = await store.rows_needing_rebackfill()
+    tickers = [c["ticker"] for c in candidates]
+    assert "BP_US_EQ" not in tickers
+    assert set(tickers) == {"AAPL_US_EQ", "MSFT_US_EQ"}
+    # Oldest → newest by observation_ts (MSFT@1000 before AAPL@3000).
+    assert [c["observation_ts"] for c in candidates] == [1000, 3000]
+
+
+@pytest.mark.asyncio
+async def test_rebackfill_row_writes_matched_block():
+    """rebackfill_row updates the row matched by (ticker, observation_ts) in place, returns True on a
+    real change, False on a no-op."""
+    coll = _FakeCollection()
+    store = FactorStore(db=_FakeDb(coll))
+    coll.docs = [_row("AAPL_US_EQ", 1000, quality_source=None)]
+    new_factors = dict(coll.docs[0]["factors"])
+    new_factors["quality"] = _cell(0.9, 95.0, SOURCE_PIT_EDGAR)
+    assert await store.rebackfill_row("AAPL_US_EQ", 1000, new_factors) is True
+    assert coll.docs[0]["factors"]["quality"] == _cell(0.9, 95.0, SOURCE_PIT_EDGAR)
+    # A second identical write is a no-op.
+    assert await store.rebackfill_row("AAPL_US_EQ", 1000, new_factors) is False
+    # A non-existent row is never created (upsert=False).
+    assert await store.rebackfill_row("NOPE_US_EQ", 1, new_factors) is False
+
+
+# ── The orchestrator entry point ─────────────────────────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_rebackfill_factor_sources_upgrades_only_null_rows():
+    """End-to-end: scan candidates, recompute PIT factors per row, upgrade ONLY the no-source cells,
+    leave a fully-sourced row untouched. The recompute_fn is the injected PIT compute."""
+    coll = _FakeCollection()
+    store = FactorStore(db=_FakeDb(coll))
+    coll.docs = [
+        _row("AAPL_US_EQ", 1000, quality_source=None),                            # null quality
+        _row("BP_US_EQ", 2000, quality_source=SOURCE_YAHOO, value_source=SOURCE_DIV),  # genuine → skipped
+    ]
+
+    async def recompute(ticker, observation_ts):
+        # PIT now answers the past as_of: a genuine pit-edgar quality (+ value) for every name.
+        return {
+            "quality": _cell(0.95, 96.0, SOURCE_PIT_EDGAR),
+            "value":   _cell(0.10, 55.0, SOURCE_PIT_EDGAR),
+        }
+
+    summary = await rebackfill_factor_sources(store, recompute)
+    # Only AAPL had a no-source cell → exactly one row, one cell upgraded.
+    assert summary["scanned"] == 1
+    assert summary["rows_upgraded"] == 1
+    assert summary["cells_upgraded"] == 1
+    aapl = next(d for d in coll.docs if d["ticker"] == "AAPL_US_EQ")
+    assert aapl["factors"]["quality"] == _cell(0.95, 96.0, SOURCE_PIT_EDGAR)   # upgraded
+    assert aapl["factors"]["value"]["source"] == SOURCE_DIV                    # genuine div leg untouched
+    # BP was fully sourced → never scanned, never changed.
+    bp = next(d for d in coll.docs if d["ticker"] == "BP_US_EQ")
+    assert bp["factors"]["quality"]["source"] == SOURCE_YAHOO
+
+
+@pytest.mark.asyncio
+async def test_rebackfill_is_idempotent():
+    """A second run over already-upgraded rows is a no-op (the upgraded cells now carry a genuine
+    source, so they no longer match the candidate query)."""
+    coll = _FakeCollection()
+    store = FactorStore(db=_FakeDb(coll))
+    coll.docs = [_row("AAPL_US_EQ", 1000, quality_source=None)]
+
+    async def recompute(ticker, ts):
+        return {"quality": _cell(0.95, 96.0, SOURCE_PIT_EDGAR)}
+
+    first = await rebackfill_factor_sources(store, recompute)
+    assert first["cells_upgraded"] == 1
+    second = await rebackfill_factor_sources(store, recompute)
+    assert second == {"scanned": 0, "rows_upgraded": 0, "cells_upgraded": 0}
+
+
+@pytest.mark.asyncio
+async def test_rebackfill_skips_when_pit_still_empty():
+    """When PIT still has nothing (recompute returns {} / a null cell), the no-source row stays the
+    honest gap — nothing upgraded, no fabricated value."""
+    coll = _FakeCollection()
+    store = FactorStore(db=_FakeDb(coll))
+    coll.docs = [_row("AAPL_US_EQ", 1000, quality_source=None)]
+
+    async def recompute_empty(ticker, ts):
+        return {}
+
+    summary = await rebackfill_factor_sources(store, recompute_empty)
+    assert summary == {"scanned": 1, "rows_upgraded": 0, "cells_upgraded": 0}
+    assert coll.docs[0]["factors"]["quality"] == _null_cell()   # still the gap
+
+
+@pytest.mark.asyncio
+async def test_rebackfill_swallows_a_bad_row_and_continues():
+    """A recompute that raises for ONE row is logged + skipped; other rows still upgrade (the
+    maintenance entry point never aborts mid-run)."""
+    coll = _FakeCollection()
+    store = FactorStore(db=_FakeDb(coll))
+    coll.docs = [
+        _row("BAD_US_EQ", 1000, quality_source=None),
+        _row("AAPL_US_EQ", 2000, quality_source=None),
+    ]
+
+    async def recompute(ticker, ts):
+        if ticker == "BAD_US_EQ":
+            raise RuntimeError("pit blew up for this name")
+        return {"quality": _cell(0.95, 96.0, SOURCE_PIT_EDGAR)}
+
+    summary = await rebackfill_factor_sources(store, recompute)
+    assert summary["scanned"] == 2
+    assert summary["rows_upgraded"] == 1          # AAPL upgraded despite BAD raising
+    aapl = next(d for d in coll.docs if d["ticker"] == "AAPL_US_EQ")
+    assert aapl["factors"]["quality"]["source"] == SOURCE_PIT_EDGAR
+    bad = next(d for d in coll.docs if d["ticker"] == "BAD_US_EQ")
+    assert bad["factors"]["quality"] == _null_cell()   # untouched (recompute raised)
+
+
+@pytest.mark.asyncio
+async def test_rebackfill_accepts_sync_recompute_fn():
+    """recompute_fn may be sync (not just async) — the entry point awaits only when it's awaitable."""
+    coll = _FakeCollection()
+    store = FactorStore(db=_FakeDb(coll))
+    coll.docs = [_row("AAPL_US_EQ", 1000, quality_source=None)]
+
+    def recompute_sync(ticker, ts):  # plain sync callable
+        return {"quality": _cell(0.95, 96.0, SOURCE_PIT_EDGAR)}
+
+    summary = await rebackfill_factor_sources(store, recompute_sync)
+    assert summary["cells_upgraded"] == 1

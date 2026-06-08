@@ -64,7 +64,7 @@ best-effort guard the feature store uses.
 from __future__ import annotations
 
 import os
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import motor.motor_asyncio
 from pymongo import ASCENDING, DESCENDING, UpdateOne
@@ -187,6 +187,72 @@ def factor_history_points(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return points
 
 
+# ── PIT re-backfill (upgrade previously-None fundamentals factors in place) ──────────────────────
+#
+# The forward-only Yahoo seam returns {} for any PAST as_of, so the fundamentals-derived factors
+# (quality, and value's earnings/book leg) were persisted as the honest no-source cell
+# ``{raw:null, pct:null, source:null}`` for historical cycles. Once the PIT warehouse can answer those
+# past as_ofs (the wider epic), a re-backfill recomputes those cycles with PIT fundamentals and upgrades
+# EXACTLY the rows that were genuinely missing — matched by ``(ticker, observation_ts)`` and GUARDED BY
+# ``source``: a cell is upgraded only when its stored ``source`` is None (the no-source cell). A cell
+# that already carries ANY source (``eod`` price factors, a ``div`` value leg, a prior ``yahoo-snapshot``
+# / ``pit-*`` value) is a genuine value and is NEVER overwritten. This is the guard the T5 doc shape was
+# designed for (the no-source cell is the upgrade target; a sourced cell is immutable history).
+
+# The set of source stamps that mark a GENUINE (immutable) factor value — a cell carrying any of these
+# is never touched by the re-backfill. The only upgradeable state is ``source: None`` (the no-source
+# cell). Kept as a frozenset so the guard is a cheap membership test and the intent is explicit.
+_GENUINE_SOURCES: frozenset[Optional[str]] = frozenset(
+    {SOURCE_EOD, SOURCE_DIV, "yahoo-snapshot", "pit-edgar", "pit-companies-house"}
+)
+
+
+def upgrade_null_cells(
+    stored_factors: dict[str, dict[str, Any]],
+    fresh_factors: dict[str, dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], int]:
+    """Merge freshly-recomputed PIT ``fresh_factors`` onto a row's ``stored_factors``, upgrading ONLY
+    the cells whose stored ``source`` is None (the no-source cell) to the fresh cell — and only when the
+    fresh cell actually has a finite value (a fresh no-source cell is not an upgrade). Returns the merged
+    factors block + the number of cells upgraded.
+
+    GUARD (the contract): a stored cell with ANY source in ``_GENUINE_SOURCES`` is a genuine value and is
+    left exactly as-is — the re-backfill never overwrites real history, only fills the gaps the
+    forward-only seam left as ``source: null``. Pure (no Mongo) so the guard is unit-testable; the store
+    method below does the matched in-place update from this result.
+
+    ``stored_factors`` / ``fresh_factors`` are both the persisted ``factors`` block shape
+    (``{factor: {raw, pct, source}}``). A factor present in ``stored`` but absent from ``fresh`` is kept
+    unchanged (the PIT recompute didn't produce it this pass); a factor in ``fresh`` but not ``stored`` is
+    ignored (we only upgrade cells that already exist in the row — the row's factor set is fixed at
+    write time)."""
+    merged: dict[str, dict[str, Any]] = {}
+    upgraded = 0
+    for factor, stored_cell in stored_factors.items():
+        cell = dict(stored_cell) if isinstance(stored_cell, dict) else {}
+        if cell.get("source") in _GENUINE_SOURCES:
+            # Genuine value — immutable history. Keep verbatim.
+            merged[factor] = cell
+            continue
+        # Stored cell is the no-source cell (source is None / unknown) — eligible for upgrade.
+        fresh_cell = fresh_factors.get(factor)
+        if (
+            isinstance(fresh_cell, dict)
+            and fresh_cell.get("raw") is not None
+            and fresh_cell.get("source") in _GENUINE_SOURCES
+        ):
+            merged[factor] = {
+                "raw": fresh_cell.get("raw"),
+                "pct": fresh_cell.get("pct"),
+                "source": fresh_cell.get("source"),
+            }
+            upgraded += 1
+        else:
+            # No finite fresh value (PIT still has nothing for this name/as_of) — leave the gap honest.
+            merged[factor] = cell
+    return merged, upgraded
+
+
 class FactorStore:
     """Mongo writer/reader for ``factor_scores``. One instance per host process; reuses the shared
     MONGODB_URL client. All methods are async (motor)."""
@@ -293,6 +359,41 @@ class FactorStore:
         rows.reverse()   # newest-first off the index → chronological for the time-series consumer
         return rows
 
+    # ── PIT re-backfill (upgrade previously-None fundamentals cells in place) ──────────────────────
+    async def rows_needing_rebackfill(
+        self, *, factors: Iterable[str] = ("quality", "value"), limit: int = 10_000
+    ) -> list[dict[str, Any]]:
+        """Historical rows with AT LEAST ONE upgradeable (no-source) cell among ``factors`` — the
+        re-backfill candidate set. A cell is upgradeable iff its ``source`` is null (the honest
+        no-source cell the forward-only seam left). Returns ``{ticker, observation_ts, factors}`` per
+        candidate (``_id`` projected out), oldest → newest so a long backfill makes monotonic progress.
+
+        Only the fundamentals-derived factors are candidates by default (``quality`` + ``value``); the
+        price factors (``momentum``/``volatility``) are ``eod`` and were never null for lack of
+        fundamentals. The ``$or`` matches a doc where any named factor's ``source`` is null."""
+        clauses = [{f"factors.{f}.source": None} for f in factors]
+        if not clauses:
+            return []
+        cursor = self._coll.find(
+            {"$or": clauses},
+            sort=[("observation_ts", ASCENDING)],
+            projection={"_id": False},
+        ).limit(limit)
+        return [doc async for doc in cursor]
+
+    async def rebackfill_row(
+        self, ticker: str, observation_ts: int, merged_factors: dict[str, dict[str, Any]]
+    ) -> bool:
+        """Write the upgraded ``factors`` block back to the row matched by ``(ticker, observation_ts)``.
+        Returns True iff a row was actually modified (no-op when the merge changed nothing). The match
+        key is the same idempotency key the writer uses, so this never creates a row (``upsert=False``)
+        — it only upgrades an existing historical row in place."""
+        res = await self._coll.update_one(
+            {"ticker": ticker, "observation_ts": observation_ts},
+            {"$set": {"factors": merged_factors}},
+        )
+        return bool(getattr(res, "modified_count", 0))
+
 
 async def persist_research_cycle(
     store: FactorStore,
@@ -319,3 +420,72 @@ async def persist_research_cycle(
     except Exception as exc:  # noqa: BLE001 — persistence is never on the emission path
         print(f"[strategy-engine:factor-store] persist failed (continuing): {exc!r}", flush=True)
         return 0
+
+
+async def rebackfill_factor_sources(
+    store: FactorStore,
+    recompute_fn: Callable[[str, int], Any],
+    *,
+    factors: Iterable[str] = ("quality", "value"),
+    limit: int = 10_000,
+) -> dict[str, int]:
+    """Re-backfill entry point: upgrade previously-``None`` fundamentals cells in historical
+    ``factor_scores`` rows in place, using freshly-recomputed PIT factors.
+
+    This is the offline upgrade the epic runs once the PIT warehouse can answer a past ``as_of``: it
+    finds every row with a no-source ``quality``/``value`` cell (``rows_needing_rebackfill``), asks
+    ``recompute_fn(ticker, observation_ts)`` for that row's PIT-recomputed ``factors`` block, merges with
+    the ``source`` guard (``upgrade_null_cells`` — only no-source cells, only when the fresh cell has a
+    finite value), and writes the upgraded block back matched by ``(ticker, observation_ts)``. A genuine
+    (sourced) cell is NEVER overwritten; a row whose PIT recompute still has nothing is left untouched.
+
+    ``recompute_fn`` is INJECTED (it carries the strategy/compute machinery + the PIT provider, which
+    live in the host — keeping this store module free of numpy/strategy deps). It may be sync or async
+    and returns the persisted ``factors`` block shape (``{factor:{raw,pct,source}}``) for that row, or an
+    empty/None result when PIT has nothing (then nothing is upgraded for that row).
+
+    Best-effort and idempotent: a per-row failure is logged and skipped (the run continues); a second run
+    over already-upgraded rows is a no-op (the upgraded cells now carry a genuine source, so the guard
+    rejects them and the candidate query no longer matches). Returns a summary
+    ``{scanned, rows_upgraded, cells_upgraded}``."""
+    import inspect
+
+    summary = {"scanned": 0, "rows_upgraded": 0, "cells_upgraded": 0}
+    try:
+        candidates = await store.rows_needing_rebackfill(factors=factors, limit=limit)
+    except Exception as exc:  # noqa: BLE001 — never raise out of a maintenance entry point
+        print(f"[strategy-engine:factor-store] re-backfill candidate scan failed: {exc!r}", flush=True)
+        return summary
+
+    for row in candidates:
+        summary["scanned"] += 1
+        ticker = row.get("ticker")
+        observation_ts = row.get("observation_ts")
+        stored_factors = row.get("factors") or {}
+        if not ticker or observation_ts is None:
+            continue
+        try:
+            fresh = recompute_fn(ticker, observation_ts)
+            if inspect.isawaitable(fresh):
+                fresh = await fresh
+            fresh_factors = fresh or {}
+            if not isinstance(fresh_factors, dict):
+                continue
+            merged, upgraded = upgrade_null_cells(stored_factors, fresh_factors)
+            if upgraded == 0:
+                continue
+            if await store.rebackfill_row(ticker, observation_ts, merged):
+                summary["rows_upgraded"] += 1
+                summary["cells_upgraded"] += upgraded
+        except Exception as exc:  # noqa: BLE001 — skip a bad row, keep the backfill going
+            print(
+                f"[strategy-engine:factor-store] re-backfill row failed "
+                f"({ticker}@{observation_ts}, continuing): {exc!r}",
+                flush=True,
+            )
+    print(
+        f"[strategy-engine:factor-store] re-backfill done — scanned={summary['scanned']} "
+        f"rows_upgraded={summary['rows_upgraded']} cells_upgraded={summary['cells_upgraded']}",
+        flush=True,
+    )
+    return summary
