@@ -54,6 +54,12 @@ class WarehouseReader:
         'risk_rejections',
         'fills_history',
         'reconciliation_log',
+        # PIT fundamentals (0009_fundamentals.sql; snapshotter TABLES). `fundamentals` is the as-of
+        # read surface a warehouse backtest pivots into line items; the other two ride along for the
+        # audit trail. Absent partitions register as empty views (pre-backfill warehouse → {}).
+        'fundamentals',
+        'fundamentals_revisions_log',
+        'fundamentals_raw_facts',
     )
 
     def __init__(self, warehouse_dir: str = DEFAULT_WAREHOUSE_DIR):
@@ -171,6 +177,64 @@ class WarehouseReader:
         for row in rel.fetchall():
             r = dict(zip(cols, row))
             out.setdefault(r['ticker'], []).append(r)
+        return out
+
+    def get_fundamentals(
+        self,
+        instrument_ids: list[int],
+        as_of_ms: int,
+    ) -> dict[int, list[dict]]:
+        """As-of fundamentals facts for many instruments in one DuckDB query, keyed by instrument_id.
+
+        Mirrors `get_bars`'s bi-temporal as-of pick, but over the `fundamentals` view and at that
+        table's logical-fact grain. The `fundamentals` PK is
+        `(instrument_id, metric, observation_ts, dim_signature)` and has NO `ticker` column — facts
+        key on `instrument_id` — so this takes instrument ids, not tickers (ticker → instrument_id is
+        the host's security-master concern, exactly as `WarehousePitFundamentals`'s injected
+        `resolve_instrument`; this reader stays the pure DuckDB primitive). Returns the latest
+        revision per logical fact with `knowledge_ts <= as_of` (`ROW_NUMBER() … PARTITION BY the full
+        fact tuple ORDER BY knowledge_ts DESC`, `rn = 1`) — the no-look-ahead guard is the
+        `knowledge_ts <= ?` clause IN SQL, never an app-layer filter a refactor could drop.
+        Consolidated only (`dim_signature = ''`); segment facts are excluded from the canonical
+        line-item set. Instruments with no fact ≤ as_of are absent from the result (the forward-only
+        degrade — the caller leaves those names `{}`, never a proxy).
+
+        The pivot to the snake_case line-item dict (latest annual per metric + the `_prev` YoY value)
+        lives in `quant_core.fundamentals.WarehousePitFundamentals`, the single source of truth the
+        live + replay sides share; this method is the raw as-of row reader under it.
+        """
+        if not instrument_ids:
+            return {}
+        placeholders = ','.join('?' for _ in instrument_ids)
+        sql = f"""
+            SELECT * FROM (
+              SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY instrument_id, metric, observation_ts, dim_signature
+                ORDER BY knowledge_ts DESC
+              ) AS rn
+              FROM fundamentals
+              WHERE instrument_id IN ({placeholders})
+                AND knowledge_ts <= ?
+                AND dim_signature = ''
+            ) sub
+            WHERE rn = 1
+            ORDER BY instrument_id, metric, observation_ts DESC
+        """
+        params = [*instrument_ids, as_of_ms]
+        try:
+            rel = self._con.execute(sql, params)
+        except duckdb.Error as exc:
+            # A never-backfilled warehouse registers an empty stub view (`SELECT NULL WHERE FALSE`)
+            # with no `instrument_id`/`metric`/… columns, so the as-of SELECT can't bind. Degrade to
+            # empty — the live warehouse pre-backfill reads {} (the forward-only contract), never an
+            # error into the replay. Once the snapshot lands rows the real schema binds normally.
+            log.warning('warehouse: fundamentals as-of read failed (empty/unbootstrapped?): %s', exc)
+            return {}
+        cols = [d[0] for d in rel.description]
+        out: dict[int, list[dict]] = {}
+        for row in rel.fetchall():
+            r = dict(zip(cols, row))
+            out.setdefault(int(r['instrument_id']), []).append(r)
         return out
 
     def close(self) -> None:
