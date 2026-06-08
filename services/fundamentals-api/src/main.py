@@ -38,11 +38,13 @@ unit suite.
 from __future__ import annotations
 
 import os
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, Gauge, Histogram, generate_latest
 
 # Connection coordinates the read path uses, read at boot purely so a missing/odd var is VISIBLE here at
 # startup (mirrors fundamentals-ingestion's main.py). The app opens no socket on import — the authoritative
@@ -54,6 +56,46 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 SERVICE_NAME = "fundamentals-api"
 
 app = FastAPI(title=SERVICE_NAME, version="0.1.0")
+
+# ── Prometheus metrics (epic Task 20) ─────────────────────────────────────────────
+# The read-side ServiceMonitor (templates/servicemonitors.yaml) scrapes /metrics. `_up` is the
+# always-on liveness signal (1 while the app serves); `_request_latency` is the per-route request-
+# duration histogram whose buckets give the API p50/p95 the monitoring card asks for (Prometheus
+# `histogram_quantile(0.50|0.95, …)` over `_bucket`). Labelled by route TEMPLATE + status class so the
+# cardinality stays bounded (no raw path/symbols in the label set).
+_up = Gauge("fundamentals_api_up", "1 while the fundamentals-api process is serving.")
+_up.set(1)
+_request_latency = Histogram(
+    "fundamentals_api_request_duration_seconds",
+    "fundamentals-api HTTP request duration by route + status class (p50/p95 source).",
+    ["route", "status"],
+)
+
+
+@app.middleware("http")
+async def _observe_latency(request: Request, call_next):
+    """Time every request into `_request_latency`, keyed on the matched route TEMPLATE (not the raw
+    path — `/internal/api/fundamentals-pit`, never the per-call tickers) so the histogram's label
+    cardinality is bounded. The /metrics scrape itself is skipped (self-measurement is noise)."""
+    start = time.perf_counter()
+    response = await call_next(request)
+    # `scope["route"]` is only set when a route MATCHED; an unmatched path (404) leaves it absent — so
+    # fall back to a STABLE sentinel, never the raw URL (a burst of 404s on distinct random paths would
+    # otherwise spawn one histogram series per path = unbounded label cardinality).
+    route = request.scope.get("route")
+    template = getattr(route, "path", None) or "<unmatched>"
+    if template != "/metrics":
+        _request_latency.labels(route=template, status=f"{response.status_code // 100}xx").observe(
+            time.perf_counter() - start
+        )
+    return response
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+def metrics() -> Response:
+    """Prometheus exposition (scraped by the read-side ServiceMonitor). Liveness gauge + the request-
+    latency histogram (the p50/p95 source). Mirrors strategy-engine's /metrics shape."""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.exception_handler(Exception)

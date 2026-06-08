@@ -17,6 +17,10 @@ asyncpg==0.29.0
 # Redis-first → Postgres-on-miss path). redis-py's async client; the same major the platform uses.
 redis==5.0.7
 
+# Prometheus /metrics exposition (epic Task 20) — the read-side ServiceMonitor scrapes it (request-
+# latency histogram → API p50/p95). Same pin as strategy-engine.
+prometheus-client==0.20.0
+
 # Security-master lookups + coverage bookkeeping ride Mongo-adjacent singletons in some surfaces; the
 # instrument resolution itself is over Timescale's security_master schema (asyncpg above), but the
 # motor pin is kept available for parity with the write-side service should a Mongo read be added.

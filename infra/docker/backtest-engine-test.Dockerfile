@@ -56,7 +56,11 @@ COPY services/strategy-engine/tests/test_pipeline.py ./strategy_engine/tests/tes
 # PyYAML (epic Task 6): the metric registry (src/stage/metadata/metric_registry.yaml) is loaded with
 # yaml.safe_load; it is not in quant-core's deps nor backtest-engine's requirements, so install it here
 # (pinned to the service requirements.txt) before the fundamentals-ingestion suite runs.
-RUN pip install --no-cache-dir 'PyYAML==6.0.2'
+# prometheus-client (epic Task 20): both fundamentals services' src/main.py now expose a /metrics
+# endpoint (liveness gauge + request-latency histogram), so their FastAPI apps import prometheus_client
+# at module load — install it here (pinned to the service requirements.txt) so the import resolves in
+# the gate exactly as in the deployed image, mirroring the strategy-engine suite above.
+RUN pip install --no-cache-dir 'PyYAML==6.0.2' 'prometheus-client==0.20.0'
 COPY services/fundamentals-ingestion/src ./fundamentals_ingestion/src
 COPY services/fundamentals-ingestion/conftest.py ./fundamentals_ingestion/conftest.py
 COPY services/fundamentals-ingestion/tests ./fundamentals_ingestion/tests
