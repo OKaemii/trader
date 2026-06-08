@@ -7,6 +7,7 @@ from quant_core.strategy.contract import HistoryView, StrategyParams
 from quant_core.strategy.factors import (
     CompositeFactor,
     Factor,
+    InvestmentFactor,
     LowVolFactor,
     MomentumFactor,
     QualityFactor,
@@ -216,3 +217,106 @@ def test_fundamentals_factor_score_is_pure_live_replay_parity():
         assert live[t] == replay[t]
     vhist = _history(fundamentals=VALUE_FUNDS)
     assert ValueFactor().score(vhist, WINDOW, _P) == ValueFactor().score(vhist, WINDOW, _P)
+
+
+# --- Investment (asset-growth anomaly) factor ------------------------------------------------
+#
+# The provider attaches the prior-year balance-sheet value under the `_prev` suffix (the warehouse
+# PIT reader's second-latest annual observation ≤ as_of). The factor reads BOTH the current and the
+# `_prev` value and z-scores the YoY growth, sign-flipped so CONSERVATIVE (low-growth) names rank
+# highest. CONSERVE expands the least, AGGRESSIVE the most.
+INVESTMENT_FUNDS = {
+    # asset growth +5%, equity growth +4% — the conservative end → scores HIGH.
+    "CONSERVE":   {"total_assets": 105.0, "total_assets_prev": 100.0,
+                   "total_equity": 104.0, "total_equity_prev": 100.0},
+    # asset growth +25%, equity growth +20% — middle of the pack.
+    "MODERATE":   {"total_assets": 125.0, "total_assets_prev": 100.0,
+                   "total_equity": 120.0, "total_equity_prev": 100.0},
+    # asset growth +60%, equity growth +55% — the aggressive end → scores LOW.
+    "AGGRESSIVE": {"total_assets": 160.0, "total_assets_prev": 100.0,
+                   "total_equity": 155.0, "total_equity_prev": 100.0},
+}
+
+
+def test_investment_factor_ranks_conservative_growth_highest():
+    """The asset-growth anomaly: low balance-sheet growth scores highest (sign-flipped)."""
+    score = InvestmentFactor().score(_history(fundamentals=INVESTMENT_FUNDS), WINDOW, _P)
+    assert set(score) == set(INVESTMENT_FUNDS)
+    assert score["CONSERVE"] > score["MODERATE"] > score["AGGRESSIVE"]
+
+
+def test_investment_factor_growth_computed_from_two_annual_observations():
+    """Parity check: the score is driven by (current − prior)/prior of BOTH legs — a name whose two
+    observations are equal (zero growth) outranks a name that grew, and a name that SHRANK (negative
+    growth) outranks the zero-growth one (most conservative)."""
+    funds = {
+        "SHRANK": {"total_assets": 90.0, "total_assets_prev": 100.0,    # -10% assets
+                   "total_equity": 95.0, "total_equity_prev": 100.0},   # -5% equity
+        "FLAT":   {"total_assets": 100.0, "total_assets_prev": 100.0,   # 0%
+                   "total_equity": 100.0, "total_equity_prev": 100.0},  # 0%
+        "GREW":   {"total_assets": 130.0, "total_assets_prev": 100.0,   # +30%
+                   "total_equity": 120.0, "total_equity_prev": 100.0},  # +20%
+    }
+    score = InvestmentFactor().score(_history(fundamentals=funds), WINDOW, _P)
+    assert score["SHRANK"] > score["FLAT"] > score["GREW"]
+
+
+def test_investment_factor_excludes_missing_or_non_positive_prior_never_false_zero():
+    """No prior-year fact (forward-only Yahoo names) or a non-positive prior base → the name is
+    EXCLUDED, never scored 0.0 (which the optimiser could rank above a real aggressive grower)."""
+    funds = {
+        **INVESTMENT_FUNDS,
+        "NO_PREV":  {"total_assets": 120.0, "total_equity": 110.0},      # forward-only: no _prev
+        "ZERO_PREV": {"total_assets": 120.0, "total_assets_prev": 0.0,   # zero prior base
+                      "total_equity": 110.0, "total_equity_prev": 0.0},
+        "NEG_PREV": {"total_assets": 120.0, "total_assets_prev": -50.0,  # negative prior base
+                     "total_equity": 110.0, "total_equity_prev": -40.0},
+    }
+    score = InvestmentFactor().score(_history(fundamentals=funds), WINDOW, _P)
+    assert "NO_PREV" not in score
+    assert "ZERO_PREV" not in score
+    assert "NEG_PREV" not in score
+    assert set(score) == set(INVESTMENT_FUNDS)
+
+
+def test_investment_factor_partial_leg_still_scores():
+    """A name with only ONE computable growth leg (e.g. assets but no prior equity) is still scored
+    from the leg it has — the blend averages the finite components."""
+    funds = {
+        "BOTH":        INVESTMENT_FUNDS["CONSERVE"],
+        "ASSETS_ONLY": {"total_assets": 150.0, "total_assets_prev": 100.0,   # only asset growth
+                        "total_equity": 110.0},                              # no prior equity
+        "EQUITY_ONLY": {"total_assets": 150.0,                               # no prior assets
+                        "total_equity": 105.0, "total_equity_prev": 100.0},  # only equity growth
+    }
+    score = InvestmentFactor().score(_history(fundamentals=funds), WINDOW, _P)
+    assert set(score) == {"BOTH", "ASSETS_ONLY", "EQUITY_ONLY"}
+    assert all(math.isfinite(v) for v in score.values())
+
+
+def test_investment_factor_empty_when_no_fundamentals():
+    """Bars-only HistoryView ⇒ emits nothing, never crashes (forward-only degrade)."""
+    assert InvestmentFactor().score(_history(), WINDOW, _P) == {}
+
+
+def test_investment_factor_satisfies_protocol_and_composes():
+    """A structural `Factor` named 'investment' that drops into CompositeFactor/breakdown."""
+    assert isinstance(InvestmentFactor(), Factor)
+    assert InvestmentFactor().name == "investment"
+    comp = CompositeFactor([QualityFactor(), InvestmentFactor()])
+    funds = {t: {**QUALITY_FUNDS.get(t, {}), **INVESTMENT_FUNDS.get(t, {})}
+             for t in set(QUALITY_FUNDS) & set(INVESTMENT_FUNDS)} or {
+        # Ensure a shared cross-section with both a quality and an investment input.
+        "X": {**QUALITY_FUNDS["HQ"], **INVESTMENT_FUNDS["CONSERVE"]},
+        "Y": {**QUALITY_FUNDS["JUNK"], **INVESTMENT_FUNDS["AGGRESSIVE"]},
+    }
+    bd = comp.breakdown(_history(fundamentals=funds), WINDOW, _P)
+    assert bd
+    for row in bd.values():
+        assert set(row) == {"quality", "investment", "composite"}
+
+
+def test_investment_factor_is_pure_live_replay_parity():
+    """Same HistoryView ⇒ identical output (the live/replay invariant — one pure `score`)."""
+    hist = _history(fundamentals=INVESTMENT_FUNDS)
+    assert InvestmentFactor().score(hist, WINDOW, _P) == InvestmentFactor().score(hist, WINDOW, _P)
