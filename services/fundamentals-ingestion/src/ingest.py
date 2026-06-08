@@ -78,6 +78,28 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+async def _effective_user_agent() -> str:
+    """Resolve the effective EDGAR User-Agent the run will send — `portal_fundamentals_config` override
+    > `EDGAR_USER_AGENT` env > the built-in default — via the shared config provider, so a portal value
+    set without a redeploy wins for the cron/backfill run too (not just the force endpoint). The provider
+    degrades a Mongo-read failure to the env/default config internally, so a down portal store never
+    blocks the cron — it falls back to the env UA. Imports motor lazily inside the provider; opens a
+    short-lived Mongo client for this one read, closed before the run proceeds."""
+    from motor.motor_asyncio import AsyncIOMotorClient
+
+    from src.config import FundamentalsConfigProvider, effective_user_agent
+
+    mongo_url = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
+    mongo_db_name = os.getenv("MONGODB_DB", "trader")
+    client = AsyncIOMotorClient(mongo_url)
+    try:
+        provider = FundamentalsConfigProvider(client[mongo_db_name])
+        cfg = await provider.get(force_refresh=True)
+        return effective_user_agent(cfg) or ""
+    finally:
+        client.close()
+
+
 async def _build_orchestrator(user_agent: str):
     """Construct the orchestrator with the real EDGAR clients (sharing one rate limiter) + the Timescale
     writers/QA engine over the singleton pool. Imports the drivers lazily so this module imports clean
@@ -115,14 +137,14 @@ async def run_async(args: argparse.Namespace) -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
-    user_agent = os.getenv("EDGAR_USER_AGENT", "").strip()
+    user_agent = await _effective_user_agent()
     if not user_agent:
         # SEC fails closed without a descriptive UA — the clients would degrade every fetch to empty and
         # the run would silently write nothing. Surface it loudly and exit non-zero so the Job shows red.
         log.error(
-            "[ingest] EDGAR_USER_AGENT is empty — SEC requires a descriptive User-Agent (e.g. "
+            "[ingest] effective EDGAR User-Agent is empty — SEC requires a descriptive User-Agent (e.g. "
             "'trader-platform fundamentals-ingestion ops@example.com'). Refusing to run a no-op "
-            "backfill; set global.env.edgarUserAgent and re-run."
+            "backfill; set the portal override or global.env.edgarUserAgent and re-run."
         )
         return 2
 

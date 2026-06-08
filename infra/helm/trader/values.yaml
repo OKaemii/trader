@@ -135,11 +135,12 @@ global:
     # live cycle NEVER breaks if fundamentals-api is down (the seam degrades to {} → Yahoo fallback).
     liveFundamentalsProvider: yahoo
     # PIT Fundamentals Warehouse (fundamentals-ingestion write-side). SEC EDGAR mandates a descriptive
-    # User-Agent on every request — the EDGAR clients fail CLOSED without it (every fetch degrades to
-    # empty, so the ingest CronJob/backfill Job writes nothing and the Job exits non-zero). ⚠ SET A REAL
-    # contact string (e.g. "trader-platform fundamentals-ingestion ops@example.com") BEFORE the first
-    # ingest run, or the backfill is a no-op. Non-secret env, not a trader-secrets key.
-    edgarUserAgent: "trader-platform fundamentals-ingestion"
+    # User-Agent (with a contact) on every request — the EDGAR clients fail CLOSED without it (every
+    # fetch degrades to empty, so the ingest CronJob/backfill Job writes nothing and the Job exits 2).
+    # This is the ENV-layer default; the operator can override it LIVE from the portal (the
+    # `portal_fundamentals_config` singleton — precedence override > this env > built-in default) without
+    # a redeploy, so a contact change doesn't need a Helm cycle. Non-secret env, not a trader-secrets key.
+    edgarUserAgent: "trader-platform/1.0 (fahadhafiz1998@gmail.com)"
     # SEC courtesy rate budget for the EDGAR fetches (requests/second, per source IP across BOTH the
     # submissions and companyfacts clients via one shared limiter). 10/s is SEC's published limit; lower
     # it to be a gentler citizen, never raise above 10 (earns a 403/IP-block). Used by the ingest run.

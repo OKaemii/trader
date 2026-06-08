@@ -60,7 +60,10 @@ COPY services/strategy-engine/tests/test_pipeline.py ./strategy_engine/tests/tes
 # endpoint (liveness gauge + request-latency histogram), so their FastAPI apps import prometheus_client
 # at module load — install it here (pinned to the service requirements.txt) so the import resolves in
 # the gate exactly as in the deployed image, mirroring the strategy-engine suite above.
-RUN pip install --no-cache-dir 'PyYAML==6.0.2' 'prometheus-client==0.20.0'
+# redis (Ops backend card): the write-side config provider (src/config.py) publishes `config:invalidated`
+# via redis.asyncio (LAZILY imported inside the publish path); the run-store/status suites import it. The
+# pin matches the service requirements.txt so the lazy import path resolves in the gate as in the image.
+RUN pip install --no-cache-dir 'PyYAML==6.0.2' 'prometheus-client==0.20.0' 'redis==5.0.7'
 COPY services/fundamentals-ingestion/src ./fundamentals_ingestion/src
 COPY services/fundamentals-ingestion/conftest.py ./fundamentals_ingestion/conftest.py
 COPY services/fundamentals-ingestion/tests ./fundamentals_ingestion/tests
