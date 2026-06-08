@@ -66,7 +66,7 @@ describe('COMMANDS registry integrity', () => {
     research: ['overview', 'signals', 'strategy-impact', 'fundamentals', 'history'],
     build: ['strategy', 'console', 'alerts', 'backtests'],
     portfolio: ['positions', 'performance', 'risk-limits', 'trips'],
-    operations: ['trade-audit', 'reconciliation', 'tca', 'market-data'],
+    operations: ['trade-audit', 'reconciliation', 'tca', 'market-data', 'fundamentals'],
   }
 
   it('exposes a deep-linked entry for every workspace tab pointing at the real route', () => {
