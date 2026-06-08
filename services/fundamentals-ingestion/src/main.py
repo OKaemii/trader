@@ -390,6 +390,14 @@ async def ingest_status(
         )
 
 
+# Sentinel instrument_id for an unresolvable `?symbol=` lookup. A real BIGSERIAL instrument_id is always
+# positive, so -1 matches NO quarantine row — the per-name predicate then yields an HONEST EMPTY summary
+# rather than silently widening to the full unfiltered set (which would mislead the operator into reading
+# every name's counts as the one they asked for). Paired with `resolved: false` so the caller can tell an
+# empty-because-unknown name from an empty-because-clean one.
+_UNRESOLVED_INSTRUMENT_ID = -1
+
+
 @app.get("/admin/api/fundamentals-ingest/quarantine")
 async def quarantine_report(
     since_ms: Optional[int] = Query(
@@ -400,6 +408,17 @@ async def quarantine_report(
         default=50, ge=1, le=500,
         description="Max recent quarantine rows to sample (the counts are unbounded over the window).",
     ),
+    symbol: Optional[str] = Query(
+        default=None,
+        description="Scope the report to one name by ticker (T212 `AAPL_US_EQ` or bare `AAPL`). Resolved "
+                    "to its instrument_id via the security master; an unknown/non-US symbol yields an "
+                    "honest empty summary with resolved:false. A directly-passed instrument_id wins.",
+    ),
+    instrument_id: Optional[int] = Query(
+        default=None,
+        description="Scope the report to one name by instrument_id directly (skips symbol resolution; "
+                    "takes precedence over `symbol`).",
+    ),
 ) -> JSONResponse:
     """QA report — summarize `fundamentals_quarantine` by reason + sector + a recent sample (epic Task 8).
 
@@ -408,15 +427,49 @@ async def quarantine_report(
     of the canonical PIT table, grouped so the financials-are-the-hotspot pattern is visible. Reuses the
     Task-3 `/admin/api/fundamentals-ingest` ingress prefix (no new ingress). On a Timescale-unreachable
     error this answers 503 with JSON (the report is a read over a possibly-cold warehouse — a DB blip
-    must not surface as an unhandled 500), so `/health` stays independent of the warehouse being up."""
+    must not surface as an unhandled 500), so `/health` stays independent of the warehouse being up.
+
+    Per-name lookup (epic coverage-broaden Task 3): pass `instrument_id` to scope every count + the
+    sample to one name, or pass `symbol` to resolve a ticker to its instrument_id first. A directly-given
+    `instrument_id` wins over `symbol`. When a `symbol` doesn't resolve to a US instrument (unknown name,
+    or a non-US ticker with no EDGAR identity), the report is scoped to the unmatchable sentinel so it
+    returns an honest EMPTY summary (`resolved: false`) — never the full unfiltered set. The response adds
+    `symbol`/`resolved` only when a `symbol` was supplied; `instrument_id` is always echoed (the applied
+    scope), matching `quarantine_summary`'s contract."""
     # Local imports keep the module-import smoke test driver-free (asyncpg/qa are only needed to serve
     # this endpoint, not to import the app).
     try:
+        from src.coverage import bare_us_symbol
         from src.qa.report import quarantine_summary
         from src.security_master.pool import get_pool
+        from src.security_master.resolver import SecurityMasterResolver
 
         pool = await get_pool()
-        summary = await quarantine_summary(pool, since_ms=since_ms, sample_limit=limit)
+
+        # Resolve the per-name scope. A directly-passed instrument_id wins; otherwise a `symbol` is
+        # routed through the security master (bare US symbol → as-of resolution at "now"). An unknown
+        # or non-US symbol becomes the unmatchable sentinel so the summary is an honest empty, flagged
+        # resolved:false. `resolved` is only meaningful (and only echoed) when a symbol was supplied.
+        scope = instrument_id
+        resolved: Optional[bool] = None
+        if scope is None and symbol is not None:
+            bare = bare_us_symbol(symbol)
+            hit = None
+            if bare is not None:
+                hit = await SecurityMasterResolver(pool).resolve_symbol(bare, int(time.time() * 1000))
+            if hit is not None:
+                scope = hit.instrument_id
+                resolved = True
+            else:
+                scope = _UNRESOLVED_INSTRUMENT_ID
+                resolved = False
+
+        summary = await quarantine_summary(
+            pool, since_ms=since_ms, sample_limit=limit, instrument_id=scope
+        )
+        if symbol is not None:
+            summary["symbol"] = symbol
+            summary["resolved"] = resolved
         return JSONResponse(content=summary)
     except Exception as exc:  # noqa: BLE001 — degrade a warehouse outage to a 503, never a bare 500
         return JSONResponse(
