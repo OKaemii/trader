@@ -67,8 +67,14 @@ const EnvSchema = z.object({
     MIN_MARKET_CAP_GBP: z.coerce.number().nonnegative().default(5_000_000_000),
     // Long-range daily history source (decoupled from the metered intraday provider).
     DAILY_HISTORY_PROVIDER: z.enum(["yahoo", "eodhd"]).default("yahoo"),
-    // Fundamentals (QMJ) source. 'yahoo' (free quoteSummary, default) or 'eodhd' (paid add-on).
-    FUNDAMENTALS_PROVIDER:  z.enum(["yahoo", "eodhd"]).default("yahoo"),
+    // Fundamentals (QMJ) source. 'yahoo' (free quoteSummary, default) or 'eodhd' (paid add-on),
+    // or 'pit' — the bi-temporal SEC-EDGAR warehouse via fundamentals-api for US (*_US_EQ) names,
+    // delegating non-US names + PIT misses to the injected Yahoo provider. The 'pit' flip is gated
+    // on the freshness audit proving US coverage complete (a later card sets it in values.yaml).
+    FUNDAMENTALS_PROVIDER:  z.enum(["yahoo", "eodhd", "pit"]).default("yahoo"),
+    // In-cluster base URL of fundamentals-api (the read side of the PIT warehouse). Read by the
+    // 'pit' provider for GET /internal/api/fundamentals-pit. Mirrors strategy-engine's default.
+    FUNDAMENTALS_API_URL:   z.string().url().default("http://fundamentals-api:8011"),
     // Fundamentals refresh pacing. The QMJ refresh walks the universe one name at a time; a
     // burst trips Yahoo's per-IP rate limiter (which arms a multi-minute session cooldown that
     // zeroes the whole run). These knobs keep the background refresher gentle + resumable.
