@@ -78,7 +78,17 @@ class FakeTimescale:
         self.instruments: list[dict[str, Any]] = []
         self.identifiers: list[dict[str, Any]] = []
         self.filings: list[dict[str, Any]] = []
+        # Raw zone (epic Task 5). No BIGSERIAL — the PK is the full natural fact tuple, so re-ingest
+        # of an identical fact is an ON CONFLICT DO NOTHING no-op (modelled below).
+        self.raw_facts: list[dict[str, Any]] = []
         self._seq = {"company": 0, "instrument": 0, "identifier": 0, "filing": 0}
+
+    # The columns of the raw-facts PK, in the deployed 0009_fundamentals.sql order. Two raw facts
+    # collide (ON CONFLICT) iff they agree on every one of these.
+    _RAW_PK = (
+        "filing_id", "raw_tag", "context_id", "period_type", "period_end",
+        "knowledge_ts", "dim_signature",
+    )
 
     # ── pool API ──────────────────────────────────────────────────────────────
     def acquire(self) -> _Acquire:
@@ -172,6 +182,20 @@ class FakeTimescale:
                  if f["source"] == args[0] and f["accession_number"] == args[1]),
                 None,
             )
+
+        # raw zone: append-only INSERT … ON CONFLICT (full PK) DO NOTHING RETURNING 1. The writer
+        # binds the 13 columns in declaration order; map them, then honour the PK conflict no-op.
+        if q.startswith("insert into fundamentals_raw_facts"):
+            cols = (
+                "filing_id", "raw_tag", "taxonomy", "context_id", "period_type", "period_start",
+                "period_end", "knowledge_ts", "value", "unit", "currency", "dim_signature",
+                "content_hash",
+            )
+            row = dict(zip(cols, args))
+            if any(all(r[k] == row[k] for k in self._RAW_PK) for r in self.raw_facts):
+                return None  # ON CONFLICT DO NOTHING → no row returned (an existing fact)
+            self.raw_facts.append(row)
+            return 1  # RETURNING 1 → a fresh insert
 
         raise AssertionError(f"FakeTimescale.run_fetchval: unrecognised query: {q}")
 
