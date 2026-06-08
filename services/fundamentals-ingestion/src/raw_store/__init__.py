@@ -9,14 +9,16 @@ context), never NULL, or two distinct facts collide on a hard duplicate-key erro
 
 Public surface (imported by the future cron/backfill — epic Task 9 — and by the tests):
   writer  — RawFactsWriter (append-only, hash-gated INSERT) + RawFactRow + build_raw_fact_row
+            · write_company_facts groups a whole-CIK payload by accession (the correct full-payload path)
   hash    — hash_raw_fact (the SHA-1 idempotency gate over one raw fact)
 """
 from .content_hash import hash_raw_fact
-from .writer import RawFactRow, RawFactsWriter, build_raw_fact_row
+from .writer import FilingLineage, RawFactRow, RawFactsWriter, build_raw_fact_row
 
 __all__ = [
     "RawFactsWriter",
     "RawFactRow",
+    "FilingLineage",
     "build_raw_fact_row",
     "hash_raw_fact",
 ]

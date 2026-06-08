@@ -106,8 +106,8 @@ def build_raw_fact_row(fact: RawFact, *, filing_id: int, knowledge_ts: int) -> R
 
 
 # The single INSERT the raw zone issues. ON CONFLICT on the full natural PK → DO NOTHING (idempotent
-# re-ingest). RETURNING xmax = 0 distinguishes a fresh insert (xmax 0) from a conflict-skip (no row
-# returned), so the writer can count writes-vs-skips without a second query.
+# re-ingest). RETURNING 1 yields a row only on a fresh insert (the conflict-skip returns no row), so
+# the writer counts writes-vs-skips without a second query.
 _INSERT_RAW_FACT = """
 INSERT INTO fundamentals_raw_facts
     (filing_id, raw_tag, taxonomy, context_id, period_type, period_start, period_end,
@@ -117,6 +117,24 @@ ON CONFLICT (filing_id, raw_tag, context_id, period_type, period_end, knowledge_
 DO NOTHING
 RETURNING 1
 """
+
+
+# A filing's lineage resolved from its accession: the `filing_id` (from `security_master.filings`) and
+# the `knowledge_ts` to stamp on its facts (the filing's `accepted_ts`, stored raw — the UTC→ET
+# availability hop is Task 7). None means "this accession has no usable lineage" — no `filing_id`
+# resolved, OR no `accepted_ts` on the filing — so its facts are SKIPPED, never written under a
+# fabricated id/timestamp (that would break the bi-temporal contract). This is the *real* skip the
+# raw-zone contract promises; the caller (cron, Task 9) builds the map and logs the skipped accessions.
+FilingLineage = tuple[int, int]   # (filing_id, knowledge_ts)
+
+
+def _row_args(row: RawFactRow) -> tuple:
+    """The 13 positional binds for `_INSERT_RAW_FACT`, in column order."""
+    return (
+        row.filing_id, row.raw_tag, row.taxonomy, row.context_id, row.period_type,
+        row.period_start, row.period_end, row.knowledge_ts, row.value, row.unit,
+        row.currency, row.dim_signature, row.content_hash,
+    )
 
 
 class RawFactsWriter:
@@ -129,13 +147,13 @@ class RawFactsWriter:
         """Insert one raw fact; return True if a row was written, False if it already existed (the
         ON CONFLICT no-op). Never raises on a duplicate — the raw zone is idempotent by construction."""
         async with self._pool.acquire() as conn:
-            written = await conn.fetchval(
-                _INSERT_RAW_FACT,
-                row.filing_id, row.raw_tag, row.taxonomy, row.context_id, row.period_type,
-                row.period_start, row.period_end, row.knowledge_ts, row.value, row.unit,
-                row.currency, row.dim_signature, row.content_hash,
-            )
-            return written is not None
+            return await self._insert(conn, row)
+
+    @staticmethod
+    async def _insert(conn, row: RawFactRow) -> bool:
+        """One INSERT on a supplied connection. True iff a fresh row landed (False = conflict no-op)."""
+        written = await conn.fetchval(_INSERT_RAW_FACT, *_row_args(row))
+        return written is not None
 
     async def write_facts(
         self,
@@ -144,12 +162,50 @@ class RawFactsWriter:
         filing_id: int,
         knowledge_ts: int,
     ) -> int:
-        """Write all facts for one filing (the downloader's per-filing call). Returns the count of
-        NEWLY-written rows (re-ingested duplicates don't count). Each fact is mapped to a row + hashed
-        here, so the caller hands raw `RawFact`s straight from the parser."""
+        """Write all facts that belong to ONE filing — the caller has already scoped `facts` to a
+        single accession and resolved its `(filing_id, knowledge_ts)`.
+
+        Returns the count of NEWLY-written rows (re-ingested duplicates don't count). All inserts run on
+        ONE pooled connection (a filing has hundreds–thousands of facts; per-fact `pool.acquire()` would
+        churn the pool), each mapped to a row + hashed here.
+
+        WARNING — this stamps the SAME `filing_id`/`knowledge_ts` on every fact, so `facts` MUST be a
+        single accession's facts, NOT a whole-CIK `parse_company_facts(...)` result (that spans many
+        filings). To ingest a full companyfacts payload, use `write_company_facts`, which groups by each
+        fact's `accession_number` first — mixing accessions under one `filing_id` would corrupt lineage
+        and inject look-ahead into the bi-temporal `knowledge_ts`."""
         written = 0
-        for fact in facts:
-            row = build_raw_fact_row(fact, filing_id=filing_id, knowledge_ts=knowledge_ts)
-            if await self.write_row(row):
-                written += 1
+        async with self._pool.acquire() as conn:
+            for fact in facts:
+                row = build_raw_fact_row(fact, filing_id=filing_id, knowledge_ts=knowledge_ts)
+                if await self._insert(conn, row):
+                    written += 1
+        return written
+
+    async def write_company_facts(
+        self,
+        facts: Iterable[RawFact],
+        *,
+        lineage_by_accession: dict[str, FilingLineage],
+    ) -> int:
+        """Write a whole companyfacts payload, grouping facts by their own `accession_number` so each
+        fact lands under ITS filing's `(filing_id, knowledge_ts)` — the correct entrypoint for a
+        `parse_company_facts(...)` result, which spans every historical filing of a CIK.
+
+        `lineage_by_accession` maps each accession to its resolved `(filing_id, knowledge_ts)` (the cron,
+        Task 9, builds it by upserting filings via `SecurityMasterWriter.upsert_filing` and reading their
+        `accepted_ts`). A fact whose accession is absent from the map — OR maps to None — is SKIPPED (no
+        `filing_id`/`accepted_ts` ⇒ no honest bi-temporal stamp), never written under a fabricated id.
+        Returns the count of newly-written rows. One pooled connection for the whole payload."""
+        written = 0
+        async with self._pool.acquire() as conn:
+            for fact in facts:
+                accn = fact.accession_number
+                lineage = lineage_by_accession.get(accn) if accn else None
+                if lineage is None:
+                    continue  # unresolved accession / no accepted_ts → skip (the documented skip)
+                filing_id, knowledge_ts = lineage
+                row = build_raw_fact_row(fact, filing_id=filing_id, knowledge_ts=knowledge_ts)
+                if await self._insert(conn, row):
+                    written += 1
         return written
