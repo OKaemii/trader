@@ -1,8 +1,9 @@
 """Coverage resolver tests — the active-universe ∪ S&P-PIT-members set (epic Task 9).
 
 Proves the pure set logic (`bare_us_symbol`, `resolve_coverage`) over fixture inputs — T212→bare
-symbol normalisation, the survivorship-free index union, mode selection, and the universe-prioritised
-cap — and the thin Mongo wrapper (`load_coverage`) against a tiny fake motor db. No network, no DB.
+symbol normalisation, the survivorship-free index union, mode selection, and the never-truncate cap
+(the curated universe is always fully covered; the cap bounds only the index-history remainder) — and
+the thin Mongo wrapper (`load_coverage`) against a tiny fake motor db. No network, no DB.
 """
 from __future__ import annotations
 
@@ -100,6 +101,70 @@ def test_cap_prioritises_the_active_universe() -> None:
     )
     assert "ZZZ" in out and len(out) == 2
     assert out == ["ZZZ", "AAA"]   # universe first, then the alphabetical index remainder
+
+
+def test_cap_below_universe_size_keeps_all_universe_names() -> None:
+    # The cap NEVER truncates the curated universe — fundamentals track what we hold. With 4 held names
+    # and cap=2 (< |universe|), ALL FOUR universe names survive and the index remainder is empty (the
+    # leftover budget max(0, 2-4) == 0). This is the bug the fix targets: the old combined-list cap
+    # would have head-truncated the held set to ["AAPL","GOOG"].
+    universe = ["MSFT_US_EQ", "GOOG_US_EQ", "AAPL_US_EQ", "TSLA_US_EQ"]
+    index = [_idx("AAA", 0), _idx("BBB", 0), _idx("ZZZ", 0)]
+    out = resolve_coverage(
+        universe_tickers=universe, index_rows=index,
+        window_lo_ms=0, window_hi_ms=None, mode=COVERAGE_UNIVERSE_PLUS_INDEX, cap=2,
+    )
+    assert out == ["AAPL", "GOOG", "MSFT", "TSLA"]            # every held name, alphabetised
+    assert set(out) == {bare_us_symbol(t) for t in universe}  # nothing dropped
+    assert not (set(out) & {"AAA", "BBB", "ZZZ"})             # index remainder bounded to empty
+
+
+def test_cap_equal_universe_size_yields_empty_index_remainder() -> None:
+    # cap == |universe| → the whole universe, no index tail (budget max(0, 3-3) == 0).
+    out = resolve_coverage(
+        universe_tickers=["AAA_US_EQ", "BBB_US_EQ", "CCC_US_EQ"],
+        index_rows=[_idx("DDD", 0), _idx("EEE", 0)],
+        window_lo_ms=0, window_hi_ms=None, mode=COVERAGE_UNIVERSE_PLUS_INDEX, cap=3,
+    )
+    assert out == ["AAA", "BBB", "CCC"]
+
+
+def test_cap_above_universe_bounds_only_the_index_remainder() -> None:
+    # cap > |universe|: the universe is whole, and the index-only remainder fills the leftover budget
+    # (cap - |universe|), still bounded. 2 held + cap=4 ⇒ 2 universe + the first 2 index-only names.
+    out = resolve_coverage(
+        universe_tickers=["ZUNI_US_EQ", "YUNI_US_EQ"],
+        index_rows=[_idx(t, 0) for t in ("AAA", "BBB", "CCC", "DDD")],
+        window_lo_ms=0, window_hi_ms=None, mode=COVERAGE_UNIVERSE_PLUS_INDEX, cap=4,
+    )
+    assert out == ["YUNI", "ZUNI", "AAA", "BBB"]              # full universe + bounded remainder
+    assert len(out) == 4
+
+
+def test_mode_index_only_now_applies_the_cap() -> None:
+    # index_only has no held universe to protect, so the cap bounds the sorted index directly.
+    rows = [_idx(t, 0) for t in ("AAA", "BBB", "CCC", "DDD")]
+    out = resolve_coverage(
+        universe_tickers=["MSFT_US_EQ"],  # ignored in index_only mode
+        index_rows=rows, window_lo_ms=0, window_hi_ms=None,
+        mode=COVERAGE_INDEX_ONLY, cap=2,
+    )
+    assert out == ["AAA", "BBB"]
+    # Uncapped index_only is unchanged (the whole sorted index).
+    assert resolve_coverage(
+        universe_tickers=[], index_rows=rows, window_lo_ms=0,
+        mode=COVERAGE_INDEX_ONLY, cap=None,
+    ) == ["AAA", "BBB", "CCC", "DDD"]
+
+
+def test_mode_universe_only_is_never_capped() -> None:
+    # The universe is never truncated — a cap below the held count is a no-op in universe_only mode.
+    out = resolve_coverage(
+        universe_tickers=["MSFT_US_EQ", "AAPL_US_EQ", "GOOG_US_EQ"],
+        index_rows=[_idx("ZZZ", 0)], window_lo_ms=0, window_hi_ms=None,
+        mode=COVERAGE_UNIVERSE_ONLY, cap=1,
+    )
+    assert out == ["AAPL", "GOOG", "MSFT"]
 
 
 def test_cap_zero_or_none_is_uncapped() -> None:

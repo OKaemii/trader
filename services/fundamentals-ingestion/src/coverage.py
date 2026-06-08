@@ -21,6 +21,21 @@ orchestrator can map symbol→CIK). A T212 `AAPL_US_EQ` → `AAPL`; an S&P `AAPL
 names are in scope for the EDGAR (US) phase — a UK `*l_EQ` T212 ticker is dropped here (Companies House
 is the gated UK phase, Tasks 16–19), never sent to EDGAR where it has no CIK.
 
+COVERAGE TRACKS THE CURATED UNIVERSE — NEVER TRUNCATED. Fundamentals exist to back the names we
+actually hold, so every curated-universe US symbol is ALWAYS in the coverage set: the cap NEVER drops a
+held name. The cap bounds ONLY the extra S&P index-history remainder (the survivorship-free backtest
+tail) — the part that can be large and is the only piece safe to bound on a first/bounded backfill. A
+cap *below* the universe size therefore still covers the whole universe (the index remainder is simply
+empty), rather than head-truncating the held set.
+
+NO PRUNE — APPEND-ONLY. A name that drops OUT of `instrument_registry` (de-listed, re-curated away)
+simply stops appearing here, so the nightly/heal walk stops *refreshing* it — but its already-ingested
+bi-temporal `fundamentals` rows are NEVER deleted. The warehouse is append-only and hash-gated, so
+re-curating the name returns it to this set and the next walk tops it up (writing only genuinely-new
+facts), while an as-of read over the dropped-out gap still returns what was knowable then. Coverage is
+the refresh frontier, not a retention policy — this module never removes anything; it only chooses what
+to (re)fetch.
+
 The pure functions (`bare_us_symbol`, `resolve_coverage`) carry the set logic and unit-test without a
 database; `load_coverage` is the thin Mongo wrapper (motor) the cron calls at the composition root.
 """
@@ -103,35 +118,45 @@ def resolve_coverage(
     mode: str = COVERAGE_UNIVERSE_PLUS_INDEX,
     cap: Optional[int] = DEFAULT_COVERAGE_CAP,
 ) -> list[str]:
-    """The coverage set — bare US symbols, sorted, de-duplicated, capped.
+    """The coverage set — bare US symbols, sorted, de-duplicated; the cap bounds only the index tail.
 
     `universe_tickers` are the active T212 symbols (`instrument_registry.ticker`, `activeTo==null`);
     `index_rows` are the `index_constituents` interval docs. `active_union(index_rows, lo, hi)` gives
     the survivorship-free set of every S&P member over `[window_lo_ms, window_hi_ms]` (the same pure
     resolver the validator uses). The two are normalised to bare US symbols and unioned per `mode`:
-      * `universe_plus_index` (default) — both;
+      * `universe_plus_index` (default) — the full curated universe PLUS the index-history remainder;
       * `universe_only` / `index_only` — the single source.
-    `cap` (None/0 ⇒ uncapped) bounds a first backfill; the cap is applied AFTER sorting so the kept
-    subset is deterministic (alphabetical) rather than dependent on Mongo iteration order. The active
-    universe is prioritised under the cap — a live-traded name is never dropped in favour of a former
-    index member — by taking universe symbols first, then filling the remaining budget from the index
-    union."""
+
+    The cap (None/0 ⇒ uncapped) NEVER truncates the curated `universe`: fundamentals track what we
+    hold, so the whole universe is always covered. The cap bounds ONLY the extra `index_only` remainder
+    (the survivorship-free backtest tail), so a `cap < len(universe)` still keeps every held name and
+    just yields an empty remainder — it never head-truncates the held set (the bug this replaces, which
+    capped the *combined* list and dropped held names when `cap < |universe|`). The remainder budget is
+    `max(0, cap - len(universe))`. In `index_only` mode (no universe to protect) the cap bounds the
+    sorted index directly. The cap is applied AFTER sorting so the kept subset is deterministic
+    (alphabetical) rather than dependent on Mongo iteration order. NO PRUNE: see the module docstring —
+    a name leaving the universe stops being refreshed but keeps its bi-temporal rows."""
     universe = _bare_set(universe_tickers)
     index = _bare_set(active_union(index_rows, window_lo_ms, window_hi_ms))
+    capped = cap is not None and cap > 0
 
     if mode == COVERAGE_UNIVERSE_ONLY:
-        selected_sorted = sorted(universe)
-    elif mode == COVERAGE_INDEX_ONLY:
-        selected_sorted = sorted(index)
-    else:  # universe_plus_index (default + any unrecognised mode → the safe superset)
-        # Universe first (priority under the cap), then the index-only remainder — both alphabetised so
-        # the kept set is deterministic.
-        index_only = sorted(index - universe)
-        selected_sorted = sorted(universe) + index_only
+        # The universe is never truncated — the cap has nothing to bound here.
+        return sorted(universe)
+    if mode == COVERAGE_INDEX_ONLY:
+        # No held universe to protect → the cap bounds the sorted index directly.
+        index_sorted = sorted(index)
+        return index_sorted[:cap] if capped else index_sorted
 
-    if cap and cap > 0:
-        return selected_sorted[:cap]
-    return selected_sorted
+    # universe_plus_index (default + any unrecognised mode → the safe superset): the full universe is
+    # always covered; the cap bounds ONLY the index-only remainder via its leftover budget. Both halves
+    # are alphabetised so the kept set is deterministic.
+    universe_sorted = sorted(universe)
+    index_only = sorted(index - universe)
+    if capped:
+        budget = max(0, cap - len(universe_sorted))
+        return universe_sorted + index_only[:budget]
+    return universe_sorted + index_only
 
 
 def coverage_cap_from_env() -> Optional[int]:
