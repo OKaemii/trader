@@ -36,10 +36,14 @@ COPY services/backtest-engine/tests ./tests
 #     stdlib, no Mongo/numpy: hit/expire/LRU/herd-coalesce + the (ticker, asOf-bucket) key),
 #   - test_pipeline (the Strategy-Lab funnel helper — pure stdlib: declarative stage shape + the
 #     narrowing invariant + degrade-gracefully when no cycle has run).
-# The respx-backed strategy-engine tests stay on the local dev runner. Add more files as they
-# become deps-clean.
+# test_pit_fundamentals_http (the PIT seam's HTTP client) is respx-backed; respx is a tiny pure-python
+# lib over the already-installed httpx, so we install it here and gate that suite too (the live seam's
+# degrade-to-{} safety + URL/JWT shape are load-bearing — worth the deps-clean gate, not just local).
+# Add more files as they become deps-clean.
+RUN pip install --no-cache-dir 'respx==0.21.1'
 COPY services/strategy-engine/src ./strategy_engine/src
 COPY services/strategy-engine/tests/test_fundamentals_as_of.py ./strategy_engine/tests/test_fundamentals_as_of.py
+COPY services/strategy-engine/tests/test_pit_fundamentals_http.py ./strategy_engine/tests/test_pit_fundamentals_http.py
 COPY services/strategy-engine/tests/test_factor_store.py ./strategy_engine/tests/test_factor_store.py
 COPY services/strategy-engine/tests/test_lru_cache.py ./strategy_engine/tests/test_lru_cache.py
 COPY services/strategy-engine/tests/test_pipeline.py ./strategy_engine/tests/test_pipeline.py

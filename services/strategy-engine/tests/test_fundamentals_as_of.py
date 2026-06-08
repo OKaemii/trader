@@ -25,8 +25,16 @@ from src.infrastructure.fundamentals_as_of import (
     MARKET_OTHER,
     MARKET_UK,
     MARKET_US,
+    PROVIDER_MODE_PIT,
+    PROVIDER_MODE_YAHOO,
+    SOURCE_PIT_COMPANIES_HOUSE,
+    SOURCE_PIT_EDGAR,
     SOURCE_YAHOO_SNAPSHOT,
+    PitFundamentalsAsOf,
+    RoutingFundamentalsAsOf,
     YahooFundamentalsAsOf,
+    _pit_line_items,
+    build_fundamentals_provider,
     market_of,
 )
 
@@ -175,3 +183,235 @@ def test_source_stamp_is_yahoo_snapshot():
     provider = YahooFundamentalsAsOf(client)
     assert provider.source_for("AAPL_US_EQ") == SOURCE_YAHOO_SNAPSHOT
     assert provider.source_for("HSBAl_EQ") == SOURCE_YAHOO_SNAPSHOT
+
+
+# ── Task 14: routing provider + PIT line-item projection + provider build (deps-light, no HTTP) ──
+#
+# These pin the live-seam wiring: RoutingFundamentalsAsOf delegates by market_of() to a PIT provider
+# for US/UK and Yahoo for OTHER, falls back to Yahoo on a PIT miss, and never injects a Yahoo proxy
+# into replay (forward-only Yahoo returns {} for a past as_of). The HTTP behaviour of the concrete
+# PitFundamentalsAsOf is covered separately (respx) in test_pit_fundamentals_http.py.
+
+
+class _FakePit:
+    """Stand-in for PitFundamentalsAsOf: returns a canned per-ticker map, records the tickers asked
+    for, and stamps pit-edgar/pit-companies-house by suffix — so we can assert the router queries PIT
+    with exactly the US/UK slice and stamps the jurisdiction source."""
+
+    def __init__(self, by_ticker: dict[str, dict[str, float]]) -> None:
+        self._by_ticker = by_ticker
+        self.asked: list[str] = []
+
+    def source_for(self, ticker: str) -> str:
+        return SOURCE_PIT_COMPANIES_HOUSE if market_of(ticker) == MARKET_UK else SOURCE_PIT_EDGAR
+
+    async def fetch_many(self, tickers, as_of_ms):
+        self.asked = list(tickers)
+        return {t: self._by_ticker[t] for t in tickers if t in self._by_ticker}
+
+    async def fetch(self, ticker, as_of_ms):
+        out = await self.fetch_many([ticker], as_of_ms)
+        return out.get(ticker, {})
+
+
+class _FakeYahooProvider:
+    """Stand-in for YahooFundamentalsAsOf at the provider level (not the client): forward-only — a
+    past as_of returns {} for ALL names; ≈now returns the canned rows. Records which names it was
+    asked for so we can prove the router only sends OTHER + PIT-miss names to Yahoo."""
+
+    def __init__(self, by_ticker: dict[str, dict[str, float]]) -> None:
+        self._by_ticker = by_ticker
+        self.asked: list[str] = []
+
+    def source_for(self, ticker: str) -> str:
+        return SOURCE_YAHOO_SNAPSHOT
+
+    async def fetch_many(self, tickers, as_of_ms):
+        self.asked = list(tickers)
+        if (_now_ms() - as_of_ms) > FORWARD_ONLY_TOLERANCE_MS:  # forward-only: past as_of → {}
+            return {}
+        return {t: self._by_ticker[t] for t in tickers if t in self._by_ticker}
+
+    async def fetch(self, ticker, as_of_ms):
+        out = await self.fetch_many([ticker], as_of_ms)
+        return out.get(ticker, {})
+
+
+@pytest.mark.asyncio
+async def test_routing_sends_us_uk_to_pit_other_to_yahoo():
+    """The router queries PIT with exactly the US/UK slice and Yahoo with the OTHER slice."""
+    pit = _FakePit({"AAPL_US_EQ": {"net_income": 1.0}, "HSBAl_EQ": {"net_income": 2.0}})
+    yahoo = _FakeYahooProvider({"BTC_OTHER": {"net_income": 3.0}})
+    router = RoutingFundamentalsAsOf(pit, yahoo)
+    result = await router.fetch_many(["AAPL_US_EQ", "HSBAl_EQ", "BTC_OTHER"], _now_ms())
+    # PIT got the US + UK names; Yahoo got only the OTHER name (no PIT misses to fall back).
+    assert set(pit.asked) == {"AAPL_US_EQ", "HSBAl_EQ"}
+    assert yahoo.asked == ["BTC_OTHER"]
+    assert result["AAPL_US_EQ"] == {"net_income": 1.0}
+    assert result["HSBAl_EQ"] == {"net_income": 2.0}
+    assert result["BTC_OTHER"] == {"net_income": 3.0}
+
+
+@pytest.mark.asyncio
+async def test_routing_pit_miss_falls_back_to_yahoo_live():
+    """A US name PIT has no fact for (empty PIT result) falls back to the Yahoo snapshot in live
+    (≈now). The router sends the PIT-miss name to Yahoo alongside the OTHER slice."""
+    pit = _FakePit({})  # PIT covers nothing yet (pre-backfill)
+    yahoo = _FakeYahooProvider({"AAPL_US_EQ": {"net_income": 9.9e10}})
+    router = RoutingFundamentalsAsOf(pit, yahoo)
+    result = await router.fetch_many(["AAPL_US_EQ"], _now_ms())
+    assert pit.asked == ["AAPL_US_EQ"]          # PIT was tried first
+    assert yahoo.asked == ["AAPL_US_EQ"]        # then fell back to Yahoo
+    assert result["AAPL_US_EQ"] == {"net_income": 9.9e10}
+
+
+@pytest.mark.asyncio
+async def test_routing_pit_miss_no_yahoo_proxy_in_replay():
+    """The fallback is LIVE-ONLY: for a PAST as_of, forward-only Yahoo returns {} — so a PIT miss
+    yields NO value (never a look-ahead proxy in a backtest replay)."""
+    pit = _FakePit({})
+    yahoo = _FakeYahooProvider({"AAPL_US_EQ": {"net_income": 9.9e10}})
+    router = RoutingFundamentalsAsOf(pit, yahoo)
+    past = _now_ms() - 365 * 24 * 60 * 60 * 1000
+    result = await router.fetch_many(["AAPL_US_EQ"], past)
+    assert result == {}   # PIT empty (warehouse miss) + Yahoo forward-only → no proxy
+
+
+@pytest.mark.asyncio
+async def test_routing_pit_hit_does_not_call_yahoo_for_that_name():
+    """A name PIT covers is NOT re-sent to Yahoo (no needless fallback / double source)."""
+    pit = _FakePit({"AAPL_US_EQ": {"net_income": 1.0}})
+    yahoo = _FakeYahooProvider({"AAPL_US_EQ": {"net_income": 9.9e10}})
+    router = RoutingFundamentalsAsOf(pit, yahoo)
+    result = await router.fetch_many(["AAPL_US_EQ"], _now_ms())
+    assert yahoo.asked == []                       # nothing fell back
+    assert result["AAPL_US_EQ"] == {"net_income": 1.0}   # the PIT value, not Yahoo's
+
+
+def test_routing_source_for_defaults_to_jurisdiction_before_fetch():
+    """Before any fetch, source_for reports the routed jurisdiction's stamp (the expected/covered case):
+    pit-edgar (US), pit-companies-house (UK), yahoo-snapshot (OTHER)."""
+    router = RoutingFundamentalsAsOf(_FakePit({}), _FakeYahooProvider({}))
+    assert router.source_for("AAPL_US_EQ") == SOURCE_PIT_EDGAR
+    assert router.source_for("HSBAl_EQ") == SOURCE_PIT_COMPANIES_HOUSE
+    assert router.source_for("BTC_OTHER") == SOURCE_YAHOO_SNAPSHOT
+
+
+@pytest.mark.asyncio
+async def test_routing_source_for_reflects_actual_yahoo_fallback():
+    """Honest provenance: a US name PIT covered keeps pit-edgar; a US name that fell back to Yahoo
+    (live) is stamped yahoo-snapshot — never mislabelled pit-* — after the fetch records the fallback."""
+    pit = _FakePit({"AAPL_US_EQ": {"net_income": 1.0}})            # PIT covers AAPL only
+    yahoo = _FakeYahooProvider({"MSFT_US_EQ": {"net_income": 2.0}})  # MSFT only on Yahoo
+    router = RoutingFundamentalsAsOf(pit, yahoo)
+    await router.fetch_many(["AAPL_US_EQ", "MSFT_US_EQ"], _now_ms())
+    assert router.source_for("AAPL_US_EQ") == SOURCE_PIT_EDGAR        # served from PIT
+    assert router.source_for("MSFT_US_EQ") == SOURCE_YAHOO_SNAPSHOT   # served from Yahoo fallback
+
+
+@pytest.mark.asyncio
+async def test_routing_source_for_past_as_of_keeps_pit_stamp_no_proxy():
+    """A PIT-miss at a PAST as_of is NOT a Yahoo fallback (forward-only Yahoo returns {}), so the name
+    is absent from the result and source_for keeps the (unused) PIT jurisdiction default — no proxy,
+    no mislabel into replay."""
+    pit = _FakePit({})                                               # PIT covers nothing
+    yahoo = _FakeYahooProvider({"AAPL_US_EQ": {"net_income": 9.9e10}})
+    router = RoutingFundamentalsAsOf(pit, yahoo)
+    past = _now_ms() - 365 * 24 * 60 * 60 * 1000
+    result = await router.fetch_many(["AAPL_US_EQ"], past)
+    assert result == {}                                              # no value (no proxy)
+    assert router.source_for("AAPL_US_EQ") == SOURCE_PIT_EDGAR       # not flagged as a Yahoo fallback
+
+
+@pytest.mark.asyncio
+async def test_routing_fallback_set_resets_between_fetches():
+    """The fallback set is per-fetch: a name that fell back last cycle but is PIT-covered this cycle is
+    re-stamped pit-* (no stale fallback flag leaks across cycles)."""
+    pit = _FakePit({})
+    yahoo = _FakeYahooProvider({"AAPL_US_EQ": {"net_income": 1.0}})
+    router = RoutingFundamentalsAsOf(pit, yahoo)
+    await router.fetch_many(["AAPL_US_EQ"], _now_ms())               # PIT miss → Yahoo fallback
+    assert router.source_for("AAPL_US_EQ") == SOURCE_YAHOO_SNAPSHOT
+    pit._by_ticker = {"AAPL_US_EQ": {"net_income": 2.0}}             # PIT now covers it
+    await router.fetch_many(["AAPL_US_EQ"], _now_ms())
+    assert router.source_for("AAPL_US_EQ") == SOURCE_PIT_EDGAR       # re-stamped, no stale flag
+
+
+@pytest.mark.asyncio
+async def test_routing_empty_tickers_no_calls():
+    """No tickers → neither provider is called."""
+    pit = _FakePit({"AAPL_US_EQ": {"net_income": 1.0}})
+    yahoo = _FakeYahooProvider({"BTC_OTHER": {"net_income": 3.0}})
+    router = RoutingFundamentalsAsOf(pit, yahoo)
+    assert await router.fetch_many([], _now_ms()) == {}
+    assert pit.asked == [] and yahoo.asked == []
+
+
+# ── PIT line-item projection (pure, no HTTP) ─────────────────────────────────────────────────────
+def test_pit_line_items_keeps_only_finite_line_items():
+    """The seam payload carries line items + provenance; the projection keeps only the LINE_ITEMS keys
+    with a finite numeric value, drops provenance (source/observation_ts/knowledge_ts) and null/
+    non-numeric line items (NaN-excluded, never a fabricated 0)."""
+    payload = {
+        "net_income": 9.9e10,
+        "total_equity": 6.2e10,
+        "current_assets": None,            # null line item → omitted (not a fabricated 0)
+        "shares_outstanding": "16000000",  # numeric-as-string → coerced
+        "gross_profit": "n/a",             # non-numeric → omitted
+        "source": "pit-edgar",             # provenance → not a factor input, dropped
+        "observation_ts": 123,
+        "knowledge_ts": 456,
+        "not_a_line_item": 1.0,            # outside LINE_ITEMS → dropped (contract pins the vocabulary)
+    }
+    out = _pit_line_items(payload)
+    assert out["net_income"] == pytest.approx(9.9e10)
+    assert out["total_equity"] == pytest.approx(6.2e10)
+    assert out["shares_outstanding"] == pytest.approx(1.6e7)
+    assert "current_assets" not in out
+    assert "gross_profit" not in out
+    assert "source" not in out and "observation_ts" not in out and "knowledge_ts" not in out
+    assert "not_a_line_item" not in out
+
+
+def test_pit_line_items_empty_payload_is_empty():
+    assert _pit_line_items({}) == {}
+
+
+# ── build_fundamentals_provider — the wiring point's mode selection (reversibility) ──────────────
+def test_build_provider_yahoo_mode_is_bare_yahoo():
+    """mode='yahoo' (the safe default) returns the bare forward-only YahooFundamentalsAsOf — the
+    pre-Task-14 behaviour. PIT is NOT constructed, so a `yahoo` deploy never touches fundamentals-api."""
+    client = _FakeClient(_QMJ_SNAPSHOT)
+    provider = build_fundamentals_provider(client, mode=PROVIDER_MODE_YAHOO)
+    assert isinstance(provider, YahooFundamentalsAsOf)
+
+
+def test_build_provider_default_mode_is_yahoo(monkeypatch):
+    """No mode + no env ⇒ yahoo (the reversible safe default): pre-backfill the PIT warehouse is empty,
+    so the live cycle gains nothing from routing through it."""
+    monkeypatch.delenv("LIVE_FUNDAMENTALS_PROVIDER", raising=False)
+    client = _FakeClient(_QMJ_SNAPSHOT)
+    provider = build_fundamentals_provider(client)
+    assert isinstance(provider, YahooFundamentalsAsOf)
+
+
+def test_build_provider_env_pit_routes(monkeypatch):
+    """LIVE_FUNDAMENTALS_PROVIDER=pit ⇒ a RoutingFundamentalsAsOf (US/UK→PIT, Yahoo fallback)."""
+    monkeypatch.setenv("LIVE_FUNDAMENTALS_PROVIDER", "PIT")  # case-insensitive
+    client = _FakeClient(_QMJ_SNAPSHOT)
+    provider = build_fundamentals_provider(client, pit_provider=_FakePit({}))
+    assert isinstance(provider, RoutingFundamentalsAsOf)
+
+
+def test_build_provider_explicit_pit_mode_routes():
+    """mode='pit' (explicit) ⇒ RoutingFundamentalsAsOf, regardless of env."""
+    client = _FakeClient(_QMJ_SNAPSHOT)
+    provider = build_fundamentals_provider(client, mode=PROVIDER_MODE_PIT, pit_provider=_FakePit({}))
+    assert isinstance(provider, RoutingFundamentalsAsOf)
+
+
+def test_build_provider_unknown_mode_falls_back_to_yahoo():
+    """An unrecognised mode is treated as yahoo (fail-safe: never route to PIT on a typo)."""
+    client = _FakeClient(_QMJ_SNAPSHOT)
+    provider = build_fundamentals_provider(client, mode="garbage")
+    assert isinstance(provider, YahooFundamentalsAsOf)

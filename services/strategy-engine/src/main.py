@@ -17,7 +17,7 @@ from .domain.dataclasses import OHLCVBar
 from .infrastructure.market_data_client import MarketDataClient, range_for_bars
 from .infrastructure import strategy_config
 from .infrastructure.factor_store import FactorStore, factor_history_points, persist_research_cycle
-from .infrastructure.fundamentals_as_of import YahooFundamentalsAsOf
+from .infrastructure.fundamentals_as_of import build_fundamentals_provider
 from .infrastructure.lru_cache import TTLCache, scores_cache_key
 from .pipeline import build_pipeline_stages, snapshot_from_state
 
@@ -663,10 +663,19 @@ async def _init_engine_singletons() -> None:
 
     # Research factor_scores store + the point-in-time fundamentals seam the host fills
     # HistoryView.fundamentals from. Both best-effort: the persist mirrors the feature store (a
-    # Mongo blip logs but never blocks emission), and the seam reuses _bars_client's internal Yahoo
-    # path (no new infra). ensure_indexes is idempotent — a failure just leaves the read slower.
+    # Mongo blip logs but never blocks emission), and the seam degrades to {} on any upstream failure
+    # (so a cycle never breaks on a fundamentals outage). ensure_indexes is idempotent — a failure
+    # just leaves the read slower.
+    #
+    # build_fundamentals_provider reads LIVE_FUNDAMENTALS_PROVIDER (pit|yahoo, default yahoo): `yahoo`
+    # is the bare forward-only snapshot (pre-Task-14 behaviour, the safe default); `pit` routes US/UK
+    # names to the PIT warehouse (fundamentals-api) with a Yahoo fallback on a miss. Reversible by env —
+    # no code change to flip back. See infrastructure/fundamentals_as_of.py.
     _factor_store = FactorStore()
-    _fundamentals_provider = YahooFundamentalsAsOf(_bars_client)
+    _fundamentals_provider = build_fundamentals_provider(_bars_client)
+    print(f"[strategy-engine] fundamentals seam: provider mode="
+          f"{os.getenv('LIVE_FUNDAMENTALS_PROVIDER', 'yahoo')} "
+          f"({type(_fundamentals_provider).__name__})", flush=True)
     try:
         await _factor_store.ensure_indexes()
         print("[strategy-engine] factor_scores store: indexes ensured — research factors will persist per cycle", flush=True)
