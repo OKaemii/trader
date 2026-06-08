@@ -119,6 +119,15 @@ global:
     eodhdDailyCallLimit: "90000"
     # Fundamentals (QMJ: ROE / D-E / current ratio) source. yahoo (free quoteSummary) | eodhd (paid add-on).
     fundamentalsProvider: yahoo
+    # LIVE strategy-engine fundamentals SEAM (the PIT warehouse wiring — epic Task 14). Distinct from
+    # `fundamentalsProvider` above (which is market-data-service's QMJ snapshot source): this selects how
+    # strategy-engine fills HistoryView.fundamentals — `yahoo` (the forward-only snapshot alone, the
+    # pre-Task-14 behaviour) | `pit` (route *_US_EQ/*l_EQ to the PIT warehouse via fundamentals-api, with
+    # a Yahoo fallback on a miss). DEFAULT yahoo: pre-backfill the PIT warehouse is empty, so the live
+    # cycle gains nothing from routing through it and Yahoo is the only live source — flipping to `pit` is
+    # the operator's deliberate, fully reversible opt-in once the Task-9 backfill has landed rows. The
+    # live cycle NEVER breaks if fundamentals-api is down (the seam degrades to {} → Yahoo fallback).
+    liveFundamentalsProvider: yahoo
     # PIT Fundamentals Warehouse (fundamentals-ingestion write-side). SEC EDGAR mandates a descriptive
     # User-Agent on every request — the EDGAR clients fail CLOSED without it (every fetch degrades to
     # empty, so the ingest CronJob/backfill Job writes nothing and the Job exits non-zero). ⚠ SET A REAL
