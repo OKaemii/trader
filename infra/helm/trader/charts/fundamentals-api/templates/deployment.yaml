@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fundamentals-api
+  namespace: {{ .Release.Namespace }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fundamentals-api
+  template:
+    metadata:
+      labels:
+        app: fundamentals-api
+    spec:
+      containers:
+        - name: fundamentals-api
+          image: {{ .Values.image | default (printf "%strader-fundamentals-api:%s" (.Values.global.imageRegistry | default "") (.Values.global.imageTag | default "latest")) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy | default "IfNotPresent" }}
+          ports:
+            - containerPort: 8011
+          envFrom:
+            - secretRef:
+                name: trader-secrets
+          env:
+            # Timescale (the bi-temporal `fundamentals` as-of READ surface — epic Task 7's write target).
+            # Password from the secret, URL assembled like backtest-engine/fundamentals-ingestion so the
+            # resolver points at trader_ts.
+            - name: TIMESCALEDB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: TIMESCALEDB_PASSWORD
+            - name: TIMESCALE_URL
+              value: "postgresql://trader:$(TIMESCALEDB_PASSWORD)@timescaledb-postgresql:5432/trader_ts"
+            # Mongo coordinates (parity with the write-side service; the resolver itself reads Timescale,
+            # but the var is wired so a future Mongo-backed surface surfaces a missing var at boot).
+            - name: MONGODB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: MONGODB_PASSWORD
+            - name: MONGODB_URL
+              value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb-headless:27017/trader?authSource=trader&directConnection=true"
+            - name: MONGODB_DB
+              value: trader
+            # Redis read-through cache fronting the as-of resolver (mirrors pg-bar-reader.ts). The in-cluster
+            # Redis service; a Redis blip degrades to an uncached (still-correct) read, never a failure.
+            - name: REDIS_URL
+              value: "redis://redis:6379"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+              ephemeral-storage: "128Mi"
+            limits:
+              memory: "512Mi"
+              ephemeral-storage: "256Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8011
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8011
+            initialDelaySeconds: 10
+            periodSeconds: 10

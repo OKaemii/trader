@@ -1,6 +1,6 @@
 name: Build & Deploy
 
-# On every push to master: build all 11 service images, push them to private GHCR
+# On every push to master: build all 12 service images, push them to private GHCR
 # tagged with the commit SHA, then deploy to the homeserver k3s via `helm upgrade`
 # pinned to that SHA.
 #
@@ -65,6 +65,9 @@ jobs:
             build_args: ""
           - service: fundamentals-ingestion
             dockerfile: infra/docker/fundamentals-ingestion.Dockerfile
+            build_args: ""
+          - service: fundamentals-api
+            dockerfile: infra/docker/fundamentals-api.Dockerfile
             build_args: ""
           # Bun/Next.js portal.
           - service: frontend-web
