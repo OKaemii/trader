@@ -73,6 +73,16 @@ COPY services/fundamentals-api/src ./fundamentals_api/src
 COPY services/fundamentals-api/conftest.py ./fundamentals_api/conftest.py
 COPY services/fundamentals-api/tests ./fundamentals_api/tests
 
+# warehouse-snapshotter TABLES suite (PIT Fundamentals Warehouse, epic Task 15). Deps-clean: the test
+# asserts only the pure `TABLES`/`TableSpec` metadata (that the three fundamentals hypertables are
+# snapshotted with the correct BIGINT-ms time columns). src/snapshot.py imports psycopg + pyarrow at
+# top level (the snapshot job's I/O) which the gate does NOT install — so its conftest stubs them in
+# sys.modules before import; the metadata under test never calls into them. Isolated under
+# ./warehouse_snapshotter so its `src.*` root doesn't collide with backtest-engine's `src` at /app.
+COPY services/warehouse-snapshotter/src ./warehouse_snapshotter/src
+COPY services/warehouse-snapshotter/conftest.py ./warehouse_snapshotter/conftest.py
+COPY services/warehouse-snapshotter/tests ./warehouse_snapshotter/tests
+
 # quant-core suite imports the installed package; backtest suite imports src.* (conftest puts
 # /app on the path). PYTHONDONTWRITEBYTECODE keeps the layer clean. -p no:cacheprovider avoids a
 # read-only-fs cache complaint. A non-zero exit here fails the build = the gate.
@@ -81,6 +91,7 @@ RUN python -m pytest quant_core_tests -q -p no:cacheprovider \
  && python -m pytest tests -q -p no:cacheprovider \
  && (cd strategy_engine && python -m pytest tests -q -p no:cacheprovider) \
  && (cd fundamentals_ingestion && python -m pytest tests -q -p no:cacheprovider) \
- && (cd fundamentals_api && python -m pytest tests -q -p no:cacheprovider)
+ && (cd fundamentals_api && python -m pytest tests -q -p no:cacheprovider) \
+ && (cd warehouse_snapshotter && python -m pytest tests -q -p no:cacheprovider)
 
 CMD ["true"]
