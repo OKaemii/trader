@@ -319,23 +319,36 @@ class FundamentalsResolver:
         (Gap 2). No-op when no `MarketDataReader` is injected. Computes market cap per name from the as-of
         adjusted close (the SAME series momentum uses) × the name's as-of `shares_outstanding` (the dei
         cover-page fact already in `line_items`) × FX→GBP, and drops the key when any input is missing
-        (NaN-excluded, never a fabricated 0). Dividend yields are fetched in ONE batch round-trip for all
-        names. A name that didn't resolve (empty line items, no source) is left untouched — there's nothing
-        to value."""
+        (NaN-excluded, never a fabricated 0).
+
+        HOT-PATH SHAPE: the whole-universe live seam (Task 14) calls this per cycle, so the upstream reads
+        are batched/coalesced — ONE batch dividend-yield round-trip, ONE batch adjusted-close round-trip,
+        and FX resolved ONCE per distinct currency (at most USD+GBP) rather than per ticker. A name that
+        didn't resolve (empty line items, no source) is skipped (nothing to value) and excluded from the
+        upstream reads."""
         if self._market_data is None:
             return resolved
-        # One batch dividend-yield round-trip for every resolved name (the leg shares the as-of basis).
-        dy_by_ticker = await self._market_data.dividend_yields_as_of(list(resolved.keys()), as_of_ms)
+        # The names worth valuing — resolved with at least one fact (an unresolved name has nothing to
+        # compute a market cap from; we don't fabricate one from a price alone).
+        valuable = [t for t, tf in resolved.items() if not (tf.source is None and not tf.line_items)]
+
+        # Coalesced upstream reads (one round-trip each); FX resolved once per distinct currency.
+        dy_by_ticker = await self._market_data.dividend_yields_as_of(valuable, as_of_ms)
+        closes = await self._market_data.adjusted_closes_as_of(valuable, as_of_ms)
+        fx_by_currency: dict[Optional[str], Optional[float]] = {}
+        for ticker in valuable:
+            ccy = currency_of(ticker)
+            if ccy not in fx_by_currency:
+                fx_by_currency[ccy] = await self._market_data.fx_to_gbp(ccy)
+
         enriched: dict[str, TickerFundamentals] = {}
         for ticker, tf in resolved.items():
-            # Unresolved name (no facts at all) — nothing to compute a market cap from; pass through.
             if tf.source is None and not tf.line_items:
-                enriched[ticker] = tf
+                enriched[ticker] = tf  # unresolved — pass through untouched
                 continue
-            adjusted_close = await self._market_data.adjusted_close_as_of(ticker, as_of_ms)
-            shares = tf.line_items.get("shares_outstanding")
-            fx_rate = await self._market_data.fx_to_gbp(currency_of(ticker))
-            market_cap = compute_market_cap_gbp(adjusted_close, shares, fx_rate)
+            market_cap = compute_market_cap_gbp(
+                closes.get(ticker), tf.line_items.get("shares_outstanding"), fx_by_currency.get(currency_of(ticker))
+            )
             new_items = apply_pit_market_cap(tf.line_items, market_cap)
             new_items = apply_dividend_yield(new_items, dy_by_ticker.get(ticker))
             enriched[ticker] = TickerFundamentals(

@@ -276,9 +276,12 @@ class FakeMarketDataReader:
         self.closes: dict[tuple[str, Optional[int]], Optional[float]] = {}
         self.fx: dict[Optional[str], Optional[float]] = {"GBP": 1.0}
         self.dividend_yields: dict[str, float] = {}
-        # Call recorders so a test can assert the batch dividend-yield round-trip + per-name close reads.
+        # Call recorders so a test can assert the coalesced upstream reads (one batch dividend-yield, one
+        # batch close, FX once per distinct currency) — and that an unresolved name is excluded from them.
         self.close_calls: list[tuple[str, Optional[int]]] = []
+        self.batch_close_calls: list[tuple[tuple[str, ...], Optional[int]]] = []
         self.dividend_calls: list[tuple[tuple[str, ...], Optional[int]]] = []
+        self.fx_calls: list[Optional[str]] = []
 
     def set_close(self, ticker: str, as_of_ms: Optional[int], close: Optional[float]) -> None:
         self.closes[(ticker, as_of_ms)] = close
@@ -293,7 +296,21 @@ class FakeMarketDataReader:
         self.close_calls.append((ticker, as_of_ms))
         return self.closes.get((ticker, as_of_ms))
 
+    async def adjusted_closes_as_of(
+        self, tickers: list[str], as_of_ms: Optional[int]
+    ) -> dict[str, float]:
+        # The batch read the resolver uses on the hot path — back it with the same seeded closes, and
+        # record the call (tickers + asOf) so a test can assert the ONE coalesced round-trip.
+        self.batch_close_calls.append((tuple(tickers), as_of_ms))
+        out: dict[str, float] = {}
+        for t in tickers:
+            c = self.closes.get((t, as_of_ms))
+            if c is not None:
+                out[t] = c
+        return out
+
     async def fx_to_gbp(self, currency: Optional[str]) -> Optional[float]:
+        self.fx_calls.append(currency)
         return self.fx.get(currency)
 
     async def dividend_yields_as_of(

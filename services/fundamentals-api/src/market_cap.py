@@ -303,7 +303,8 @@ class MarketDataReader:
         Reads market-data-service's internal bars endpoint with the internal JWT, passing `asOf` so the
         bar read is itself point-in-time. Returns the close of the latest bar at/<= as_of. Any failure
         (HTTP error, no bars, market-data down) degrades to None — the name's market cap is then absent
-        that cycle, never fabricated."""
+        that cycle, never fabricated. For the whole-universe hot path prefer `adjusted_closes_as_of`
+        (one round-trip)."""
         import httpx
 
         url = (
@@ -321,6 +322,39 @@ class MarketDataReader:
             log.warning("[market_cap] adjusted-close read failed for %s: %s", ticker, exc)
             return None
         return adjusted_close_at_or_before(payload.get("bars") or [], as_of_ms)
+
+    async def adjusted_closes_as_of(
+        self, tickers: list[str], as_of_ms: Optional[int]
+    ) -> dict[str, float]:
+        """As-of adjusted closes for MANY tickers in ONE round-trip (the whole-universe hot path) via
+        market-data-service's batch bars endpoint (`POST /internal/api/market-data/bars`). Returns only
+        the names with a resolvable close at/<= as_of — a name with no bar (unseeded / nothing ≤ as_of) is
+        simply absent (its market cap is then absent, never fabricated). Any failure degrades to {} (every
+        name's market cap is absent that cycle). Empty on no tickers."""
+        if not tickers:
+            return {}
+        import httpx
+
+        url = f"{self._base_url}/internal/api/market-data/bars"
+        body: dict = {"tickers": tickers, "interval": _BARS_INTERVAL, "range": _BARS_RANGE}
+        if as_of_ms is not None:
+            body["asOf"] = as_of_ms
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                r = await client.post(
+                    url, headers={**self._auth_header(), "Content-Type": "application/json"}, json=body
+                )
+                r.raise_for_status()
+                payload = r.json()
+        except Exception as exc:  # noqa: BLE001 — a batch bars read failure degrades to {}
+            log.warning("[market_cap] batch adjusted-close read failed: %s", exc)
+            return {}
+        out: dict[str, float] = {}
+        for t, raw_bars in (payload.get("bars") or {}).items():
+            close = adjusted_close_at_or_before(raw_bars or [], as_of_ms)
+            if close is not None:
+                out[t] = close
+        return out
 
     async def dividend_yields_as_of(
         self, tickers: list[str], as_of_ms: Optional[int]

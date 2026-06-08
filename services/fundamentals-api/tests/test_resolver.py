@@ -298,17 +298,44 @@ async def test_dividend_yield_null_omitted() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unresolved_name_not_market_data_queried() -> None:
+async def test_unresolved_name_excluded_from_market_data_reads() -> None:
     """An unresolved name (no facts) is passed through untouched — there's nothing to value, and we don't
-    fabricate a market cap from a price alone."""
+    fabricate a market cap from a price alone. It is also EXCLUDED from the coalesced upstream reads (the
+    batch close + dividend-yield carry only the valuable names; no FX is resolved for it)."""
     db = FakeTimescale()  # no instruments
     md = FakeMarketDataReader()
     md.set_close("NOPE_US_EQ", _AS_OF_MID, 150.0)
     md.set_fx("USD", 0.79)
     out = await _resolver_md(db, md).get_pit_fundamentals(["NOPE_US_EQ"], _AS_OF_MID)
     assert out["NOPE_US_EQ"].line_items == {}
-    # No per-name close read for an unresolved name (we short-circuit before the market-data hop).
-    assert md.close_calls == []
+    # The unresolved name is excluded from every upstream read — the batch close + dividend-yield are
+    # called with NO tickers, and no FX is resolved.
+    assert md.batch_close_calls == [((), _AS_OF_MID)]
+    assert md.dividend_calls == [((), _AS_OF_MID)]
+    assert md.fx_calls == []
+
+
+@pytest.mark.asyncio
+async def test_fx_resolved_once_per_currency_not_per_ticker() -> None:
+    """FX is resolved ONCE per distinct currency across the universe (the hot-path coalescing), not once
+    per ticker — three USD names share a single USD FX read."""
+    db = FakeTimescale()
+    md = FakeMarketDataReader()
+    md.set_fx("USD", 0.79)
+    for i, t in enumerate(["AAA_US_EQ", "BBB_US_EQ", "CCC_US_EQ"], start=1):
+        db.add_instrument(instrument_id=i, t212_ticker=t)
+        db.add_fact(instrument_id=i, metric="shares_outstanding", observation_ts=_T2018,
+                    knowledge_ts=_KNOW_ORIG, value=1e9)
+        md.set_close(t, _AS_OF_MID, 100.0)
+    out = await _resolver_md(db, md).get_pit_fundamentals(
+        ["AAA_US_EQ", "BBB_US_EQ", "CCC_US_EQ"], _AS_OF_MID
+    )
+    # All three priced.
+    for t in ["AAA_US_EQ", "BBB_US_EQ", "CCC_US_EQ"]:
+        assert out[t].line_items["market_cap_gbp"] == 100.0 * 1e9 * 0.79
+    # FX read exactly once (for USD), not three times; the batch close was one round-trip.
+    assert md.fx_calls == ["USD"]
+    assert len(md.batch_close_calls) == 1
 
 
 @pytest.mark.asyncio
