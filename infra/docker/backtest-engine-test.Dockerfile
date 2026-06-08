@@ -49,6 +49,10 @@ COPY services/strategy-engine/tests/test_pipeline.py ./strategy_engine/tests/tes
 # [http] extra above) — no Mongo/Timescale connection. Isolated under ./fundamentals_ingestion so its
 # `src.*` package root doesn't collide with backtest-engine's `src` at /app, and run from that dir so
 # `import src.main` resolves via its own conftest (same approach as the strategy-engine suite above).
+# PyYAML (epic Task 6): the metric registry (src/stage/metadata/metric_registry.yaml) is loaded with
+# yaml.safe_load; it is not in quant-core's deps nor backtest-engine's requirements, so install it here
+# (pinned to the service requirements.txt) before the fundamentals-ingestion suite runs.
+RUN pip install --no-cache-dir 'PyYAML==6.0.2'
 COPY services/fundamentals-ingestion/src ./fundamentals_ingestion/src
 COPY services/fundamentals-ingestion/conftest.py ./fundamentals_ingestion/conftest.py
 COPY services/fundamentals-ingestion/tests ./fundamentals_ingestion/tests
