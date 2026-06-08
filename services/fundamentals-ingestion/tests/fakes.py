@@ -81,7 +81,13 @@ class FakeTimescale:
         # Raw zone (epic Task 5). No BIGSERIAL — the PK is the full natural fact tuple, so re-ingest
         # of an identical fact is an ON CONFLICT DO NOTHING no-op (modelled below).
         self.raw_facts: list[dict[str, Any]] = []
-        self._seq = {"company": 0, "instrument": 0, "identifier": 0, "filing": 0}
+        # Canonical zone (epic Task 7). `fundamentals` is bi-temporal (supersede-in-txn); the revisions
+        # log + quarantine are append-only ledgers. Modelled below: the supersede flips is_superseded on
+        # the current row, the insert honours the full PK ON CONFLICT, quarantine assigns a BIGSERIAL.
+        self.fundamentals: list[dict[str, Any]] = []
+        self.fundamentals_revisions_log: list[dict[str, Any]] = []
+        self.fundamentals_quarantine: list[dict[str, Any]] = []
+        self._seq = {"company": 0, "instrument": 0, "identifier": 0, "filing": 0, "quarantine": 0}
 
     # The columns of the raw-facts PK, in the deployed 0009_fundamentals.sql order. Two raw facts
     # collide (ON CONFLICT) iff they agree on every one of these.
@@ -89,6 +95,12 @@ class FakeTimescale:
         "filing_id", "raw_tag", "context_id", "period_type", "period_end",
         "knowledge_ts", "dim_signature",
     )
+
+    # The canonical `fundamentals` LOGICAL-FACT key (the partial-unique current-row scope) and the full
+    # PK (which adds knowledge_ts). The supersede targets the logical key + is_superseded=FALSE; the
+    # insert's ON CONFLICT is on the full PK.
+    _FUND_LOGICAL_KEY = ("instrument_id", "metric", "observation_ts", "dim_signature")
+    _FUND_PK = ("instrument_id", "metric", "observation_ts", "dim_signature", "knowledge_ts")
 
     # ── pool API ──────────────────────────────────────────────────────────────
     def acquire(self) -> _Acquire:
@@ -197,6 +209,33 @@ class FakeTimescale:
             self.raw_facts.append(row)
             return 1  # RETURNING 1 → a fresh insert
 
+        # canonical zone (Task 7): hash-compare gate read — the content_hash of the current
+        # (is_superseded=FALSE) row for a logical fact, or None when there is no current row.
+        if "select content_hash from fundamentals" in q and "is_superseded = false" in q:
+            inst, metric, obs, dim = args
+            return next(
+                (r["content_hash"] for r in self.fundamentals
+                 if r["instrument_id"] == inst and r["metric"] == metric
+                 and r["observation_ts"] == obs and r["dim_signature"] == dim
+                 and not r["is_superseded"]),
+                None,
+            )
+
+        # canonical INSERT … ON CONFLICT (full PK) DO NOTHING RETURNING 1. 15 binds in declaration
+        # order; is_superseded is the literal FALSE in the statement (not bound).
+        if q.startswith("insert into fundamentals ("):
+            cols = (
+                "instrument_id", "metric", "observation_ts", "knowledge_ts", "fiscal_year",
+                "fiscal_period", "period_type", "dim_signature", "value", "unit", "currency",
+                "source", "accession_number", "raw_tag", "content_hash",
+            )
+            row = dict(zip(cols, args))
+            row["is_superseded"] = False
+            if any(all(r[k] == row[k] for k in self._FUND_PK) for r in self.fundamentals):
+                return None  # ON CONFLICT DO NOTHING → no row (same logical key + same knowledge_ts)
+            self.fundamentals.append(row)
+            return 1  # RETURNING 1 → a fresh insert
+
         raise AssertionError(f"FakeTimescale.run_fetchval: unrecognised query: {q}")
 
     # ── fetch (row sets: candidate intervals; resolve_instrument row) ──────────
@@ -244,9 +283,44 @@ class FakeTimescale:
         raise AssertionError(f"FakeTimescale.run_fetch: unrecognised query: {q}")
 
     def run_execute(self, query: str, args: tuple) -> None:
-        # The append-only writers issue NO UPDATE/DELETE; reaching execute() with one is a test
-        # failure that would mean the code violated the append-only contract.
         q = self._norm(query)
+
+        # canonical supersede (Task 7): the ONLY mutation the fundamentals_writer role is granted —
+        # UPDATE(is_superseded) flipping the current row(s) of one logical fact to TRUE. Scoped to
+        # is_superseded=FALSE so it touches only the current row (the partial-unique invariant).
+        if q.startswith("update fundamentals set is_superseded = true"):
+            inst, metric, obs, dim = args
+            for r in self.fundamentals:
+                if (r["instrument_id"] == inst and r["metric"] == metric
+                        and r["observation_ts"] == obs and r["dim_signature"] == dim
+                        and not r["is_superseded"]):
+                    r["is_superseded"] = True
+            return
+
+        # revisions-log append (one row per supersede/first-print). ON CONFLICT (full PK) DO NOTHING.
+        if q.startswith("insert into fundamentals_revisions_log"):
+            cols = (
+                "instrument_id", "metric", "observation_ts", "dim_signature", "knowledge_ts",
+                "prior_hash", "new_hash", "accession_number",
+            )
+            row = dict(zip(cols, args))
+            if any(all(r[k] == row[k] for k in self._FUND_PK) for r in self.fundamentals_revisions_log):
+                return  # ON CONFLICT DO NOTHING
+            self.fundamentals_revisions_log.append(row)
+            return
+
+        # quarantine append (value-agreement conflicts handed off to Task 8's review queue). BIGSERIAL
+        # event_id; payload arrives as a JSON string ($4::jsonb) — decode it so tests can assert shape.
+        if q.startswith("insert into fundamentals_quarantine"):
+            instrument_id, filing_id, reason, payload = args
+            self.fundamentals_quarantine.append({
+                "event_id": self._next("quarantine"),
+                "instrument_id": instrument_id, "filing_id": filing_id, "reason": reason,
+                "payload": payload,
+            })
+            return
+
+        # Any OTHER UPDATE/DELETE is an append-only violation (the security-master writers issue none).
         if q.startswith("update") or q.startswith("delete"):
             raise AssertionError(f"append-only violation: writer issued {q.split()[0].upper()}")
         raise AssertionError(f"FakeTimescale.run_execute: unrecognised query: {q}")
