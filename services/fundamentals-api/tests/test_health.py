@@ -64,6 +64,15 @@ def test_metrics_exposes_prometheus() -> None:
     assert "fundamentals_api_request_duration_seconds_bucket" in body
 
 
+def test_metrics_unmatched_path_uses_stable_label() -> None:
+    # A 404 on a random path must NOT spawn a per-path histogram series (unbounded cardinality) — the
+    # latency middleware labels an unmatched route with the stable `<unmatched>` sentinel, never the URL.
+    client.get("/this/path/does/not/exist/abc123")
+    body = client.get("/metrics").text
+    assert 'route="<unmatched>"' in body
+    assert "abc123" not in body  # the raw path never leaks into a label
+
+
 # ── internal seam hot path ─────────────────────────────────────────────────────────
 def test_internal_fundamentals_returns_pit_payload(monkeypatch) -> None:
     db = FakeTimescale()

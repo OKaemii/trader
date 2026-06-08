@@ -61,8 +61,11 @@ async def _observe_latency(request: Request, call_next):
     path) so the histogram's label cardinality stays bounded. The /metrics scrape is skipped."""
     start = time.perf_counter()
     response = await call_next(request)
+    # `scope["route"]` is only set when a route MATCHED; an unmatched path (404) leaves it absent — so
+    # fall back to a STABLE sentinel, never the raw URL (a burst of 404s on distinct random paths would
+    # otherwise spawn one histogram series per path = unbounded label cardinality).
     route = request.scope.get("route")
-    template = getattr(route, "path", request.url.path)
+    template = getattr(route, "path", None) or "<unmatched>"
     if template != "/metrics":
         _request_latency.labels(route=template, status=f"{response.status_code // 100}xx").observe(
             time.perf_counter() - start
