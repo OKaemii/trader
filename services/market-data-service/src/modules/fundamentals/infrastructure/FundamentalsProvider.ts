@@ -19,4 +19,13 @@ export interface FundamentalsRaw {
 export interface FundamentalsProvider {
   /** Best-effort per-ticker fundamentals. Tickers the provider can't resolve are absent. */
   fetch(tickers: string[]): Promise<Record<string, FundamentalsRaw>>;
+
+  /**
+   * Optional per-name provenance for the most recent `fetch`: the concrete upstream a ticker's
+   * data came from (e.g. `pit-edgar` vs the `yahoo` fall-back under the `pit` provider), so the
+   * cache can persist an honest per-name source rather than one blanket mode string. Providers that
+   * resolve every name from a single upstream (Yahoo, EODHD) omit it — the cache then stamps its
+   * configured mode, which is already the truth for them. Only meaningful right after a `fetch`.
+   */
+  sourceOf?(ticker: string): string | undefined;
 }

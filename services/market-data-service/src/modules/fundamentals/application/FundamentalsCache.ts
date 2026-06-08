@@ -18,6 +18,10 @@ export interface FundamentalsDoc {
   ratios:       QmjRatios | null;
   qualityPass:  boolean;
   marketCapGbp: number;
+  // Per-name provenance: the concrete upstream this row came from, as the provider reported it on
+  // the fetch (`provider.sourceOf`) — `pit-edgar` for a PIT-warehouse hit, `yahoo` for the PIT
+  // fall-back (non-US / PIT miss / outage), or the configured mode (`yahoo`/`eodhd`) when the
+  // provider resolves every name from one upstream. Lets the scanner show an honest per-name source.
   source:       string;
   updatedAt:    number;
 }
@@ -28,6 +32,15 @@ export class FundamentalsCache {
     private readonly source: string,
     private readonly ttlMs = MONTH_MS,
   ) {}
+
+  /**
+   * The effective provider mode this cache was built with (`yahoo` | `eodhd` | `pit`) — the live
+   * `FUNDAMENTALS_PROVIDER`. The scanner feed-health reports this so the panel reflects the provider
+   * actually running, not a re-read of an env var that could drift from the wired cache.
+   */
+  get effectiveSource(): string {
+    return this.source;
+  }
 
   private async coll(): Promise<Collection<FundamentalsDoc>> {
     return (await getMongoDb()).collection<FundamentalsDoc>(COLLECTIONS.COMPANY_FUNDAMENTALS);
@@ -79,11 +92,14 @@ export class FundamentalsCache {
     const now = Date.now();
     let written = 0;
     for (const [ticker, raw] of Object.entries(fetched)) {
+      // Persist the provider's per-name source when it exposes one (the `pit` provider stamps
+      // `pit-edgar`/`yahoo` per ticker); otherwise the configured mode is already the per-name truth.
+      const source = this.provider.sourceOf?.(ticker) ?? this.source;
       await coll.updateOne(
         { _id: ticker },
         { $set: {
           asOf: now, raw, ratios: computeRatios(raw), qualityPass: qualityPass(raw),
-          marketCapGbp: raw.marketCapGbp, source: this.source, updatedAt: now,
+          marketCapGbp: raw.marketCapGbp, source, updatedAt: now,
         } },
         { upsert: true },
       );

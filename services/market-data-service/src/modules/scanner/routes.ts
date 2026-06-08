@@ -43,6 +43,10 @@ export function createScannerRouter(universe: UniverseManager, fundamentals: Fun
         marketCapGbp: f?.marketCapGbp ?? null,
         ratios:       f?.ratios ?? null,
         qualityPass:  f?.qualityPass ?? null,           // null = fundamentals not yet fetched
+        // Per-name provenance for the portal source badge (#150): `pit-edgar` (US warehouse hit) /
+        // `yahoo` (PIT fall-back or yahoo mode) / `eodhd`, as persisted on the cached row. null when
+        // fundamentals aren't fetched yet — the badge then shows "none", never a fabricated source.
+        source:       f?.source ?? null,
       };
     });
     rows.sort((a, b) => (b.marketCapGbp ?? 0) - (a.marketCapGbp ?? 0));
@@ -70,7 +74,10 @@ export function createScannerRouter(universe: UniverseManager, fundamentals: Fun
       config: {
         universeSource:       process.env.UNIVERSE_SOURCE ?? 'curated',
         dailyHistoryProvider: process.env.DAILY_HISTORY_PROVIDER ?? 'yahoo',
-        fundamentalsProvider: process.env.FUNDAMENTALS_PROVIDER ?? 'yahoo',
+        // EFFECTIVE provider the wired cache runs (the live FUNDAMENTALS_PROVIDER) — `yahoo` today,
+        // `pit` once the capstone flips it. Read from the cache, not a re-parse of process.env, so
+        // the panel can't drift from the provider actually serving the snapshot's per-name sources.
+        fundamentalsProvider: fundamentals.effectiveSource,
         minMarketCapGbp:      Number(process.env.MIN_MARKET_CAP_GBP ?? 5_000_000_000),
       },
     });
