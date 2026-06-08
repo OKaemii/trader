@@ -692,11 +692,12 @@ app.route('/', createAdminRouter(universeManager, provider, adminLogger, {
 app.route('/', createInternalBarsRouter(universeManager));
 
 // Fundamentals (QMJ) — read-through company_fundamentals cache + internal/admin routes.
-// Provider selected by FUNDAMENTALS_PROVIDER (yahoo default; eodhd dormant until the add-on).
+// Provider selected by FUNDAMENTALS_PROVIDER (yahoo default; eodhd dormant until the add-on; pit
+// routes US names to the SEC-EDGAR warehouse via fundamentals-api with a Yahoo fall-back).
 const fundamentalsCache = buildFundamentalsCache(
   async (amount, currency) => (await getFxClient()).toGBP({ amount, currency }),
   env.FUNDAMENTALS_PROVIDER,
-  { requestSpacingMs: env.FUNDAMENTALS_REQUEST_SPACING_MS },
+  { requestSpacingMs: env.FUNDAMENTALS_REQUEST_SPACING_MS, pitBaseUrl: env.FUNDAMENTALS_API_URL },
 );
 // Background QMJ refresher — keeps company_fundamentals populated off the request path (a full
 // Yahoo walk runs for minutes; the admin endpoint just wakes this loop). Started in bootstrap()
