@@ -10,6 +10,13 @@
 // whatever the background sync has accreted. Dividend `valuePerShare` is BASE units (pence killed by
 // the provider at the boundary), matching the persisted daily `close` — so the yield ratio computed
 // downstream is unit-consistent.
+//
+// New-event hook (plan §8 Gap 1): the store is the single authority on what is genuinely NEW (it
+// owns the watermark cursors + the dedupe), so it fires an injected `onNewActions(ticker, summary)`
+// callback exactly when a sync appends a previously-unseen dividend/split. The corporate-actions
+// watcher binds that callback to a forced daily-series re-backfill so `writeBarRevisions` supersedes
+// the now-stale-adjusted history (the provider re-adjusts the whole series on a new action). The
+// callback is best-effort — a throw is swallowed so a failed re-adjust never aborts the sync loop.
 
 import { getMongoDb, COLLECTIONS } from '@trader/shared-mongo';
 import type { Collection } from 'mongodb';
@@ -47,6 +54,18 @@ export interface CorporateActionsDoc {
   updatedAt: number;
 }
 
+// What a sync appended for one ticker — handed to the new-event hook so a listener (the corporate-
+// actions watcher) can decide whether a re-adjust is warranted (newDividends + newSplits > 0).
+export interface NewActionsSummary {
+  newDividends: number;
+  newSplits: number;
+}
+
+// Fired by `syncOne` when (and only when) a sync appends a previously-unseen dividend/split for
+// `ticker`. Best-effort: the store awaits it but swallows any rejection (a failed re-adjust must not
+// abort the sync). Plan §8 Gap 1.
+export type OnNewActions = (ticker: string, summary: NewActionsSummary) => void | Promise<void>;
+
 // Max 'YYYY-MM-DD' in a list (string compare is date-correct for fixed-width ISO dates), or undefined.
 function maxDate(dates: string[]): string | undefined {
   let max: string | undefined;
@@ -59,6 +78,9 @@ export class CorporateActionsStore {
     private readonly provider: CorporateActionsProvider,
     private readonly source: string,
     private readonly ttlMs = SYNC_TTL_MS,
+    // Optional new-event hook — fired when a sync appends a previously-unseen action (plan §8 Gap 1).
+    // Best-effort; a rejection is swallowed so the re-adjust trigger can never break the sync loop.
+    private readonly onNewActions?: OnNewActions,
   ) {}
 
   private async coll(): Promise<Collection<CorporateActionsDoc>> {
@@ -136,6 +158,16 @@ export class CorporateActionsStore {
     if (lastSplitDate !== undefined) set.lastSplitDate = lastSplitDate;
 
     await coll.updateOne({ _id: ticker }, { $set: set }, { upsert: true });
+
+    // A genuinely-new action landed → notify the listener (re-adjust the daily series). Fired only
+    // after the cursors are persisted, so a re-adjust always sees the store consistent. Best-effort:
+    // swallow a rejection so a failing re-adjust never aborts this sync (or the batch loop).
+    if (this.onNewActions && (newDivs.length > 0 || newSplits.length > 0)) {
+      try {
+        await this.onNewActions(ticker, { newDividends: newDivs.length, newSplits: newSplits.length });
+      } catch { /* best-effort — never let the re-adjust trigger break the sync */ }
+    }
+
     return { fetched: true, newDividends: newDivs.length, newSplits: newSplits.length };
   }
 

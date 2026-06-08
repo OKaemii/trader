@@ -35,6 +35,15 @@ export interface EodhdFeedResult {
   skipped?:  boolean;
 }
 
+// The corporate-actions sync pass run after the bulk-EOD pull (plan §8 Gap 1). Decoupled behind this
+// shape so the feed doesn't import the store directly and the test can stub it: `syncMany` runs the
+// incremental dividend/split sync over the active universe (near-free when current), and a newly-seen
+// action fires the store's bound watcher → a forced daily-series re-adjust. Returns aggregate counts
+// for logging. Absent ⇒ the feed runs exactly as before (back-compatible).
+export interface CorporateActionsSync {
+  syncMany(tickers: string[], now?: number): Promise<{ tickers: number; fetched: number; newDividends: number; newSplits: number }>;
+}
+
 function utcDate(atMs = Date.now()): string { return new Date(atMs).toISOString().slice(0, 10); }
 
 // {EODHD-code|EXCHANGE -> T212 ticker} for the active universe, so a whole-exchange bulk dump is
@@ -68,6 +77,9 @@ export async function runEodhdDailyFeed(
   db: Db,
   redis: RedisClientType,
   activeTickers: string[],
+  // Optional corporate-actions sync — run AFTER the bulk-EOD pull so a new split/dividend triggers a
+  // forced daily-series re-adjust on the same EOD cycle (plan §8 Gap 1). Absent ⇒ unchanged behaviour.
+  corporateActions?: CorporateActionsSync,
 ): Promise<EodhdFeedResult[]> {
   if (activeTickers.length === 0) return [];
   const client = getEodhdClient();
@@ -96,5 +108,22 @@ export async function runEodhdDailyFeed(
     log.info(`[eodhd-feed] ${ex} ${date}: ${rows.length} bulk rows, ${bars.length} matched active universe, ${persisted} persisted`);
     results.push({ exchange: ex, date, matched: bars.length, persisted });
   }
+
+  // Corporate-actions pass (plan §8 Gap 1) — run once after the bulk-EOD pull, over the whole active
+  // universe. The store's per-ticker TTL gate keeps this near-free when nothing is new; a newly-seen
+  // split/dividend fires the bound watcher → a forced re-adjust of that ticker's daily series so the
+  // seeded history is re-based off the provider's re-adjusted closes (no stale-adjustment discontinuity).
+  // Best-effort: any failure here must never compromise the daily-bar write that already succeeded.
+  if (corporateActions) {
+    try {
+      const ca = await corporateActions.syncMany(activeTickers);
+      if (ca.newDividends > 0 || ca.newSplits > 0) {
+        log.info(`[eodhd-feed] corporate-actions: +${ca.newDividends} dividends, +${ca.newSplits} splits across ${ca.fetched}/${ca.tickers} tickers — re-adjust triggered`);
+      }
+    } catch (err) {
+      log.warn('[eodhd-feed] corporate-actions sync failed (continuing):', err);
+    }
+  }
+
   return results;
 }

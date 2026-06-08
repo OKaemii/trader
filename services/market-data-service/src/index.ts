@@ -41,6 +41,7 @@ import { EarningsRefreshScheduler } from './modules/earnings/application/Earning
 import { createEarningsRouter } from './modules/earnings/routes.ts';
 import { buildCorporateActionsStore } from './modules/corporate-actions/wiring.ts';
 import { CorporateActionsRefreshScheduler } from './modules/corporate-actions/application/CorporateActionsRefreshScheduler.ts';
+import { CorporateActionsWatcher } from './modules/corporate-actions/application/CorporateActionsWatcher.ts';
 import { createCorporateActionsRouter } from './modules/corporate-actions/routes.ts';
 import { closeAtOrBefore } from './modules/corporate-actions/application/price-at.ts';
 import { buildNewsStore } from './modules/news/wiring.ts';
@@ -387,7 +388,10 @@ async function pollLoop(): Promise<void> {
     // is the daily source (the EODHD-scanned universe is too large for TwelveData intraday).
     if (env.DAILY_HISTORY_PROVIDER === 'eodhd' && cfg.barFrequency === 'daily') {
       try {
-        await runEodhdDailyFeed(await getMongoDb(), redis, activeTickers);
+        // Pass the corporate-actions store so the feed runs the incremental dividend/split sync after
+        // the bulk-EOD pull — a newly-seen action fires the bound watcher → a forced daily-series
+        // re-adjust (plan §8 Gap 1). Near-free when nothing is new (the store's per-ticker TTL gate).
+        await runEodhdDailyFeed(await getMongoDb(), redis, activeTickers, corporateActionsStore);
       } catch (err) {
         log.warn('[market-data] EODHD daily feed failed (continuing):', err);
       }
@@ -728,7 +732,20 @@ app.route('/', createEarningsRouter(earningsStore, earningsRefresher));
 // factor host injects into HistoryView.fundamentals (the point-in-time, backfillable Value div-yield
 // component — §H). The yield denominator is the persisted daily close at/<= asOf, read via getBars
 // over a wide range so a backfill replay finds an old enough bar. Refresher started in bootstrap().
-const corporateActionsStore = buildCorporateActionsStore({ syncTtlMs: env.CORPORATE_ACTIONS_SYNC_TTL_MS });
+// Gap 1 (plan §8): the watcher re-adjusts the seeded daily series when a new split/dividend lands, so
+// a corporate action never leaves history on a stale adjustment basis (the discontinuity that
+// distorts returns/risk). Bound into the store as its new-event hook: the store appends a previously-
+// unseen action → fires the watcher → a forced daily-series re-backfill for that ticker (whole-span
+// re-fetch so writeBarRevisions supersedes the now-stale-adjusted rows). Constructed before the store
+// so the hook can be passed at construction; resolves db/redis lazily (pools may not be up yet).
+const corporateActionsWatcher = new CorporateActionsWatcher(
+  { getDb: getMongoDb, getRedis: getRedisClient },
+  { spacingMs: env.CORPORATE_ACTIONS_READJUST_SPACING_MS },
+);
+const corporateActionsStore = buildCorporateActionsStore({
+  syncTtlMs: env.CORPORATE_ACTIONS_SYNC_TTL_MS,
+  onNewActions: corporateActionsWatcher.onNewActions,
+});
 const corporateActionsRefresher = new CorporateActionsRefreshScheduler(
   corporateActionsStore,
   () => universeManager.activeTickers,

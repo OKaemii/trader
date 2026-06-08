@@ -94,6 +94,10 @@ const EnvSchema = z.object({
     CORPORATE_ACTIONS_SYNC_TTL_MS:        z.coerce.number().int().positive().default(24 * 60 * 60_000),
     CORPORATE_ACTIONS_REFRESH_IDLE_MS:    z.coerce.number().int().positive().default(24 * 60 * 60_000),
     CORPORATE_ACTIONS_REQUEST_SPACING_MS: z.coerce.number().int().nonnegative().default(250),
+    // Pause between successive forced daily-series re-adjusts when a new split/dividend lands (plan §8
+    // Gap 1). A market-wide split day fans out across many tickers at once; the watcher drains them
+    // serially with this spacing so concurrent whole-span re-fetches don't spike the EODHD budget.
+    CORPORATE_ACTIONS_READJUST_SPACING_MS: z.coerce.number().int().nonnegative().default(1000),
 
     // Per-symbol EODHD news incremental sync (Overview "Recent Events"). The store re-checks a symbol
     // no more often than the TTL and fetches only articles on/after its stored publish-date cursor
