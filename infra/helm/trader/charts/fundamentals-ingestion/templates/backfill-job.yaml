@@ -1,0 +1,93 @@
+# One-shot PIT-fundamentals backfill Job (epic Task 9).
+#
+# The operator-triggered from-scratch backfill — `python -m src.ingest --full
+# --tickers <list>`. UNLIKE the nightly CronJob (which runs every deploy), this
+# Job renders ONLY when explicitly enabled (global.env.fundamentalsBackfill ==
+# "true"), so a routine `helm upgrade` never kicks off a heavy backfill. It is the
+# task's "demonstrate an AAPL+MSFT backfill landing `fundamentals` rows" step.
+#
+# Re-run safety: the Job name is suffixed with the image tag, so each enabled
+# deploy at a new SHA creates a FRESH Job rather than colliding with a completed
+# one (a Job's pod template is immutable — re-applying a same-named Job errors).
+# To re-run at the same tag, delete the prior Job first. The ingest itself is
+# idempotent (hash-gated), so re-running over the same tickers writes no new
+# canonical rows.
+#
+# Tickers: global.env.fundamentalsBackfillTickers (default "AAPL,MSFT") — bare US
+# symbols. Empty ⇒ the full configured coverage set (universe ∪ index), which is
+# the production backfill rather than the demo.
+#
+# EDGAR_USER_AGENT MANDATORY (SEC fails closed); the run exits non-zero on an empty
+# UA so the Job shows red rather than silently writing nothing.
+{{- if eq (printf "%v" (.Values.global.env.fundamentalsBackfill | default "false")) "true" }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ printf "fundamentals-backfill-%s" (.Values.global.imageTag | default "latest" | trunc 12 | trimSuffix "-") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: fundamentals-backfill
+spec:
+  backoffLimit: 2
+  # A from-scratch backfill over many filers is long but bounded by the 10 req/s SEC limiter; reap a
+  # wedged run after 6h.
+  activeDeadlineSeconds: 21600
+  ttlSecondsAfterFinished: 86400      # auto-clean the finished Job after a day (logs kept 24h)
+  template:
+    metadata:
+      labels:
+        app: fundamentals-backfill
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: fundamentals-backfill
+          image: {{ .Values.image | default (printf "%strader-fundamentals-ingestion:%s" (.Values.global.imageRegistry | default "") (.Values.global.imageTag | default "latest")) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy | default "IfNotPresent" }}
+          command:
+            - "python"
+            - "-m"
+            - "src.ingest"
+            - "--full"
+            - "--tickers"
+            - {{ .Values.global.env.fundamentalsBackfillTickers | default "AAPL,MSFT" | quote }}
+          envFrom:
+            - secretRef:
+                name: trader-secrets
+          env:
+            # Mongo (coverage resolver — only consulted when --tickers is empty; harmless otherwise).
+            - name: MONGODB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: MONGODB_PASSWORD
+            - name: MONGODB_URL
+              value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb-headless:27017/trader?authSource=trader&directConnection=true"
+            - name: MONGODB_DB
+              value: trader
+            # Timescale (the bi-temporal `fundamentals` write target).
+            - name: TIMESCALEDB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: TIMESCALEDB_PASSWORD
+            - name: TIMESCALE_URL
+              value: "postgresql://trader:$(TIMESCALEDB_PASSWORD)@timescaledb-postgresql:5432/trader_ts"
+            # SEC EDGAR — mandatory descriptive UA + rate budget.
+            - name: EDGAR_USER_AGENT
+              value: {{ .Values.global.env.edgarUserAgent | default "trader-platform fundamentals-ingestion" | quote }}
+            - name: EDGAR_REQS_PER_SEC
+              value: {{ .Values.global.env.edgarReqsPerSec | default "10" | quote }}
+            # Coverage knobs (used only on the empty --tickers full-coverage path).
+            - name: FUNDAMENTALS_COVERAGE
+              value: {{ .Values.global.env.fundamentalsCoverage | default "universe_plus_index" | quote }}
+            - name: FUNDAMENTALS_COVERAGE_CAP
+              value: {{ .Values.global.env.fundamentalsCoverageCap | default "64" | quote }}
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+              ephemeral-storage: "128Mi"
+            limits:
+              memory: "768Mi"
+              ephemeral-storage: "256Mi"
+{{- end }}

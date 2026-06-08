@@ -74,12 +74,21 @@ class SubmissionFiling:
 
 @dataclass(frozen=True)
 class CompanySubmissions:
-    """The parsed shape of a per-CIK submissions document the security-master upsert path consumes."""
+    """The parsed shape of a per-CIK submissions document the security-master upsert path consumes.
+
+    `sic` is the filer's SEC Standard Industrial Classification code (a 4-digit string EDGAR puts at
+    the top level of `submissions.json`, e.g. `"3571"` for Apple). It drives the normalizer's
+    sector-template selection (`normalize.sectors.template_for_sic`) — a bank/insurer/REIT/utility uses
+    different us-gaap tags than the general template. Carried RAW (the string SEC gave, or None when
+    SEC omitted/garbled it); the template map coerces + bands it, so a missing SIC degrades to the
+    'general' template rather than failing. (Task 7 flagged this field as missing; it is added here so
+    the cron's CIK→SIC→template hop works.)"""
 
     cik: str  # zero-padded 10-digit
     name: str
     tickers: tuple[str, ...]
     exchanges: tuple[str, ...]
+    sic: Optional[str] = None
     filings: tuple[SubmissionFiling, ...] = field(default_factory=tuple)
 
 
@@ -117,6 +126,22 @@ def _iso_to_ms(value: Any) -> Optional[int]:
         return int(dt.timestamp() * 1000)
     except ValueError:
         return None
+
+
+def _normalise_sic(value: Any) -> Optional[str]:
+    """The submissions `sic` field → a clean SIC string, or None when absent/garbled.
+
+    EDGAR gives `sic` as a 4-digit string (occasionally an int, occasionally with stray whitespace, and
+    `""` for an unclassified filer). Normalise to the digit string (or None) so the downstream
+    `template_for_sic` — which already coerces int/str/None — gets a stable shape. A non-numeric value
+    (a description slipped into the field) → None rather than a fabricated code; the template falls back
+    to 'general'."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value)
+    s = str(value).strip()
+    return s if s and s.isdigit() else None
 
 
 def parse_company_tickers(payload: Any) -> list[TickerMapEntry]:
@@ -186,6 +211,7 @@ def parse_submissions(payload: Any) -> Optional[CompanySubmissions]:
         name=str(payload.get("name", "")).strip(),
         tickers=tickers,
         exchanges=exchanges,
+        sic=_normalise_sic(payload.get("sic")),
         filings=tuple(filings),
     )
 

@@ -37,6 +37,10 @@ META_SUBMISSIONS_JSON = {
     "name": "Meta Platforms, Inc.",
     "tickers": ["META"],
     "exchanges": ["Nasdaq"],
+    # SEC SIC — a 4-digit string at the top level (Meta = 7372 Prepackaged Software). The normalizer's
+    # sector-template selection (Task 7) reads this; Task 7 flagged it was previously dropped.
+    "sic": "7372",
+    "sicDescription": "Services-Prepackaged Software",
     "filings": {
         "recent": {
             "accessionNumber": ["0001326801-22-000018", "0001326801-19-000009"],
@@ -74,6 +78,7 @@ def test_parse_submissions_shape_and_timestamps() -> None:
     assert parsed.name == "Meta Platforms, Inc."
     assert parsed.tickers == ("META",)
     assert parsed.exchanges == ("Nasdaq",)
+    assert parsed.sic == "7372"          # SIC parsed for sector-template selection (Task 7)
     assert len(parsed.filings) == 2
 
     f0 = parsed.filings[0]
@@ -119,6 +124,43 @@ def test_parse_submissions_tolerates_missing_filings_block() -> None:
 def test_parse_submissions_none_on_missing_cik() -> None:
     assert parse_submissions({"name": "Co"}) is None
     assert parse_submissions("not-json") is None
+
+
+# ── SIC parsing (Task 7 fix: the field the normalizer's sector-template selection needs) ──────────
+@pytest.mark.parametrize(
+    "raw_sic,expected",
+    [
+        ("6021", "6021"),       # bank — clean 4-digit string
+        (6021, "6021"),         # int (some feeds give an int) → str
+        ("  6798 ", "6798"),    # stray whitespace stripped (REIT)
+        ("", None),             # SEC's "unclassified filer" empty string → None
+        ("N/A", None),          # a non-numeric value → None, never a fabricated code
+        (None, None),           # absent → None
+        (True, None),           # bool is an int subclass — must NOT be read as SIC 1
+    ],
+)
+def test_parse_submissions_sic_normalisation(raw_sic, expected) -> None:
+    payload = {"cik": "1", "name": "Co", "tickers": [], "exchanges": [], "sic": raw_sic}
+    parsed = parse_submissions(payload)
+    assert parsed is not None and parsed.sic == expected
+
+
+def test_parse_submissions_missing_sic_is_none() -> None:
+    # No `sic` key at all (older/partial submissions) → None (the template falls back to 'general').
+    parsed = parse_submissions({"cik": "1", "name": "Co", "tickers": [], "exchanges": []})
+    assert parsed is not None and parsed.sic is None
+
+
+def test_parsed_sic_drives_sector_template() -> None:
+    # End-to-end of the Task-7 hop: a parsed bank SIC selects the 'bank' template; Meta's tech SIC stays
+    # 'general'. This is the exact CIK→SIC→template flow the cron uses.
+    from src.normalize.sectors import template_for_sic
+
+    bank = parse_submissions({"cik": "1", "name": "B", "tickers": [], "exchanges": [], "sic": "6022"})
+    assert bank is not None and template_for_sic(bank.sic) == "bank"
+
+    tech = parse_submissions(META_SUBMISSIONS_JSON)
+    assert tech is not None and template_for_sic(tech.sic) == "general"
 
 
 def test_parse_submissions_ragged_arrays_truncate() -> None:

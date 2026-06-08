@@ -24,6 +24,12 @@ def test_stage_modules_import() -> None:
         "src.stage",
         "src.normalize",
         "src.qa",
+        # Task 9 wiring: the coverage resolver, the per-ticker orchestrator, and the CronJob/backfill
+        # entry point. These must import WITHOUT a live driver (asyncpg/motor are lazy inside the run),
+        # so a top-level import regression would crash the CronJob — caught here at the gate.
+        "src.coverage",
+        "src.orchestrator",
+        "src.ingest",
     ):
         assert importlib.import_module(mod) is not None
 
