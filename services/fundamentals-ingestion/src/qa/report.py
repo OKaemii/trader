@@ -38,38 +38,46 @@ DEFAULT_SAMPLE_LIMIT = 50
 
 
 # ── SQL ────────────────────────────────────────────────────────────────────────────
-# Total + by-reason counts over the window. $1 is the lower-bound `occurred_at` as a timestamptz (bound
-# natively from a Python datetime by `_since_param`), or NULL for an unbounded window. The
-# `$1::timestamptz IS NULL OR occurred_at >= $1` predicate is a no-op when $1 is NULL (NULL IS NULL is
-# TRUE), so "all time" needs no separate query.
+# Each query takes the same two optional filters as its leading binds:
+#   $1 — the lower-bound `occurred_at` as a timestamptz (bound natively from a Python datetime by
+#        `_since_param`), or NULL for an unbounded window. `$1::timestamptz IS NULL OR occurred_at >= $1`
+#        is a no-op when $1 is NULL (NULL IS NULL is TRUE), so "all time" needs no separate query.
+#   $2 — an optional `instrument_id` for the per-name lookup. `$2::bigint IS NULL OR instrument_id = $2`
+#        is a no-op when $2 is NULL, so a name-scoped read and the unfiltered aggregate share one query:
+#        when $2 is NULL the result is BYTE-FOR-BYTE the prior unfiltered behaviour.
 _COUNT_BY_REASON = """
 SELECT reason, COUNT(*) AS n
 FROM fundamentals_quarantine
 WHERE ($1::timestamptz IS NULL OR occurred_at >= $1)
+  AND ($2::bigint IS NULL OR instrument_id = $2)
 GROUP BY reason
 ORDER BY n DESC, reason
 """
 
 # By-sector counts: LEFT JOIN quarantine → instruments → companies on instrument_id, grouping on the
 # company's sector (NULL → the unknown bucket, coalesced in Python). LEFT JOINs so a row with an
-# unresolved instrument still counts.
+# unresolved instrument still counts. The optional `instrument_id` predicate ($2) filters on the
+# quarantine row's own column (q.instrument_id), scoping BEFORE the sector join.
 _COUNT_BY_SECTOR = """
 SELECT c.sector AS sector, COUNT(*) AS n
 FROM fundamentals_quarantine q
 LEFT JOIN security_master.instruments i ON i.instrument_id = q.instrument_id
 LEFT JOIN security_master.companies   c ON c.company_id    = i.company_id
 WHERE ($1::timestamptz IS NULL OR q.occurred_at >= $1)
+  AND ($2::bigint IS NULL OR q.instrument_id = $2)
 GROUP BY c.sector
 ORDER BY n DESC
 """
 
-# A recent sample of quarantine rows for the operator to eyeball (newest first), bounded by $2.
+# A recent sample of quarantine rows for the operator to eyeball (newest first), bounded by $3 (the
+# sample LIMIT shifts to $3 now that the optional instrument_id is $2).
 _RECENT_SAMPLE = """
 SELECT event_id, occurred_at, instrument_id, filing_id, reason, payload
 FROM fundamentals_quarantine
 WHERE ($1::timestamptz IS NULL OR occurred_at >= $1)
+  AND ($2::bigint IS NULL OR instrument_id = $2)
 ORDER BY occurred_at DESC, event_id DESC
-LIMIT $2
+LIMIT $3
 """
 
 
@@ -92,25 +100,30 @@ async def quarantine_summary(
     *,
     since_ms: Optional[int] = None,
     sample_limit: int = DEFAULT_SAMPLE_LIMIT,
+    instrument_id: Optional[int] = None,
 ) -> dict:
     """Aggregate `fundamentals_quarantine` into the admin report.
 
-    `since_ms` bounds the window (UTC ms; None = all time). Returns:
+    `since_ms` bounds the window (UTC ms; None = all time). `instrument_id` optionally scopes every
+    count + the sample to a single name (the per-name lookup); None = the unfiltered aggregate, in which
+    case the result is byte-for-byte the pre-filter behaviour (the predicate degrades to a no-op in SQL).
+    Returns:
       {
         "total": <int>,
         "by_reason": { "<reason>": <int>, … },     # value_disagreement / identity_break / outlier / …
         "by_sector": { "<sector>|(unknown)": <int>, … },
         "recent":    [ { event_id, occurred_at, instrument_id, filing_id, reason, payload }, … ],
         "since_ms":  <int|null>,
+        "instrument_id": <int|null>,                # echoed back so the caller knows the applied scope
       }
     Pure pass-through over the SQL above — no business logic. The handler serialises this as-is."""
     since_param = _since_param(since_ms)
     limit = max(1, int(sample_limit))
 
     async with pool.acquire() as conn:
-        reason_rows = await conn.fetch(_COUNT_BY_REASON, since_param)
-        sector_rows = await conn.fetch(_COUNT_BY_SECTOR, since_param)
-        sample_rows = await conn.fetch(_RECENT_SAMPLE, since_param, limit)
+        reason_rows = await conn.fetch(_COUNT_BY_REASON, since_param, instrument_id)
+        sector_rows = await conn.fetch(_COUNT_BY_SECTOR, since_param, instrument_id)
+        sample_rows = await conn.fetch(_RECENT_SAMPLE, since_param, instrument_id, limit)
 
     by_reason = {r["reason"]: int(r["n"]) for r in reason_rows}
     by_sector: dict[str, int] = {}
@@ -136,6 +149,7 @@ async def quarantine_summary(
         "by_sector": by_sector,
         "recent": recent,
         "since_ms": since_ms,
+        "instrument_id": instrument_id,
     }
 
 

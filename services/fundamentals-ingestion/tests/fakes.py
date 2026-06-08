@@ -299,25 +299,26 @@ class FakeTimescale:
                     by_metric[r["metric"]] = r
             return [{"metric": m, "value": r["value"]} for m, r in by_metric.items()]
 
-        # QA report (Task 8) — by-reason counts over the optional occurred_at window ($1). Reproduce
-        # qa/report._COUNT_BY_REASON.
+        # QA report (Task 8) — by-reason counts over the optional occurred_at window ($1) + optional
+        # instrument_id filter ($2). Reproduce qa/report._COUNT_BY_REASON.
         if "from fundamentals_quarantine" in q and "group by reason" in q:
-            since = args[0]
+            since, instrument_id = args[0], args[1]
             counts: dict[str, int] = {}
             for r in self.fundamentals_quarantine:
-                if not self._after(r, since):
+                if not self._after(r, since) or not self._matches_instrument(r, instrument_id):
                     continue
                 counts[r["reason"]] = counts.get(r["reason"], 0) + 1
             return [{"reason": reason, "n": n} for reason, n in
                     sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
 
         # QA report — by-sector counts (LEFT JOIN quarantine → instruments → companies on instrument_id,
-        # group by company sector; NULL sector groups under None). Reproduce qa/report._COUNT_BY_SECTOR.
+        # group by company sector; NULL sector groups under None). Optional instrument_id filter ($2)
+        # scopes on the quarantine row's own column. Reproduce qa/report._COUNT_BY_SECTOR.
         if "from fundamentals_quarantine q" in q and "group by c.sector" in q:
-            since = args[0]
+            since, instrument_id = args[0], args[1]
             counts: dict[Any, int] = {}
             for r in self.fundamentals_quarantine:
-                if not self._after(r, since):
+                if not self._after(r, since) or not self._matches_instrument(r, instrument_id):
                     continue
                 inst = self._instrument(r["instrument_id"]) if r["instrument_id"] is not None else None
                 comp = self._company(inst["company_id"]) if inst else None
@@ -326,10 +327,14 @@ class FakeTimescale:
             return [{"sector": sector, "n": n} for sector, n in
                     sorted(counts.items(), key=lambda kv: -kv[1])]
 
-        # QA report — recent sample (newest first, bounded by $2). Reproduce qa/report._RECENT_SAMPLE.
+        # QA report — recent sample (newest first; optional instrument_id filter $2; bounded by $3 now
+        # that the instrument_id is $2). Reproduce qa/report._RECENT_SAMPLE.
         if "from fundamentals_quarantine" in q and "order by occurred_at desc" in q:
-            since, limit = args
-            rows = [r for r in self.fundamentals_quarantine if self._after(r, since)]
+            since, instrument_id, limit = args
+            rows = [
+                r for r in self.fundamentals_quarantine
+                if self._after(r, since) and self._matches_instrument(r, instrument_id)
+            ]
             rows.sort(key=lambda r: (r.get("occurred_at") or 0, r["event_id"]), reverse=True)
             return [
                 {
@@ -357,6 +362,16 @@ class FakeTimescale:
         if occurred is None:
             return True
         return occurred >= since
+
+    @staticmethod
+    def _matches_instrument(row: dict[str, Any], instrument_id: Any) -> bool:
+        """Per-name predicate for the QA-report queries: `instrument_id` None ⇒ every row (the no-op the
+        `$2::bigint IS NULL OR instrument_id = $2` SQL degrades to); otherwise the row's `instrument_id`
+        must equal it. A quarantine row with a NULL instrument_id (a filing that failed before
+        instrument resolution) is excluded by any non-null filter — exactly as the SQL equality does."""
+        if instrument_id is None:
+            return True
+        return row.get("instrument_id") == instrument_id
 
     def run_execute(self, query: str, args: tuple) -> None:
         q = self._norm(query)
