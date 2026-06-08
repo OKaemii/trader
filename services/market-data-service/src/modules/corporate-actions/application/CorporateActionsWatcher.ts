@@ -25,6 +25,7 @@
 // the EODHD client degrades to empty (the limiter never throws out of the client) → backfill writes
 // nothing for that ticker → the watcher logs and moves on. Nothing throws into the sync loop.
 
+import { setTimeout as sleep } from 'node:timers/promises';
 import type { Db } from 'mongodb';
 import type { RedisClientType } from 'redis';
 import { backfillDailyHistory } from '../../bars/infrastructure/daily-history.ts';
@@ -129,8 +130,4 @@ export class CorporateActionsWatcher {
       this.draining = null;
     }
   }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
