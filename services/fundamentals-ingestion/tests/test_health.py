@@ -43,9 +43,42 @@ def test_metrics_exposes_prometheus() -> None:
     assert "fundamentals_ingestion_request_duration_seconds_bucket" in body
 
 
-def test_trigger_ingest_accepts_without_running() -> None:
-    # SKELETON behaviour: the trigger only acknowledges intent. It must NOT block on a multi-minute
-    # pipeline, and it reports the scope it would run.
+# ── force-ingest trigger (Ops backend card): now a REAL single-flight run ──────────
+# A fake run store so the trigger endpoints are exercised without Mongo/Timescale/EDGAR — the real
+# IngestRunStore is unit-tested in test_run_store.py; here we only assert the HTTP contract.
+class _FakeRecord:
+    def __init__(self, run_id="run-1", state="running", scope="all"):
+        self.run_id = run_id
+        self._state = state
+        self._scope = scope
+
+    def to_payload(self):
+        return {"run_id": self.run_id, "state": self._state, "scope": self._scope}
+
+
+class _FakeRunStore:
+    def __init__(self, *, started=True, record=None):
+        self._started = started
+        self._record = record or _FakeRecord()
+        self.start_calls: list[list | None] = []
+
+    async def start(self, *, tickers=None, cap=None):  # noqa: ARG002
+        self.start_calls.append(tickers)
+        scope = "subset" if tickers else "all"
+        return _FakeRecord(scope=scope), self._started
+
+    def get(self, run_id):
+        return self._record if run_id == self._record.run_id else None
+
+    def latest(self):
+        return self._record
+
+
+def test_trigger_ingest_starts_real_run_and_returns_run_id(monkeypatch) -> None:
+    # The trigger now STARTS a single-flight background run and returns immediately with a run id; the
+    # historical accept-shape keys are preserved so the portal contract is stable.
+    store = _FakeRunStore()
+    monkeypatch.setattr("src.main.get_run_store", lambda: store)
     res = client.post("/admin/api/fundamentals-ingest", json={"tickers": ["AAPL_US_EQ", "MSFT_US_EQ"]})
     assert res.status_code == 200
     body = res.json()
@@ -53,9 +86,14 @@ def test_trigger_ingest_accepts_without_running() -> None:
     assert body["service"] == SERVICE_NAME
     assert body["scope"] == "subset"
     assert body["ticker_count"] == 2
+    assert body["started"] is True
+    assert body["run"]["run_id"] == "run-1"
+    assert store.start_calls == [["AAPL_US_EQ", "MSFT_US_EQ"]]
 
 
-def test_trigger_ingest_defaults_to_full_coverage() -> None:
+def test_trigger_ingest_defaults_to_full_coverage(monkeypatch) -> None:
+    store = _FakeRunStore()
+    monkeypatch.setattr("src.main.get_run_store", lambda: store)
     res = client.post("/admin/api/fundamentals-ingest", json={})
     assert res.status_code == 200
     body = res.json()
@@ -63,6 +101,130 @@ def test_trigger_ingest_defaults_to_full_coverage() -> None:
     assert body["scope"] == "all"
     assert body["ticker_count"] is None
     assert body["full"] is False
+    assert store.start_calls == [None]
+
+
+def test_force_ingest_endpoint_returns_run_id(monkeypatch) -> None:
+    store = _FakeRunStore()
+    monkeypatch.setattr("src.main.get_run_store", lambda: store)
+    res = client.post("/admin/api/fundamentals-ingest/force", json={})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["started"] is True
+    assert body["run_id"] == "run-1"
+
+
+def test_force_ingest_single_flight_reports_not_started(monkeypatch) -> None:
+    store = _FakeRunStore(started=False)
+    monkeypatch.setattr("src.main.get_run_store", lambda: store)
+    res = client.post("/admin/api/fundamentals-ingest/force", json={})
+    assert res.status_code == 200
+    assert res.json()["started"] is False  # a concurrent trigger is a no-op accept, not an error
+
+
+def test_get_run_by_id(monkeypatch) -> None:
+    store = _FakeRunStore(record=_FakeRecord(run_id="run-42", state="done"))
+    monkeypatch.setattr("src.main.get_run_store", lambda: store)
+    ok = client.get("/admin/api/fundamentals-ingest/runs/run-42")
+    assert ok.status_code == 200 and ok.json()["state"] == "done"
+    missing = client.get("/admin/api/fundamentals-ingest/runs/nope")
+    assert missing.status_code == 404
+
+
+# ── portal_fundamentals_config GET/PUT (Ops backend card) ──────────────────────────
+class _FakeConfigProvider:
+    def __init__(self):
+        from src.config import resolve_effective
+        self._doc: dict = {}
+        self._resolve = resolve_effective
+        self.put_patches: list[dict] = []
+
+    async def get(self, *, force_refresh=False):  # noqa: ARG002
+        return self._resolve(self._doc)
+
+    async def put(self, patch, *, updated_by="portal"):  # noqa: ARG002
+        self.put_patches.append(patch)
+        self._doc.update({k: v for k, v in patch.items()})
+        return self._resolve(self._doc)
+
+
+def test_get_config_returns_effective(monkeypatch) -> None:
+    monkeypatch.delenv("EDGAR_USER_AGENT", raising=False)
+    monkeypatch.setattr("src.main.get_config_provider", _FakeConfigProvider)
+    res = client.get("/admin/api/fundamentals-ingest/config")
+    assert res.status_code == 200
+    body = res.json()
+    # No override/env → built-in default, usable.
+    assert body["edgarUserAgentSource"] == "default"
+    assert body["edgarUserAgentUsable"] is True
+    assert body["ingestEnabled"] is True
+
+
+def test_put_config_updates_and_returns_effective(monkeypatch) -> None:
+    provider = _FakeConfigProvider()
+    monkeypatch.setattr("src.main.get_config_provider", lambda: provider)
+    res = client.put(
+        "/admin/api/fundamentals-ingest/config",
+        json={"edgarUserAgent": "portal-ua portal@example.com", "coverageCap": 8},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["updated"] is True
+    assert body["edgarUserAgent"] == "portal-ua portal@example.com"
+    assert body["edgarUserAgentSource"] == "override"
+    assert body["coverageCap"] == 8
+    # Only explicitly-set fields are forwarded to the provider patch.
+    assert provider.put_patches == [{"edgarUserAgent": "portal-ua portal@example.com", "coverageCap": 8}]
+
+
+def test_put_config_omits_unset_fields(monkeypatch) -> None:
+    # An omitted field is NOT forwarded (per-field fall-back); only edgarUserAgent is in the patch.
+    provider = _FakeConfigProvider()
+    monkeypatch.setattr("src.main.get_config_provider", lambda: provider)
+    client.put(
+        "/admin/api/fundamentals-ingest/config", json={"edgarUserAgent": "ua only@example.com"}
+    )
+    assert provider.put_patches == [{"edgarUserAgent": "ua only@example.com"}]
+
+
+# ── status aggregation endpoint (Ops backend card) ─────────────────────────────────
+def test_status_endpoint_aggregates(monkeypatch) -> None:
+    from tests.test_status import _CoverageFakeTimescale
+
+    db = _CoverageFakeTimescale()
+    db.fundamentals.append({
+        "instrument_id": 1, "metric": "net_income", "observation_ts": 1_000, "knowledge_ts": 5_000,
+        "dim_signature": "", "value": 1.0, "is_superseded": False, "content_hash": "h",
+        "source": "pit-edgar",
+    })
+
+    async def _fake_get_pool(*_a, **_k):
+        return db
+
+    monkeypatch.setattr("src.main.get_config_provider", _FakeConfigProvider)
+    monkeypatch.setattr("src.main.get_run_store", lambda: _FakeRunStore(record=_FakeRecord(state="done")))
+    monkeypatch.setattr("src.security_master.pool.get_pool", _fake_get_pool)
+    res = client.get("/admin/api/fundamentals-ingest/status")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["coverage"]["instruments"] == 1
+    assert body["coverage"]["facts"] == 1
+    assert "ingestion_lag_ms" in body
+    assert body["last_run"]["state"] == "done"
+    assert body["feed_health"]["edgar_user_agent_usable"] is True
+    assert "quarantine" in body
+
+
+def test_status_degrades_to_503_on_db_error(monkeypatch) -> None:
+    async def _boom(*_a, **_k):
+        raise OSError("timescale unreachable")
+
+    monkeypatch.setattr("src.main.get_config_provider", _FakeConfigProvider)
+    monkeypatch.setattr("src.main.get_run_store", lambda: _FakeRunStore())
+    monkeypatch.setattr("src.security_master.pool.get_pool", _boom)
+    res = client.get("/admin/api/fundamentals-ingest/status")
+    assert res.status_code == 503
+    assert "detail" in res.json()
 
 
 # ── QA quarantine report endpoint (epic Task 8) ───────────────────────────────────
