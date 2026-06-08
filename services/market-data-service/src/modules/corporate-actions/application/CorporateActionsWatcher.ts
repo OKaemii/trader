@@ -82,16 +82,23 @@ export class CorporateActionsWatcher {
 
   /**
    * The CorporateActionsStore new-event hook. Enqueues a forced daily-series re-adjust for `ticker`
-   * (deduped) and kicks the drain. Returns immediately — the store's sync pass is not blocked on the
-   * (slow) re-fetch; the drain runs to completion in the background. Never throws (the store treats
-   * it as best-effort regardless, but we keep the contract clean here too).
+   * (deduped via the pending Set) and kicks the drain. Returns immediately — the store's sync pass is
+   * not blocked on the (slow) re-fetch; the drain runs to completion in the background. Never throws
+   * (the store treats it as best-effort regardless, but we keep the contract clean here too).
+   *
+   * The drain start is deferred one microtask so a SYNCHRONOUS burst (the EOD sync loop firing this
+   * hook for many tickers back-to-back) fully populates `pending` before the drain pops anything —
+   * so a market-wide split day collapses any same-ticker duplicates and batches the distinct names
+   * into one serial drain rather than spawning work per enqueue.
    */
   onNewActions = (ticker: string, _summary: NewActionsSummary): void => {
     this.pending.add(ticker);
     if (this.draining === null) {
-      this.draining = this.drain().catch((err) => {
-        log.warn(`[corporate-actions] re-adjust drain failed: ${err instanceof Error ? err.message : String(err)}`);
-      });
+      this.draining = Promise.resolve()
+        .then(() => this.drain())
+        .catch((err) => {
+          log.warn(`[corporate-actions] re-adjust drain failed: ${err instanceof Error ? err.message : String(err)}`);
+        });
     }
   };
 
