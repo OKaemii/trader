@@ -227,7 +227,14 @@ class WarehousePitFundamentals:
     def _apply_market_cap(self, ticker: str, line_items: dict[str, float], as_of_ms: int) -> None:
         """Compute PIT market cap (price × shares × fx) off the warehouse bars view and OVERRIDE any
         provider scalar; DROP the key when any input is missing (never a fabricated 0)."""
+        # Short-circuit before the bars query + FX lookup: no shares ⇒ no honest market cap, so skip
+        # the per-name DuckDB close read on the replay hot path (called per step × per name) and drop
+        # any stale provider scalar. The FX basis (currency) is also absent for OTHER-market names,
+        # but shares is the cheapest gate (already in hand from the pivot).
         shares = line_items.get(_SHARES_KEY)
+        if shares is None:
+            line_items.pop(_MARKET_CAP_KEY, None)
+            return
         close = self._adjusted_close_as_of(ticker, as_of_ms)
         fx_rate = self._fx(_currency_of(ticker))
         cap = _compute_market_cap_gbp(close, shares, fx_rate)

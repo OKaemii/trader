@@ -230,6 +230,23 @@ def test_market_cap_computed_for_usd_name_with_injected_fx():
     assert out["AAPL_US_EQ"]["market_cap_gbp"] == 300.0 * 10.0 * 0.8
 
 
+def test_market_cap_skipped_when_no_shares_no_bars_query():
+    """A covered name with NO shares_outstanding fact drops market cap WITHOUT touching the bars view
+    (the hot-path short-circuit) — and a stale provider scalar, if any, is removed."""
+    facts = [
+        _FactRow(4, "total_equity", FY2019, KNOWN_2019, 50.0),
+        # A provider-supplied market_cap_gbp scalar that MUST be overridden/dropped (no shares).
+        _FactRow(4, "market_cap_gbp", FY2019, KNOWN_2019, 999.0),
+    ]
+    # No bars injected; if the reader queried bars it would still return [] → None, but the
+    # short-circuit means it never asks. Either way the key must be absent.
+    conn = FakeWarehouseConn(facts=facts)
+    wh = WarehousePitFundamentals(conn, resolve_instrument=_resolver({"HSBAl_EQ": 4}))
+    out = asyncio.run(wh.fetch_many(["HSBAl_EQ"], AS_OF_AFTER_2019))
+    assert out["HSBAl_EQ"]["total_equity"] == 50.0
+    assert "market_cap_gbp" not in out["HSBAl_EQ"]   # provider scalar dropped, no shares to compute
+
+
 def test_unresolved_or_uncovered_name_absent_never_fabricated():
     """A ticker that doesn't resolve, or resolves to an instrument with no fact ≤ as_of, is ABSENT
     from the map (the forward-only degrade) — never a fabricated value."""
