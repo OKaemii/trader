@@ -72,8 +72,41 @@ async def _load_validation_history(req: dict) -> dict:
             bench_bars[bt] = bars
 
     grid_override = await resolve_search_grid(_db, req.get('strategy_id', 'factor_rank_v1'))
+
+    # Warehouse PIT fundamentals (Task 15): build the DuckDB-backed per-step provider so the
+    # main-process replay reads TRUE point-in-time fundamentals (knowledge_ts ≤ as_of, market cap
+    # computed price×shares×fx). DuckDB lives in the SAME process (the run step is to_thread, not a
+    # process pool), so the connection-bearing provider passes through ctx without pickling. Built
+    # here (load phase) so a missing/absent warehouse is caught before the off-loop compute starts.
+    pit_fundamentals = _build_pit_fundamentals(req) if req.get('fundamentals_source') == 'warehouse' else None
     return {'prices': prices, 'benchmark_bars': bench_bars, 'constituents': constituents,
-            'grid_override': grid_override}
+            'grid_override': grid_override, 'pit_fundamentals': pit_fundamentals}
+
+
+def _build_pit_fundamentals(req: dict):
+    """Build a WarehousePitFundamentals over the DuckDB warehouse for a `fundamentals_source=warehouse`
+    validation run (Task 15).
+
+    Opens the `WarehouseReader` (DuckDB views over the snapshot Parquet, incl. the `fundamentals` +
+    `bars` views Task 15 registers) and wraps its connection. The provider re-resolves fundamentals
+    as-of at every replay step; uncovered names degrade to {} (the forward-only contract).
+
+    INJECTION GAPS (deliberate, documented — see the plan §7 / Task 13 release notes):
+      • resolve_instrument (ticker → instrument_id): the security master lives in Timescale
+        (`security_master.instruments`), NOT in the snapshotted DuckDB warehouse, so it is NOT wired
+        here yet — the default resolver returns None ⇒ every name unresolved ⇒ {} until a security-
+        master snapshot (or an in-process Timescale lookup) is injected. Pre-backfill the warehouse is
+        empty anyway, so this is the honest no-op landing; a later task injects the resolver.
+      • fx_to_gbp: GBP-identity default (LSE names compute fully; USD market caps need a historical
+        GBP/USD series the warehouse doesn't yet snapshot — the FX-series gap). USD names drop
+        market_cap_gbp (NaN-excluded) until an FX series is injected.
+    The wiring + the real-DuckDB as-of SQL are what Task 15 proves; the resolver/FX injection is the
+    remaining seam to fill once the warehouse is backfilled with security_master + an FX series."""
+    from quant_core.fundamentals.warehouse import WarehousePitFundamentals
+    from .infrastructure.duckdb_reader import WarehouseReader
+
+    reader = WarehouseReader()   # DEFAULT_WAREHOUSE_DIR; empty stub views pre-backfill ⇒ {} per name
+    return WarehousePitFundamentals(reader._con)   # resolver=None, fx=GBP-identity (documented gaps)
 
 
 async def _run_validator(ctx: dict, req: dict, progress) -> dict:
@@ -81,10 +114,14 @@ async def _run_validator(ctx: dict, req: dict, progress) -> dict:
     under an older schema re-runs best-effort), plus the resolved grid + the progress sink."""
     validator = Validator()
     accepted = set(inspect.signature(validator.run).parameters) - {
-        'prices', 'benchmark_bars', 'constituents', 'progress', 'param_grid'}
+        'prices', 'benchmark_bars', 'constituents', 'progress', 'param_grid', 'pit_fundamentals'}
     run_kwargs = {k: v for k, v in req.items() if k in accepted}
     if ctx.get('grid_override') is not None:
         run_kwargs['param_grid'] = ctx['grid_override']
+    # Warehouse PIT provider (ctx-built, not a request key — it holds a live DuckDB connection): only
+    # forwarded when fundamentals_source=warehouse resolved one in the load phase.
+    if ctx.get('pit_fundamentals') is not None:
+        run_kwargs['pit_fundamentals'] = ctx['pit_fundamentals']
     return await validator.run(ctx['prices'], ctx['benchmark_bars'],
                                constituents=ctx['constituents'], progress=progress, **run_kwargs)
 
@@ -204,6 +241,8 @@ class ValidationRunRequest(BaseModel):
     benchmark_tickers: Optional[list[str]] = None   # default: SPY + 11 sector SPDRs
     tickers: Optional[list[str]] = None    # default: curated S&P 100 (ignored if survivorship_free)
     survivorship_free: bool = False        # use point-in-time index_constituents membership
+    fundamentals_source: str = 'auto'      # 'auto' (Yahoo static approximate) | 'warehouse' (true PIT
+                                           # fundamentals from the DuckDB warehouse, re-resolved per step)
     rebalance_days: int = 7
     n_folds: int = 5
     embargo_days: int = 21

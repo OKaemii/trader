@@ -105,7 +105,13 @@ global:
     # universeSource=eodhd_scan; the bulk daily feed runs only under this + barFrequency=daily);
     # 'yahoo' (free, multi-year fallback, decoupled from the metered 5m provider).
     dailyHistoryProvider: eodhd         # eodhd (paid) | yahoo (free fallback)
-    dailyBackfillYears: "5"             # one-shot seed depth for the daily series on bootstrap
+    # One-shot seed depth for the persisted daily series on bootstrap. Set DEEP (provider-permitting,
+    # to inception for index names) so the research warehouse isn't truncated at 5y — QA Suite 5
+    # wants SPY daily back to inception (1993-01-29 ≈ 33y); 35 covers its full lifecycle with headroom.
+    # EODHD `/eod` + Yahoo both serve from inception when asked (no hard floor); the gap-aware backfill
+    # only fetches dates it doesn't already hold, so a deep value costs credits ONCE per ticker, then
+    # zero. Bump further only if a name predates 1990. (PIT-fundamentals epic Task 15.)
+    dailyBackfillYears: "35"            # deep seed for the research warehouse (was 5; SPY → 1993 inception)
     # ── EODHD as the single universe source + market scanner (Plan A) ──
     # universeSource: 'curated' (UNIVERSE_INCLUDE_* lists) | 'eodhd_scan' (EODHD screener scans
     # all US+LSE common stock >= minMarketCapGbp → the ONE active universe; no parallel pool).

@@ -29,6 +29,7 @@ from typing import Optional
 
 import numpy as np
 
+from quant_core.bars.fundamentals_reader import PitFundamentalsBarsReader
 from quant_core.bars.in_memory_reader import InMemoryBarsReader
 from quant_core.strategy.factory import make_strategy
 from quant_core.universe import load_constituents
@@ -237,6 +238,8 @@ class Validator:
         param_grid: Optional[dict] = None,   # portal searchGrid override; None ⇒ parameter_space()
         seed: int = 0,                       # MT19937 base; 0 reproduces the original 0.. / 10000.. streams
         mcpt_early_stop: bool = True,        # decision-bounded sequential stop (verdict-identical to full N)
+        pit_fundamentals=None,               # WarehousePitFundamentals over the DuckDB warehouse (Task 15);
+                                             # when set, the main-process replay reads TRUE PIT per step
         progress: ProgressSink = NullProgress(),
     ) -> dict:
         step = max(1, rebalance_days) * DAY_MS
@@ -289,14 +292,30 @@ class Validator:
                "needs a paid feed)" if constituents else "current-membership ⇒ survivorship bias")
         )
 
-        # Point-in-time-approximate fundamentals for quality-screening strategies (high_velocity).
-        # Loaded once; applied at every replay step (main process here + MCPT workers via ctx). The
-        # fail-closed QMJ screen yields an empty backtest if no snapshot exists — honest, not faked.
+        # Fundamentals for quality-screening strategies (high_velocity). Two paths:
+        #   • WAREHOUSE PIT (pit_fundamentals supplied, Task 15): wrap the main-process reader with the
+        #     per-step true-PIT reader (re-resolves as-of at EVERY replay step from the DuckDB
+        #     warehouse). Covered names stamp 'point_in_time'; uncovered degrade to {} (no proxy).
+        #   • STATIC APPROXIMATE (default): one current `company_fundamentals` snapshot applied at
+        #     every step — a documented look-ahead approximation (Yahoo has no as-of fundamentals).
+        # The fail-closed QMJ screen yields an empty backtest if neither resolves — honest, not faked.
         fundamentals_snapshot: dict = {}
         if strategy_id == 'high_velocity_v1':
-            fundamentals_snapshot = await load_fundamentals_snapshot(list(panel.tickers))
-            data_quality += ("; fundamentals=point_in_time_approximate "
-                             "(current company_fundamentals applied historically — Yahoo has no as-of fundamentals)")
+            if pit_fundamentals is not None:
+                # True PIT: wrap ONLY the main-process reader (step-1 fit + step-3 walk-forward). The
+                # MCPT workers (steps 2 & 4) permute the bars, so a per-step as-of fundamentals lookup
+                # against shuffled prices is meaningless there — and a live DuckDB connection can't
+                # cross the spawn boundary anyway; those nulls keep the spawn-safe static snapshot.
+                real_reader = PitFundamentalsBarsReader(real_reader, pit_fundamentals)
+                data_quality += (f"; fundamentals={PitFundamentalsBarsReader.FUNDAMENTALS_DATA_QUALITY} "
+                                 "(warehouse PIT, re-resolved as-of per replay step; uncovered names ⇒ {}); "
+                                 "MCPT permutation nulls use the static approximate snapshot")
+                # Best-effort static snapshot still loaded for the spawn-safe MCPT-null path.
+                fundamentals_snapshot = await load_fundamentals_snapshot(list(panel.tickers))
+            else:
+                fundamentals_snapshot = await load_fundamentals_snapshot(list(panel.tickers))
+                data_quality += ("; fundamentals=point_in_time_approximate "
+                                 "(current company_fundamentals applied historically — Yahoo has no as-of fundamentals)")
         set_replay_fundamentals(fundamentals_snapshot)   # main process: step-1 fit + step-3 walk-forward
 
         # Shared, fully-picklable worker ctx for the parallel MCPT stages (steps 2 & 4).

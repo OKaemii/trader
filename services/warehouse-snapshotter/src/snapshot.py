@@ -31,6 +31,14 @@ Behaviour by table:
   - risk_rejections                  — occurred_at TIMESTAMPTZ.
   - fills_history                    — filled_at TIMESTAMPTZ.
   - reconciliation_log               — occurred_at TIMESTAMPTZ.
+  - fundamentals / fundamentals_revisions_log — observation_ts (BIGINT ms, fiscal period_end).
+  - fundamentals_raw_facts           — period_end (BIGINT ms, fiscal period_end). [0009_fundamentals.sql]
+
+The fundamentals tables are the offline twin of the live PIT-fundamentals read surface
+(fundamentals-api). Snapshotting them lets a warehouse-source backtest read true point-in-time
+fundamentals per replay step via quant_core.fundamentals.WarehousePitFundamentals (PIT-fundamentals
+epic Task 15). They carry the SAME bi-temporal contract as bars — every revision in the day's
+window is kept, and the backtest's DuckDB reader picks the as-of revision (knowledge_ts <= as_of).
 
 Each snapshot includes EVERY revision in the day's window — not just the
 latest unsuperseded one. Research queries get to pick which revision to use;
@@ -75,6 +83,12 @@ TABLES: list[TableSpec] = [
     TableSpec(name='risk_rejections',       time_column='occurred_at',    time_is_bigint=False),
     TableSpec(name='fills_history',         time_column='filled_at',      time_is_bigint=False),
     TableSpec(name='reconciliation_log',    time_column='occurred_at',    time_is_bigint=False),
+    # PIT fundamentals (0009_fundamentals.sql) — the offline twin of fundamentals-api, partitioned
+    # on the BIGINT-ms fiscal period_end. `fundamentals`/`fundamentals_revisions_log` use
+    # observation_ts (= fiscal period_end); the raw zone uses period_end directly.
+    TableSpec(name='fundamentals',              time_column='observation_ts', time_is_bigint=True),
+    TableSpec(name='fundamentals_revisions_log', time_column='observation_ts', time_is_bigint=True),
+    TableSpec(name='fundamentals_raw_facts',    time_column='period_end',     time_is_bigint=True),
 ]
 
 
