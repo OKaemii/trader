@@ -17,6 +17,10 @@ pymongo==4.7.0
 # EDGAR / Companies House HTTP downloaders (epic Tasks 5/18). Same pin as quant-core's [http] extra.
 httpx==0.27.2
 
+# Prometheus /metrics exposition (epic Task 20) — the ServiceMonitor scrapes it. Same pin as
+# strategy-engine, the platform's other prometheus_client service.
+prometheus-client==0.20.0
+
 # Metric registry (epic Task 6) — the canonical-metric → us-gaap/dei tag mapping is a versioned YAML
 # (src/stage/metadata/metric_registry.yaml), loaded with yaml.safe_load. PyYAML is a small pure dep;
 # pinned here and mirrored in the python test gate (infra/docker/backtest-engine-test.Dockerfile).

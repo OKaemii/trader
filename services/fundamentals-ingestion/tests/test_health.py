@@ -30,6 +30,19 @@ def test_admin_aliased_health_ok() -> None:
     assert res.json()["service"] == SERVICE_NAME
 
 
+def test_metrics_exposes_prometheus() -> None:
+    # The write-side ServiceMonitor scrapes /metrics (epic Task 20): a Prometheus exposition carrying the
+    # liveness gauge, and — after a request flows through the latency middleware — the request-duration
+    # histogram. text/plain exposition, 200, no auth (cluster-internal scrape).
+    client.get("/health")  # drive one request so the histogram has a sample
+    res = client.get("/metrics")
+    assert res.status_code == 200
+    assert res.headers["content-type"].startswith("text/plain")
+    body = res.text
+    assert "fundamentals_ingestion_up 1.0" in body
+    assert "fundamentals_ingestion_request_duration_seconds_bucket" in body
+
+
 def test_trigger_ingest_accepts_without_running() -> None:
     # SKELETON behaviour: the trigger only acknowledges intent. It must NOT block on a multi-minute
     # pipeline, and it reports the scope it would run.

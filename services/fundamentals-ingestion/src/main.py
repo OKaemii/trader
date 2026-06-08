@@ -14,11 +14,13 @@ CronJob + a one-shot backfill Job), so the HTTP trigger only **accepts** a reque
 multi-minute pipeline inside the handler.
 """
 import os
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, Gauge, Histogram, generate_latest
 from pydantic import BaseModel
 
 # Connection coordinates the real pipeline will use (read here so a missing var surfaces at boot, not
@@ -35,6 +37,44 @@ EDGAR_USER_AGENT = os.getenv("EDGAR_USER_AGENT", "")
 SERVICE_NAME = "fundamentals-ingestion"
 
 app = FastAPI(title=SERVICE_NAME, version="0.1.0")
+
+# ── Prometheus metrics (epic Task 20) ─────────────────────────────────────────────
+# The write-side ServiceMonitor (templates/servicemonitors.yaml) scrapes /metrics off the always-on
+# FastAPI Deployment. This Deployment is thin (the admin trigger + the quarantine read); the heavy
+# ingest counters (filings/facts ingested, ingestion lag, factor-gen duration) belong to the SEPARATE
+# `fundamentals-ingest` CronJob/backfill-Job pods — short-lived batch containers a ServiceMonitor
+# cannot reliably scrape. Those are a documented follow-up (push the last-run gauges to a Pushgateway
+# or persist a last_run table the API surfaces); see CLAUDE.md "Fundamentals (PIT warehouse)". Here we
+# expose the always-on liveness gauge + the request-latency histogram (also the API p50/p95 source).
+_up = Gauge("fundamentals_ingestion_up", "1 while the fundamentals-ingestion app is serving.")
+_up.set(1)
+_request_latency = Histogram(
+    "fundamentals_ingestion_request_duration_seconds",
+    "fundamentals-ingestion HTTP request duration by route + status class (p50/p95 source).",
+    ["route", "status"],
+)
+
+
+@app.middleware("http")
+async def _observe_latency(request: Request, call_next):
+    """Time every request into `_request_latency`, keyed on the matched route TEMPLATE (not the raw
+    path) so the histogram's label cardinality stays bounded. The /metrics scrape is skipped."""
+    start = time.perf_counter()
+    response = await call_next(request)
+    route = request.scope.get("route")
+    template = getattr(route, "path", request.url.path)
+    if template != "/metrics":
+        _request_latency.labels(route=template, status=f"{response.status_code // 100}xx").observe(
+            time.perf_counter() - start
+        )
+    return response
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+def metrics() -> Response:
+    """Prometheus exposition (scraped by the write-side ServiceMonitor). Liveness gauge + request-
+    latency histogram. The deep ingest counters live in the CronJob (see the metrics note above)."""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.exception_handler(Exception)

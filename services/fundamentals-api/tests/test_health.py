@@ -52,6 +52,18 @@ def test_admin_aliased_health_ok() -> None:
     assert res.json()["service"] == SERVICE_NAME
 
 
+def test_metrics_exposes_prometheus() -> None:
+    # The read-side ServiceMonitor scrapes /metrics (epic Task 20): a Prometheus exposition carrying the
+    # liveness gauge + the request-latency histogram whose buckets give the API p50/p95. text/plain, 200.
+    client.get("/health")  # drive one request so the histogram has a sample
+    res = client.get("/metrics")
+    assert res.status_code == 200
+    assert res.headers["content-type"].startswith("text/plain")
+    body = res.text
+    assert "fundamentals_api_up 1.0" in body
+    assert "fundamentals_api_request_duration_seconds_bucket" in body
+
+
 # ── internal seam hot path ─────────────────────────────────────────────────────────
 def test_internal_fundamentals_returns_pit_payload(monkeypatch) -> None:
     db = FakeTimescale()
