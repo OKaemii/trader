@@ -390,6 +390,64 @@ async def ingest_status(
         )
 
 
+def _stale_after_days() -> Optional[int]:
+    """The staleness window in days from `FUNDAMENTALS_STALE_AFTER_DAYS`. Absent/unparseable/non-positive
+    ⇒ None so `freshness.stale_after_ms_from_days` applies its default (≈ quarter + filing grace) — a
+    bad value must never silently disable the safe-to-retire gate by making everything "never stale"."""
+    raw = os.getenv("FUNDAMENTALS_STALE_AFTER_DAYS", "")
+    if not raw:
+        return None
+    try:
+        n = int(raw)
+    except ValueError:
+        return None
+    return n if n > 0 else None
+
+
+@app.get("/admin/api/fundamentals-ingest/freshness")
+async def ingest_freshness() -> JSONResponse:
+    """Per-name PIT coverage + freshness audit (epic coverage-broaden Task 4) — the "is the curated US
+    universe fully ingested, and how current is each name?" surface, and the gate that proves it is safe
+    to retire Yahoo for US (`retirable`).
+
+    Walks the curated US universe (`instrument_registry {activeTo:null}`, US-filtered — the same set the
+    ingest covers) and, per name, joins the canonical `fundamentals` table for: `covered`, the freshest
+    fiscal period (`newest_period_end`), the freshest availability (`newest_knowledge_ts`), the wall-clock
+    our ingest last persisted a row (`last_stored_at` = MAX(fundamentals_revisions_log.logged_at)), and
+    `stale`. The aggregate carries `coverage_pct`, `retirable` (no missing + no stale), and the last
+    force-ingest sweep (`last_ingest_run`, from the run store — like `/status`'s `last_run`).
+
+    Reads the warehouse DIRECTLY (no cross-service hop): a cold (un-backfilled) warehouse degrades to
+    every curated name uncovered/stale at 200, and a Timescale-unreachable read to a JSON 503 — mirrors
+    `/status`. `stale_after_ms` derives from `FUNDAMENTALS_STALE_AFTER_DAYS` (default ≈ quarter + grace)."""
+    try:
+        from motor.motor_asyncio import AsyncIOMotorClient
+
+        from src.freshness import freshness_audit, stale_after_ms_from_days
+        from src.security_master.pool import get_pool
+
+        pool = await get_pool()
+        last = get_run_store().latest()
+        stale_after_ms = stale_after_ms_from_days(_stale_after_days())
+        client = AsyncIOMotorClient(MONGODB_URL)
+        try:
+            payload = await freshness_audit(
+                pool,
+                client[MONGODB_DB],
+                now_ms=int(time.time() * 1000),
+                stale_after_ms=stale_after_ms,
+                last_ingest_run=last.to_payload() if last is not None else None,
+            )
+        finally:
+            client.close()
+        return JSONResponse(content=payload)
+    except Exception as exc:  # noqa: BLE001 — a warehouse outage degrades to 503, never a bare 500
+        return JSONResponse(
+            status_code=503,
+            content={"detail": f"freshness audit unavailable: {type(exc).__name__}: {exc}"},
+        )
+
+
 # Sentinel instrument_id for an unresolvable `?symbol=` lookup. A real BIGSERIAL instrument_id is always
 # positive, so -1 matches NO quarantine row — the per-name predicate then yields an HONEST EMPTY summary
 # rather than silently widening to the full unfiltered set (which would mislead the operator into reading
