@@ -149,9 +149,11 @@ def build_fundamental_row(
 
 # ── SQL ──────────────────────────────────────────────────────────────────────────
 # Latest unsuperseded row per logical fact — the hash-compare gate's read. Bounded by
-# fundamentals_latest_unique (exactly one is_superseded=FALSE row per logical key).
+# fundamentals_latest_unique (exactly one is_superseded=FALSE row per logical key). Returns BOTH the
+# content_hash (the change gate) and the knowledge_ts (the same-instant-collision guard: a supersede
+# whose new row would share the current row's knowledge_ts would orphan the fact — see _write_one).
 _SELECT_LATEST = """
-SELECT content_hash
+SELECT content_hash, knowledge_ts
 FROM fundamentals
 WHERE instrument_id = $1 AND metric = $2 AND observation_ts = $3 AND dim_signature = $4
   AND is_superseded = FALSE
@@ -275,9 +277,6 @@ class FundamentalsWriter:
                 revisions += 1
             elif outcome == "first_print":
                 inserted += 1
-            # "noop_conflict" (the same-knowledge_ts ON CONFLICT edge) counts as neither insert nor
-            # skip — nothing changed and the prior current row was untouched (no supersede happened
-            # for it, see _write_one).
 
         quarantined = await self._quarantine_conflicts(
             result.conflicts, instrument_id=instrument_id, filing_id=filing_id
@@ -294,39 +293,56 @@ class FundamentalsWriter:
     async def _write_one(self, row: FundamentalRow) -> str:
         """Hash-compare gate + supersede-in-transaction for ONE canonical row.
 
-        Returns: 'skipped' (hash == current row — no-op), 'first_print' (no prior current row),
-        'revision' (a prior current row with a different hash was superseded), or 'noop_conflict' (the
-        rare same-logical-key + same-knowledge_ts re-derivation where the insert hit ON CONFLICT)."""
+        Returns: 'skipped' (no-op — identical to the current row, OR a same-instant collision the
+        supersede can't safely represent, see below), 'first_print' (no prior current row), or
+        'revision' (a prior current row with a different hash was superseded inside the txn)."""
         async with self._pool.acquire() as conn:
-            prior_hash = await conn.fetchval(
+            current = await conn.fetchrow(
                 _SELECT_LATEST, row.instrument_id, row.metric, row.observation_ts, row.dim_signature
             )
+            prior_hash = current["content_hash"] if current is not None else None
             if prior_hash == row.content_hash:
                 return "skipped"  # idempotent: identical to the current row — no write, no txn
 
             is_revision = prior_hash is not None
+
+            # SAME-INSTANT COLLISION GUARD. knowledge_ts is DERIVED deterministically from accepted_ts
+            # (unlike persist-bars' wall-clock `now`, so the bars writer never sees this). If a prior
+            # current row exists at the SAME derived knowledge_ts but a different value, the new row
+            # would share the full PK (instrument_id, metric, observation_ts, dim_signature,
+            # knowledge_ts) → its INSERT no-ops on ON CONFLICT. Superseding the current row first would
+            # then orphan the logical fact with ZERO unsuperseded rows (it would vanish from live reads
+            # — a data-loss bug). So we DON'T supersede: keep the existing current row and skip. A
+            # genuine restatement always arrives via a LATER filing → a later accepted_ts → a later
+            # knowledge_ts, which takes the revision path below. A same-accept value change is an
+            # upstream ambiguity (two values claimed knowable at the same instant); the safe, lossless
+            # choice is to keep the first-seen current row and surface the collision.
+            if is_revision and current["knowledge_ts"] == row.knowledge_ts:
+                log.warning(
+                    "[normalize] same-knowledge_ts value change for instrument=%s metric=%s "
+                    "observation_ts=%s dim=%r (knowledge_ts=%s); keeping the existing current row, "
+                    "skipping the re-derived value (no supersede — would orphan the fact)",
+                    row.instrument_id, row.metric, row.observation_ts, row.dim_signature,
+                    row.knowledge_ts,
+                )
+                return "skipped"
+
             async with conn.transaction():
                 if is_revision:
                     await conn.execute(
                         _SUPERSEDE,
                         row.instrument_id, row.metric, row.observation_ts, row.dim_signature,
                     )
-                inserted = await conn.fetchval(_INSERT_FUNDAMENTAL, *_fundamental_row_args(row))
-                # The insert is the source of truth for whether a row landed; only log a revision when
-                # it did. The same-knowledge_ts ON CONFLICT edge (inserted is None) means a row with
-                # this exact PK already existed — but note the supersede above may have flipped the
-                # prior CURRENT row. That is acceptable: the colliding row carries the same logical key
-                # at the same knowledge instant; the current-row invariant is preserved because the
-                # colliding row's is_superseded is unchanged and remains the single current row only if
-                # IT was the current one. In practice this edge is a same-instant duplicate ingest and
-                # is vanishingly rare; we DO write the audit row for it so the attempt is traceable.
+                # The new row carries a knowledge_ts strictly greater than any prior current row's (the
+                # guard above ruled out equality; a revision only arrives via a later accept), so its
+                # PK is fresh — the insert always lands. ON CONFLICT DO NOTHING stays as defence in
+                # depth (a concurrent identical insert), but is not the normal path.
+                await conn.fetchval(_INSERT_FUNDAMENTAL, *_fundamental_row_args(row))
                 await conn.execute(
                     _INSERT_REVISION_LOG,
                     row.instrument_id, row.metric, row.observation_ts, row.dim_signature,
                     row.knowledge_ts, prior_hash, row.content_hash, row.accession_number,
                 )
-            if inserted is None:
-                return "noop_conflict"
             return "revision" if is_revision else "first_print"
 
     async def _quarantine_conflicts(

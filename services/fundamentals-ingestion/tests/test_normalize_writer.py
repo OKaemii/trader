@@ -202,6 +202,29 @@ async def test_value_unchanged_but_provenance_changed_is_a_noop() -> None:
     assert len(db.fundamentals) == 1
 
 
+@pytest.mark.asyncio
+async def test_same_instant_value_change_keeps_current_row_no_orphan() -> None:
+    # REGRESSION: knowledge_ts is DERIVED deterministically from accepted_ts. A re-ingest of the SAME
+    # filing (same accepted_ts → same derived knowledge_ts) with a CHANGED value must NOT supersede the
+    # current row — the new row would share the full PK and no-op on INSERT, orphaning the logical fact
+    # with ZERO unsuperseded rows (it would vanish from live reads — a data-loss bug). The writer keeps
+    # the first-seen current row and skips.
+    db = FakeTimescale()
+    writer = FundamentalsWriter(db)
+    await writer.write_filing(_result(_fact()), instrument_id=7, accepted_ts_ms=_ACCEPTED_ORIG)
+    # SAME accept (same knowledge_ts), DIFFERENT value.
+    stats = await writer.write_filing(
+        _result(_fact(value=99999.0)), instrument_id=7, accepted_ts_ms=_ACCEPTED_ORIG
+    )
+    assert stats.skipped == 1 and stats.inserted == 0 and stats.revisions == 0
+    # The original current row survives — exactly one current row, unchanged value, never orphaned.
+    current = [r for r in db.fundamentals if not r["is_superseded"]]
+    assert len(current) == 1
+    assert current[0]["value"] == 57411000000.0
+    # No spurious revisions-log row for the skipped same-instant change.
+    assert len(db.fundamentals_revisions_log) == 1
+
+
 # ── multiple metrics + segment isolation ────────────────────────────────────────
 @pytest.mark.asyncio
 async def test_multiple_metrics_and_segment_rows_are_independent() -> None:

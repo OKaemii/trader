@@ -209,18 +209,6 @@ class FakeTimescale:
             self.raw_facts.append(row)
             return 1  # RETURNING 1 → a fresh insert
 
-        # canonical zone (Task 7): hash-compare gate read — the content_hash of the current
-        # (is_superseded=FALSE) row for a logical fact, or None when there is no current row.
-        if "select content_hash from fundamentals" in q and "is_superseded = false" in q:
-            inst, metric, obs, dim = args
-            return next(
-                (r["content_hash"] for r in self.fundamentals
-                 if r["instrument_id"] == inst and r["metric"] == metric
-                 and r["observation_ts"] == obs and r["dim_signature"] == dim
-                 and not r["is_superseded"]),
-                None,
-            )
-
         # canonical INSERT … ON CONFLICT (full PK) DO NOTHING RETURNING 1. 15 binds in declaration
         # order; is_superseded is the literal FALSE in the statement (not bound).
         if q.startswith("insert into fundamentals ("):
@@ -279,6 +267,19 @@ class FakeTimescale:
                 "instrument_id": inst["instrument_id"], "company_id": inst["company_id"],
                 "t212_ticker": inst["t212_ticker"], "cik": comp["cik"] if comp else None,
             }]
+
+        # canonical zone (Task 7) hash-compare gate read (via fetchrow): the current
+        # (is_superseded=FALSE) row's content_hash + knowledge_ts for a logical fact, or [] when there
+        # is no current row. Returns the columns the writer's _SELECT_LATEST projects.
+        if "select content_hash, knowledge_ts from fundamentals" in q and "is_superseded = false" in q:
+            inst, metric, obs, dim = args
+            return [
+                {"content_hash": r["content_hash"], "knowledge_ts": r["knowledge_ts"]}
+                for r in self.fundamentals
+                if r["instrument_id"] == inst and r["metric"] == metric
+                and r["observation_ts"] == obs and r["dim_signature"] == dim
+                and not r["is_superseded"]
+            ]
 
         raise AssertionError(f"FakeTimescale.run_fetch: unrecognised query: {q}")
 
