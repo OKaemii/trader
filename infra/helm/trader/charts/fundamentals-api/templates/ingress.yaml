@@ -1,0 +1,46 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: fundamentals-api
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    kubernetes.io/ingress.class: nginx
+spec:
+  rules:
+    - host: trader.local
+      http:
+        paths:
+          # READ-SIDE of the PIT Fundamentals Warehouse, on a DISTINCT, collision-free prefix.
+          #
+          # INGRESS COLLISION AVOIDANCE (the epic plan's "AVOID INGRESS COLLISION" note + Task 3's
+          # release notes). The PIT read endpoints mount under `/admin/api/fundamentals-pit` (admin/QA)
+          # and `/internal/api/fundamentals-pit` (the seam hot path) so they do NOT steal any existing
+          # route:
+          #   - `/internal/api/fundamentals` is ALREADY served by market-data-service (the Yahoo QMJ
+          #     path strategy-engine reads) — and ONLY in-cluster (service DNS), it is not on the
+          #     ingress at all; we must never claim it.
+          #   - `/admin/api/fundamentals-ingest` is the WRITE-side service (Task 3).
+          #   - the bare `/admin/api/fundamentals` 307s to the portal today (no service claims it).
+          # nginx ingress uses longest-prefix matching. `/admin/api/fundamentals-pit`,
+          # `/admin/api/fundamentals-ingest`, and the bare `/admin/api/fundamentals` are mutually
+          # non-prefixing strings, so each request resolves to its own backend with no rewrite and no
+          # ambiguity — the `-pit` and `-ingest` services coexist, and neither swallows the bare path.
+          #
+          # The live seam (epic Task 14) calls this service IN-CLUSTER
+          # (`http://fundamentals-api:8011/internal/api/fundamentals-pit?…`), not through the ingress;
+          # exposing `/internal/api/fundamentals-pit` here too is harmless and lets the headline `/pit`
+          # QA run through trader.local.
+          - path: /admin/api/fundamentals-pit
+            pathType: Prefix
+            backend:
+              service:
+                name: fundamentals-api
+                port:
+                  number: 8011
+          - path: /internal/api/fundamentals-pit
+            pathType: Prefix
+            backend:
+              service:
+                name: fundamentals-api
+                port:
+                  number: 8011

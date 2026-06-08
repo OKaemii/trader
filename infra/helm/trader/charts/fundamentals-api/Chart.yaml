@@ -1,0 +1,5 @@
+apiVersion: v2
+name: fundamentals-api
+description: fundamentals-api microservice (PIT Fundamentals Warehouse read-side)
+type: application
+version: 0.1.0

@@ -57,6 +57,18 @@ COPY services/fundamentals-ingestion/src ./fundamentals_ingestion/src
 COPY services/fundamentals-ingestion/conftest.py ./fundamentals_ingestion/conftest.py
 COPY services/fundamentals-ingestion/tests ./fundamentals_ingestion/tests
 
+# fundamentals-api skeleton + resolver suite (PIT Fundamentals Warehouse read-side, epic Task 11).
+# Deps-clean: the app + resolver import only fastapi/pydantic + the installed quant_core (TestClient
+# needs httpx from the [http] extra above); asyncpg + redis are imported LAZILY inside request handlers
+# and the tests inject in-memory fakes (FakeTimescale/FakeRedis), so no live Timescale/Redis is needed.
+# `redis` is installed (pinned to the service requirements.txt) so the lazy import path in src.main is
+# resolvable, mirroring the deployed image. Isolated under ./fundamentals_api so its `src.*` package root
+# doesn't collide with backtest-engine's `src` at /app, run from that dir via its own conftest.
+RUN pip install --no-cache-dir 'redis==5.0.7'
+COPY services/fundamentals-api/src ./fundamentals_api/src
+COPY services/fundamentals-api/conftest.py ./fundamentals_api/conftest.py
+COPY services/fundamentals-api/tests ./fundamentals_api/tests
+
 # quant-core suite imports the installed package; backtest suite imports src.* (conftest puts
 # /app on the path). PYTHONDONTWRITEBYTECODE keeps the layer clean. -p no:cacheprovider avoids a
 # read-only-fs cache complaint. A non-zero exit here fails the build = the gate.
@@ -64,6 +76,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 RUN python -m pytest quant_core_tests -q -p no:cacheprovider \
  && python -m pytest tests -q -p no:cacheprovider \
  && (cd strategy_engine && python -m pytest tests -q -p no:cacheprovider) \
- && (cd fundamentals_ingestion && python -m pytest tests -q -p no:cacheprovider)
+ && (cd fundamentals_ingestion && python -m pytest tests -q -p no:cacheprovider) \
+ && (cd fundamentals_api && python -m pytest tests -q -p no:cacheprovider)
 
 CMD ["true"]
