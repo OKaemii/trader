@@ -44,12 +44,20 @@ spec:
               value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb-headless:27017/trader?authSource=trader&directConnection=true"
             - name: MONGODB_DB
               value: trader
-            # Redis read-through cache fronting the as-of resolver (mirrors pg-bar-reader.ts). The in-cluster
-            # Redis service; a Redis blip degrades to an uncached (still-correct) read, never a failure.
-            # ALSO the consumer-side FX path for the Gap-2 PIT market cap: market-data-service publishes the
-            # GBP/USD rate to fx:GBPUSD:lastGood here, which the MarketDataReader reads for fx_to_gbp.
+            # Redis read-through cache fronting the as-of resolver (mirrors pg-bar-reader.ts) AND the
+            # consumer-side FX path for the Gap-2 PIT market cap: market-data-service publishes the GBP/USD
+            # rate to fx:GBPUSD:lastGood here, which the MarketDataReader reads for fx_to_gbp. The Bitnami
+            # Redis is `redis-master` and requires REDIS_PASSWORD (the same coordinates signal-service /
+            # market-data-service / strategy-engine use) — REDIS_PASSWORD is declared BEFORE REDIS_URL so
+            # the `$(…)` interpolation resolves. (The prior `redis://redis:6379` resolved to no service and
+            # carried no password, so the FX read raised and USD market caps were silently dropped.)
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: trader-secrets
+                  key: REDIS_PASSWORD
             - name: REDIS_URL
-              value: "redis://redis:6379"
+              value: "redis://:$(REDIS_PASSWORD)@redis-master:6379"
             # market-data-service base URL — the Gap-2 in-cluster reads (epic Task 12): the as-of adjusted
             # daily close (the SAME series momentum uses) for the PIT market cap, and the point-in-time
             # dividend-yield leg, both over the internal bars + /internal/api/dividend-yield endpoints with
