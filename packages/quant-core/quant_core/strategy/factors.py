@@ -99,6 +99,21 @@ def _safe_ratio(numerator: float, denominator: float) -> float:
     return numerator / denominator
 
 
+def _growth(current: float, prior: float) -> float:
+    """Year-over-year growth (current − prior) / prior, or NaN when it can't be honestly computed.
+
+    The asset/equity-growth legs of InvestmentFactor need a positive prior-year base: a zero or
+    negative denominator (a firm with no/negative prior equity, or a missing prior-year fact) makes
+    the percentage change meaningless and would manufacture an extreme finite score from no real
+    signal — so it collapses to NaN, which the z-score step drops rather than ranking on. Mirrors
+    `_safe_ratio`'s fail-to-NaN discipline for the growth (rather than ratio) shape."""
+    if prior is None or not np.isfinite(prior) or prior <= 0:
+        return float("nan")
+    if current is None or not np.isfinite(current):
+        return float("nan")
+    return (current - prior) / prior
+
+
 def _blend(components: list[np.ndarray]) -> np.ndarray:
     """Mean across already-z-scored component columns, ignoring NaN per name.
 
@@ -179,6 +194,45 @@ class ValueFactor:
         earnings_yield = np.array([_safe_ratio(d.get("net_income"), d.get("market_cap_gbp")) for d in f])
         book_to_market = np.array([_safe_ratio(d.get("total_equity"), d.get("market_cap_gbp")) for d in f])
         components = [nan_zscore(div_yield), nan_zscore(earnings_yield), nan_zscore(book_to_market)]
+        return _fundamentals_factor(components, tickers)
+
+
+class InvestmentFactor:
+    """Continuous investment (asset-growth) factor — higher = LOWER balance-sheet growth.
+
+    The asset-growth anomaly (Cooper-Gulen-Schill 2008; the CMA leg of the q-factor / Fama-French
+    5-factor models): firms that aggressively expand their balance sheet subsequently under-perform
+    conservative ones. We score *conservative* investment high (the sign is flipped so the
+    cross-section ranks low-growth names at the top, consistent with the other long-only factors
+    where a higher z-score is the more attractive name).
+
+    Two YoY-growth legs, each z-scored independently over the names that have it, then blended:
+      - asset growth   = (total_assets  − total_assets_prev)  / total_assets_prev
+      - equity growth  = (total_equity  − total_equity_prev)  / total_equity_prev
+    both sign-flipped (`-growth`) so conservative (low/negative growth) scores higher.
+
+    POINT-IN-TIME BY CONSTRUCTION. A YoY growth needs the line item at TWO annual `observation_ts`
+    for the same name, both knowable as-of the cycle's knowledge-time. The provider supplies the
+    prior-year value under the `_prev` suffix on the same per-ticker dict (`total_assets_prev`,
+    `total_equity_prev`) — the warehouse PIT reader fills it from the second-latest annual
+    observation ≤ as_of; the forward-only Yahoo snapshot cannot, so it simply omits `_prev` and
+    those names are NaN-excluded (this factor is a PIT-warehouse capability, never a fabricated
+    proxy). Source-agnostic like Quality/Value: the factor never learns where the numbers came from.
+
+    A missing/non-positive prior-year denominator → NaN for that leg (`_growth` below), and a name
+    with no finite leg is dropped from the result (never a false 0 the optimiser could rank).
+    """
+    name = "investment"
+
+    def score(self, history, window, params) -> FactorScores:
+        tickers = sorted(history.fundamentals.keys())
+        if not tickers:
+            return {}
+        f = [history.fundamentals.get(t, {}) for t in tickers]
+        asset_growth = np.array([_growth(d.get("total_assets"), d.get("total_assets_prev")) for d in f])
+        equity_growth = np.array([_growth(d.get("total_equity"), d.get("total_equity_prev")) for d in f])
+        # Sign-flipped: conservative (low-growth) names score higher — the asset-growth anomaly.
+        components = [nan_zscore(-asset_growth), nan_zscore(-equity_growth)]
         return _fundamentals_factor(components, tickers)
 
 
