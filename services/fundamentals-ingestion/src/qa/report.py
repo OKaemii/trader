@@ -38,9 +38,10 @@ DEFAULT_SAMPLE_LIMIT = 50
 
 
 # ── SQL ────────────────────────────────────────────────────────────────────────────
-# Total + by-reason counts over the window. occurred_at >= $1 (a UTC-ms→timestamptz bound passed as the
-# epoch-seconds the caller computes, applied via to_timestamp) when $1 is provided; the handler passes
-# NULL to mean "all time". COALESCE keeps the predicate a no-op when unbounded.
+# Total + by-reason counts over the window. $1 is the lower-bound `occurred_at` as a timestamptz (bound
+# natively from a Python datetime by `_since_param`), or NULL for an unbounded window. The
+# `$1::timestamptz IS NULL OR occurred_at >= $1` predicate is a no-op when $1 is NULL (NULL IS NULL is
+# TRUE), so "all time" needs no separate query.
 _COUNT_BY_REASON = """
 SELECT reason, COUNT(*) AS n
 FROM fundamentals_quarantine
