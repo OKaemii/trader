@@ -133,7 +133,7 @@ global:
     # cycle gains nothing from routing through it and Yahoo is the only live source — flipping to `pit` is
     # the operator's deliberate, fully reversible opt-in once the Task-9 backfill has landed rows. The
     # live cycle NEVER breaks if fundamentals-api is down (the seam degrades to {} → Yahoo fallback).
-    liveFundamentalsProvider: yahoo
+    liveFundamentalsProvider: pit
     # PIT Fundamentals Warehouse (fundamentals-ingestion write-side). SEC EDGAR mandates a descriptive
     # User-Agent (with a contact) on every request — the EDGAR clients fail CLOSED without it (every
     # fetch degrades to empty, so the ingest CronJob/backfill Job writes nothing and the Job exits 2).
