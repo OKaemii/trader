@@ -34,8 +34,10 @@ from typing import Optional
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
-# Connection coordinates the read path uses (read at boot so a missing var surfaces here, not mid-request).
-# The app does not open a pool on import — the resolver/pool modules own that on first request.
+# Connection coordinates the read path uses, read at boot purely so a missing/odd var is VISIBLE here at
+# startup (mirrors fundamentals-ingestion's main.py). The app opens no socket on import — the authoritative
+# reads + the singleton pool/redis-client construction live in `src/pool.py` (`get_pool`/`get_redis`),
+# which re-read these envs; these module constants are the boot-visibility surface only.
 TIMESCALE_URL = os.getenv("TIMESCALE_URL", "postgresql://localhost:5432/trader_ts")
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 
@@ -83,24 +85,19 @@ def _parse_tickers(raw: Optional[str]) -> list[str]:
 
 
 async def _build_resolver():
-    """Construct the as-of resolver with a live Timescale pool, the security-master resolver, and a Redis
-    read-through cache. Lazy imports keep the module-import smoke test driver-free (asyncpg/redis are only
-    needed to serve a read, not to import the app). A Redis-construction failure degrades to an
-    uncached resolver (the warehouse read still works) rather than failing the request."""
-    from src.pool import get_pool
+    """Construct the as-of resolver with the SINGLETON Timescale pool + Redis client + the security-master
+    resolver. Both the pool (`get_pool`) and the Redis client (`get_redis`) are process singletons — they
+    own connection pools and MUST be reused across requests (building a Redis client per request, on the
+    seam hot path, would leak a connection pool each call). Lazy imports keep the module-import smoke test
+    driver-free (asyncpg/redis are only needed to serve a read, not to import the app); a Redis-build
+    failure inside `get_redis` degrades to an uncached (still-correct) resolver, never a failed request."""
+    from src.pool import get_pool, get_redis
     from src.resolver import FundamentalsResolver
     from src.security_master import SecurityMasterResolver
 
     pool = await get_pool()
     sec = SecurityMasterResolver(pool)
-    redis = None
-    try:
-        import redis.asyncio as aioredis
-
-        redis = aioredis.from_url(REDIS_URL, decode_responses=True)
-    except Exception:  # noqa: BLE001 — cache is best-effort; an uncached resolver is still correct
-        redis = None
-    return FundamentalsResolver(pool, sec, redis=redis)
+    return FundamentalsResolver(pool, sec, redis=get_redis())
 
 
 async def _resolve_payload(tickers: list[str], as_of_ms: Optional[int]) -> dict:
