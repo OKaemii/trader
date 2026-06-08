@@ -78,16 +78,17 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def _build_orchestrator(user_agent: str):
+async def _build_orchestrator(user_agent: str):
     """Construct the orchestrator with the real EDGAR clients (sharing one rate limiter) + the Timescale
-    writers/QA engine over the singleton pool. Imports the drivers lazily so this module imports clean."""
+    writers/QA engine over the singleton pool. Imports the drivers lazily so this module imports clean
+    without asyncpg/httpx; opens the pool exactly once (get_pool is the process singleton)."""
     from src.download.edgar import EdgarFactsClient, edgar_rate_limiter
     from src.normalize.writer import FundamentalsWriter
     from src.orchestrator import IngestionOrchestrator
     from src.qa.engine import QaEngine
     from src.raw_store.writer import RawFactsWriter
     from src.security_master.edgar_submissions import EdgarSubmissionsClient
-    from src.security_master.pool import get_pool  # noqa: F401 — pool is opened in run(), not here
+    from src.security_master.pool import get_pool
     from src.security_master.writers import SecurityMasterWriter
 
     # ONE shared 10 req/s (or EDGAR_REQS_PER_SEC) window across BOTH EDGAR clients — the SEC budget is
@@ -96,9 +97,15 @@ def _build_orchestrator(user_agent: str):
     submissions = EdgarSubmissionsClient(user_agent=user_agent, limiter=limiter)
     facts = EdgarFactsClient(user_agent=user_agent, limiter=limiter)
 
-    # The Timescale-backed writers/engine take the pool by injection; we build them with a thin lazy
-    # accessor so the pool is created exactly once inside run() (get_pool is the process singleton).
-    return submissions, facts, SecurityMasterWriter, RawFactsWriter, FundamentalsWriter, QaEngine, IngestionOrchestrator
+    pool = await get_pool()
+    return IngestionOrchestrator(
+        submissions_client=submissions,
+        facts_client=facts,
+        secmaster=SecurityMasterWriter(pool),
+        raw_writer=RawFactsWriter(pool),
+        fundamentals_writer=FundamentalsWriter(pool),
+        qa_engine=QaEngine(pool),
+    )
 
 
 async def run_async(args: argparse.Namespace) -> int:
@@ -119,27 +126,9 @@ async def run_async(args: argparse.Namespace) -> int:
         )
         return 2
 
-    (
-        submissions,
-        facts,
-        SecurityMasterWriter,
-        RawFactsWriter,
-        FundamentalsWriter,
-        QaEngine,
-        IngestionOrchestrator,
-    ) = _build_orchestrator(user_agent)
+    orchestrator = await _build_orchestrator(user_agent)
 
-    from src.security_master.pool import close_pool, get_pool
-
-    pool = await get_pool()
-    orchestrator = IngestionOrchestrator(
-        submissions_client=submissions,
-        facts_client=facts,
-        secmaster=SecurityMasterWriter(pool),
-        raw_writer=RawFactsWriter(pool),
-        fundamentals_writer=FundamentalsWriter(pool),
-        qa_engine=QaEngine(pool),
-    )
+    from src.security_master.pool import close_pool
 
     try:
         symbols = await _resolve_symbols(args)

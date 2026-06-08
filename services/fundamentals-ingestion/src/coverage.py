@@ -30,7 +30,7 @@ import logging
 import os
 from typing import Iterable, Optional
 
-from quant_core.fundamentals import MARKET_US, market_of
+from quant_core.fundamentals import MARKET_OTHER, market_of
 from quant_core.universe import active_union
 
 log = logging.getLogger("fundamentals-ingestion.coverage")
@@ -59,23 +59,29 @@ COVERAGE_INDEX_ONLY = "index_only"
 def bare_us_symbol(ticker: str) -> Optional[str]:
     """A T212-or-bare ticker → its bare uppercase US symbol, or None when it is not a US name.
 
-    `AAPL_US_EQ` → `AAPL`; a bare `AAPL` → `AAPL`; a UK `VODl_EQ` (or any non-US suffix) → None (out
-    of scope for the EDGAR phase — it has no CIK). Uses the shared `market_of` router for the
-    jurisdiction decision rather than re-deriving suffix rules, then strips the `_US_EQ` suffix. A
-    bare symbol (no recognised suffix → `market_of` returns OTHER) is treated as an already-bare US
-    symbol IFF it carries no suffix marker, since the S&P membership rows store bare US symbols."""
-    t = ticker.strip().upper()
-    if not t:
+    `AAPL_US_EQ` → `AAPL`; a bare `AAPL` → `AAPL`; a UK `VODl_EQ` (or any other non-US T212 suffix) →
+    None (out of scope for the EDGAR phase — it has no US CIK). The jurisdiction decision is taken on
+    the RAW ticker via the shared `market_of` router (whose suffix matching is case-sensitive — `l_EQ`
+    for UK — so it must see the un-uppercased symbol), THEN the US `_US_EQ` suffix is stripped and the
+    result uppercased. A symbol with no recognised T212 suffix is treated as an already-bare US symbol
+    (the alphabet the S&P `index_constituents` rows store)."""
+    raw = ticker.strip()
+    if not raw:
         return None
-    if t.endswith("_US_EQ"):
-        return t[: -len("_US_EQ")] or None
-    # A recognised non-US suffix (UK `l_EQ`, or any other market) is dropped — EDGAR is US-only here.
-    if market_of(t) != MARKET_US and ("_EQ" in t or t.endswith("L_EQ")):
+    # US `_US_EQ` is unambiguous → match case-insensitively + strip (instrument_registry stores it
+    # uppercase, but tolerate any case). market_of's UK `l_EQ` check IS case-sensitive, so the UK/other
+    # routing below operates on the raw symbol it expects.
+    if raw.upper().endswith("_US_EQ"):
+        return raw[: -len("_US_EQ")].upper() or None
+    if market_of(raw) != MARKET_OTHER:
+        # A recognised NON-US T212 suffix (UK `l_EQ`, …) → dropped (no US CIK).
         return None
-    # No suffix marker at all ⇒ an already-bare symbol (the S&P membership alphabet).
-    if "_EQ" in t:
+    # market_of == OTHER: either a bare symbol (S&P alphabet) OR an unrecognised `*_EQ` T212 ticker we
+    # can't route to the US. A residual `_EQ` marker ⇒ a non-US tradeable line → drop; otherwise bare.
+    up = raw.upper()
+    if "_EQ" in up:
         return None
-    return t
+    return up
 
 
 def _bare_set(tickers: Iterable[str]) -> set[str]:
