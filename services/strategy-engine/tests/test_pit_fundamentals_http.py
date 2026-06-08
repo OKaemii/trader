@@ -173,6 +173,27 @@ async def test_malformed_json_degrades_to_empty():
     assert out == {}
 
 
+@pytest.mark.asyncio
+async def test_structurally_malformed_payload_degrades_to_empty():
+    """A 200 with VALID JSON but a structurally-wrong shape (a name mapping to a non-dict, or
+    `fundamentals` not a dict) degrades to {} — the projection is inside the try, so the live cycle
+    never crashes on an upstream shape regression (the parse-failure → {} contract)."""
+    provider = _provider()
+    as_of = 1_600_100_000_000
+    # A name mapping to a string instead of a line-item dict.
+    with respx.mock() as mock:
+        mock.get(f"{BASE_URL}/internal/api/fundamentals-pit?tickers=AAPL_US_EQ&asOf={as_of}").mock(
+            return_value=httpx.Response(200, json={"fundamentals": {"AAPL_US_EQ": "garbage"}})
+        )
+        assert await provider.fetch_many(["AAPL_US_EQ"], as_of) == {}
+    # `fundamentals` not a dict at all.
+    with respx.mock() as mock:
+        mock.get(f"{BASE_URL}/internal/api/fundamentals-pit?tickers=AAPL_US_EQ&asOf={as_of}").mock(
+            return_value=httpx.Response(200, json={"fundamentals": ["not", "a", "dict"]})
+        )
+        assert await provider.fetch_many(["AAPL_US_EQ"], as_of) == {}
+
+
 def test_source_for_routes_by_jurisdiction():
     """source_for stamps pit-edgar (US) / pit-companies-house (UK)."""
     provider = _provider()

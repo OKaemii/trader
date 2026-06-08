@@ -216,7 +216,16 @@ class PitFundamentalsAsOf:
                 r = await client.get(url, headers=self._auth_header())
                 r.raise_for_status()
                 payload = r.json()
-        except Exception as exc:  # noqa: BLE001 — the live cycle must never break on a PIT outage
+            # Parse + project INSIDE the try: a structurally-malformed-but-JSON-valid payload (a name
+            # mapping to a non-dict, `fundamentals` not a dict) must also degrade to {}, not raise — the
+            # live cycle can't trust the upstream shape never regresses (the whole "parse failure → {}").
+            out: dict[str, dict[str, float]] = {}
+            for ticker, tf in (payload.get("fundamentals") or {}).items():
+                line_items = _pit_line_items(tf)
+                if line_items:  # empty line-item dict = "no PIT fact for this name" → let it fall back
+                    out[ticker] = line_items
+            return out
+        except Exception as exc:  # noqa: BLE001 — the live cycle must never break on a PIT outage/parse
             if not self._warned:
                 print(
                     f"[strategy-engine:pit-fundamentals] read failed (degrading to Yahoo fallback): {exc!r}",
@@ -224,12 +233,6 @@ class PitFundamentalsAsOf:
                 )
                 self._warned = True
             return {}
-        out: dict[str, dict[str, float]] = {}
-        for ticker, tf in (payload.get("fundamentals") or {}).items():
-            line_items = _pit_line_items(tf)
-            if line_items:  # an empty line-item dict = "no PIT fact for this name" → let it fall back
-                out[ticker] = line_items
-        return out
 
     async def fetch(self, ticker: str, as_of_ms: int) -> dict[str, float]:
         """Single-name PIT lookup over `fetch_many`. `{}` when the warehouse has no fact ≤ asOf."""
@@ -246,6 +249,9 @@ def _pit_line_items(payload: dict) -> dict[str, float]:
     (`source`/`observation_ts`/`knowledge_ts`) are not factor inputs, and a `None`/non-numeric line item
     is OMITTED so the factor NaN-excludes a missing component rather than reading a fabricated 0 (the
     same contract `_to_factor_line_items` honours for the Yahoo path)."""
+    if not isinstance(payload, dict):
+        # A name mapping to a non-dict (malformed payload) carries no line items — never crash on it.
+        return {}
     out: dict[str, float] = {}
     for key in LINE_ITEMS:
         val = payload.get(key)

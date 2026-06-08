@@ -377,6 +377,14 @@ def test_pit_line_items_empty_payload_is_empty():
     assert _pit_line_items({}) == {}
 
 
+def test_pit_line_items_non_dict_payload_is_empty():
+    """A non-dict payload (a name mapping to a string/list/None in a malformed response) yields no line
+    items — never an AttributeError into the live cycle."""
+    assert _pit_line_items("garbage") == {}      # type: ignore[arg-type]
+    assert _pit_line_items(None) == {}            # type: ignore[arg-type]
+    assert _pit_line_items(["not", "a", "dict"]) == {}   # type: ignore[arg-type]
+
+
 # ── build_fundamentals_provider — the wiring point's mode selection (reversibility) ──────────────
 def test_build_provider_yahoo_mode_is_bare_yahoo():
     """mode='yahoo' (the safe default) returns the bare forward-only YahooFundamentalsAsOf — the
