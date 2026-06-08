@@ -385,12 +385,16 @@ class FakeTimescale:
             self.fundamentals_revisions_log.append(row)
             return
 
-        # quarantine append (value-agreement conflicts handed off to Task 8's review queue). BIGSERIAL
-        # event_id; payload arrives as a JSON string ($4::jsonb) — decode it so tests can assert shape.
+        # quarantine append (value-agreement conflicts from the writer + identity_break/outlier/
+        # missing_data from the QA engine). BIGSERIAL event_id; payload arrives as a JSON string
+        # ($4::jsonb) — kept as the string the code passes (tests json.loads it). `occurred_at` mirrors
+        # the table DEFAULT NOW(); a monotonically-increasing counter stands in so the report sample's
+        # newest-first ordering is deterministic without a real clock.
         if q.startswith("insert into fundamentals_quarantine"):
             instrument_id, filing_id, reason, payload = args
             self.fundamentals_quarantine.append({
                 "event_id": self._next("quarantine"),
+                "occurred_at": self._seq["quarantine"],  # surrogate monotonic clock (== event_id)
                 "instrument_id": instrument_id, "filing_id": filing_id, "reason": reason,
                 "payload": payload,
             })

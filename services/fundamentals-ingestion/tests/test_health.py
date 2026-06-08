@@ -50,3 +50,44 @@ def test_trigger_ingest_defaults_to_full_coverage() -> None:
     assert body["scope"] == "all"
     assert body["ticker_count"] is None
     assert body["full"] is False
+
+
+# ── QA quarantine report endpoint (epic Task 8) ───────────────────────────────────
+def test_quarantine_report_serves_summary(monkeypatch) -> None:
+    # The admin QA report (under the Task-3 ingress prefix) returns the aggregated quarantine summary.
+    # Patch the pool factory to hand the handler the in-memory FakeTimescale (no real Timescale), seeded
+    # with one quarantine row, and assert the endpoint serialises the report.
+    import json as _json
+
+    from src.qa.checks import REASON_OUTLIER
+    from tests.fakes import FakeTimescale
+
+    db = FakeTimescale()
+    db.fundamentals_quarantine.append({
+        "event_id": db._next("quarantine"), "occurred_at": db._seq["quarantine"],
+        "instrument_id": None, "filing_id": None, "reason": REASON_OUTLIER,
+        "payload": _json.dumps({"check": "period_ratio", "metric": "total_revenue"}),
+    })
+
+    async def _fake_get_pool(*_a, **_k):
+        return db
+
+    monkeypatch.setattr("src.security_master.pool.get_pool", _fake_get_pool)
+    res = client.get("/admin/api/fundamentals-ingest/quarantine")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["total"] == 1
+    assert body["by_reason"] == {REASON_OUTLIER: 1}
+    assert body["recent"][0]["payload"]["metric"] == "total_revenue"
+
+
+def test_quarantine_report_degrades_to_503_on_db_error(monkeypatch) -> None:
+    # A Timescale-unreachable error must surface as a JSON 503 (a read over a possibly-cold warehouse),
+    # never an unhandled 500 — and /health stays independent of the warehouse being up.
+    async def _boom(*_a, **_k):
+        raise OSError("timescale unreachable")
+
+    monkeypatch.setattr("src.security_master.pool.get_pool", _boom)
+    res = client.get("/admin/api/fundamentals-ingest/quarantine")
+    assert res.status_code == 503
+    assert "detail" in res.json()
