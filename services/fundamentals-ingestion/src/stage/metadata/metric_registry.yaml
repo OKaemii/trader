@@ -1,0 +1,139 @@
+# metric_registry.yaml — US (SEC EDGAR) normalization mapping (PIT-fundamentals epic Task 6).
+#
+# Maps each canonical `quant_core.fundamentals.LINE_ITEMS` key to an ORDERED list of candidate
+# us-gaap:* / dei:* tags. The stage resolver (`src/stage/resolver.py`) picks the HIGHEST-PRIORITY tag
+# that is PRESENT for a given (cik, period), so a filer that reports `RevenueFromContractWith
+# CustomerExcludingAssessedTax` is read off that tag, while an older filer reporting only `Revenues`
+# falls through to it. Order = preference (index 0 is most preferred).
+#
+# PER-SECTOR OVERRIDES. Some metrics have no single cross-sector tag: a bank's "revenue" is interest +
+# fee income (`us-gaap:RevenuesNetOfInterestExpense` / `InterestAndDividendIncomeOperating`), not the
+# product-sale `RevenueFromContractWithCustomer…` a manufacturer uses. A `<metric>.sectors.<template>`
+# block REPLACES the default candidate list for filers classified into that sector template (the SIC →
+# template map is the normalizer's job, epic Task 7; staging is handed the chosen template). The
+# template names match the normalizer's set: general | bank | insurance | reit | utility.
+#
+# SOURCE / PROVENANCE. Seeded from the public, widely-used `dgunning/edgartools` financial-statement
+# concept mapping (its `standardization` / `concepts` tables map canonical statement lines to the same
+# us-gaap tag families) cross-checked against the SEC us-gaap Financial Reporting Taxonomy element
+# names. edgartools is MIT-licensed; we reproduce only the (public) tag *names*, not its code. The
+# tag families below (NetIncomeLoss/ProfitLoss; the Revenue trio; StockholdersEquity ±NCI;
+# Assets/Liabilities; the current-asset/-liability pair; the long-term-debt + current-maturities +
+# short-term-borrowings debt build; GrossProfit; NetCashProvidedByUsedInOperatingActivities;
+# dei:EntityCommonStockSharesOutstanding) are the standard edgartools/SEC-DEI choices.
+#
+# WHAT THE REGISTRY DOES NOT DO. Order is preference only — the resolver still applies the value-
+# agreement guard (it will NOT silently prefer tag A over tag B if both are present for the same period
+# with DISAGREEING values; that is a data-quality signal, surfaced, not merged). Instant-vs-duration is
+# carried on the raw fact (`period_type`) and is NOT in the registry; QTD-vs-YTD selection for flow
+# metrics is the resolver's explicit choice (the fiscal-quarter (start,end), not the YTD cumulative).
+# `flow_metrics` below names which canonical metrics are period flows (duration) so the resolver knows
+# to apply QTD/YTD disambiguation; the rest are balance-sheet instants (a point-in-time stock).
+
+version: 1
+
+# Canonical metrics that are period FLOWS (duration facts: income-statement + cash-flow lines). The
+# resolver applies QTD-vs-YTD disambiguation to these. Everything else in `metrics` is a balance-sheet
+# INSTANT (a stock at period_end) and is taken as-is. `shares_outstanding` is a dei cover-page instant
+# with its OWN knowledge_ts (the filing date) — it is an instant, NOT a flow.
+flow_metrics:
+  - net_income
+  - total_revenue
+  - gross_profit
+  - cash_flow_ops
+
+metrics:
+  # ── Income statement (flows) ────────────────────────────────────────────────
+  net_income:
+    default:
+      - us-gaap:NetIncomeLoss
+      - us-gaap:ProfitLoss            # IFRS-filer / consolidated-incl-NCI fallback
+      - us-gaap:NetIncomeLossAvailableToCommonStockholdersBasic
+
+  total_revenue:
+    default:
+      # ASC 606 contract-revenue tag is the modern standard; older filers used Revenues / SalesRevenueNet.
+      - us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax
+      - us-gaap:Revenues
+      - us-gaap:SalesRevenueNet
+      - us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax
+    sectors:
+      bank:
+        # A bank's top line is net interest + noninterest income, not product sales.
+        - us-gaap:RevenuesNetOfInterestExpense
+        - us-gaap:InterestAndDividendIncomeOperating
+        - us-gaap:Revenues
+      insurance:
+        # Insurers report premiums + net investment income; Revenues is the rolled-up total.
+        - us-gaap:Revenues
+        - us-gaap:PremiumsEarnedNet
+      reit:
+        - us-gaap:Revenues
+        - us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax
+      utility:
+        - us-gaap:RegulatedAndUnregulatedOperatingRevenue
+        - us-gaap:Revenues
+        - us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax
+
+  gross_profit:
+    default:
+      - us-gaap:GrossProfit
+    # Banks / insurers do not report a gross-profit line; absent for those templates (NaN-excluded
+    # downstream, never fabricated). An empty candidate list ⇒ the resolver yields no fact for it.
+    sectors:
+      bank: []
+      insurance: []
+
+  cash_flow_ops:
+    default:
+      - us-gaap:NetCashProvidedByUsedInOperatingActivities
+      - us-gaap:NetCashProvidedByUsedInOperatingActivitiesContinuingOperations
+
+  # ── Balance sheet (instants) ────────────────────────────────────────────────
+  total_equity:
+    default:
+      - us-gaap:StockholdersEquity
+      # Includes noncontrolling interest — preferred only when the parent-only tag is absent.
+      - us-gaap:StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest
+
+  total_assets:
+    default:
+      - us-gaap:Assets
+
+  total_liabilities:
+    default:
+      - us-gaap:Liabilities
+      # Some filers only tag Liabilities+Equity; the resolver does NOT subtract here (that derivation,
+      # if ever wanted, is the normalizer's — staging only SELECTS a reported tag).
+
+  current_assets:
+    default:
+      - us-gaap:AssetsCurrent
+    # Banks / insurers run unclassified balance sheets (no current/non-current split) — absent.
+    sectors:
+      bank: []
+      insurance: []
+
+  current_liabilities:
+    default:
+      - us-gaap:LiabilitiesCurrent
+    sectors:
+      bank: []
+      insurance: []
+
+  total_debt:
+    default:
+      # No single "total debt" us-gaap tag exists; filers tag the components. Staging selects the
+      # single best-available *reported* debt total in preference order — it does NOT sum components
+      # (summation is a normalizer derivation, Task 7, where the sector template decides the build).
+      - us-gaap:DebtAndCapitalLeaseObligations
+      - us-gaap:LongTermDebtAndCapitalLeaseObligations
+      - us-gaap:LongTermDebt
+      - us-gaap:DebtCurrent
+
+  # ── Cover page (instant; own knowledge_ts = filing date) ─────────────────────
+  shares_outstanding:
+    # The canonical PIT share count is the DEI cover-page fact (entity-level, as-of the cover date) —
+    # NOT a us-gaap weighted-average (that is a flow used for EPS). Per the spec: dei tag only.
+    default:
+      - dei:EntityCommonStockSharesOutstanding
