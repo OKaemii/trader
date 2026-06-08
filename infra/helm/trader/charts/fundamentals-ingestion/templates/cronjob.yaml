@@ -1,0 +1,98 @@
+# Nightly incremental PIT-fundamentals ingest (epic Task 9).
+#
+# Runs `python -m src.ingest` (services/fundamentals-ingestion) in a Job container —
+# the ingest is a long, scheduled batch (it walks each coverage filer's filings),
+# so it runs OUT-OF-BAND from the FastAPI app, exactly like warehouse-snapshot's
+# snapshotter. Per coverage ticker the run resolves CIK -> fetches EDGAR
+# submissions+companyfacts -> upserts the security master -> writes the raw zone ->
+# normalizes + bi-temporally writes `fundamentals` -> QA-quarantines suspects.
+# Idempotent (hash-gated): a re-run over unchanged filers writes zero canonical rows,
+# so a missed/overlapping tick is safe.
+#
+# Schedule:
+#   global.env.fundamentalsIngestCron (default "30 2 * * *" = 02:30 UTC). Picked to
+#   land after the US close (21:00 UTC) AND the warehouse-snapshot (23:30 UTC), so a
+#   day's filings have been accepted by SEC and the snapshot job isn't contended.
+#
+# Concurrency: Forbid — the ingest worker + the asyncpg pool are single-instance; a
+# still-running backfill must not be stacked on by the nightly tick.
+#
+# EDGAR_USER_AGENT: MANDATORY. SEC fails closed without a descriptive UA — the run
+# logs the misconfig and exits non-zero (the Job shows red) rather than silently
+# writing nothing. Set global.env.edgarUserAgent to a real contact string first.
+#
+# Image: the SAME fundamentals-ingestion image the Deployment runs (the modules are
+# shared), overriding the FastAPI entrypoint with the ingest command.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: fundamentals-ingest
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: fundamentals-ingest
+spec:
+  schedule: {{ .Values.global.env.fundamentalsIngestCron | default "30 2 * * *" | quote }}
+  timeZone: "UTC"
+  concurrencyPolicy: Forbid          # don't stack runs; a still-running backfill skips the nightly tick
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  startingDeadlineSeconds: 1800       # missed the tick by >30min → skip rather than backfill-storm
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      # A full incremental over the coverage set can run a while behind the 10 req/s SEC limiter;
+      # give it a generous ceiling but bound it so a wedged run is reaped (6h).
+      activeDeadlineSeconds: 21600
+      template:
+        metadata:
+          labels:
+            app: fundamentals-ingest
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: fundamentals-ingest
+              image: {{ .Values.image | default (printf "%strader-fundamentals-ingestion:%s" (.Values.global.imageRegistry | default "") (.Values.global.imageTag | default "latest")) }}
+              imagePullPolicy: {{ .Values.global.imagePullPolicy | default "IfNotPresent" }}
+              command: ["python", "-m", "src.ingest"]
+              envFrom:
+                - secretRef:
+                    name: trader-secrets
+              env:
+                # Mongo (coverage resolver: instrument_registry ∪ index_constituents). Same assembly the
+                # Deployment + warehouse-snapshot use — password from the secret, URL composed here.
+                - name: MONGODB_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: trader-secrets
+                      key: MONGODB_PASSWORD
+                - name: MONGODB_URL
+                  value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb-headless:27017/trader?authSource=trader&directConnection=true"
+                - name: MONGODB_DB
+                  value: trader
+                # Timescale (the bi-temporal `fundamentals` write target). Password from the secret, URL
+                # assembled like the Deployment/backtest-engine so the writers point at trader_ts.
+                - name: TIMESCALEDB_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: trader-secrets
+                      key: TIMESCALEDB_PASSWORD
+                - name: TIMESCALE_URL
+                  value: "postgresql://trader:$(TIMESCALEDB_PASSWORD)@timescaledb-postgresql:5432/trader_ts"
+                # SEC EDGAR — mandatory descriptive UA + the rate budget. Non-secret env.
+                - name: EDGAR_USER_AGENT
+                  value: {{ .Values.global.env.edgarUserAgent | default "trader-platform fundamentals-ingestion" | quote }}
+                - name: EDGAR_REQS_PER_SEC
+                  value: {{ .Values.global.env.edgarReqsPerSec | default "10" | quote }}
+                # Coverage knobs (mode + cap). The run reads these to size the universe∪index set.
+                - name: FUNDAMENTALS_COVERAGE
+                  value: {{ .Values.global.env.fundamentalsCoverage | default "universe_plus_index" | quote }}
+                - name: FUNDAMENTALS_COVERAGE_CAP
+                  value: {{ .Values.global.env.fundamentalsCoverageCap | default "64" | quote }}
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: "256Mi"
+                  ephemeral-storage: "128Mi"
+                limits:
+                  memory: "768Mi"
+                  ephemeral-storage: "256Mi"

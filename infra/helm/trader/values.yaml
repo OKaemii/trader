@@ -120,10 +120,33 @@ global:
     # Fundamentals (QMJ: ROE / D-E / current ratio) source. yahoo (free quoteSummary) | eodhd (paid add-on).
     fundamentalsProvider: yahoo
     # PIT Fundamentals Warehouse (fundamentals-ingestion write-side). SEC EDGAR mandates a descriptive
-    # User-Agent on every request — the EDGAR downloader (epic Task 5) fails closed without it. Set a
-    # real contact string (e.g. "trader-platform fundamentals-ingestion ops@example.com") before that
-    # downloader ships; the skeleton only reads/echoes it. Non-secret env, not a trader-secrets key.
+    # User-Agent on every request — the EDGAR clients fail CLOSED without it (every fetch degrades to
+    # empty, so the ingest CronJob/backfill Job writes nothing and the Job exits non-zero). ⚠ SET A REAL
+    # contact string (e.g. "trader-platform fundamentals-ingestion ops@example.com") BEFORE the first
+    # ingest run, or the backfill is a no-op. Non-secret env, not a trader-secrets key.
     edgarUserAgent: "trader-platform fundamentals-ingestion"
+    # SEC courtesy rate budget for the EDGAR fetches (requests/second, per source IP across BOTH the
+    # submissions and companyfacts clients via one shared limiter). 10/s is SEC's published limit; lower
+    # it to be a gentler citizen, never raise above 10 (earns a 403/IP-block). Used by the ingest run.
+    edgarReqsPerSec: "10"
+    # Ingestion CronJob schedule (nightly incremental) — UTC cron. 02:30 UTC lands well after the US
+    # close + the warehouse-snapshot (23:30 UTC), so a day's filings have been accepted and the snapshot
+    # isn't contended. The one-shot backfill Job is hook-gated separately (see the subchart).
+    fundamentalsIngestCron: "30 2 * * *"
+    # Coverage set the ingest run walks: universe_plus_index (active T212 universe ∪ point-in-time US
+    # S&P members — the default) | universe_only | index_only. A small default cap keeps a first
+    # backfill bounded (FUNDAMENTALS_COVERAGE_CAP env, default 64; 0 ⇒ uncapped — the operator's opt-in
+    # to the full set once the per-name cost is understood). The full ~15k-CIK market is out of scope.
+    fundamentalsCoverage: "universe_plus_index"
+    fundamentalsCoverageCap: "64"
+    # One-shot backfill Job gate. "false" (default) ⇒ the backfill-job.yaml renders NOTHING, so a
+    # routine `helm upgrade` never kicks off a heavy from-scratch backfill. Flip to "true" (and redeploy)
+    # to run a one-off `python -m src.ingest --full --tickers <fundamentalsBackfillTickers>` — the Job
+    # name is image-tag-suffixed so each enabled deploy creates a fresh Job. Set back to "false" after.
+    fundamentalsBackfill: "false"
+    # Tickers for the one-shot backfill Job (bare US symbols). Default AAPL,MSFT is the demo that lands
+    # `fundamentals` rows; set "" to backfill the full configured coverage set (universe ∪ index).
+    fundamentalsBackfillTickers: "AAPL,MSFT"
     # Earnings/dividend calendar source. yahoo (free calendarEvents) | eodhd (dormant — falls back to yahoo).
     earningsProvider: yahoo
     # Sector-rotation reference ETFs (comma-separated T212 tickers). Empty → built-in 11 SPDRs + SPY.
