@@ -59,6 +59,13 @@ from quant_core.fundamentals import (
     market_of,
 )
 
+from src.market_cap import (
+    apply_dividend_yield,
+    apply_pit_market_cap,
+    compute_market_cap_gbp,
+    currency_of,
+)
+
 log = logging.getLogger("fundamentals-api.resolver")
 
 # Cache TTL + key namespace mirror pg-bar-reader.ts. v1 + a distinct `fund:` prefix so the bars cache
@@ -193,12 +200,22 @@ class FundamentalsResolver:
     Inject an asyncpg.Pool (the Timescale reader — `security_master.pool.get_pool`), a security-master
     resolver (ticker → instrument_id), and optionally a redis client (the read-through cache front; a
     None client disables caching — useful in tests). Holds no global state and opens no socket on import.
-    """
 
-    def __init__(self, pool, resolver, redis=None) -> None:
+    `market_data` (optional `src.market_cap.MarketDataReader`) is the Gap-2 enrichment edge: when present,
+    the resolver OVERRIDES each covered name's `market_cap_gbp` with the computed PIT value
+    (adjusted_close(as_of) × shares_outstanding(as_of) × fx_to_gbp) and wires the PIT `dividend_yield`
+    leg, so Value's three legs share one as-of basis and earnings_yield/book_to_market are point-in-time.
+    None (tests / a degraded boot) leaves the warehouse pivot untouched — the warehouse never stores a
+    provider market-cap scalar (the writer doesn't land `market_cap_gbp`), so without the reader the key
+    is simply absent (the factor NaN-excludes it), never a fabricated value. The enrichment runs OUTSIDE
+    the Redis cache (below) so it always uses fresh price/FX/dividends while the slow warehouse read stays
+    cached."""
+
+    def __init__(self, pool, resolver, redis=None, market_data=None) -> None:
         self._pool = pool
         self._resolver = resolver
         self._redis = redis
+        self._market_data = market_data
 
     async def _instrument_id(self, ticker: str, as_of_ms: Optional[int]) -> Optional[int]:
         """Resolve a T212 ticker to its instrument_id via the security master, as-of aware. A ticker
@@ -276,8 +293,14 @@ class FundamentalsResolver:
         `as_of_ms=None` is the live fast lane (current rows); a past `as_of_ms` returns ONLY facts whose
         `knowledge_ts <= as_of_ms` (the guard is in SQL). Names that don't resolve, or have no fact ≤ asOf,
         are present in the result with an empty `line_items` dict (the caller can choose to include or drop
-        them) — never a fabricated value. Redis read-through fronts each name; a cache failure degrades to
-        a direct Postgres read."""
+        them) — never a fabricated value. Redis read-through fronts the WAREHOUSE pivot per name; a cache
+        failure degrades to a direct Postgres read.
+
+        Gap-2 ENRICHMENT (when a `MarketDataReader` is injected) runs AFTER the cache layer, on the merged
+        warehouse result: each covered name's `market_cap_gbp` is overridden with the computed PIT value
+        (price×shares×fx) and the PIT `dividend_yield` leg is wired in — both from the fresh in-cluster
+        reads (market-data's own Redis cache keeps them cheap), so the slow warehouse read stays cached
+        while the fast-moving price/FX/dividend inputs are never stale-cached against an old market cap."""
         out: dict[str, TickerFundamentals] = {}
         for ticker in tickers:
             cached = await self._cache_get(ticker, as_of_ms)
@@ -287,4 +310,51 @@ class FundamentalsResolver:
             resolved = await self._resolve_one(ticker, as_of_ms)
             await self._cache_set(ticker, as_of_ms, resolved)
             out[ticker] = resolved
-        return out
+        return await self._enrich_market_data(out, as_of_ms)
+
+    async def _enrich_market_data(
+        self, resolved: dict[str, TickerFundamentals], as_of_ms: Optional[int]
+    ) -> dict[str, TickerFundamentals]:
+        """Override `market_cap_gbp` with the computed PIT value + wire the PIT `dividend_yield` leg
+        (Gap 2). No-op when no `MarketDataReader` is injected. Computes market cap per name from the as-of
+        adjusted close (the SAME series momentum uses) × the name's as-of `shares_outstanding` (the dei
+        cover-page fact already in `line_items`) × FX→GBP, and drops the key when any input is missing
+        (NaN-excluded, never a fabricated 0).
+
+        HOT-PATH SHAPE: the whole-universe live seam (Task 14) calls this per cycle, so the upstream reads
+        are batched/coalesced — ONE batch dividend-yield round-trip, ONE batch adjusted-close round-trip,
+        and FX resolved ONCE per distinct currency (at most USD+GBP) rather than per ticker. A name that
+        didn't resolve (empty line items, no source) is skipped (nothing to value) and excluded from the
+        upstream reads."""
+        if self._market_data is None:
+            return resolved
+        # The names worth valuing — resolved with at least one fact (an unresolved name has nothing to
+        # compute a market cap from; we don't fabricate one from a price alone).
+        valuable = [t for t, tf in resolved.items() if not (tf.source is None and not tf.line_items)]
+
+        # Coalesced upstream reads (one round-trip each); FX resolved once per distinct currency.
+        dy_by_ticker = await self._market_data.dividend_yields_as_of(valuable, as_of_ms)
+        closes = await self._market_data.adjusted_closes_as_of(valuable, as_of_ms)
+        fx_by_currency: dict[Optional[str], Optional[float]] = {}
+        for ticker in valuable:
+            ccy = currency_of(ticker)
+            if ccy not in fx_by_currency:
+                fx_by_currency[ccy] = await self._market_data.fx_to_gbp(ccy)
+
+        enriched: dict[str, TickerFundamentals] = {}
+        for ticker, tf in resolved.items():
+            if tf.source is None and not tf.line_items:
+                enriched[ticker] = tf  # unresolved — pass through untouched
+                continue
+            market_cap = compute_market_cap_gbp(
+                closes.get(ticker), tf.line_items.get("shares_outstanding"), fx_by_currency.get(currency_of(ticker))
+            )
+            new_items = apply_pit_market_cap(tf.line_items, market_cap)
+            new_items = apply_dividend_yield(new_items, dy_by_ticker.get(ticker))
+            enriched[ticker] = TickerFundamentals(
+                line_items=new_items,
+                source=tf.source,
+                observation_ts=tf.observation_ts,
+                knowledge_ts=tf.knowledge_ts,
+            )
+        return enriched

@@ -18,12 +18,22 @@ each resolves to its own backend. Task 14's live seam calls this service IN-CLUS
 (`http://fundamentals-api:8011/internal/api/fundamentals-pit?…`), not through the ingress; exposing
 `/internal/api/fundamentals-pit` on the ingress too is harmless (and lets the headline `/pit` QA run).
 
+GAP-2 MARKET CAP (epic Task 12). `market_cap_gbp` is NOT a stored provider scalar — for every covered
+name it is COMPUTED point-in-time as `adjusted_close(as_of) × shares_outstanding(as_of) × fx_to_gbp`
+(the same adjusted price series momentum uses, the dei cover-page shares fact, and the platform's GBP/USD
+rate) inside the resolver's enrichment step, and the PIT `dividend_yield` leg is wired in alongside so
+Value's three legs share one as-of basis. The in-cluster read paths (market-data-service internal bars
+for the as-of close, shared Redis for FX, market-data-service `/internal/api/dividend-yield` for the
+yield) live in `src/market_cap.py`; the value/quality factor-input computation behind
+`/admin/api/fundamentals-pit/factors` lives in `src/factors.py`.
+
 The app is thin (mirrors backtest-engine / fundamentals-ingestion `main.py`): the resolver + pool +
-security-master modules are side-effect-free and open no socket on import; the DB drivers (asyncpg,
-redis) are imported lazily inside the request handlers so the module-import smoke test stays driver-free
-and `/health` is independent of the warehouse being up. The cluster has no fundamentals rows until the
-operator runs the Task-9 backfill, so a live read legitimately returns empty (200 with `{}` per name) —
-that is correct, not a failure; the resolver's correctness is proven by the unit suite.
+security-master + market-cap modules are side-effect-free and open no socket on import; the DB/HTTP
+drivers (asyncpg, redis, httpx) are imported lazily inside the request handlers so the module-import
+smoke test stays driver-free and `/health` is independent of the warehouse being up. The cluster has no
+fundamentals rows until the operator runs the Task-9 backfill, so a live read legitimately returns empty
+(200 with `{}` per name) — that is correct, not a failure; the resolver's correctness is proven by the
+unit suite.
 """
 from __future__ import annotations
 
@@ -86,18 +96,27 @@ def _parse_tickers(raw: Optional[str]) -> list[str]:
 
 async def _build_resolver():
     """Construct the as-of resolver with the SINGLETON Timescale pool + Redis client + the security-master
-    resolver. Both the pool (`get_pool`) and the Redis client (`get_redis`) are process singletons — they
-    own connection pools and MUST be reused across requests (building a Redis client per request, on the
-    seam hot path, would leak a connection pool each call). Lazy imports keep the module-import smoke test
-    driver-free (asyncpg/redis are only needed to serve a read, not to import the app); a Redis-build
-    failure inside `get_redis` degrades to an uncached (still-correct) resolver, never a failed request."""
+    resolver + the Gap-2 market-data reader. The pool (`get_pool`) and the Redis client (`get_redis`) are
+    process singletons — they own connection pools and MUST be reused across requests (building a Redis
+    client per request, on the seam hot path, would leak a connection pool each call). Lazy imports keep
+    the module-import smoke test driver-free (asyncpg/redis/httpx are only needed to serve a read, not to
+    import the app); a Redis-build failure inside `get_redis` degrades to an uncached (still-correct)
+    resolver, never a failed request.
+
+    The `MarketDataReader` shares the singleton Redis client (for the published GBP/USD rate — the
+    consumer-side FX path) and calls market-data-service's internal bars + dividend-yield endpoints
+    in-cluster (with the internal JWT) for the as-of adjusted close + the PIT dividend-yield leg, so the
+    resolver can override `market_cap_gbp` with the computed PIT value (price×shares×fx)."""
+    from src.market_cap import MarketDataReader
     from src.pool import get_pool, get_redis
     from src.resolver import FundamentalsResolver
     from src.security_master import SecurityMasterResolver
 
     pool = await get_pool()
     sec = SecurityMasterResolver(pool)
-    return FundamentalsResolver(pool, sec, redis=get_redis())
+    redis = get_redis()
+    market_data = MarketDataReader(redis=redis)
+    return FundamentalsResolver(pool, sec, redis=redis, market_data=market_data)
 
 
 async def _resolve_payload(tickers: list[str], as_of_ms: Optional[int]) -> dict:
@@ -159,6 +178,49 @@ async def admin_pit(
         return JSONResponse(
             status_code=503,
             content={"detail": f"pit read unavailable: {type(exc).__name__}: {exc}"},
+        )
+
+
+@app.get("/admin/api/fundamentals-pit/factors")
+async def admin_factors(
+    universe: Optional[str] = Query(
+        default=None,
+        description="Comma-separated T212 tickers to compute factor inputs for (e.g. AAPL_US_EQ,MSFT_US_EQ).",
+    ),
+    as_of: Optional[int] = Query(
+        default=None,
+        description="Knowledge-time cutoff (UTC ms). Omit = live. Factor inputs use ONLY facts knowable ≤ as_of.",
+    ),
+) -> JSONResponse:
+    """The computed value/quality factor INPUTS per name (epic Task 12) — the operator/QA view of the
+    point-in-time legs the Value/Quality factors z-score. For each name: the resolved PIT line items
+    (with `market_cap_gbp` already OVERRIDDEN by the computed price×shares×fx value — Gap 2 — and the PIT
+    `dividend_yield` leg wired in), the six factor legs (earnings_yield/book_to_market/dividend_yield/
+    roe/gross_margin/leverage) computed with the EXACT `_safe_ratio` semantics the live factor uses, plus
+    the raw drivers + provenance. A leg whose inputs are unavailable is `null` (the factor NaN-excludes
+    it — never a fabricated 0). The cluster has no fundamentals rows until the operator backfill, so a
+    live call legitimately returns the names with empty factor inputs (200, not an error)."""
+    try:
+        from src.factors import compute_factor_inputs
+
+        tickers = _parse_tickers(universe)
+        resolver = await _build_resolver()
+        resolved = await resolver.get_pit_fundamentals(tickers, as_of)
+        factors = {
+            ticker: {
+                "factors": compute_factor_inputs(tf.line_items),
+                "line_items": tf.line_items,
+                "source": tf.source,
+                "observation_ts": tf.observation_ts,
+                "knowledge_ts": tf.knowledge_ts,
+            }
+            for ticker, tf in resolved.items()
+        }
+        return JSONResponse(content={"factors": factors, "asOf": as_of, "count": len(factors)})
+    except Exception as exc:  # noqa: BLE001 — a warehouse/market-data outage degrades to 503, never a bare 500
+        return JSONResponse(
+            status_code=503,
+            content={"detail": f"factors unavailable: {type(exc).__name__}: {exc}"},
         )
 
 
