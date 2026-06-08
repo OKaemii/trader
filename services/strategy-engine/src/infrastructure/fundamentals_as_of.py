@@ -273,6 +273,22 @@ PROVIDER_MODE_PIT = "pit"
 PROVIDER_MODE_YAHOO = "yahoo"
 
 
+def resolve_provider_mode(mode: str | None = None) -> str:
+    """The SINGLE source of truth for the live fundamentals provider mode: `pit` only when the
+    configured value is exactly `pit` (case-insensitive, trimmed), else `yahoo`.
+
+    Resolution order: an explicit `mode` argument wins; otherwise `LIVE_FUNDAMENTALS_PROVIDER`
+    (`global.env.liveFundamentalsProvider`); otherwise the `yahoo` default. Anything that doesn't
+    resolve to `pit` — `yahoo`, an unset env, a typo — returns `yahoo` (fail-safe: never route to the
+    PIT warehouse on an unrecognised value). Returns one of `PROVIDER_MODE_PIT` / `PROVIDER_MODE_YAHOO`.
+
+    Both `build_fundamentals_provider` (the startup wiring) and the observability endpoint
+    (`GET /admin/api/strategy/fundamentals-source`) call this, so the mode the host runs on and the
+    mode the portal reports can never disagree."""
+    resolved = (mode or os.getenv("LIVE_FUNDAMENTALS_PROVIDER") or PROVIDER_MODE_YAHOO).strip().lower()
+    return PROVIDER_MODE_PIT if resolved == PROVIDER_MODE_PIT else PROVIDER_MODE_YAHOO
+
+
 class RoutingFundamentalsAsOf:
     """`FundamentalsAsOf` that routes each name to its jurisdiction's PIT source, falling back to the
     forward-only Yahoo snapshot on a miss/empty — the live wiring the epic's Task 14 installs.
@@ -364,9 +380,10 @@ def build_fundamentals_provider(
     - `mode='pit'` → `RoutingFundamentalsAsOf(PIT, Yahoo)`: US/UK read the PIT warehouse with a Yahoo
       fallback, OTHER reads Yahoo. Reversible — flip back to `yahoo` to restore the bare snapshot.
 
-    `mode` defaults to `LIVE_FUNDAMENTALS_PROVIDER` (env), then `yahoo`. `pit_provider` is injectable for
+    `mode` defaults to `LIVE_FUNDAMENTALS_PROVIDER` (env), then `yahoo` (via `resolve_provider_mode`,
+    the single source of truth shared with the observability endpoint). `pit_provider` is injectable for
     tests (otherwise a `PitFundamentalsAsOf` over fundamentals-api is built)."""
-    resolved = (mode or os.getenv("LIVE_FUNDAMENTALS_PROVIDER") or PROVIDER_MODE_YAHOO).strip().lower()
+    resolved = resolve_provider_mode(mode)
     yahoo = YahooFundamentalsAsOf(client)
     if resolved != PROVIDER_MODE_PIT:
         # Default + explicit `yahoo`: forward-only snapshot only (pre-Task-14 behaviour, reversible).
