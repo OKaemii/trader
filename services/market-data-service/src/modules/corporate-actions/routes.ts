@@ -30,7 +30,7 @@ export function createCorporateActionsRouter(
   // dividends, ex-date <= asOf) over the close at/<= asOf — a unit-consistent, point-in-time yield.
   // A ticker with no price as-of returns `dividendYield: null` (the host omits the leg; never a
   // fabricated 0). Reads only the store + bars this service owns — no cross-service hop.
-  r.get('/internal/api/dividend-yield', parseInternalHeaders('strategy-engine'), async (c) => {
+  r.get('/internal/api/dividend-yield', parseInternalHeaders('strategy-engine', 'fundamentals-api'), async (c) => {
     const tickers = (c.req.query('tickers') ?? '').split(',').map((t) => t.trim()).filter(Boolean);
     if (tickers.length === 0) return c.json({ error: 'tickers query param required (comma-separated)' }, 400);
     const asOfRaw = Number(c.req.query('asOf'));

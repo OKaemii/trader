@@ -46,8 +46,17 @@ spec:
               value: trader
             # Redis read-through cache fronting the as-of resolver (mirrors pg-bar-reader.ts). The in-cluster
             # Redis service; a Redis blip degrades to an uncached (still-correct) read, never a failure.
+            # ALSO the consumer-side FX path for the Gap-2 PIT market cap: market-data-service publishes the
+            # GBP/USD rate to fx:GBPUSD:lastGood here, which the MarketDataReader reads for fx_to_gbp.
             - name: REDIS_URL
               value: "redis://redis:6379"
+            # market-data-service base URL — the Gap-2 in-cluster reads (epic Task 12): the as-of adjusted
+            # daily close (the SAME series momentum uses) for the PIT market cap, and the point-in-time
+            # dividend-yield leg, both over the internal bars + /internal/api/dividend-yield endpoints with
+            # an internal JWT. Same in-cluster default strategy-engine's MarketDataClient uses; JWT_SECRET
+            # for the mint is already injected via the trader-secrets envFrom above.
+            - name: MARKET_DATA_SERVICE_URL
+              value: "http://market-data-service:3002"
           resources:
             requests:
               cpu: "100m"

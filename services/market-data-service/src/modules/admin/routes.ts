@@ -539,7 +539,7 @@ export function createInternalBarsRouter(universeManager: UniverseManager): Hono
   const r = new Hono();
 
 
-  r.get('/internal/api/market-data/bars/:ticker', parseInternalHeaders('strategy-engine'), async (c) => {
+  r.get('/internal/api/market-data/bars/:ticker', parseInternalHeaders('strategy-engine', 'fundamentals-api'), async (c) => {
     const ticker   = c.req.param('ticker')!;
     const interval = (c.req.query('interval') ?? 'daily') as BarInterval;
     const range    = (c.req.query('range')    ?? '30d')   as RangeKey;
@@ -566,7 +566,7 @@ export function createInternalBarsRouter(universeManager: UniverseManager): Hono
 
   r.post(
     '/internal/api/market-data/bars',
-    parseInternalHeaders('strategy-engine'),
+    parseInternalHeaders('strategy-engine', 'fundamentals-api'),
     zValidator('json', MarketDataContracts.InternalBarsRequestSchema, (result, c) => {
       if (!result.success) return c.json({ error: 'invalid body', issues: result.error.issues }, 400);
     }),
