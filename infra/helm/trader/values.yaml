@@ -149,6 +149,16 @@ global:
     # close + the warehouse-snapshot (23:30 UTC), so a day's filings have been accepted and the snapshot
     # isn't contended. The one-shot backfill Job is hook-gated separately (see the subchart).
     fundamentalsIngestCron: "30 2 * * *"
+    # Self-heal CronJob schedule (`python -m src.ingest --heal`) — UTC cron. A SECOND, more frequent pass
+    # alongside the nightly full walk: it ingests ONLY the missing/stale curated-US subset (via the
+    # freshness audit), so a newly-curated or stale name converges intra-day rather than waiting for the
+    # next nightly tick. Idempotent + Forbid, so an overlap with the nightly job is harmless.
+    fundamentalsHealCron: "0 */6 * * *"
+    # Self-heal staleness window (days). A covered name whose freshest fiscal period_end is older than
+    # this is treated as stale and re-ingested by the heal run. Default 135 ≈ a reporting quarter (~90d)
+    # plus a ~45d filing-grace buffer; a non-positive value is ignored (the window can never be silently
+    # disabled — that would make every name look fresh and heal nothing).
+    fundamentalsStaleAfterDays: "135"
     # Coverage set the ingest run walks: universe_plus_index (active T212 universe ∪ point-in-time US
     # S&P members — the default) | universe_only | index_only. A small default cap keeps a first
     # backfill bounded (FUNDAMENTALS_COVERAGE_CAP env, default 64; 0 ⇒ uncapped — the operator's opt-in
