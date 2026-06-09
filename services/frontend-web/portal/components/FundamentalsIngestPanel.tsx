@@ -1,12 +1,12 @@
 'use client'
 
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { FundamentalsSourceTag } from '@/components/FundamentalsSourceTag'
 import { QuantOnly } from '@/components/QuantOnly'
 import {
   buildSummary,
   filterRows,
   mergeFundamentalsRows,
-  provenanceKind,
   sortRows,
   type FreshnessAudit,
   type FundamentalsSource,
@@ -534,27 +534,6 @@ function fmtDateUTC(ms: number | null): string {
   return new Date(ms).toISOString().slice(0, 10)
 }
 
-// Provenance tag for the table's Source column. Inline for this card; card 10 swaps in the reusable
-// <FundamentalsSourceTag>. "PIT" = ours (SEC EDGAR); "Yahoo" = third-party; "—" = no source row yet.
-function SourceTag({ source }: { source: string | null }) {
-  const kind = provenanceKind(source)
-  if (kind === 'pit') {
-    return (
-      <span className="rounded bg-emerald-950 px-1.5 py-0.5 text-[11px] font-semibold text-emerald-300" title={source ?? undefined}>
-        PIT
-      </span>
-    )
-  }
-  if (kind === 'yahoo') {
-    return (
-      <span className="rounded bg-gray-800 px-1.5 py-0.5 text-[11px] font-semibold text-gray-300" title={source ?? undefined}>
-        Yahoo
-      </span>
-    )
-  }
-  return <span className="text-gray-600" title={source ?? undefined}>—</span>
-}
-
 // Always-visible operator summary: the live strategy source line + the warehouse coverage gate. This
 // is operational state (what's serving the live cycle, whether Yahoo is retirable), so NEVER mode-gated.
 function FundamentalsSummaryCard({ summary }: { summary: ReturnType<typeof buildSummary> }) {
@@ -728,7 +707,7 @@ function FundamentalsStateTable({
                   view.map((r) => (
                     <tr key={r.ticker} className="border-b border-gray-900 last:border-0">
                       <td className="py-1.5 pr-3 font-mono text-gray-200">{r.ticker}</td>
-                      <td className="py-1.5 pr-3"><SourceTag source={r.source} /></td>
+                      <td className="py-1.5 pr-3"><FundamentalsSourceTag source={r.source} /></td>
                       <td className="py-1.5 pr-3">
                         {r.covered == null ? (
                           <span className="text-gray-600">—</span>

@@ -1,6 +1,7 @@
 'use client'
 
 import { useMemo, useState } from 'react'
+import { FundamentalsSourceTag } from '@/components/FundamentalsSourceTag'
 import { MarketBadge } from '@/components/MarketBadge'
 import { TickerChip } from '@/components/TickerChip'
 
@@ -12,6 +13,9 @@ interface Ratios { roe: number; debtToEquity: number; currentRatio: number }
 interface Row {
   ticker: string; name: string; market: string; sector: string
   marketCapGbp: number | null; ratios: Ratios | null; qualityPass: boolean | null
+  // card 148: per-name fundamentals provenance — 'pit-edgar' | 'yahoo' | 'eodhd' | null
+  // (null = not yet fetched). Tagged honestly by <FundamentalsSourceTag> in the row.
+  source: string | null
 }
 interface Snapshot { universeSize: number; qualityKnown: number; qualityPassCount: number; rows: Row[] }
 interface Health {
@@ -27,6 +31,15 @@ const fmtCap = (v: number | null): string =>
   v == null ? '—' : v >= 1e9 ? `£${(v / 1e9).toFixed(1)}B` : `£${(v / 1e6).toFixed(0)}M`
 const pct = (v: number): string => `${(v * 100).toFixed(1)}%`
 const QMJ_TITLE = 'QMJ quality screen (fail-closed): ROE ≥ 10% ∧ Debt/Equity ≤ 2.0 ∧ Current ratio ≥ 1.0'
+// The scanner's own QMJ snapshot is a SEPARATE source from the live PIT strategy seam: it's the
+// market-data-service FUNDAMENTALS_PROVIDER (its own cache), which serves US names from the PIT
+// SEC-EDGAR warehouse and other names from the Yahoo snapshot. Per-name provenance is the source
+// tag in each row; this value is just the effective screener provider. Not the strategy's
+// LIVE_FUNDAMENTALS_PROVIDER (that one is on Operations › PIT Fundamentals).
+const SCREENER_FUND_TITLE =
+  'Fundamentals the screener (market-data-service) uses to compute QMJ — PIT (our SEC-EDGAR ' +
+  'warehouse) for US names, Yahoo (third-party snapshot) for the rest. Per-name provenance is the ' +
+  'Source tag in each row. This is the screener’s own cache, separate from the live PIT strategy source.'
 
 type MarketFilter = 'ALL' | 'US' | 'LSE'
 type SortKey = 'cap' | 'ticker' | 'sector' | 'roe'
@@ -135,7 +148,11 @@ export function ScannerPanel({
             <span>EODHD credits today: <span className="text-gray-100">{health.eodhd.callsUsedToday} / {health.eodhd.dailyCallLimit}</span></span>
             <span>Universe source: <span className="text-gray-100">{health.config.universeSource}</span></span>
             <span>Daily provider: <span className="text-gray-100">{health.config.dailyHistoryProvider}</span></span>
-            <span>Fundamentals src: <span className="text-gray-100">{health.config.fundamentalsProvider}</span> ({health.fundamentals.count} cached / {health.fundamentals.passing} pass)</span>
+            <span title={SCREENER_FUND_TITLE}>
+              Screener fundamentals — PIT (US) / Yahoo (other):{' '}
+              <span className="text-gray-100">{health.config.fundamentalsProvider}</span>{' '}
+              ({health.fundamentals.count} cached / {health.fundamentals.passing} pass)
+            </span>
             <span>Min market cap: <span className="text-gray-100">{fmtCap(health.config.minMarketCapGbp)}</span></span>
             <span>Bulk EOD {health.feed.date}: US <span className={health.feed.usPulledToday ? 'text-emerald-400' : 'text-amber-300'}>{health.feed.usPulledToday ? '✓' : 'pending'}</span>, LSE <span className={health.feed.lsePulledToday ? 'text-emerald-400' : 'text-amber-300'}>{health.feed.lsePulledToday ? '✓' : 'pending'}</span></span>
           </div>
@@ -199,6 +216,7 @@ export function ScannerPanel({
                 <th className="px-3 py-2 font-normal">Name</th>
                 <th className="px-3 py-2 font-normal">Mkt</th>
                 <th className="px-3 py-2 font-normal">Sector</th>
+                <th className="px-3 py-2 font-normal" title={SCREENER_FUND_TITLE}>Source</th>
                 <th className="px-3 py-2 text-right font-normal">Mkt cap</th>
                 <th className="px-3 py-2 text-right font-normal">ROE</th>
                 <th className="px-3 py-2 text-right font-normal">D/E</th>
@@ -218,6 +236,7 @@ export function ScannerPanel({
                     <td className="px-3 py-1.5 text-gray-400" title={r.name}>{truncate(r.name, 30)}</td>
                     <td className="px-3 py-1.5"><MarketBadge market={(r.market === 'US' || r.market === 'LSE') ? r.market : 'OTHER'} /></td>
                     <td className="px-3 py-1.5 text-gray-400">{r.sector}</td>
+                    <td className="px-3 py-1.5"><FundamentalsSourceTag source={r.source} /></td>
                     <td className="px-3 py-1.5 text-right font-mono">{fmtCap(r.marketCapGbp)}</td>
                     <td className="px-3 py-1.5 text-right">{r.ratios ? pct(r.ratios.roe) : '—'}</td>
                     <td className="px-3 py-1.5 text-right">{r.ratios ? r.ratios.debtToEquity.toFixed(2) : '—'}</td>
@@ -233,7 +252,7 @@ export function ScannerPanel({
                 )
               })}
               {rows.length === 0 && (
-                <tr><td colSpan={9} className="px-3 py-6 text-center text-gray-500">No names match the filter.</td></tr>
+                <tr><td colSpan={10} className="px-3 py-6 text-center text-gray-500">No names match the filter.</td></tr>
               )}
             </tbody>
           </table>
