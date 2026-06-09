@@ -17,6 +17,15 @@ CLI:
     python -m src.ingest --full          # from-scratch backfill (same set; the writers are idempotent)
     python -m src.ingest --tickers AAPL,MSFT   # a one-off subset (bare US symbols) — the backfill-Job demo
     python -m src.ingest --cap 32        # override the coverage cap for this run
+    python -m src.ingest --heal          # self-heal: ingest ONLY the missing/stale curated-US subset
+
+SELF-HEAL (`--heal`): the nightly full walk keeps steady-state, but a newly-curated or stale name should
+converge intra-day without waiting for the next nightly tick. With `--heal` the run resolves the full
+coverage set as usual, then narrows it to the missing/stale subset via `freshness.freshness_audit` (the
+SAME per-name coverage+staleness query the `…/freshness` endpoint serves — one source of truth for "what
+is stale"), and the orchestrator ingests only that subset. The write path is byte-for-byte the full
+walk's (idempotent, hash-gated), so this is a smaller, more frequent convergence pass, not a second code
+path. Without `--heal` the resolved coverage set is ingested unchanged.
 
 ENV (surfaced by the CronJob/Job templates):
     EDGAR_USER_AGENT          mandatory descriptive UA — SEC fails closed without it (the run logs +
@@ -24,6 +33,8 @@ ENV (surfaced by the CronJob/Job templates):
     EDGAR_REQS_PER_SEC        SEC rate budget (default 10/s).
     FUNDAMENTALS_COVERAGE     mode: universe_plus_index (default) | universe_only | index_only.
     FUNDAMENTALS_COVERAGE_CAP small default cap on the coverage set (0 ⇒ uncapped).
+    FUNDAMENTALS_STALE_AFTER_DAYS  self-heal staleness window in days (default 135 ≈ a reporting quarter
+                              plus a filing-grace buffer); `--stale-after-days` overrides it for one run.
     TIMESCALE_URL / MONGODB_URL / MONGODB_DB   the stores (assembled by the templates like the
                               warehouse-snapshot CronJob / backtest-engine).
 
@@ -74,6 +85,20 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         type=int,
         default=_DEFAULT_WINDOW_YEARS,
         help="Survivorship-free index-union lookback in years (every S&P member over the window).",
+    )
+    p.add_argument(
+        "--heal",
+        action="store_true",
+        help="Self-heal: after resolving the full coverage set, ingest ONLY the missing/stale "
+             "curated-US subset (via freshness.freshness_audit). The 6-hourly heal CronJob's mode — a "
+             "smaller, more frequent convergence pass on top of the nightly full walk.",
+    )
+    p.add_argument(
+        "--stale-after-days",
+        type=int,
+        default=None,
+        help="Staleness window in days for --heal (a covered name whose freshest fiscal period is older "
+             "is healed). Absent ⇒ FUNDAMENTALS_STALE_AFTER_DAYS (default 135). Ignored without --heal.",
     )
     return p.parse_args(argv)
 
@@ -157,7 +182,14 @@ async def run_async(args: argparse.Namespace) -> int:
         if not symbols:
             log.warning("[ingest] no coverage symbols resolved — nothing to do")
             return 0
-        log.info("[ingest] starting run: %d symbols, full=%s", len(symbols), args.full)
+        if args.heal:
+            # Self-heal: narrow the resolved set to only the missing/stale curated-US names (the full
+            # walk stays the steady-state nightly job; this converges newly-curated/stale names intra-day).
+            symbols = await _filter_stale_symbols(symbols, args)
+            if not symbols:
+                log.info("[ingest] --heal: coverage already fresh — nothing to heal")
+                return 0
+        log.info("[ingest] starting run: %d symbols, full=%s heal=%s", len(symbols), args.full, args.heal)
         summary = await orchestrator.run(symbols)
         log.info(
             "[ingest] DONE requested=%d ingested=%d skipped=%d raw_written=%d "
@@ -205,6 +237,67 @@ async def _resolve_symbols(args: argparse.Namespace) -> list[str]:
         return await load_coverage(db, window_lo_ms=lo_ms, window_hi_ms=now_ms, mode=mode, cap=cap)
     finally:
         client.close()
+
+
+def _stale_after_days(args: argparse.Namespace) -> Optional[int]:
+    """The self-heal staleness window in days: the `--stale-after-days` flag, else
+    `FUNDAMENTALS_STALE_AFTER_DAYS`, else None (⇒ `stale_after_ms_from_days` applies the 135-day
+    default). A non-positive/unparseable env is ignored (the default window can never be silently
+    disabled — that would make every name look fresh and heal nothing)."""
+    if args.stale_after_days is not None:
+        return args.stale_after_days
+    raw = os.getenv("FUNDAMENTALS_STALE_AFTER_DAYS", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("[ingest] FUNDAMENTALS_STALE_AFTER_DAYS=%r is not an int; using the default window", raw)
+        return None
+
+
+async def _filter_stale_symbols(symbols: list[str], args: argparse.Namespace) -> list[str]:
+    """Narrow the resolved coverage set to the missing/stale subset for a `--heal` run.
+
+    Reuses `freshness.freshness_audit` — the SAME per-name coverage+staleness query the `…/freshness`
+    endpoint serves — as the single source of truth for "which curated-US names are missing or stale",
+    rather than re-deriving staleness here. The audit walks the curated US universe and flags each name
+    `stale = (not covered) or (period_end older than the window)`; we keep only the resolved-coverage
+    symbols that are in that stale set, so heal fetches exactly the names that need a refresh (a fresh,
+    fully-covered name is skipped — the orchestrator would no-op it anyway, but skipping it up front
+    saves the EDGAR round-trip under the shared rate budget).
+
+    Intersecting against `symbols` (the already-resolved coverage set) keeps the run's existing scope
+    rules intact: an index-only remainder name outside the freshness universe is simply not in the stale
+    set, so heal stays focused on the curated-US freshness gate. Opens its own short-lived Mongo client
+    (as `_resolve_symbols`/`_effective_user_agent` do) and uses the already-open singleton asyncpg pool."""
+    from motor.motor_asyncio import AsyncIOMotorClient
+
+    from src.freshness import freshness_audit, stale_after_ms_from_days
+    from src.security_master.pool import get_pool
+
+    now_ms = int(time.time() * 1000)
+    stale_after_ms = stale_after_ms_from_days(_stale_after_days(args))
+
+    pool = await get_pool()
+    mongo_url = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
+    mongo_db_name = os.getenv("MONGODB_DB", "trader")
+    client = AsyncIOMotorClient(mongo_url)
+    try:
+        audit = await freshness_audit(
+            pool, client[mongo_db_name], now_ms=now_ms, stale_after_ms=stale_after_ms
+        )
+    finally:
+        client.close()
+
+    stale_set = {n["symbol"] for n in audit["names"] if n["stale"]}
+    subset = [s for s in symbols if s in stale_set]
+    log.info(
+        "[ingest] --heal: %d/%d coverage symbols missing/stale (covered=%d, stale=%d of %d curated; "
+        "stale_after_ms=%d)",
+        len(subset), len(symbols), audit["covered"], audit["stale"], audit["universe"], stale_after_ms,
+    )
+    return subset
 
 
 def main(argv: Optional[list[str]] = None) -> int:
