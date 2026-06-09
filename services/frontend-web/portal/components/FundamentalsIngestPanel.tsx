@@ -1,25 +1,44 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { QuantOnly } from '@/components/QuantOnly'
+import {
+  buildSummary,
+  filterRows,
+  mergeFundamentalsRows,
+  provenanceKind,
+  sortRows,
+  type FreshnessAudit,
+  type FundamentalsSource,
+  type MergedRow,
+  type RowFilter,
+  type SortDir,
+  type SortKey,
+} from '@/app/lib/fundamentals-merge'
 
-// Operations › PIT Fundamentals panel (card 134) — the operator surface over the
-// fundamentals-ingestion write-side. Three jobs in one client component, SSR-seeded by the tab:
+// Operations › PIT Fundamentals panel (card 134, extended by card 149) — the operator surface over
+// the fundamentals-ingestion write-side. Jobs in one client component, SSR-seeded by the tab:
 //   1. MONITOR  — coverage (instruments + facts), ingestion lag, last force-run state, quarantine
 //                 count, and feed-health (effective EDGAR UA + provenance + ingest-enabled).
 //                 Polls /portal-api/admin/fundamentals-ingest/status every 15s like the other
 //                 operator cards (a background CronJob run moves coverage without us triggering it,
 //                 so a static view would lie).
-//   2. FORCE    — "Run ingest now" → POST …/force (single-flight in-cluster run), then polls
+//   2. SUMMARY + STATE TABLE (card 149) — an always-visible PIT-fundamentals summary (live strategy
+//                 source · PIT coverage C/U · stale N · retirable yes/no · last ingest run) and a full
+//                 per-ticker table merging the freshness audit (warehouse side) with the strategy
+//                 by_ticker map (consume side) so BOTH clocks show per row: when we last STORED a fact
+//                 (ingest) vs when the strategy last READ+BUILT it. Sortable / filterable. Both reads
+//                 poll on the same 15s cadence as status. This data is operational, so NOT mode-gated.
+//   3. FORCE    — "Run ingest now" → POST …/force (single-flight in-cluster run), then polls
 //                 …/runs/{run_id} until done|failed, surfacing the live counts. Confirm-before-run +
 //                 disabled-while-running, matching the panic-control affordances.
-//   3. UA EDITOR — the EDGAR User-Agent the next run sends to SEC, bound to GET/PUT …/config
+//   4. UA EDITOR — the EDGAR User-Agent the next run sends to SEC, bound to GET/PUT …/config
 //                 (portal_fundamentals_config override > env > default). Shows the effective value +
 //                 where it came from; PUT persists the override; an empty value clears it back.
 //
-// Operational status + the operator controls are NEVER mode-gated (per the portal safety contract);
-// only the quarantine by-reason breakdown — a forensic QA detail, not a control — sits under
-// <QuantOnly>.
+// Operational status, the summary, the state table, and the operator controls are NEVER mode-gated
+// (per the portal safety contract); only the quarantine forensics — the by-reason breakdown and the
+// per-name quarantine lookup — sit under <QuantOnly>.
 
 // ── Mirrors the fundamentals-ingestion /status payload (snake_case, ms timestamps). ─────────────
 interface RunRecord {
@@ -77,6 +96,10 @@ interface IngestConfig {
 interface Props {
   initialStatus: IngestStatus | null
   initialConfig: IngestConfig | null
+  // card 149: per-name freshness audit (warehouse side) + live strategy source map (consume side),
+  // SSR-seeded by the tab. Either may be null (cold/unreachable upstream) without blanking the panel.
+  initialFreshness?: FreshnessAudit | null
+  initialSource?: FundamentalsSource | null
 }
 
 function agoMs(ms: number | null): string {
@@ -115,9 +138,19 @@ const SOURCE_LABEL: Record<string, string> = {
 
 const RUN_DONE = (s: string | null | undefined) => s === 'done' || s === 'failed'
 
-export function FundamentalsIngestPanel({ initialStatus, initialConfig }: Props) {
+export function FundamentalsIngestPanel({
+  initialStatus,
+  initialConfig,
+  initialFreshness = null,
+  initialSource = null,
+}: Props) {
   const [status, setStatus] = useState<IngestStatus | null>(initialStatus)
   const [config, setConfig] = useState<IngestConfig | null>(initialConfig)
+
+  // card 149: the two provenance reads behind the summary + per-ticker state table. Polled alongside
+  // status so a background ingest / strategy cycle is reflected without an operator refresh.
+  const [freshness, setFreshness] = useState<FreshnessAudit | null>(initialFreshness)
+  const [source, setSource] = useState<FundamentalsSource | null>(initialSource)
 
   // UA editor — seed the input from the EFFECTIVE config; '' (after edit) means "clear the override".
   const [uaInput, setUaInput] = useState<string>(initialConfig?.edgarUserAgent ?? '')
@@ -139,14 +172,46 @@ export function FundamentalsIngestPanel({ initialStatus, initialConfig }: Props)
     }
   }
 
-  // 15s status poll — matches the circuit-breaker / auto-approve cadence.
+  // card 149: refresh the per-ticker provenance reads. Each is independent — a failure on one (or a
+  // null/cold body) leaves the prior value rather than blanking the table, mirroring refreshStatus.
+  async function refreshProvenance(): Promise<void> {
+    try {
+      const r = await fetch('/portal-api/admin/fundamentals-ingest/freshness', { cache: 'no-store' })
+      if (r.ok) {
+        const b = await r.json().catch(() => null)
+        if (b) setFreshness(b)
+      }
+    } catch {
+      // transient — keep the last good freshness
+    }
+    try {
+      const r = await fetch('/portal-api/admin/strategy/fundamentals-source', { cache: 'no-store' })
+      if (r.ok) {
+        const b = await r.json().catch(() => null)
+        if (b) setSource(b)
+      }
+    } catch {
+      // transient — keep the last good source map
+    }
+  }
+
+  // 15s poll — matches the circuit-breaker / auto-approve cadence. Status + the two provenance reads
+  // refresh together so coverage, the summary, and the table never drift apart between ticks.
   useEffect(() => {
-    const id = setInterval(refreshStatus, 15_000)
+    const id = setInterval(() => {
+      void refreshStatus()
+      void refreshProvenance()
+    }, 15_000)
     return () => clearInterval(id)
   }, [])
 
   // Stop any in-flight run poller on unmount.
   useEffect(() => () => { if (runPoll.current) clearInterval(runPoll.current) }, [])
+
+  // card 149: derive the summary + the merged per-ticker rows once per (freshness, source) change.
+  // Must be declared with the other hooks (before any early return) to satisfy rules-of-hooks.
+  const summary = useMemo(() => buildSummary(freshness, source), [freshness, source])
+  const mergedRows = useMemo(() => mergeFundamentalsRows(freshness, source), [freshness, source])
 
   // ── UA editor ────────────────────────────────────────────────────────────────────────────────
   async function saveUa(): Promise<void> {
@@ -251,7 +316,10 @@ export function FundamentalsIngestPanel({ initialStatus, initialConfig }: Props)
   }
 
   // ── Render ───────────────────────────────────────────────────────────────────────────────────
-  if (!status && !config) {
+  // Only show the wholesale "unavailable" fallback when EVERY read is cold. status/config back the
+  // monitor + controls; freshness/source back the summary + per-ticker table — those come from
+  // independent upstreams, so a status-service blip must not hide the always-visible coverage summary.
+  if (!status && !config && !freshness && !source) {
     return (
       <div className="rounded border border-amber-900 bg-amber-950 px-4 py-2 text-sm text-amber-300">
         PIT-fundamentals status unavailable — the ingestion service may be unreachable. The controls
@@ -317,6 +385,12 @@ export function FundamentalsIngestPanel({ initialStatus, initialConfig }: Props)
         </dl>
       </div>
 
+      {/* ── PIT-fundamentals summary + per-ticker state table (card 149) ───────────────────────────
+          Always-visible (operational, not mode-gated): the live-source line, PIT coverage, stale
+          count, the retirable gate, and the full per-ticker table with BOTH provenance clocks. */}
+      <FundamentalsSummaryCard summary={summary} />
+      <FundamentalsStateTable rows={mergedRows} hasFreshness={!!freshness} hasSource={!!source} />
+
       {/* Quarantine by-reason — a forensic QA breakdown, not a control: quant-only detail. */}
       {status && status.quarantine.total > 0 && Object.keys(status.quarantine.by_reason).length > 0 && (
         <QuantOnly>
@@ -332,6 +406,11 @@ export function FundamentalsIngestPanel({ initialStatus, initialConfig }: Props)
           </div>
         </QuantOnly>
       )}
+
+      {/* Per-name quarantine lookup — forensic QA only (not a control): quant-only. */}
+      <QuantOnly>
+        <QuarantineLookup />
+      </QuantOnly>
 
       {/* ── Force ingest ──────────────────────────────────────────────────────────────────────── */}
       <div className="rounded border border-gray-800 bg-gray-900 p-4">
@@ -443,5 +522,386 @@ function RunBadge({ run }: { run: RunRecord | null }) {
       {run.state}
       {run.state !== 'running' && run.finished_at_ms ? ` · ${agoMs(run.finished_at_ms)}` : ''}
     </span>
+  )
+}
+
+// ── card 149 helpers + sub-components ───────────────────────────────────────────────────────────
+
+// UTC calendar date (yyyy-mm-dd) for a ms timestamp. The bi-temporal model is UTC-anchored, so the
+// table renders dates in UTC to keep period-end / availability / store / build instants comparable.
+function fmtDateUTC(ms: number | null): string {
+  if (ms == null) return '—'
+  return new Date(ms).toISOString().slice(0, 10)
+}
+
+// Provenance tag for the table's Source column. Inline for this card; card 10 swaps in the reusable
+// <FundamentalsSourceTag>. "PIT" = ours (SEC EDGAR); "Yahoo" = third-party; "—" = no source row yet.
+function SourceTag({ source }: { source: string | null }) {
+  const kind = provenanceKind(source)
+  if (kind === 'pit') {
+    return (
+      <span className="rounded bg-emerald-950 px-1.5 py-0.5 text-[11px] font-semibold text-emerald-300" title={source ?? undefined}>
+        PIT
+      </span>
+    )
+  }
+  if (kind === 'yahoo') {
+    return (
+      <span className="rounded bg-gray-800 px-1.5 py-0.5 text-[11px] font-semibold text-gray-300" title={source ?? undefined}>
+        Yahoo
+      </span>
+    )
+  }
+  return <span className="text-gray-600" title={source ?? undefined}>—</span>
+}
+
+// Always-visible operator summary: the live strategy source line + the warehouse coverage gate. This
+// is operational state (what's serving the live cycle, whether Yahoo is retirable), so NEVER mode-gated.
+function FundamentalsSummaryCard({ summary }: { summary: ReturnType<typeof buildSummary> }) {
+  const providerLabel =
+    summary.provider === 'pit' ? 'PIT (SEC EDGAR)' : summary.provider === 'yahoo' ? 'Yahoo' : '—'
+  const coverage =
+    summary.covered != null && summary.universe != null
+      ? `${summary.covered}/${summary.universe}`
+      : '—'
+  return (
+    <div className="rounded border border-gray-800 bg-gray-900 p-4" data-testid="fundamentals-summary">
+      <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-400">
+        PIT-fundamentals summary
+      </h3>
+      <div className="mt-2 flex flex-wrap items-center gap-x-6 gap-y-2 text-sm">
+        <span className="text-gray-300">
+          Live strategy source:{' '}
+          <span className="font-semibold text-gray-100">{providerLabel}</span>
+          {summary.provider != null && (
+            <span className="text-gray-400">
+              {' '}
+              — <span className="text-emerald-300">pit-edgar {summary.pitServed ?? '—'}</span>
+              {' / '}
+              <span className="text-gray-300">yahoo-snapshot {summary.yahooServed ?? '—'}</span>
+              {summary.nullServed ? <span className="text-amber-300"> / null {summary.nullServed}</span> : null}
+            </span>
+          )}
+        </span>
+        <span className="text-gray-300">
+          PIT coverage: <span className="font-semibold text-gray-100">{coverage}</span>
+        </span>
+        <span className="text-gray-300">
+          stale:{' '}
+          <span className={`font-semibold ${summary.stale ? 'text-amber-300' : 'text-gray-100'}`}>
+            {summary.stale ?? '—'}
+          </span>
+        </span>
+        <span className="text-gray-300">
+          retirable:{' '}
+          <span
+            className={`font-semibold ${
+              summary.retirable === true
+                ? 'text-emerald-400'
+                : summary.retirable === false
+                  ? 'text-amber-300'
+                  : 'text-gray-100'
+            }`}
+          >
+            {summary.retirable == null ? '—' : summary.retirable ? 'yes' : 'no'}
+          </span>
+        </span>
+        <span className="text-gray-300">
+          last ingest run:{' '}
+          <span className="font-semibold text-gray-100">{agoMs(summary.lastIngestRunMs)}</span>
+          {summary.lastIngestRunState ? (
+            <span className="text-gray-500"> ({summary.lastIngestRunState})</span>
+          ) : null}
+        </span>
+      </div>
+    </div>
+  )
+}
+
+const FILTERS: { key: RowFilter; label: string }[] = [
+  { key: 'all', label: 'All' },
+  { key: 'stale', label: 'Stale' },
+  { key: 'missing', label: 'Missing' },
+  { key: 'pit', label: 'PIT' },
+  { key: 'yahoo', label: 'Yahoo' },
+]
+
+// Full per-ticker state table merging the freshness audit (warehouse: covered · fiscal period ·
+// availability · last stored · stale) with the strategy by_ticker map (consume: source · last
+// read+built). Both clocks per row — the whole point: "last stored" (ingest) ≠ "last read+built"
+// (strategy). Sortable + filterable. Always-visible (operational), not mode-gated.
+function FundamentalsStateTable({
+  rows,
+  hasFreshness,
+  hasSource,
+}: {
+  rows: MergedRow[]
+  hasFreshness: boolean
+  hasSource: boolean
+}) {
+  const [sortKey, setSortKey] = useState<SortKey>('ticker')
+  const [sortDir, setSortDir] = useState<SortDir>('asc')
+  const [filter, setFilter] = useState<RowFilter>('all')
+  const [query, setQuery] = useState('')
+
+  const view = useMemo(
+    () => sortRows(filterRows(rows, filter, query), sortKey, sortDir),
+    [rows, filter, query, sortKey, sortDir],
+  )
+
+  function toggleSort(key: SortKey): void {
+    if (key === sortKey) {
+      setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))
+    } else {
+      setSortKey(key)
+      setSortDir(key === 'ticker' || key === 'source' ? 'asc' : 'desc')
+    }
+  }
+
+  return (
+    <div className="rounded border border-gray-800 bg-gray-900 p-4" data-testid="fundamentals-state-table">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-400">
+          Per-ticker state
+        </h3>
+        <div className="flex flex-wrap items-center gap-2">
+          <input
+            type="text"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="filter ticker…"
+            spellCheck={false}
+            className="w-36 rounded border border-gray-700 bg-gray-950 px-2 py-1 text-xs text-gray-100 focus:border-emerald-600 focus:outline-none"
+          />
+          <div className="flex gap-1">
+            {FILTERS.map((f) => (
+              <button
+                key={f.key}
+                type="button"
+                onClick={() => setFilter(f.key)}
+                className={`rounded px-2 py-1 text-xs ${
+                  filter === f.key
+                    ? 'bg-emerald-800 text-emerald-100'
+                    : 'bg-gray-800 text-gray-400 hover:text-gray-200'
+                }`}
+              >
+                {f.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {!hasFreshness && !hasSource ? (
+        <p className="mt-3 text-sm text-amber-300">
+          Per-ticker state unavailable — freshness + source reads are cold or unreachable.
+        </p>
+      ) : (
+        <>
+          <p className="mt-1 text-[11px] text-gray-500">
+            Two clocks per row: <span className="text-gray-400">last stored</span> = when our ingest
+            last persisted a fact · <span className="text-gray-400">last read+built</span> = when the
+            live strategy last read it and built this name&apos;s factors.
+          </p>
+          <div className="mt-2 overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead>
+                <tr className="border-b border-gray-800 text-gray-500">
+                  <Th label="Ticker" col="ticker" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                  <Th label="Source" col="source" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                  <Th label="Covered" col="covered" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                  <Th label="Fiscal period (obs)" col="fiscal" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                  <Th label="Availability (know.)" col="availability" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                  <Th label="Last stored (ingest)" col="lastStored" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                  <Th label="Last read+built (strat.)" col="lastReadBuilt" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                  <Th label="Stale?" col="stale" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                </tr>
+              </thead>
+              <tbody>
+                {view.length === 0 ? (
+                  <tr>
+                    <td colSpan={8} className="py-3 text-center text-gray-500">
+                      No tickers match this filter.
+                    </td>
+                  </tr>
+                ) : (
+                  view.map((r) => (
+                    <tr key={r.ticker} className="border-b border-gray-900 last:border-0">
+                      <td className="py-1.5 pr-3 font-mono text-gray-200">{r.ticker}</td>
+                      <td className="py-1.5 pr-3"><SourceTag source={r.source} /></td>
+                      <td className="py-1.5 pr-3">
+                        {r.covered == null ? (
+                          <span className="text-gray-600">—</span>
+                        ) : r.covered ? (
+                          <span className="text-emerald-400">yes</span>
+                        ) : (
+                          <span className="text-amber-300">no</span>
+                        )}
+                      </td>
+                      <td className="py-1.5 pr-3 text-gray-300" title={r.fiscalPeriodMs ? new Date(r.fiscalPeriodMs).toISOString() : undefined}>
+                        {fmtDateUTC(r.fiscalPeriodMs)}
+                      </td>
+                      <td className="py-1.5 pr-3 text-gray-300" title={r.availabilityMs ? new Date(r.availabilityMs).toISOString() : undefined}>
+                        {fmtDateUTC(r.availabilityMs)}
+                      </td>
+                      <td className="py-1.5 pr-3 text-gray-300" title={r.lastStoredMs ? new Date(r.lastStoredMs).toISOString() : undefined}>
+                        {agoMs(r.lastStoredMs)}
+                      </td>
+                      <td className="py-1.5 pr-3 text-gray-300" title={r.lastReadBuiltMs ? new Date(r.lastReadBuiltMs).toISOString() : undefined}>
+                        {agoMs(r.lastReadBuiltMs)}
+                      </td>
+                      <td className="py-1.5 pr-3">
+                        {r.stale == null ? (
+                          <span className="text-gray-600">—</span>
+                        ) : r.stale ? (
+                          <span className="text-amber-300" title={r.stalenessDays != null ? `${r.stalenessDays}d` : undefined}>
+                            stale
+                          </span>
+                        ) : (
+                          <span className="text-emerald-400">fresh</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+          <p className="mt-2 text-[11px] text-gray-600">
+            {view.length} of {rows.length} ticker{rows.length === 1 ? '' : 's'}
+          </p>
+        </>
+      )}
+    </div>
+  )
+}
+
+// Sortable header cell — clicking toggles the sort key/direction. Shows ▲/▼ on the active column.
+function Th({
+  label,
+  col,
+  sortKey,
+  sortDir,
+  onSort,
+}: {
+  label: string
+  col: SortKey
+  sortKey: SortKey
+  sortDir: SortDir
+  onSort: (k: SortKey) => void
+}) {
+  const active = sortKey === col
+  return (
+    <th className="py-1.5 pr-3 font-medium">
+      <button
+        type="button"
+        onClick={() => onSort(col)}
+        className={`flex items-center gap-1 ${active ? 'text-gray-200' : 'text-gray-500 hover:text-gray-300'}`}
+      >
+        {label}
+        {active && <span aria-hidden>{sortDir === 'asc' ? '▲' : '▼'}</span>}
+      </button>
+    </th>
+  )
+}
+
+// Per-name quarantine lookup — forensic QA only (wrapped in <QuantOnly> at the call site). Type a
+// ticker → the …/quarantine?symbol= proxy → AAPL-scoped counts (or an honest empty for an unknown
+// symbol: resolved:false, instrument_id:-1, never the full unfiltered set).
+interface QuarantineResult {
+  resolved?: boolean
+  symbol?: string
+  instrument_id?: number
+  total: number
+  by_reason: Record<string, number>
+  by_sector: Record<string, number>
+  recent: { reason?: string; occurred_at?: string }[]
+}
+
+function QuarantineLookup() {
+  const [symbol, setSymbol] = useState('')
+  const [result, setResult] = useState<QuarantineResult | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  async function lookup(): Promise<void> {
+    const s = symbol.trim().toUpperCase()
+    if (!s) return
+    setLoading(true)
+    setError(null)
+    setResult(null)
+    try {
+      const r = await fetch(
+        `/portal-api/admin/fundamentals-ingest/quarantine?symbol=${encodeURIComponent(s)}`,
+        { cache: 'no-store' },
+      )
+      const b = await r.json().catch(() => null)
+      if (!r.ok || !b) throw new Error(b?.detail ?? b?.error ?? `failed (${r.status})`)
+      setResult(b)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="rounded border border-gray-800 bg-gray-950 p-4" data-testid="quarantine-lookup">
+      <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-400">
+        Per-name quarantine lookup
+      </h3>
+      <p className="mt-1 text-[11px] text-gray-500">
+        Scope the QA hold-out forensics to one ticker. An unknown symbol resolves to an honest empty
+        (not the full set).
+      </p>
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <input
+          type="text"
+          value={symbol}
+          onChange={(e) => setSymbol(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') void lookup()
+          }}
+          placeholder="e.g. AAPL"
+          spellCheck={false}
+          className="w-40 rounded border border-gray-700 bg-gray-950 px-2 py-1 font-mono text-sm text-gray-100 focus:border-emerald-600 focus:outline-none"
+        />
+        <button
+          type="button"
+          onClick={lookup}
+          disabled={loading || symbol.trim() === ''}
+          className="rounded bg-emerald-700 px-3 py-1 text-xs font-semibold text-white transition-colors hover:bg-emerald-600 disabled:opacity-50"
+        >
+          {loading ? 'Looking up…' : 'Look up'}
+        </button>
+      </div>
+      {error && <p className="mt-2 text-xs text-red-400">{error}</p>}
+      {result && (
+        <div className="mt-3 text-sm">
+          {result.resolved === false ? (
+            <p className="text-amber-300">
+              {result.symbol} not resolved (instrument_id {result.instrument_id}) — no such US name in
+              the security master. Honest empty.
+            </p>
+          ) : (
+            <>
+              <p className="text-gray-300">
+                {result.symbol ?? 'symbol'}: <span className="font-semibold text-gray-100">{result.total}</span>{' '}
+                quarantined event{result.total === 1 ? '' : 's'}.
+              </p>
+              {Object.keys(result.by_reason).length > 0 && (
+                <div className="mt-1 flex flex-wrap gap-x-6 gap-y-1">
+                  {Object.entries(result.by_reason).map(([reason, n]) => (
+                    <span key={reason} className="text-gray-300">
+                      {reason}: <span className="text-amber-300">{n}</span>
+                    </span>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
   )
 }
