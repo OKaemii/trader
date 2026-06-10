@@ -141,7 +141,9 @@ class _FakeFacts(EdgarFactsClient):
         return parse_company_facts(payload) if payload is not None else []
 
 
-def _orchestrator(db: FakeTimescale, *, tickers=None, subs=None, facts=None) -> IngestionOrchestrator:
+def _orchestrator(
+    db: FakeTimescale, *, tickers=None, subs=None, facts=None, openfigi=None,
+) -> IngestionOrchestrator:
     return IngestionOrchestrator(
         submissions_client=_FakeSubmissions(
             tickers if tickers is not None else _COMPANY_TICKERS,
@@ -152,6 +154,7 @@ def _orchestrator(db: FakeTimescale, *, tickers=None, subs=None, facts=None) -> 
         raw_writer=RawFactsWriter(db),
         fundamentals_writer=FundamentalsWriter(db),
         qa_engine=QaEngine(db),
+        openfigi_client=openfigi,
     )
 
 
@@ -333,3 +336,186 @@ async def test_filing_without_accepted_ts_is_skipped_for_facts() -> None:
     obs = {r["observation_ts"] for r in db.fundamentals if not r["is_superseded"]}
     assert _ms("2021-09-25") in obs           # FY2021 wrote
     assert _ms("2020-09-26") not in obs       # FY2020 skipped (no accepted_ts → no lineage)
+
+
+# ── alias-bridge (ticker-rename / no_cik) fixtures + tests ─────────────────────────
+# Meta's stable CIK (the rename-invariant key the FB→META alias bridges to). A two-filing companyfacts
+# payload under THIS CIK proves the resolved CIK actually ingests fundamentals.
+_META_CIK = "0001326801"
+_META_RENAME_MS = _ms("2022-06-09")  # the FB→META rebrand date the alias is dated with
+_M_ACCN_2022 = "0001326801-22-000076"
+_M_ACCN_2023 = "0001326801-23-000064"
+
+
+def _meta_facts_payload() -> dict:
+    # A single required-metric (net_income) across two filings is enough to land canonical rows under the
+    # resolved CIK; the alias path reuses the SAME per-filing pipeline as the AAPL fixture above.
+    return {
+        "cik": 1326801,
+        "entityName": "Meta Platforms, Inc.",
+        "facts": {
+            "us-gaap": {
+                "NetIncomeLoss": {"units": {"USD": [
+                    {"start": "2021-01-01", "end": "2021-12-31", "val": 39370000000,
+                     "accn": _M_ACCN_2022, "fy": 2021, "fp": "FY", "form": "10-K"},
+                    {"start": "2022-01-01", "end": "2022-12-31", "val": 23200000000,
+                     "accn": _M_ACCN_2023, "fy": 2022, "fp": "FY", "form": "10-K"},
+                ]}},
+            },
+        },
+    }
+
+
+_META_SUBMISSIONS = {
+    "cik": _META_CIK,
+    "name": "Meta Platforms, Inc.",
+    "tickers": ["META"],
+    "exchanges": ["Nasdaq"],
+    "sic": "7372",  # prepackaged software → general template
+    "filings": {"recent": {
+        "accessionNumber": [_M_ACCN_2023, _M_ACCN_2022],
+        "form": ["10-K", "10-K"],
+        "filingDate": ["2023-02-02", "2022-02-03"],
+        "acceptanceDateTime": ["2023-02-01T18:05:00.000Z", "2022-02-02T18:05:00.000Z"],
+        "primaryDocument": ["meta-20221231.htm", "meta-20211231.htm"],
+    }},
+}
+
+# A SEC ticker map that does NOT carry META (the real-world state: the bulk map dropped the legacy FB and
+# the test exercises the moment before/without META being in it) — so resolution MUST fall to the alias.
+_TICKERS_WITHOUT_META = {"0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."}}
+
+
+def _ticker_identifiers(db: FakeTimescale) -> list[dict]:
+    return [r for r in db.identifiers if r["identifier_type"] == "ticker"]
+
+
+@pytest.mark.asyncio
+async def test_alias_hit_resolves_cik_and_lands_rows_when_sec_map_misses() -> None:
+    # META is absent from the SEC ticker map; the curated TICKER_ALIASES table bridges it to its CIK, so
+    # the filer ingests instead of skipping no_cik (the headline outcome of the card).
+    db = FakeTimescale()
+    orch = _orchestrator(
+        db, tickers=_TICKERS_WITHOUT_META,
+        subs={_META_CIK: _META_SUBMISSIONS}, facts={_META_CIK: _meta_facts_payload()},
+    )
+    summary = await orch.run(["META"])
+
+    assert summary.ingested == 1 and summary.skipped == 0
+    assert summary.results[0].skipped_reason is None
+    assert summary.results[0].cik == _META_CIK
+    # The entity landed under the resolved CIK with the live T212 join key.
+    assert len(db.companies) == 1 and db.companies[0]["cik"] == _META_CIK
+    assert db.instruments[0]["t212_ticker"] == "META_US_EQ"
+    # Canonical rows actually wrote under the resolved CIK (net_income across the two filings).
+    canonical = [r for r in db.fundamentals if not r["is_superseded"]]
+    assert canonical and all(r["metric"] == "net_income" for r in canonical)
+
+
+@pytest.mark.asyncio
+async def test_alias_rename_records_effective_dated_ticker_intervals() -> None:
+    # The rename is recorded append-only: FB's ID_TICKER interval is closed at the rename instant and
+    # META's is open from it — no fundamentals fact rewrite, just two effective-dated identifier rows.
+    db = FakeTimescale()
+    orch = _orchestrator(
+        db, tickers=_TICKERS_WITHOUT_META,
+        subs={_META_CIK: _META_SUBMISSIONS}, facts={_META_CIK: _meta_facts_payload()},
+    )
+    await orch.run(["META"])
+
+    tickers = _ticker_identifiers(db)
+    fb = next(r for r in tickers if r["identifier_value"] == "FB")
+    meta = next(r for r in tickers if r["identifier_value"] == "META")
+    assert len(tickers) == 2
+    # Prior symbol closed at the rename instant; current symbol open from it (the half-open boundary the
+    # as-of interval resolver keys off so a pre-rename replay still resolves FB).
+    assert fb["effective_from"] == 0 and fb["effective_to"] == _META_RENAME_MS
+    assert meta["effective_from"] == _META_RENAME_MS and meta["effective_to"] is None
+    # Both intervals hang off the same instrument (one filer), and no fundamentals row was superseded by
+    # the rename (it is purely a resolution concern).
+    assert fb["instrument_id"] == meta["instrument_id"]
+    assert all(not r["is_superseded"] for r in db.fundamentals)
+
+
+@pytest.mark.asyncio
+async def test_alias_rename_recording_is_idempotent() -> None:
+    # A second run over the same fixtures re-asserts the exact two intervals (append_identifier's
+    # exact-interval guard) — never a third row, never a mutation.
+    db = FakeTimescale()
+    orch = _orchestrator(
+        db, tickers=_TICKERS_WITHOUT_META,
+        subs={_META_CIK: _META_SUBMISSIONS}, facts={_META_CIK: _meta_facts_payload()},
+    )
+    await orch.run(["META"])
+    await orch.run(["META"])
+    assert len(_ticker_identifiers(db)) == 2
+    assert len(db.companies) == 1 and len(db.instruments) == 1
+
+
+@pytest.mark.asyncio
+async def test_alias_resolves_even_when_already_in_sec_map() -> None:
+    # If the SEC map DOES carry META, the native CIK wins and no alias rename is recorded (the alias is
+    # only the fallback for a miss) — META gets the plain open-ended interval, not a FB→META pair.
+    db = FakeTimescale()
+    tickers_with_meta = {"0": {"cik_str": 1326801, "ticker": "META", "title": "Meta Platforms, Inc."}}
+    orch = _orchestrator(
+        db, tickers=tickers_with_meta,
+        subs={_META_CIK: _META_SUBMISSIONS}, facts={_META_CIK: _meta_facts_payload()},
+    )
+    summary = await orch.run(["META"])
+    assert summary.ingested == 1
+    tickers = _ticker_identifiers(db)
+    assert [r["identifier_value"] for r in tickers] == ["META"]
+    assert tickers[0]["effective_from"] == 0 and tickers[0]["effective_to"] is None
+
+
+@pytest.mark.asyncio
+async def test_unmapped_symbol_still_skips_no_cik_when_no_alias() -> None:
+    # A symbol the SEC map misses AND that has no alias entry still skips no_cik (never a fabricated CIK).
+    db = FakeTimescale()
+    orch = _orchestrator(db, tickers=_TICKERS_WITHOUT_META)
+    summary = await orch.run(["ZZZZ"])
+    assert summary.ingested == 0 and summary.skipped == 1
+    assert summary.results[0].skipped_reason == "no_cik"
+    assert db.companies == [] and db.fundamentals == []
+
+
+class _FakeOpenFigi:
+    """Records the symbols it was asked to map; returns a FIGI (identity hint) but never a CIK."""
+
+    def __init__(self) -> None:
+        self.queried: list[str] = []
+
+    async def map_ticker(self, ticker, *, exch_code="US"):
+        from src.security_master.openfigi import FigiMapping
+        self.queried.append(ticker)
+        return FigiMapping(query_ticker=ticker, figi="BBG000FAKE01", composite_figi="BBG000FAKE00",
+                           name="Fake Co", exch_code="US", security_type="Common Stock")
+
+
+@pytest.mark.asyncio
+async def test_openfigi_fallback_identifies_but_does_not_fabricate_cik() -> None:
+    # The OpenFIGI seam is the LAST resort for a symbol the SEC map + alias table both miss. It returns a
+    # FIGI (an identity hint, logged for an operator), NOT a CIK — so the symbol still skips no_cik and
+    # nothing is written. This keeps the seam real/exercised without inventing a CIK.
+    db = FakeTimescale()
+    figi = _FakeOpenFigi()
+    orch = _orchestrator(db, tickers=_TICKERS_WITHOUT_META, openfigi=figi)
+    summary = await orch.run(["NEWIPO"])
+    assert summary.skipped == 1 and summary.results[0].skipped_reason == "no_cik"
+    assert figi.queried == ["NEWIPO"]          # the fallback WAS consulted
+    assert db.companies == [] and db.fundamentals == []  # but no fabricated entity/fact
+
+
+@pytest.mark.asyncio
+async def test_openfigi_not_consulted_when_alias_resolves() -> None:
+    # An alias hit short-circuits before the OpenFIGI hop (it resolved a real CIK) — the fallback is for
+    # genuine misses only, so it must not be queried for META.
+    db = FakeTimescale()
+    figi = _FakeOpenFigi()
+    orch = _orchestrator(
+        db, tickers=_TICKERS_WITHOUT_META, openfigi=figi,
+        subs={_META_CIK: _META_SUBMISSIONS}, facts={_META_CIK: _meta_facts_payload()},
+    )
+    await orch.run(["META"])
+    assert figi.queried == []

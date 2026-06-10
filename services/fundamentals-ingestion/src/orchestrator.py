@@ -59,6 +59,8 @@ from src.security_master.edgar_submissions import (
     EdgarSubmissionsClient,
     TickerMapEntry,
 )
+from src.security_master.openfigi import OpenFigiClient
+from src.security_master.ticker_aliases import TickerAlias, resolve_alias
 from src.security_master.writers import (
     SOURCE_SEC_EDGAR,
     CompanyRecord,
@@ -178,6 +180,7 @@ class IngestionOrchestrator:
         raw_writer: RawFactsWriter,
         fundamentals_writer: FundamentalsWriter,
         qa_engine: QaEngine,
+        openfigi_client: Optional[OpenFigiClient] = None,
         source: str = SOURCE_PIT_EDGAR,
     ) -> None:
         self._submissions = submissions_client
@@ -186,6 +189,12 @@ class IngestionOrchestrator:
         self._raw = raw_writer
         self._fundamentals = fundamentals_writer
         self._qa = qa_engine
+        # OPTIONAL OpenFIGI fallback (sub-step 4). Used only to IDENTIFY a symbol the SEC map + alias
+        # table both miss — a brand-new filer can post-date even a daily SEC snapshot. OpenFIGI returns
+        # a FIGI, NOT a CIK, so it cannot itself complete the no_cik resolution (we never fabricate a
+        # CIK); the seam logs the FIGI it found so an operator can add an alias entry, and records the
+        # FIGI on the resolved instrument when the name otherwise resolves. None ⇒ the fallback is off.
+        self._openfigi = openfigi_client
         self._source = source
         self._ticker_cik: dict[str, str] = {}
 
@@ -197,6 +206,58 @@ class IngestionOrchestrator:
         self._ticker_cik = build_ticker_cik_map(entries)
         log.info("[orchestrator] primed EDGAR ticker map: %d symbols", len(self._ticker_cik))
         return len(self._ticker_cik)
+
+    async def _resolve_cik(self, sym: str) -> tuple[Optional[str], Optional[TickerAlias]]:
+        """Resolve a bare US symbol → (CIK, bridging alias). The CIK is the stable, rename-invariant key.
+
+        Resolution order, each step honest (a miss never fabricates a CIK):
+          1. The SEC bulk `company_tickers.json` map (the common path — every filer's CURRENT symbol).
+          2. The curated `TICKER_ALIASES` table — bridges a symbol the SEC snapshot misses because of a
+             rename (FB after the Meta rebrand) or because the name is too new for the snapshot. On a hit
+             the alias is returned alongside its CIK so `_upsert_entity` can record the rename interval.
+          3. The optional OpenFIGI fallback — IDENTIFIES a still-unresolved symbol but returns a FIGI, not
+             a CIK, so it cannot complete the resolution: it logs the FIGI it found (an operator then adds
+             an alias entry) and the symbol still skips `no_cik`. This keeps the seam real and exercised
+             without ever inventing a CIK.
+
+        Returns `(None, None)` when nothing resolves (the caller skips `no_cik`)."""
+        cik = self._ticker_cik.get(sym)
+        if cik is not None:
+            return cik, None
+
+        alias = resolve_alias(sym)
+        if alias is not None:
+            log.info("[orchestrator] %s missing from SEC ticker map — bridged via alias to CIK %s (%s)",
+                     sym, alias.cik, alias.note)
+            return alias.cik, alias
+
+        # Last resort: a brand-new filer can post-date even a daily SEC snapshot. OpenFIGI can confirm the
+        # security exists (a FIGI), but it carries no CIK — so we cannot resolve from it (no fabrication).
+        # Surface the FIGI so an operator can add a curated alias entry; the symbol still skips no_cik.
+        await self._identify_via_openfigi(sym)
+        return None, None
+
+    async def _identify_via_openfigi(self, sym: str) -> Optional[str]:
+        """Best-effort OpenFIGI identification of a symbol the SEC map + alias table both miss.
+
+        Returns the composite FIGI when OpenFIGI resolves the name (logged so an operator can add an
+        alias), else None. Fail-soft + a no-op when no OpenFIGI client is injected — the FIGI is an
+        identity hint, NOT a CIK, so this never resolves the ingest by itself."""
+        if self._openfigi is None:
+            return None
+        try:
+            mapping = await self._openfigi.map_ticker(sym)
+        except Exception as exc:  # noqa: BLE001 — the fallback is best-effort; never abort the ticker
+            log.warning("[orchestrator] OpenFIGI lookup for %s failed: %s", sym, exc)
+            return None
+        if mapping is None:
+            return None
+        figi = mapping.composite_figi or mapping.figi  # composite is rename-stable; specific listing else
+        if figi is not None:
+            log.info("[orchestrator] %s unresolved by SEC map + alias table; OpenFIGI identifies FIGI %s "
+                     "(%s) — add a curated TICKER_ALIASES entry to bridge it to a CIK",
+                     sym, figi, mapping.name or "?")
+        return figi
 
     async def run(self, symbols: list[str]) -> IngestSummary:
         """Ingest a coverage set (bare US symbols). Primes the ticker map, then runs the per-ticker
@@ -226,7 +287,7 @@ class IngestionOrchestrator:
         A ticker with no CIK in the map, or no submissions, or no facts is SKIPPED (with a reason) — the
         skip is honest (we never fabricate an entity/fact), and the run continues."""
         sym = symbol.strip().upper()
-        cik = self._ticker_cik.get(sym)
+        cik, alias = await self._resolve_cik(sym)
         if cik is None:
             return TickerResult(ticker=sym, skipped_reason="no_cik")
 
@@ -243,14 +304,14 @@ class IngestionOrchestrator:
         if not facts:
             # No facts to write, but we still want the entity in the security master (it resolves
             # to an instrument for a later run / the read API). Upsert it, then skip the fact write.
-            instrument_id = await self._upsert_entity(sym, submissions, sector=sector)
+            instrument_id = await self._upsert_entity(sym, submissions, sector=sector, alias=alias)
             return TickerResult(
                 ticker=sym, cik=cik, instrument_id=instrument_id,
                 sector=sector, skipped_reason="no_facts",
             )
 
         # Steps 3: company → instrument → ticker identifier → instrument_id.
-        instrument_id = await self._upsert_entity(sym, submissions, sector=sector)
+        instrument_id = await self._upsert_entity(sym, submissions, sector=sector, alias=alias)
 
         # Step 4: upsert filings → lineage_by_accession (accn → (filing_id, accepted_ts)).
         lineage = await self._upsert_filings(submissions, instrument_id=instrument_id)
@@ -298,14 +359,26 @@ class IngestionOrchestrator:
             canonical_skipped=canon_skipped, quarantined=quarantined,
         )
 
-    async def _upsert_entity(self, symbol: str, submissions: CompanySubmissions, *, sector: str) -> int:
-        """Upsert the company + instrument + current-ticker identifier; return the instrument_id.
+    async def _upsert_entity(
+        self, symbol: str, submissions: CompanySubmissions, *, sector: str,
+        alias: Optional[TickerAlias] = None,
+    ) -> int:
+        """Upsert the company + instrument + ticker identifier(s); return the instrument_id.
 
         Idempotent (find-or-insert by CIK / by (company, t212_ticker) / by exact identifier interval).
-        The `t212_ticker` is the reconstructed `<SYMBOL>_US_EQ` join key the live universe speaks; the
-        current display ticker is appended as an effective-dated `ticker` identifier (open-ended) so the
-        as-of resolver can place it — a later run that observes a rename appends the successor and the
-        prior interval closes on read (the append-only contract; never an UPDATE).
+        The `t212_ticker` is the reconstructed `<SYMBOL>_US_EQ` join key the live universe speaks.
+
+        TICKER IDENTITY — two cases, both append-only (never an UPDATE), both idempotent:
+          * No rename (`alias` is None, or an alias with no `renamed_from` — a legacy/origin or new
+            IPO/ADR symbol): the current display ticker is appended as a single open-ended `ticker`
+            interval. `effective_from` 0 (epoch) is the safe lower bound for a backfill that only knows
+            "this is the ticker now"; a successor appended later closes it on read.
+          * A recorded rename (`alias.renamed_from` set — the current side of a rename, e.g. ingesting
+            META with the SEC map missing the legacy FB): record the rename as TWO effective-dated rows
+            via `record_ticker_change` — the PRIOR symbol (`FB`) closed at `since_ms`, the CURRENT symbol
+            (`META`) open from it — so the rename year is recorded in the identifier history. No
+            `fundamentals` fact is rewritten; this is purely a resolution concern (`since_ms` is the
+            rename instant the as-of interval resolver keys off).
 
         `sector` is the SIC→QA template (`template_for_sic` — general/bank/insurance/reit/utility, a
         coarse routing bucket, NOT a GICS sector), recorded on `companies.sector` so the quarantine
@@ -330,18 +403,27 @@ class IngestionOrchestrator:
                 t212_ticker=f"{symbol}{_US_EQ_SUFFIX}",
             )
         )
-        # The current display ticker (the SEC symbol) as an open-ended identifier interval. effective_from
-        # 0 (epoch) is the safe lower bound for a backfill that only knows "this is the ticker now"; a
-        # real rename later appends the successor with its change date and the resolver closes this on read.
-        await self._secmaster.append_identifier(
-            IdentifierRecord(
-                instrument_id=instrument_id,
-                identifier_type=ID_TICKER,
-                identifier_value=symbol,
-                effective_from=0,
-                effective_to=None,
+        if alias is not None and alias.renamed_from:
+            # A recorded rename: append the prior symbol's interval (closed at the rename instant) and the
+            # current symbol's interval (open from it). Append-only + idempotent (re-running the same
+            # rename is a no-op via the exact-interval guard in `append_identifier`).
+            await self._secmaster.record_ticker_change(
+                instrument_id,
+                old_ticker=alias.renamed_from,
+                new_ticker=symbol,
+                changed_at_ms=alias.since_ms,
             )
-        )
+        else:
+            # No rename to record: the current display ticker (the SEC symbol) as an open-ended interval.
+            await self._secmaster.append_identifier(
+                IdentifierRecord(
+                    instrument_id=instrument_id,
+                    identifier_type=ID_TICKER,
+                    identifier_value=symbol,
+                    effective_from=0,
+                    effective_to=None,
+                )
+            )
         return instrument_id
 
     async def _upsert_filings(
