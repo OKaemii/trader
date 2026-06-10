@@ -27,6 +27,7 @@ from tests.test_freshness import (
     _FakeMongo,
     _FreshnessFakeTimescale,
     _seed_fact,
+    _seed_filing,
     _seed_instrument,
 )
 
@@ -36,7 +37,8 @@ _DAY = 86_400_000
 def _args(**overrides) -> argparse.Namespace:
     """A Namespace with the ingest CLI defaults, overridable per test (mirrors `_parse_args`'s output
     so a test drives `run_async`/`_filter_stale_symbols` without building an argv)."""
-    base = dict(tickers="", full=False, cap=None, window_years=30, heal=False, stale_after_days=None)
+    base = dict(tickers="", full=False, cap=None, window_years=30, heal=False, stale_after_days=None,
+                annual_stale_after_days=None)
     base.update(overrides)
     return argparse.Namespace(**base)
 
@@ -49,9 +51,15 @@ def test_heal_flag_defaults_off() -> None:
 
 
 def test_heal_flag_and_stale_after_days_parse() -> None:
-    args = ingest._parse_args(["--heal", "--stale-after-days", "90"])
+    args = ingest._parse_args(["--heal", "--stale-after-days", "90", "--annual-stale-after-days", "420"])
     assert args.heal is True
     assert args.stale_after_days == 90
+    assert args.annual_stale_after_days == 420
+
+
+def test_annual_stale_after_days_defaults_off() -> None:
+    args = ingest._parse_args([])
+    assert args.annual_stale_after_days is None    # absent ⇒ env / built-in 400-day annual default
 
 
 def test_stale_after_days_precedence(monkeypatch) -> None:
@@ -66,6 +74,44 @@ def test_stale_after_days_precedence(monkeypatch) -> None:
     # A non-int env is ignored (falls back to None ⇒ default window — never silently "never stale").
     monkeypatch.setenv("FUNDAMENTALS_STALE_AFTER_DAYS", "not-a-number")
     assert ingest._stale_after_days(_args()) is None
+
+
+def test_annual_stale_after_days_precedence(monkeypatch) -> None:
+    # Flag wins over env (mirrors the quarterly knob's precedence).
+    monkeypatch.setenv("FUNDAMENTALS_STALE_AFTER_DAYS_ANNUAL", "500")
+    assert ingest._annual_stale_after_days(_args(annual_stale_after_days=420)) == 420
+    # No flag ⇒ env.
+    assert ingest._annual_stale_after_days(_args()) == 500
+    # No flag, no env ⇒ None (the audit then applies its 400-day annual default).
+    monkeypatch.delenv("FUNDAMENTALS_STALE_AFTER_DAYS_ANNUAL", raising=False)
+    assert ingest._annual_stale_after_days(_args()) is None
+    # A non-int env is ignored (falls back to None ⇒ default annual window — never "never stale").
+    monkeypatch.setenv("FUNDAMENTALS_STALE_AFTER_DAYS_ANNUAL", "not-a-number")
+    assert ingest._annual_stale_after_days(_args()) is None
+
+
+@pytest.mark.asyncio
+async def test_heal_annual_filer_not_force_re_ingested(monkeypatch) -> None:
+    """`--heal` must NOT keep re-ingesting a 20-F annual filer every cycle: with a recent annual filing
+    and a fiscal period inside the 400-day annual window, the name is fresh → not in the heal subset,
+    while a 10-Q filer at the same age is stale → healed. End-to-end through the REAL freshness_audit."""
+    mongo = _FakeMongo(["AAPL_US_EQ", "TSM_US_EQ"])
+    db = _FreshnessFakeTimescale()
+    now = 900_000 * _DAY
+    age = 200 * _DAY
+    monkeypatch.setattr(ingest.time, "time", lambda: now / 1000)  # freeze now_ms = now
+    # AAPL: a 10-Q filer, fiscal period 200 days old → stale under the 135-day window → healed.
+    _seed_instrument(db, instrument_id=1, t212_ticker="AAPL_US_EQ")
+    _seed_fact(db, instrument_id=1, metric="net_income", observation_ts=now - age, knowledge_ts=now - age + _DAY)
+    _seed_filing(db, instrument_id=1, form_type="10-Q", accepted_ts=now - age + _DAY)
+    # TSM: a 20-F annual filer, same 200-day-old period → fresh under the 400-day annual window → skipped.
+    _seed_instrument(db, instrument_id=2, t212_ticker="TSM_US_EQ")
+    _seed_fact(db, instrument_id=2, metric="net_income", observation_ts=now - age, knowledge_ts=now - age + _DAY)
+    _seed_filing(db, instrument_id=2, form_type="20-F", accepted_ts=now - age + _DAY)
+    _patch_freshness_sources(monkeypatch, timescale=db, mongo=mongo)
+
+    subset = await ingest._filter_stale_symbols(["AAPL", "TSM"], _args(heal=True))
+    assert subset == ["AAPL"]      # only the quarterly filer; the 20-F is not re-healed every cycle
 
 
 # ── _filter_stale_symbols (end-to-end against the real freshness_audit) ─────────────────────────────
