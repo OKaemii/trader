@@ -107,6 +107,19 @@ function SourceTag({ label }: { label: string }) {
   )
 }
 
+// Honest provenance label for the QMJ line-item groups, derived from the per-name `source` the
+// market-data cache stamped (NOT hardcoded — a US name now resolves to the PIT SEC-EDGAR warehouse,
+// not Yahoo). `pit-edgar` → PIT; `yahoo*` → Yahoo; `ai-estimate` (Yahoo analyst-derived QMJ fallback)
+// → "Yahoo · est"; absent → "—". The Growth group is genuinely Yahoo analyst estimates regardless.
+function qmjSourceLabel(source: string | null | undefined): string {
+  if (!source) return '—'
+  const s = source.toLowerCase()
+  if (s.startsWith('pit')) return 'SEC EDGAR · PIT'
+  if (s === 'ai-estimate') return 'Yahoo · est'
+  if (s.startsWith('yahoo')) return 'Yahoo'
+  return source
+}
+
 function Group({ title, source, children }: { title: string; source: string; children: React.ReactNode }) {
   return (
     <div className="rounded border border-gray-800 bg-gray-900/40 p-4">
@@ -154,8 +167,9 @@ export async function FundamentalsTab({ symbol }: { symbol: string }) {
   return (
     <div className="space-y-4">
       <div className="rounded border border-amber-900/40 bg-amber-950/20 p-3 text-xs text-amber-200/80">
-        Company financials are a <span className="font-medium">current Yahoo snapshot</span> (monthly
-        TTL) — EODHD Fundamentals is not entitled, so there is no deep historical fundamentals series.
+        Company financials are a <span className="font-medium">current QMJ snapshot</span> (monthly
+        TTL) — the per-group tag shows the provenance (PIT SEC-EDGAR for covered US names, Yahoo
+        otherwise). EODHD Fundamentals is not entitled, so there is no deep historical fundamentals series.
         Dividend history is point-in-time from the EODHD Dividends feed. Analyst estimates are
         best-effort Yahoo and may trail.
         {fund?.asOf ? (
@@ -174,7 +188,7 @@ export async function FundamentalsTab({ symbol }: { symbol: string }) {
         </div>
       ) : (
         <>
-          <Group title="Valuation" source="Yahoo">
+          <Group title="Valuation" source={qmjSourceLabel(fund?.source)}>
             <Stat label="Market cap" value={gbpCompact(raw?.marketCapGbp)} hint="FX-normalised to GBP" />
             {fund?.qualityPass != null ? (
               <Stat
@@ -185,12 +199,12 @@ export async function FundamentalsTab({ symbol }: { symbol: string }) {
             ) : null}
           </Group>
 
-          <Group title="Profitability" source="Yahoo">
+          <Group title="Profitability" source={qmjSourceLabel(fund?.source)}>
             <Stat label="Return on equity" value={pct(ratios?.roe)} hint="net income / equity (annual)" />
             <Stat label="Net income" value={num(raw?.netIncome, 0)} hint="latest fiscal year (native units)" />
           </Group>
 
-          <Group title="Balance sheet" source="Yahoo">
+          <Group title="Balance sheet" source={qmjSourceLabel(fund?.source)}>
             <Stat label="Total equity" value={num(raw?.totalEquity, 0)} />
             <Stat label="Total debt" value={num(raw?.totalDebt, 0)} />
             <Stat label="Debt / equity" value={ratio(ratios?.debtToEquity)} />
