@@ -42,6 +42,35 @@ export class FundamentalsCache {
     return this.source;
   }
 
+  /**
+   * Force a full re-source of `tickers` when the provider MODE changed since the last boot (e.g. an
+   * operator flips `FUNDAMENTALS_PROVIDER` yahoo→pit). The TTL refresher never catches this — a doc
+   * isn't time-stale, and a `yahoo`-sourced US row is a *valid* `pit`-mode fallback — so the surfaces
+   * that read this cache (Research › Fundamentals, the Scanner) would keep serving the OLD provider's
+   * rows for up to the monthly TTL. Persists the mode in `modeStore`; on a change, re-sources the
+   * whole universe through the new provider (US → `pit-edgar`, fallbacks → `yahoo`). The mode key is
+   * written only AFTER a successful refresh, so a crash mid-walk retries on the next boot. Same mode
+   * ⇒ no-op. Call it backgrounded (`void … .catch`) at boot — a full walk runs for minutes.
+   */
+  async refreshIfModeChanged(
+    modeStore: { get(k: string): Promise<string | null>; set(k: string, v: string): Promise<unknown> },
+    tickers: string[],
+  ): Promise<{ changed: boolean; from: string | null; refreshed: number }> {
+    const last = await modeStore.get(FundamentalsCache.MODE_KEY);
+    if (last === this.source) return { changed: false, from: last, refreshed: 0 };
+    log.info(
+      `[fundamentals] provider mode ${last ?? '(none)'} → ${this.source}; full cache re-source of ` +
+      `${tickers.length} ticker(s) so cached rows reflect the new provider`,
+    );
+    const refreshed = await this.refresh(tickers);
+    await modeStore.set(FundamentalsCache.MODE_KEY, this.source);
+    log.info(`[fundamentals] mode-change re-sourced ${refreshed}/${tickers.length} ticker(s)`);
+    return { changed: true, from: last, refreshed };
+  }
+
+  /** Redis key holding the provider mode the cache last re-sourced under (mode-change detection). */
+  static readonly MODE_KEY = 'market-data:fundamentals:provider_mode';
+
   private async coll(): Promise<Collection<FundamentalsDoc>> {
     return (await getMongoDb()).collection<FundamentalsDoc>(COLLECTIONS.COMPANY_FUNDAMENTALS);
   }
