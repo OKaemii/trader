@@ -404,6 +404,21 @@ def _stale_after_days() -> Optional[int]:
     return n if n > 0 else None
 
 
+def _annual_stale_after_days() -> Optional[int]:
+    """The ANNUAL staleness window in days from `FUNDAMENTALS_STALE_AFTER_DAYS_ANNUAL` (for 20-F/40-F/10-K
+    once-a-year filers). Absent/unparseable/non-positive ⇒ None so `annual_stale_after_ms_from_days`
+    applies its 400-day default. Same fail-safe as the quarterly knob: a bad value falls back to the
+    default window, never to "never stale"."""
+    raw = os.getenv("FUNDAMENTALS_STALE_AFTER_DAYS_ANNUAL", "")
+    if not raw:
+        return None
+    try:
+        n = int(raw)
+    except ValueError:
+        return None
+    return n if n > 0 else None
+
+
 @app.get("/admin/api/fundamentals-ingest/freshness")
 async def ingest_freshness() -> JSONResponse:
     """Per-name PIT coverage + freshness audit (epic coverage-broaden Task 4) — the "is the curated US
@@ -423,12 +438,17 @@ async def ingest_freshness() -> JSONResponse:
     try:
         from motor.motor_asyncio import AsyncIOMotorClient
 
-        from src.freshness import freshness_audit, stale_after_ms_from_days
+        from src.freshness import (
+            annual_stale_after_ms_from_days,
+            freshness_audit,
+            stale_after_ms_from_days,
+        )
         from src.security_master.pool import get_pool
 
         pool = await get_pool()
         last = get_run_store().latest()
         stale_after_ms = stale_after_ms_from_days(_stale_after_days())
+        annual_stale_after_ms = annual_stale_after_ms_from_days(_annual_stale_after_days())
         client = AsyncIOMotorClient(MONGODB_URL)
         try:
             payload = await freshness_audit(
@@ -436,6 +456,7 @@ async def ingest_freshness() -> JSONResponse:
                 client[MONGODB_DB],
                 now_ms=int(time.time() * 1000),
                 stale_after_ms=stale_after_ms,
+                annual_stale_after_ms=annual_stale_after_ms,
                 last_ingest_run=last.to_payload() if last is not None else None,
             )
         finally:
