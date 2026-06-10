@@ -160,7 +160,7 @@ describe('PitFundamentalsProvider', () => {
     expect(yahoo.seen).toEqual([['HSBAl_EQ', 'ZZZZ_US_EQ']]);
   });
 
-  it('treats a missing snake_case line item as 0 (fail-closed), matching the Yahoo contract', async () => {
+  it('treats a missing snake_case QMJ line item as 0 (fail-closed), matching the Yahoo contract', async () => {
     const fetcher = vi.fn(async () => pitResponse({
       // A bank: no current assets/liabilities. Mapped to 0 ⇒ QMJ fail-closed downstream (no false PASS).
       JPM_US_EQ: { net_income: 50000, total_equity: 250000, total_debt: 900000, market_cap_gbp: 4e11, source: 'pit-edgar' },
@@ -173,6 +173,56 @@ describe('PitFundamentalsProvider', () => {
       netIncome: 50000, totalEquity: 250000, totalDebt: 900000,
       currentAssets: 0, currentLiabilities: 0, marketCapGbp: 4e11,
     });
+  });
+
+  it('carries an ABSENT market_cap_gbp as null, NOT 0 (the QMJ inputs still default to 0)', async () => {
+    // C1's as-of read omits `market_cap_gbp` only when the cap is genuinely uncomputable (shares
+    // absent / pre-data as-of). The provider must carry that through as `null` so the scanner /
+    // Research render `—`, never a fabricated £0 (the NVIDIA-£0 bug this card closes). The five QMJ
+    // inputs are unaffected — a missing one stays 0 (fail-closed).
+    const fetcher = vi.fn(async () => pitResponse({
+      NVDA_US_EQ: {
+        net_income: 100000, total_equity: 500000, total_debt: 300000,
+        current_assets: 200000, current_liabilities: 150000,
+        // market_cap_gbp deliberately absent (uncomputable as-of)
+        source: 'pit-edgar',
+      },
+    }));
+    const p = new PitFundamentalsProvider(fakeYahoo(), BASE, fetcher as unknown as typeof fetch, noMint);
+
+    const out = await p.fetch(['NVDA_US_EQ']);
+
+    expect(out['NVDA_US_EQ']).toEqual({
+      netIncome: 100000, totalEquity: 500000, totalDebt: 300000,
+      currentAssets: 200000, currentLiabilities: 150000, marketCapGbp: null,
+    });
+    expect(out['NVDA_US_EQ'].marketCapGbp).toBeNull();
+    expect(out['NVDA_US_EQ'].marketCapGbp).not.toBe(0);   // the regression guard
+    expect(p.sourceOf('NVDA_US_EQ')).toBe(SOURCE_PIT_EDGAR);   // still a hit — only the cap is absent
+  });
+
+  it('treats an explicit null market_cap_gbp the same as absent → null (never 0)', async () => {
+    // The resolver may emit the key with a JSON null when the cap drops out; `num(null)` is undefined,
+    // so `?? null` keeps it null — not a fabricated £0.
+    const fetcher = vi.fn(async () => pitResponse({
+      AAPL_US_EQ: { ...AAPL_PIT, market_cap_gbp: null },
+    }));
+    const p = new PitFundamentalsProvider(fakeYahoo(), BASE, fetcher as unknown as typeof fetch, noMint);
+
+    const out = await p.fetch(['AAPL_US_EQ']);
+
+    expect(out['AAPL_US_EQ'].marketCapGbp).toBeNull();
+  });
+
+  it('passes a present market_cap_gbp through unchanged (the NVDA=£3.71T computed-cap case)', async () => {
+    const fetcher = vi.fn(async () => pitResponse({
+      NVDA_US_EQ: { ...AAPL_PIT, market_cap_gbp: 3_712_141_818_000 },
+    }));
+    const p = new PitFundamentalsProvider(fakeYahoo(), BASE, fetcher as unknown as typeof fetch, noMint);
+
+    const out = await p.fetch(['NVDA_US_EQ']);
+
+    expect(out['NVDA_US_EQ'].marketCapGbp).toBe(3_712_141_818_000);   // a real cap is never nulled
   });
 
   it('returns {} for an empty ticker list without any call', async () => {
