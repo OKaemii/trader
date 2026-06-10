@@ -35,6 +35,7 @@ from .intervals import IdentifierInterval, resolve_instrument_id, resolve_interv
 from .pool import close_pool, get_pool, timescale_url
 from .rate_limiter import RateLimiter
 from .resolver import ResolvedInstrument, SecurityMasterResolver, pad_cik
+from .ticker_aliases import TICKER_ALIASES, TickerAlias, resolve_alias
 from .writers import (
     COUNTRY_GB,
     COUNTRY_US,
@@ -84,6 +85,10 @@ __all__ = [
     "OpenFigiClient",
     "FigiMapping",
     "parse_mapping_response",
+    # ticker aliases (the rename / ADR / new-IPO → CIK bridge)
+    "TICKER_ALIASES",
+    "TickerAlias",
+    "resolve_alias",
     # pool / limiter
     "get_pool",
     "close_pool",

@@ -48,11 +48,18 @@ class TickerAlias:
     `cik` is the zero-padded 10-digit EDGAR central index key (rename-invariant). `since_ms` is the
     UTC-ms instant the CURRENT symbol became effective (the rename date, or a new filer's first-listing
     date) — the boundary the effective-dated identifier interval is closed/opened at. `note` is a short,
-    human-auditable reason (`renamed_to META` / `rename_target` / `new_ipo` / `adr`)."""
+    human-auditable reason (`renamed_to META` / `rename_target` / `new_ipo` / `adr`).
+
+    `renamed_from` is set ONLY on the CURRENT side of a rename (META carries `renamed_from="FB"`); it
+    is the PRIOR symbol whose effective-dated `ID_TICKER` interval the orchestrator closes at `since_ms`
+    when it ingests the current symbol, so the FB→META transition is recorded as an append-only identifier
+    pair regardless of which symbol triggered resolution. A legacy/origin or new-IPO/ADR entry leaves it
+    None (there is no predecessor to close)."""
 
     cik: str
     since_ms: int
     note: str
+    renamed_from: Optional[str] = None
 
 
 # Seeded with the operator-named cases. KEY is the BARE uppercase symbol (the orchestrator upper-cases
@@ -69,7 +76,8 @@ class TickerAlias:
 #             we never fabricate a CIK for a name that genuinely does not file.
 TICKER_ALIASES: dict[str, TickerAlias] = {
     "FB":   TickerAlias(cik="0001326801", since_ms=_ts("2022-06-09"), note="renamed_to META"),
-    "META": TickerAlias(cik="0001326801", since_ms=_ts("2022-06-09"), note="rename_target"),
+    "META": TickerAlias(cik="0001326801", since_ms=_ts("2022-06-09"), note="rename_target",
+                        renamed_from="FB"),
 }
 
 
