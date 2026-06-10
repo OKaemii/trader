@@ -17,7 +17,7 @@ export interface FundamentalsDoc {
   raw:          FundamentalsRaw;
   ratios:       QmjRatios | null;
   qualityPass:  boolean;
-  marketCapGbp: number;
+  marketCapGbp: number | null;   // null = uncomputable cap (renders `—`, never a fabricated £0)
   // Per-name provenance: the concrete upstream this row came from, as the provider reported it on
   // the fetch (`provider.sourceOf`) — `pit-edgar` for a PIT-warehouse hit, `yahoo` for the PIT
   // fall-back (non-US / PIT miss / outage), or the configured mode (`yahoo`/`eodhd`) when the

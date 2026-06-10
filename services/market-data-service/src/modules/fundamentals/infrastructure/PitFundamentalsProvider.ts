@@ -22,11 +22,12 @@ import { mintInternalJwt } from '@trader/shared-auth';
 import type { FundamentalsProvider, FundamentalsRaw } from './FundamentalsProvider.ts';
 import { log } from '../../../logger.ts';
 
-// The 6 QMJ inputs are stored in the warehouse as canonical snake_case `LINE_ITEMS`
+// The line items are stored in the warehouse as canonical snake_case `LINE_ITEMS`
 // (quant_core.fundamentals.contract) and surfaced verbatim by fundamentals-api's resolver; the
-// market-data QMJ screen wants camelCase `FundamentalsRaw`. Missing items default to 0 downstream,
+// market-data QMJ screen wants camelCase `FundamentalsRaw`. A missing QMJ input defaults to 0,
 // which keeps the screen fail-closed (a zero denominator => excluded, never a false PASS) — the same
-// contract YahooFundamentalsProvider honours.
+// contract YahooFundamentalsProvider honours. `marketCapGbp` (a display field, not a QMJ input) is
+// the lone exception: an absent computed cap is carried as `null`, never a fabricated £0.
 type PitPayload = Record<string, unknown>;
 
 const CALLER = 'market-data-service';
@@ -60,7 +61,12 @@ function isPitHit(payload: PitPayload | undefined): payload is PitPayload {
   return payload != null && typeof payload === 'object' && typeof payload.source === 'string';
 }
 
-/** Map a covered name's snake_case PIT payload onto camelCase `FundamentalsRaw` (missing ⇒ 0). */
+// Map a covered name's snake_case PIT payload onto camelCase `FundamentalsRaw`. The five QMJ inputs
+// default a missing item to 0 (fail-closed — a zero denominator excludes the name, never a false
+// PASS). `marketCapGbp` is NOT a QMJ input and 0 is never a real cap, so an absent computed cap is
+// carried as `null` (renders `—` on the scanner / Research, not a fabricated £0). With C1's as-of
+// read, the resolver omits `market_cap_gbp` only when the cap is genuinely uncomputable (shares
+// absent, or a pre-data as-of) — exactly the cases that should display `—`, not £0.
 function toFundamentalsRaw(payload: PitPayload): FundamentalsRaw {
   return {
     netIncome:          num(payload.net_income) ?? 0,
@@ -68,7 +74,7 @@ function toFundamentalsRaw(payload: PitPayload): FundamentalsRaw {
     totalDebt:          num(payload.total_debt) ?? 0,
     currentAssets:      num(payload.current_assets) ?? 0,
     currentLiabilities: num(payload.current_liabilities) ?? 0,
-    marketCapGbp:       num(payload.market_cap_gbp) ?? 0,
+    marketCapGbp:       num(payload.market_cap_gbp) ?? null,
   };
 }
 

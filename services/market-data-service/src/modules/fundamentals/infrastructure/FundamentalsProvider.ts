@@ -4,16 +4,21 @@ export type FxToGBP = (amount: number, currency: Currency) => Promise<number>;
 
 // Raw balance-sheet + income line items (+ market cap in GBP) — the inputs to the QMJ quality
 // screen. We store the RAW items (not pre-computed ratios) so the canonical ratio math lives in
-// one place: quant-core `quality.py` for live/replay, `qmj.ts` for the scanner badge. Missing
-// items default to 0 downstream, which makes the screen fail-closed (a zero denominator =>
+// one place: quant-core `quality.py` for live/replay, `qmj.ts` for the scanner badge. The five QMJ
+// inputs default to 0 downstream, which makes the screen fail-closed (a zero denominator =>
 // excluded — quality data we don't have is never a false PASS).
+//
+// `marketCapGbp` is the exception: it is NOT a QMJ input (the ratio math never reads it), and a £0
+// company cannot trade, so 0 is never a real cap — only a fabricated one. An uncomputable cap
+// (genuinely missing shares / pre-data as-of) is carried as `null`, which the display formatters
+// render as `—` (ScannerPanel `fmtCap`, Research `gbpCompact`), instead of a misleading £0.
 export interface FundamentalsRaw {
-  netIncome:          number;   // latest fiscal-YEAR net income (annual, for ROE)
+  netIncome:          number;        // latest fiscal-YEAR net income (annual, for ROE)
   totalEquity:        number;
   totalDebt:          number;
   currentAssets:      number;
   currentLiabilities: number;
-  marketCapGbp:       number;
+  marketCapGbp:       number | null; // null = uncomputable cap (renders `—`, never a fabricated £0)
 }
 
 export interface FundamentalsProvider {
