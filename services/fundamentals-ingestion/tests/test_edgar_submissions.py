@@ -243,3 +243,74 @@ async def test_client_fail_soft_on_non_200_and_error() -> None:
 def test_company_tickers_fixture_is_valid_json() -> None:
     # Guard: the fixture must round-trip as JSON (it stands in for the real downloaded file).
     assert json.loads(json.dumps(COMPANY_TICKERS_JSON))["0"]["ticker"] == "AAPL"
+
+
+# ── ticker-map TTL cache (sub-step 4) ─────────────────────────────────────────
+def _counting_tickers_handler(counter: dict):
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "company_tickers.json" in str(request.url):
+            counter["n"] += 1
+            return httpx.Response(200, json=COMPANY_TICKERS_JSON)
+        return httpx.Response(404)
+
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_ticker_map_cached_within_ttl() -> None:
+    # A second call inside the TTL window serves the cached parse — the transport is hit exactly once
+    # (the ~800KB file isn't re-pulled per call inside one run).
+    counter = {"n": 0}
+    client = EdgarSubmissionsClient(user_agent="ua", transport=httpx_transport(_counting_tickers_handler(counter)),
+                                    limiter=RateLimiter(1000, 1.0), ticker_map_ttl_s=3600)
+    first = await client.fetch_company_tickers()
+    second = await client.fetch_company_tickers()
+    assert {e.ticker for e in first} == {"AAPL", "MSFT", "META"}
+    assert {e.ticker for e in second} == {"AAPL", "MSFT", "META"}
+    assert counter["n"] == 1                         # cached on the second call
+
+
+@pytest.mark.asyncio
+async def test_ticker_map_force_refresh_repulls() -> None:
+    counter = {"n": 0}
+    client = EdgarSubmissionsClient(user_agent="ua", transport=httpx_transport(_counting_tickers_handler(counter)),
+                                    limiter=RateLimiter(1000, 1.0), ticker_map_ttl_s=3600)
+    await client.fetch_company_tickers()
+    await client.fetch_company_tickers(force_refresh=True)
+    assert counter["n"] == 2                         # force_refresh bypasses the cache
+
+
+@pytest.mark.asyncio
+async def test_ticker_map_ttl_zero_disables_cache() -> None:
+    counter = {"n": 0}
+    client = EdgarSubmissionsClient(user_agent="ua", transport=httpx_transport(_counting_tickers_handler(counter)),
+                                    limiter=RateLimiter(1000, 1.0), ticker_map_ttl_s=0)
+    await client.fetch_company_tickers()
+    await client.fetch_company_tickers()
+    assert counter["n"] == 2                         # TTL 0 ⇒ every call re-pulls
+
+
+@pytest.mark.asyncio
+async def test_ticker_map_failure_not_cached_then_recovers() -> None:
+    # A transient failure (empty result) must NOT poison the cache: the next call retries and can succeed.
+    import httpx
+
+    state = {"fail": True, "n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "company_tickers.json" in str(request.url):
+            state["n"] += 1
+            if state["fail"]:
+                return httpx.Response(500, text="boom")
+            return httpx.Response(200, json=COMPANY_TICKERS_JSON)
+        return httpx.Response(404)
+
+    client = EdgarSubmissionsClient(user_agent="ua", transport=httpx_transport(handler),
+                                    limiter=RateLimiter(1000, 1.0), ticker_map_ttl_s=3600)
+    assert await client.fetch_company_tickers() == []     # first fetch fails → empty, NOT cached
+    state["fail"] = False
+    recovered = await client.fetch_company_tickers()       # retried (not served a cached [])
+    assert {e.ticker for e in recovered} == {"AAPL", "MSFT", "META"}
+    assert state["n"] == 2
