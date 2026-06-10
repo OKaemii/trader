@@ -28,10 +28,10 @@ import type { RedisClientType } from 'redis';
 import type { OHLCVBar, BarInterval } from '@trader/shared-types';
 import { COLLECTIONS } from '@trader/shared-mongo';
 import { getPgPool } from '@trader/shared-pg';
-import { getBarsFromPg, pgCacheKey } from './pg-bar-reader.ts';
+import { getBarsFromPg, getBarAtOrBeforePg, pgCacheKey, pgAtCacheKey } from './pg-bar-reader.ts';
 
 export { hashBarContent } from './content-hash.ts';
-export { getBarsFromPg, getLastClosePg, pgCacheKey } from './pg-bar-reader.ts';
+export { getBarsFromPg, getBarAtOrBeforePg, getLastClosePg, pgCacheKey, pgAtCacheKey } from './pg-bar-reader.ts';
 export { computeMissingRanges, coverageOf } from './coverage.ts';
 export type { MissingRange } from './coverage.ts';
 
@@ -148,6 +148,14 @@ interface CachedSeries {
   bars: OHLCVBar[];
 }
 
+// Single-bar cache (getBarAtOrBefore). Distinct shape from CachedSeries — a single bar (or null),
+// keyed under a distinct `:at:` segment so it never collides with the windowed-series entries.
+interface CachedBar {
+  v: 2;
+  cachedAt: number;
+  bar: OHLCVBar | null;
+}
+
 // 60s buckets. Live readers all want "now" ± a few seconds, and a 60s bucket keeps
 // cache hit rate high without serving more than a minute of stale data. Backtests
 // pass exact asOf values (wall-clock minutes from a replay clock) that fall on aligned
@@ -159,6 +167,10 @@ function asOfBucket(asOf: number | undefined): string {
 
 function cacheKey(ticker: string, interval: BarInterval, range: RangeKey, asOf?: number): string {
   return `bars:v2:${ticker}:${interval}:${range}:${asOfBucket(asOf)}`;
+}
+
+function atCacheKey(ticker: string, interval: BarInterval, asOf?: number): string {
+  return `bars:v2:${ticker}:${interval}:at:${asOfBucket(asOf)}`;
 }
 
 function metaKey(ticker: string, interval: BarInterval): string {
@@ -279,6 +291,97 @@ async function getBarsFromMongo(
 }
 
 /**
+ * The single latest bar at/<= a knowledge instant (or the latest bar live), dispatching to the
+ * active backend per `BARS_BACKEND`. Returns `null` when none qualifies.
+ *
+ * This is the OOM-safe read the PIT market-cap / dividend-yield enrichment uses INSTEAD of
+ * `getBars(..., 'max', { asOf })`: it never carries a now-anchored lower bound, so a deep
+ * historical as-of and 'now' both touch one row via a `DESC … LIMIT 1` index seek (the old
+ * `range='max'` lower-bound scan matched every chunk back to ~1926 → Timescale lock-table
+ * exhaustion → "out of shared memory" → a 500 to the caller). The live windowed strategy reads
+ * are untouched — this is an additive read used only by enrichment.
+ *
+ * @param db  MongoDB handle. Required when `BARS_BACKEND=mongo` (the default); may be `undefined`
+ *           when `BARS_BACKEND=timescale`.
+ */
+export async function getBarAtOrBefore(
+  redis: Pick<RedisClientType, 'get' | 'setEx'>,
+  db: Db | undefined,
+  ticker: string,
+  interval: BarInterval,
+  opts: GetBarsOpts = {},
+): Promise<OHLCVBar | null> {
+  if (activeBackend() === 'timescale') {
+    return getBarAtOrBeforePg(redis, ticker, interval, opts);
+  }
+  if (!db) {
+    throw new Error('[shared-bars] getBarAtOrBefore: db parameter required when BARS_BACKEND=mongo (the default)');
+  }
+  return getBarAtOrBeforeFromMongo(redis, db, ticker, interval, opts);
+}
+
+async function getBarAtOrBeforeFromMongo(
+  redis: Pick<RedisClientType, 'get' | 'setEx'>,
+  db: Db,
+  ticker: string,
+  interval: BarInterval,
+  opts: GetBarsOpts,
+): Promise<OHLCVBar | null> {
+  const asOf = opts.asOf;
+  const key = atCacheKey(ticker, interval, asOf);
+  try {
+    const cached = await redis.get(key);
+    if (cached) {
+      const parsed = JSON.parse(cached) as CachedBar;
+      if (parsed.v === 2 && 'bar' in parsed) return parsed.bar;
+    }
+  } catch (err) {
+    console.warn(`[shared-bars] at-cache read failed for ${key}:`, err);
+  }
+
+  const coll = db.collection(COLLECTIONS.OHLCV_BARS);
+
+  let bar: OHLCVBar | null;
+  if (asOf === undefined) {
+    // Live path — partial-index fast lane. Newest unsuperseded bar; no lower bound.
+    const docs = await coll
+      .find({ ticker, interval, is_superseded: false })
+      .sort({ observation_ts: -1 })
+      .limit(1)
+      .toArray();
+    bar = docs[0] ? docToBar(docs[0]) : null;
+  } else {
+    // As-of path — newest observation_ts at/<= asOf, then its latest revision known by asOf.
+    // $sort observation_ts DESC, knowledge_ts DESC → $group picks the first (latest revision) per
+    // observation_ts → $sort DESC → LIMIT 1 takes the newest observation. Mirrors the PG
+    // DISTINCT ON … LIMIT 1 shape.
+    const docs = await coll.aggregate([
+      { $match: {
+          ticker,
+          interval,
+          observation_ts: { $lte: asOf },
+          knowledge_ts:   { $lte: asOf },
+      } },
+      { $sort: { observation_ts: -1, knowledge_ts: -1 } },
+      { $group: { _id: '$observation_ts', doc: { $first: '$$ROOT' } } },
+      { $replaceRoot: { newRoot: '$doc' } },
+      { $sort: { observation_ts: -1 } },
+      { $limit: 1 },
+    ]).toArray();
+    bar = docs[0] ? docToBar(docs[0]) : null;
+  }
+
+  try {
+    const payload: CachedBar = { v: 2, cachedAt: Date.now(), bar };
+    await redis.setEx(key, CACHE_TTL_SECONDS, JSON.stringify(payload));
+  } catch (err) {
+    console.warn(`[shared-bars] at-cache write failed for ${key}:`, err);
+  }
+
+  return bar;
+}
+
+/**
  * Latest close for a ticker at the given interval. Convenience over getBars('30d')
  * for callers that only need the most recent price (e.g. dispatcher drift gate).
  * Returns null if no bars are cached or stored. Pass `opts.asOf` to ask "what was
@@ -363,6 +466,11 @@ export async function invalidateBars(
     keys.push(cacheKey(ticker, interval, r));
     keys.push(pgCacheKey(ticker, interval, r));
   }
+  // The single-bar at-or-before live caches (Mongo + PG namespaces) — the live bucket only; as-of
+  // buckets are minute-resolution and decay on their 1h TTL (their asOf is in the past, so a new
+  // write doesn't change what they should return).
+  keys.push(atCacheKey(ticker, interval));
+  keys.push(pgAtCacheKey(ticker, interval));
   keys.push(metaKey(ticker, interval));
   let removed = 0;
   for (const k of keys) {

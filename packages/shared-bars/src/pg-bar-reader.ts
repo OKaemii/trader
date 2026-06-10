@@ -17,6 +17,11 @@
 //                `$sort+$group({$first})` pattern. The `bars_knowledge_lookup`
 //                index makes the range scan cheap; DISTINCT ON does the
 //                per-observation_ts pick.
+//
+// getBarAtOrBeforePg (below) is the single-bar, no-lower-bound read the PIT
+// enrichment uses — see its docstring + 0011_bars_asof_lookup.sql. It is the
+// OOM-safe replacement for the `range='max'` series scan and is deliberately
+// kept here beside the series reader (same cache namespace, same row mapper).
 
 import type { RedisClientType } from 'redis';
 import type { OHLCVBar, BarInterval } from '@trader/shared-types';
@@ -135,6 +140,107 @@ export async function getBarsFromPg(
   }
 
   return bars;
+}
+
+interface CachedBar {
+  v: 1;
+  cachedAt: number;
+  bar: OHLCVBar | null;
+}
+
+/**
+ * Cache key for the single-bar at-or-before read. Distinct `:at:` segment so it never
+ * collides with the windowed-series keys (`pgCacheKey`) — a series read and a single-bar
+ * read for the same (ticker, interval, asOf) are different shapes.
+ */
+export function pgAtCacheKey(ticker: string, interval: BarInterval, asOf?: number): string {
+  return `bars:pg:v1:${ticker}:${interval}:at:${asOfBucket(asOf)}`;
+}
+
+/**
+ * The single latest bar at/<= a knowledge instant — `null` when none qualifies. This is the
+ * OOM-safe replacement for `getBarsFromPg(..., 'max', { asOf })` in the PIT market-cap /
+ * dividend-yield enrichment: there is **no now-anchored lower bound**, so the read reaches a
+ * deep 2006 as-of and 'now' alike by touching one row. A `DESC … LIMIT 1` over the
+ * `bars_asof_lookup` / `bars_knowledge_lookup` index seeks (ticker, interval) and walks
+ * `observation_ts DESC` from the newest qualifying chunk — it never opens every chunk the way the
+ * old `range='max'` lower-bound scan did (which exhausted Timescale's lock table → "out of shared
+ * memory" → a 500 to the enrichment caller).
+ *
+ * Modelled on `getMidQuote` (index.ts) — the same LIMIT-1 shape, applied to `bars`.
+ *
+ * @param opts.asOf  Knowledge-time cutoff (UTC ms). Omitted = live (the `is_superseded=FALSE`
+ *                  fast lane). Set = the latest revision known at that instant (audit / replay).
+ */
+export async function getBarAtOrBeforePg(
+  redis: Pick<RedisClientType, 'get' | 'setEx'>,
+  ticker: string,
+  interval: BarInterval,
+  opts: GetBarsOpts = {},
+): Promise<OHLCVBar | null> {
+  const asOf = opts.asOf;
+  const key = pgAtCacheKey(ticker, interval, asOf);
+  try {
+    const cached = await redis.get(key);
+    if (cached) {
+      const parsed = JSON.parse(cached) as CachedBar;
+      if (parsed.v === 1 && 'bar' in parsed) return parsed.bar;
+    }
+  } catch (err) {
+    // Cache read failure never blocks a request — fall through to PG.
+    console.warn(`[shared-bars/pg] at-cache read failed for ${key}:`, err);
+  }
+
+  const pool = getPgPool();
+  let bar: OHLCVBar | null;
+  if (asOf === undefined) {
+    // Live path — partial-unique-index fast lane (`bars_latest_unique` / `bars_asof_lookup`).
+    // Newest unsuperseded bar; no lower bound.
+    const { rows } = await pool.query(
+      `SELECT ticker, observation_ts, knowledge_ts, interval,
+              open, high, low, close, volume,
+              raw_close, adjusted_close, adjustment_factor,
+              currency, content_hash, is_superseded
+         FROM bars
+        WHERE ticker = $1
+          AND interval = $2
+          AND is_superseded = FALSE
+        ORDER BY observation_ts DESC
+        LIMIT 1`,
+      [ticker, interval],
+    );
+    bar = rows[0] ? rowToBar(rows[0]) : null;
+  } else {
+    // As-of path — the newest observation_ts at/<= asOf, then its latest revision known by asOf.
+    // `DISTINCT ON (observation_ts)` + the double DESC ORDER BY picks one row; LIMIT 1 takes the
+    // newest observation. Bounded by `observation_ts <= asOf` + DESC + LIMIT, so it too starts at
+    // the newest qualifying chunk and stops — no full-chunk fan.
+    const { rows } = await pool.query(
+      `SELECT DISTINCT ON (observation_ts)
+              ticker, observation_ts, knowledge_ts, interval,
+              open, high, low, close, volume,
+              raw_close, adjusted_close, adjustment_factor,
+              currency, content_hash, is_superseded
+         FROM bars
+        WHERE ticker = $1
+          AND interval = $2
+          AND observation_ts <= $3
+          AND knowledge_ts <= $3
+        ORDER BY observation_ts DESC, knowledge_ts DESC
+        LIMIT 1`,
+      [ticker, interval, asOf],
+    );
+    bar = rows[0] ? rowToBar(rows[0]) : null;
+  }
+
+  try {
+    const payload: CachedBar = { v: 1, cachedAt: Date.now(), bar };
+    await redis.setEx(key, CACHE_TTL_SECONDS, JSON.stringify(payload));
+  } catch (err) {
+    console.warn(`[shared-bars/pg] at-cache write failed for ${key}:`, err);
+  }
+
+  return bar;
 }
 
 /**
