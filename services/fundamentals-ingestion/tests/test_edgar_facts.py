@@ -99,6 +99,63 @@ MSFT_FACTS_JSON = {
     },
 }
 
+# TSM: a foreign private issuer filing a 20-F under IFRS. Its income/balance-sheet facts are tagged in
+# the `ifrs-full` taxonomy (ifrs-full:ProfitLoss / ifrs-full:Revenue), NOT us-gaap. The fixture also
+# carries the dei cover-page share count (every EDGAR filer tags DEI, IFRS or not) so the test proves
+# ifrs-full is preserved ALONGSIDE dei, and an unrelated `ifrs-sme:*` taxonomy to prove preservation
+# stays scoped to the financial-reporting set (only `ifrs-full` of the IFRS taxonomies is in-contract).
+TSM_FACTS_JSON = {
+    "cik": 1046179,
+    "entityName": "TAIWAN SEMICONDUCTOR MANUFACTURING CO LTD",
+    "facts": {
+        "ifrs-full": {
+            "ProfitLoss": {
+                "label": "Profit (Loss)",
+                "units": {
+                    "USD": [
+                        {"start": "2021-01-01", "end": "2021-12-31", "val": 21350000000,
+                         "accn": "0001193125-22-000300", "fy": 2021, "fp": "FY", "form": "20-F",
+                         "frame": "CY2021"},
+                    ]
+                },
+            },
+            "Revenue": {
+                "label": "Revenue",
+                "units": {
+                    "USD": [
+                        {"start": "2021-01-01", "end": "2021-12-31", "val": 56800000000,
+                         "accn": "0001193125-22-000300", "fy": 2021, "fp": "FY", "form": "20-F"},
+                    ]
+                },
+            },
+            "Equity": {
+                "label": "Equity",
+                "units": {
+                    "USD": [
+                        {"end": "2021-12-31", "val": 67000000000, "accn": "0001193125-22-000300",
+                         "fy": 2021, "fp": "FY", "form": "20-F"},
+                    ]
+                },
+            },
+        },
+        "dei": {
+            "EntityCommonStockSharesOutstanding": {
+                "units": {
+                    "shares": [
+                        {"end": "2022-03-31", "val": 5186077000, "accn": "0001193125-22-000300",
+                         "fy": 2021, "fp": "FY", "form": "20-F"},
+                    ]
+                },
+            },
+        },
+        # A non-preserved IFRS taxonomy — must be ignored (only `ifrs-full` is in the contract).
+        "ifrs-smes": {
+            "ProfitLossSme": {"units": {"USD": [{"end": "2021-12-31", "val": 1.0, "accn": "x",
+                                                 "fy": 2021, "fp": "FY", "form": "20-F"}]}},
+        },
+    },
+}
+
 
 # ── parse_company_facts ───────────────────────────────────────────────────────
 def test_parse_company_facts_flattens_us_gaap_and_dei() -> None:
@@ -110,6 +167,33 @@ def test_parse_company_facts_flattens_us_gaap_and_dei() -> None:
     assert "us-gaap:StockholdersEquity" in tags
     assert "dei:EntityCommonStockSharesOutstanding" in tags
     assert not any(t.startswith("srt:") for t in tags)
+
+
+def test_parse_company_facts_preserves_ifrs_full_for_foreign_filer() -> None:
+    # A 20-F IFRS filer (TSM) tags income/balance-sheet facts under `ifrs-full`. The parser must keep
+    # those verbatim — without this the alias in metric_registry.yaml has nothing to select and the
+    # filer stages null for net_income/revenue. The parser is taxonomy-agnostic, so the IFRS facts carry
+    # the SAME flattened identity (period_type, currency, accession, frame) as a us-gaap fact.
+    facts = parse_company_facts(TSM_FACTS_JSON)
+    tags = {f.raw_tag for f in facts}
+    assert "ifrs-full:ProfitLoss" in tags
+    assert "ifrs-full:Revenue" in tags
+    assert "ifrs-full:Equity" in tags
+    # dei is still preserved alongside ifrs-full; the non-contract `ifrs-smes` taxonomy is dropped.
+    assert "dei:EntityCommonStockSharesOutstanding" in tags
+    assert not any(t.startswith("ifrs-smes:") for t in tags)
+
+    # The IFRS profit-or-loss fact retains full provenance — a duration flow in USD, with its accession.
+    pl = next(f for f in facts if f.raw_tag == "ifrs-full:ProfitLoss")
+    assert pl.period_type == "duration"
+    assert pl.period_start == _ms("2021-01-01") and pl.period_end == _ms("2021-12-31")
+    assert pl.value == 21350000000.0
+    assert pl.unit == "USD" and pl.currency == "USD"
+    assert pl.accession_number == "0001193125-22-000300"
+    assert pl.fiscal_period == "FY" and pl.form == "20-F"
+    # The IFRS equity fact is an instant (balance-sheet point: end only, no start).
+    eq = next(f for f in facts if f.raw_tag == "ifrs-full:Equity")
+    assert eq.period_type == "instant" and eq.period_start is None
 
 
 def test_parse_company_facts_period_type_instant_vs_duration() -> None:
