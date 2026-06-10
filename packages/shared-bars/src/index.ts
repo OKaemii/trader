@@ -173,6 +173,16 @@ function atCacheKey(ticker: string, interval: BarInterval, asOf?: number): strin
   return `bars:v2:${ticker}:${interval}:at:${asOfBucket(asOf)}`;
 }
 
+// at-or-before window bounds (ms). The single-bar read is bounded BELOW at the anchor (`asOf`, or
+// `now` for live) so the two backends share one semantics: the latest bar within the window, the
+// dense steady-state served by the primary, a long pre-asOf hole cleared by the one wider fallback.
+// This bound is load-bearing on Timescale (it stops the per-chunk lock fan that exhausted the lock
+// table on a deep daily series → "out of shared memory"; see pg-bar-reader.ts); on Mongo it keeps
+// the result identical across `BARS_BACKEND`. Mirrors AT_PRIMARY_WINDOW_MS / AT_WIDE_WINDOW_MS there.
+const AT_DAY_MS = 24 * 60 * 60 * 1000;
+const AT_PRIMARY_WINDOW_MS = 400 * AT_DAY_MS;
+const AT_WIDE_WINDOW_MS = 5 * 365 * AT_DAY_MS;
+
 function metaKey(ticker: string, interval: BarInterval): string {
   return `bars:v2:meta:${ticker}:${interval}`;
 }
@@ -295,11 +305,12 @@ async function getBarsFromMongo(
  * active backend per `BARS_BACKEND`. Returns `null` when none qualifies.
  *
  * This is the OOM-safe read the PIT market-cap / dividend-yield enrichment uses INSTEAD of
- * `getBars(..., 'max', { asOf })`: it never carries a now-anchored lower bound, so a deep
- * historical as-of and 'now' both touch one row via a `DESC … LIMIT 1` index seek (the old
- * `range='max'` lower-bound scan matched every chunk back to ~1926 → Timescale lock-table
- * exhaustion → "out of shared memory" → a 500 to the caller). The live windowed strategy reads
- * are untouched — this is an additive read used only by enrichment.
+ * `getBars(..., 'max', { asOf })`: it carries a bounded window anchored at `asOf` (NOT at `now`),
+ * so a deep historical as-of and 'now' both touch one row from a bounded slice of chunks via a
+ * `DESC … LIMIT 1` read. The old `range='max'` lower-bound scan matched every chunk back to ~1926
+ * → Timescale lock-table exhaustion → "out of shared memory" → a 500 to the caller; the asOf-
+ * anchored window prunes chunk-exclusion on BOTH bounds so the lock fan never spans the hypertable.
+ * The live windowed strategy reads are untouched — this is an additive read used only by enrichment.
  *
  * @param db  MongoDB handle. Required when `BARS_BACKEND=mongo` (the default); may be `undefined`
  *           when `BARS_BACKEND=timescale`.
@@ -340,36 +351,33 @@ async function getBarAtOrBeforeFromMongo(
   }
 
   const coll = db.collection(COLLECTIONS.OHLCV_BARS);
+  const isLive = asOf === undefined;
+  const anchor = isLive ? Date.now() : asOf;
 
-  let bar: OHLCVBar | null;
-  if (asOf === undefined) {
-    // Live path — partial-index fast lane. Newest unsuperseded bar; no lower bound.
+  // One bounded read in `(anchor - windowMs, anchor]`. Live filters the unsuperseded fast lane;
+  // as-of additionally filters `knowledge_ts <= anchor`. `sort(observation_ts DESC, knowledge_ts
+  // DESC).limit(1)` already returns the newest observation's latest-knowledge row — no `$group`
+  // stage is needed (a single row, not a per-observation pick). Same shape as the PG single-row read.
+  const queryWindow = async (windowMs: number): Promise<OHLCVBar | null> => {
+    const lowerBound = anchor - windowMs;
+    const filter: Record<string, unknown> = {
+      ticker,
+      interval,
+      observation_ts: { $lte: anchor, $gt: lowerBound },
+    };
+    if (isLive) filter.is_superseded = false;
+    else filter.knowledge_ts = { $lte: anchor };
     const docs = await coll
-      .find({ ticker, interval, is_superseded: false })
-      .sort({ observation_ts: -1 })
+      .find(filter)
+      .sort({ observation_ts: -1, knowledge_ts: -1 })
       .limit(1)
       .toArray();
-    bar = docs[0] ? docToBar(docs[0]) : null;
-  } else {
-    // As-of path — newest observation_ts at/<= asOf, then its latest revision known by asOf.
-    // $sort observation_ts DESC, knowledge_ts DESC → $group picks the first (latest revision) per
-    // observation_ts → $sort DESC → LIMIT 1 takes the newest observation. Mirrors the PG
-    // DISTINCT ON … LIMIT 1 shape.
-    const docs = await coll.aggregate([
-      { $match: {
-          ticker,
-          interval,
-          observation_ts: { $lte: asOf },
-          knowledge_ts:   { $lte: asOf },
-      } },
-      { $sort: { observation_ts: -1, knowledge_ts: -1 } },
-      { $group: { _id: '$observation_ts', doc: { $first: '$$ROOT' } } },
-      { $replaceRoot: { newRoot: '$doc' } },
-      { $sort: { observation_ts: -1 } },
-      { $limit: 1 },
-    ]).toArray();
-    bar = docs[0] ? docToBar(docs[0]) : null;
-  }
+    return docs[0] ? docToBar(docs[0]) : null;
+  };
+
+  // Primary window first; expand once to the bounded wide window on a miss (a long pre-asOf hole).
+  let bar = await queryWindow(AT_PRIMARY_WINDOW_MS);
+  if (!bar) bar = await queryWindow(AT_WIDE_WINDOW_MS);
 
   try {
     const payload: CachedBar = { v: 2, cachedAt: Date.now(), bar };
