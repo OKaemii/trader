@@ -123,8 +123,13 @@ global:
     # ceilings under the 100k/month plan; bulk/screener cost >1 call each. Raise on a larger plan.
     eodhdCallsPerMin: "1000"
     eodhdDailyCallLimit: "90000"
-    # Fundamentals (QMJ: ROE / D-E / current ratio) source. yahoo (free quoteSummary) | eodhd (paid add-on).
-    fundamentalsProvider: yahoo
+    # Fundamentals (QMJ: ROE / D-E / current ratio) source. yahoo (free quoteSummary) | eodhd (paid add-on)
+    # | pit (route *_US_EQ QMJ line items to the PIT SEC-EDGAR warehouse via fundamentals-api, Yahoo
+    # fallback for non-US / a PIT miss — epic pit-coverage-broaden Task 11). `pit` migrates the QMJ
+    # pass/fail to point-in-time for the curated US universe; the broad EODHD 10k universe SCAN is
+    # untouched (PIT can't scan 10k), and LSE/foreign-issuer names (no US 10-K EDGAR) degrade to Yahoo.
+    # The provider degrades to Yahoo on any fundamentals-api miss/outage, so the flip is safe + reversible.
+    fundamentalsProvider: pit
     # LIVE strategy-engine fundamentals SEAM (the PIT warehouse wiring — epic Task 14). Distinct from
     # `fundamentalsProvider` above (which is market-data-service's QMJ snapshot source): this selects how
     # strategy-engine fills HistoryView.fundamentals — `yahoo` (the forward-only snapshot alone, the
@@ -164,7 +169,11 @@ global:
     # backfill bounded (FUNDAMENTALS_COVERAGE_CAP env, default 64; 0 ⇒ uncapped — the operator's opt-in
     # to the full set once the per-name cost is understood). The full ~15k-CIK market is out of scope.
     fundamentalsCoverage: "universe_plus_index"
-    fundamentalsCoverageCap: "64"
+    # Raised 64 → 200 (epic pit-coverage-broaden Task 11): bounds the per-service ingest envelope while
+    # guaranteeing the full active US universe (≤60 active + the curated US list) PLUS a healthy S&P-PIT
+    # index union. The curated universe is NEVER truncated (Task 1 — the cap bounds only the index-history
+    # remainder); the 6-hourly self-heal CronJob keeps it fresh. 0 ⇒ uncapped (an unbounded nightly walk).
+    fundamentalsCoverageCap: "200"
     # One-shot backfill Job gate. "false" (default) ⇒ the backfill-job.yaml renders NOTHING, so a
     # routine `helm upgrade` never kicks off a heavy from-scratch backfill. Flip to "true" (and redeploy)
     # to run a one-off `python -m src.ingest --full --tickers <fundamentalsBackfillTickers>` — the Job
