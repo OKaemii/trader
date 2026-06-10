@@ -30,6 +30,7 @@ own only the I/O + rate-limit + fail-soft.
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -43,6 +44,13 @@ _SEC_MAX_REQS = 10
 _SEC_PER_SECONDS = 1.0
 # httpx read timeout: SEC is usually fast, but submissions for a heavy filer is a large body.
 _DEFAULT_TIMEOUT_S = 20.0
+
+# Short TTL for the bulk ticker map within ONE process (default 6h, env-overridable). SEC publishes
+# `company_tickers.json` roughly daily, so re-fetching it more than once inside a single run (the nightly
+# walk + a same-process heal pass) is wasted bandwidth — cache the parsed map for the window. A SEPARATE
+# same-day re-run is a fresh process with an empty cache, so it always re-pulls a fresher snapshot (the
+# case a brand-new IPO needs); the TTL only bounds in-process staleness. A 0/negative TTL disables it.
+_TICKER_MAP_TTL_S = float(os.getenv("EDGAR_TICKER_MAP_TTL_S", "21600"))
 
 # Forms that materially change reported fundamentals — the downloader (Task 5) filters to these;
 # exposed here so the parser can flag amendments (`is_amendment`) consistently with the schema.
@@ -231,11 +239,16 @@ class EdgarSubmissionsClient:
         limiter: Optional[RateLimiter] = None,
         transport: Any = None,
         timeout: float = _DEFAULT_TIMEOUT_S,
+        ticker_map_ttl_s: Optional[float] = None,
     ) -> None:
         self._user_agent = user_agent if user_agent is not None else os.getenv("EDGAR_USER_AGENT", "")
         self._limiter = limiter or RateLimiter(_SEC_MAX_REQS, _SEC_PER_SECONDS)
         self._transport = transport
         self._timeout = timeout
+        self._ticker_map_ttl_s = ticker_map_ttl_s if ticker_map_ttl_s is not None else _TICKER_MAP_TTL_S
+        # In-process TTL cache for the bulk ticker map: (entries, monotonic-seconds-fetched). Only a
+        # non-empty fetch is cached so a transient SEC failure (which degrades to []) never poisons it.
+        self._tickers_cache: Optional[tuple[list[TickerMapEntry], float]] = None
 
     def _headers(self) -> dict[str, str]:
         # SEC asks for a descriptive UA identifying the requester + contact; Accept-Encoding gzip
@@ -263,10 +276,23 @@ class EdgarSubmissionsClient:
             # Network error / decode error: degrade to empty, mirror EodhdCreditLimiter's never-throw.
             return None
 
-    async def fetch_company_tickers(self) -> list[TickerMapEntry]:
-        """The bulk CIK↔ticker map. Empty list on any failure."""
+    async def fetch_company_tickers(self, *, force_refresh: bool = False) -> list[TickerMapEntry]:
+        """The bulk CIK↔ticker map. Empty list on any failure.
+
+        Served from a short in-process TTL cache (`_ticker_map_ttl_s`) so repeated calls inside one run
+        (the nightly walk + a same-process heal pass) don't re-pull the ~800KB file every time. Only a
+        non-empty fetch is cached (a transient SEC failure returns [] without poisoning the cache, so the
+        next call retries). `force_refresh` bypasses the cache; a separate same-day re-run is a fresh
+        process whose cache is empty and therefore always re-pulls a fresher snapshot."""
+        if not force_refresh and self._tickers_cache is not None and self._ticker_map_ttl_s > 0:
+            entries, fetched_at = self._tickers_cache
+            if (time.monotonic() - fetched_at) < self._ticker_map_ttl_s:
+                return entries
         payload = await self._get_json(SEC_COMPANY_TICKERS_URL)
-        return parse_company_tickers(payload) if payload is not None else []
+        entries = parse_company_tickers(payload) if payload is not None else []
+        if entries:
+            self._tickers_cache = (entries, time.monotonic())
+        return entries
 
     async def fetch_submissions(self, cik: Any) -> Optional[CompanySubmissions]:
         """Per-CIK submissions (name, tickers, exchanges, filings). None on any failure."""
