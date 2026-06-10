@@ -266,6 +266,11 @@ class IngestionOrchestrator:
         if not self._ticker_cik:
             await self.prime_ticker_map()
         summary = IngestSummary(requested=len(symbols))
+        # One name at a time (memory hardening §C4): the loop fetches + ingests a single CIK's
+        # companyfacts per iteration, never accumulating payloads across the backfill. `ingest_ticker`
+        # drops its own facts before returning; `result` here is only a small `TickerResult` (counts +
+        # ids), and dropping it each iteration keeps the per-name boundary explicit — so a deep
+        # curated-US walk holds one payload resident, bounding the 768Mi backfill-Job pod.
         for symbol in symbols:
             try:
                 result = await self.ingest_ticker(symbol)
@@ -273,6 +278,7 @@ class IngestionOrchestrator:
                 log.exception("[orchestrator] ticker %s failed: %s", symbol, exc)
                 result = TickerResult(ticker=symbol, skipped_reason=f"error:{type(exc).__name__}")
             summary.add(result)
+            del result
         log.info(
             "[orchestrator] run complete: requested=%d ingested=%d skipped=%d raw=%d "
             "canonical_inserted=%d revisions=%d quarantined=%d",
@@ -324,6 +330,13 @@ class IngestionOrchestrator:
         # Step 7: per filing — stage → write → QA in-line.
         canon_inserted = canon_revisions = canon_skipped = quarantined = filings_with_facts = 0
         by_accn = _group_facts_by_accession(facts)
+        # Memory hardening (plan §C4): a heavy filer's companyfacts is a large in-RAM list, and on the
+        # 768Mi backfill-Job pod a deep curated-US walk must hold ONE payload at a time, not accumulate.
+        # `by_accn` now owns every RawFact (grouped by accession), so the flat `facts` list is dead from
+        # here — drop it so the redundant container can't keep the peak doubled through the per-filing
+        # loop below. The decoded JSON itself was already freed inside `fetch_company_facts` (a local
+        # there); this drops the last app-RAM hold on the parsed facts that the loop doesn't read.
+        del facts
         for accn, accn_facts in by_accn.items():
             filing_lineage = lineage.get(accn)
             if filing_lineage is None:
@@ -352,6 +365,10 @@ class IngestionOrchestrator:
             )
             quarantined += qa_stats.quarantined
 
+        # The grouped facts are fully consumed — drop the last app-RAM reference to this name's payload
+        # so it is reclaimable before the caller's loop moves to the next name (memory hardening §C4: the
+        # returned `TickerResult` carries only counts/ids, never the facts, so no payload survives here).
+        del by_accn
         return TickerResult(
             ticker=sym, cik=cik, instrument_id=instrument_id, sector=sector,
             filings_seen=filings_with_facts, raw_written=raw_written,
