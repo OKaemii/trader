@@ -880,6 +880,18 @@ async function bootstrap(): Promise<void> {
     }
   })();
 
+  // A FUNDAMENTALS_PROVIDER flip (e.g. yahoo→pit) doesn't make cached rows time-stale, so the TTL
+  // refresher below would keep serving the old provider's data on the Research/Scanner surfaces for
+  // up to a month. Re-source the whole universe once when the mode changes (backgrounded — a full
+  // walk runs for minutes; never block boot). Idempotent across boots via the Redis mode key.
+  void (async () => {
+    const r = await getRedisClient();
+    await fundamentalsCache.refreshIfModeChanged(
+      r as unknown as { get(k: string): Promise<string | null>; set(k: string, v: string): Promise<unknown> },
+      universeManager.activeTickers,
+    );
+  })().catch((err) => log.warn('[fundamentals] mode-change refresh failed:', err));
+
   // Universe is resolved by now — start the background QMJ refresher (first pass runs immediately,
   // populating any missing fundamentals, then self-paces). Independent of the bar poll cadence.
   fundamentalsRefresher.start();
