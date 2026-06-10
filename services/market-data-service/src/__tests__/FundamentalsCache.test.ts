@@ -57,12 +57,52 @@ describe('FundamentalsCache.refreshIfModeChanged (re-source on a provider-mode f
     expect(refresh).not.toHaveBeenCalled(); // never re-sources on steady state
   });
 
-  it('does NOT advance the mode key if the refresh throws (retries next boot)', async () => {
+  it('re-sources US names FIRST and in chunks (a slow non-US tail cannot block US writes)', async () => {
+    const cache = new FundamentalsCache(noopProvider, 'pit');
+    const seen: string[][] = [];
+    vi.spyOn(cache, 'refresh').mockImplementation(async (t) => { seen.push(t); return t.length; });
+    const store = fakeModeStore('yahoo');
+    // 13 US + 1 LSE → chunk size 12 means: chunk1 = 12 US, chunk2 = 1 US + the LSE last.
+    const us = Array.from({ length: 13 }, (_, i) => `US${i}_US_EQ`);
+    const tickers = ['VODl_EQ', ...us]; // LSE listed first to prove it is reordered LAST
+
+    const r = await cache.refreshIfModeChanged(store, tickers);
+
+    expect(r.refreshed).toBe(14);
+    expect(seen).toHaveLength(2);            // 14 tickers / chunk 12 → 2 chunks
+    expect(seen[0]).toHaveLength(12);
+    expect(seen[0].every((t) => t.endsWith('_US_EQ'))).toBe(true); // first chunk is all US
+    expect(seen[1][seen[1].length - 1]).toBe('VODl_EQ');           // the LSE name is dead last
+    expect(store.peek()).toBe('pit');
+  });
+
+  it('records the mode after PARTIAL progress (a bad chunk is skipped, not fatal)', async () => {
+    const cache = new FundamentalsCache(noopProvider, 'pit');
+    let call = 0;
+    vi.spyOn(cache, 'refresh').mockImplementation(async (t) => {
+      call += 1;
+      if (call === 2) throw new Error('yahoo cooldown'); // the non-US tail chunk throws
+      return t.length;
+    });
+    const store = fakeModeStore('yahoo');
+    const us = Array.from({ length: 13 }, (_, i) => `US${i}_US_EQ`);
+
+    const r = await cache.refreshIfModeChanged(store, [...us, 'VODl_EQ']);
+
+    expect(r.changed).toBe(true);
+    expect(r.refreshed).toBe(12);     // chunk1 (12 US) succeeded; chunk2 threw → counted 0
+    expect(store.peek()).toBe('pit'); // partial progress still records the mode
+  });
+
+  it('does NOT advance the mode key when EVERY chunk fails (retries next boot)', async () => {
     const cache = new FundamentalsCache(noopProvider, 'pit');
     vi.spyOn(cache, 'refresh').mockRejectedValue(new Error('provider down'));
     const store = fakeModeStore('yahoo');
 
-    await expect(cache.refreshIfModeChanged(store, ['AAPL_US_EQ'])).rejects.toThrow('provider down');
-    expect(store.peek()).toBe('yahoo'); // unchanged → the flip is re-attempted on the next boot
+    const r = await cache.refreshIfModeChanged(store, ['AAPL_US_EQ']);
+
+    expect(r.changed).toBe(true);
+    expect(r.refreshed).toBe(0);      // nothing re-sourced
+    expect(store.peek()).toBe('yahoo'); // mode unchanged → the flip is re-attempted on the next boot
   });
 });
