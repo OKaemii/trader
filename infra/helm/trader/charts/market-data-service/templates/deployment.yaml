@@ -77,6 +77,11 @@ spec:
               value: {{ .Values.global.env.eodhdDailyCallLimit | default "90000" | quote }}
             - name: FUNDAMENTALS_PROVIDER
               value: {{ .Values.global.env.fundamentalsProvider | default "yahoo" | quote }}
+            # In-cluster read side of the PIT warehouse — the `pit` FUNDAMENTALS_PROVIDER mode routes US
+            # (*_US_EQ) QMJ line items here (Yahoo fallback for non-US / miss). Mirrors strategy-engine's
+            # wiring; env.ts also defaults to this, so the value is explicit + operator-overridable.
+            - name: FUNDAMENTALS_API_URL
+              value: {{ .Values.global.env.fundamentalsApiUrl | default "http://fundamentals-api:8011" | quote }}
             - name: EARNINGS_PROVIDER
               value: {{ .Values.global.env.earningsProvider | default "yahoo" | quote }}
             - name: SECTOR_ETF_TICKERS
