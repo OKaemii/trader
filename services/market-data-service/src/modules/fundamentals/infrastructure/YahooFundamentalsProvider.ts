@@ -73,7 +73,9 @@ export class YahooFundamentalsProvider implements FundamentalsProvider {
       ?? (typeof summary?.currency === 'string' ? summary.currency : undefined);
     // Market cap is reported in the major currency unit (GBp/GBX quote → cap still GBP).
     const ccy: Currency = ccyStr === 'USD' ? 'USD' : 'GBP';
-    const marketCapGbp = capNative > 0 ? await this.fxToGBP(capNative, ccy) : 0;
+    // 0 is never a real market cap; an absent quote carries `null` so the scanner / Research render
+    // `—` rather than a fabricated £0 (the same null-not-zero contract the PIT provider honours).
+    const marketCapGbp = capNative > 0 ? await this.fxToGBP(capNative, ccy) : null;
 
     return { netIncome, totalEquity, totalDebt, currentAssets, currentLiabilities, marketCapGbp };
   }

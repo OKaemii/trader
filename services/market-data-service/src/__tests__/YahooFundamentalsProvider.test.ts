@@ -41,4 +41,19 @@ describe('YahooFundamentalsProvider', () => {
     const p = new YahooFundamentalsProvider(fx, qsReturning(null), 0);
     expect(await p.fetch(['ZZZZ_US_EQ'])).toEqual({});
   });
+
+  it('carries an absent market cap as null, NOT 0 (renders `—`, never a fabricated £0)', async () => {
+    // A resolvable name whose payload has the QMJ line items but no market-cap quote. 0 is never a
+    // real cap, so it must be null (the scanner / Research then show `—`) — the same null-not-zero
+    // contract as the PIT provider.
+    const p = new YahooFundamentalsProvider(fx, qsReturning({
+      incomeStatementHistory: { incomeStatementHistory: [{ netIncome: { raw: 1000 } }] },
+      balanceSheetHistory: { balanceSheetStatements: [{ totalStockholderEquity: { raw: 5000 } }] },
+      // no price / summaryDetail marketCap
+    }), 0);
+    const out = await p.fetch(['NOCAP_US_EQ']);
+    expect(out['NOCAP_US_EQ']!.marketCapGbp).toBeNull();
+    expect(out['NOCAP_US_EQ']!.marketCapGbp).not.toBe(0);   // regression guard
+    expect(out['NOCAP_US_EQ']!.netIncome).toBe(1000);       // the QMJ items still extract
+  });
 });
