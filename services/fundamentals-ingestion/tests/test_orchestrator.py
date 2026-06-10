@@ -519,3 +519,156 @@ async def test_openfigi_not_consulted_when_alias_resolves() -> None:
     )
     await orch.run(["META"])
     assert figi.queried == []
+
+
+# ── memory hardening (plan §C4): one companyfacts payload resident at a time ────────
+# The 768Mi backfill-Job pod must hold ONE filer's companyfacts in RAM at a time, never accumulate the
+# whole curated-US walk. These tests pin that the orchestrator drops every reference to a name's parsed
+# facts before the next name is fetched (so a heavy filer is reclaimable, not retained by the summary or
+# a per-iteration handle). The proof is a weakref to a parsed `RawFact`: after the owning name finishes,
+# the weakref must be dead under `gc.collect()` — i.e. the orchestrator holds no strong reference.
+
+class _WeakrefRecordingFacts(EdgarFactsClient):
+    """A facts client that parses fresh per call (so the orchestrator owns the only strong reference to
+    the returned list) and records a WEAKREF — never a strong ref — to one `RawFact` per CIK. It also
+    snapshots, at the moment each name is fetched, whether every PREVIOUS name's payload is already dead;
+    that snapshot is the 'released between names' assertion (the prior name's `ingest_ticker` has
+    returned and its `result` handle has been dropped by the time the next fetch runs)."""
+
+    def __init__(self, facts_by_cik: dict) -> None:
+        import weakref
+
+        self._facts = facts_by_cik
+        self._weakref = weakref
+        self.parsed_refs: dict[str, "weakref.ref"] = {}
+        # Per fetched CIK: were ALL earlier CIKs' parsed payloads already collected at this point?
+        self.prior_dead_at_fetch: dict[str, bool] = {}
+
+    async def fetch_company_facts(self, cik):
+        import gc
+
+        from src.security_master.edgar_submissions import pad_cik
+
+        padded = pad_cik(cik)
+        # Force a collection so a still-referenced prior payload would survive (and fail the snapshot),
+        # while a properly-dropped one is reclaimed — the per-name boundary is what we are asserting.
+        gc.collect()
+        self.prior_dead_at_fetch[padded] = all(
+            ref() is None for c, ref in self.parsed_refs.items() if c != padded
+        )
+
+        payload = self._facts.get(padded)
+        if payload is None:
+            return []
+        facts = parse_company_facts(payload)
+        # Record a weakref to a representative fact; do NOT keep a strong ref (that would defeat the test).
+        if facts:
+            self.parsed_refs[padded] = self._weakref.ref(facts[0])
+        return facts
+
+
+_MSFT_CIK = "0000789019"
+_MS_ACCN_2021 = "0000789019-21-000001"
+
+
+def _msft_facts_payload() -> dict:
+    # A single-metric (net_income) one-filing MSFT payload — enough to land a canonical row under a
+    # SECOND CIK so the two-name walk exercises the per-name boundary with distinct payloads.
+    return {
+        "cik": 789019,
+        "entityName": "MICROSOFT CORP",
+        "facts": {
+            "us-gaap": {
+                "NetIncomeLoss": {"units": {"USD": [
+                    {"start": "2020-07-01", "end": "2021-06-30", "val": 61271000000,
+                     "accn": _MS_ACCN_2021, "fy": 2021, "fp": "FY", "form": "10-K"},
+                ]}},
+            },
+        },
+    }
+
+
+_MSFT_SUBMISSIONS = {
+    "cik": _MSFT_CIK,
+    "name": "MICROSOFT CORP",
+    "tickers": ["MSFT"],
+    "exchanges": ["Nasdaq"],
+    "sic": "7372",  # prepackaged software → general template
+    "filings": {"recent": {
+        "accessionNumber": [_MS_ACCN_2021],
+        "form": ["10-K"],
+        "filingDate": ["2021-07-29"],
+        "acceptanceDateTime": ["2021-07-28T18:05:00.000Z"],
+        "primaryDocument": ["msft-20210630.htm"],
+    }},
+}
+
+
+@pytest.mark.asyncio
+async def test_companyfacts_payload_is_released_after_each_name() -> None:
+    # The single-name proof: after a name's run completes, the orchestrator retains NO strong reference
+    # to its parsed companyfacts — the weakref is dead under gc (so a heavy filer is reclaimable, not
+    # held by the summary/result). This is the core memory-hardening invariant.
+    import gc
+
+    db = FakeTimescale()
+    facts = _WeakrefRecordingFacts({"0000320193": _facts_payload()})
+    orch = IngestionOrchestrator(
+        submissions_client=_FakeSubmissions(_COMPANY_TICKERS, {"0000320193": _AAPL_SUBMISSIONS}),
+        facts_client=facts,
+        secmaster=SecurityMasterWriter(db),
+        raw_writer=RawFactsWriter(db),
+        fundamentals_writer=FundamentalsWriter(db),
+        qa_engine=QaEngine(db),
+    )
+    summary = await orch.run(["AAPL"])
+
+    # The name ingested for real (so the payload genuinely flowed through the pipeline, not a no-op skip).
+    assert summary.ingested == 1 and summary.raw_written == 12
+    # …and after the run nothing strong-references the parsed facts: the weakref is dead under gc.
+    gc.collect()
+    assert facts.parsed_refs["0000320193"]() is None, (
+        "orchestrator still holds the AAPL companyfacts after its name completed — a deep backfill would "
+        "then accumulate every filer's payload and OOM the 768Mi backfill-Job pod"
+    )
+
+
+@pytest.mark.asyncio
+async def test_prior_payload_dropped_before_next_name_is_fetched() -> None:
+    # The 'between names' proof: by the time the SECOND name (MSFT) is fetched, the FIRST name's (AAPL)
+    # parsed payload is already collected — so the walk holds ONE payload resident at a time, never two
+    # (the property that bounds the pod under a multi-name backfill).
+    tickers = {
+        "0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."},
+        "1": {"cik_str": 789019, "ticker": "MSFT", "title": "MICROSOFT CORP"},
+    }
+    db = FakeTimescale()
+    facts = _WeakrefRecordingFacts(
+        {"0000320193": _facts_payload(), _MSFT_CIK: _msft_facts_payload()}
+    )
+    orch = IngestionOrchestrator(
+        submissions_client=_FakeSubmissions(
+            tickers, {"0000320193": _AAPL_SUBMISSIONS, _MSFT_CIK: _MSFT_SUBMISSIONS}
+        ),
+        facts_client=facts,
+        secmaster=SecurityMasterWriter(db),
+        raw_writer=RawFactsWriter(db),
+        fundamentals_writer=FundamentalsWriter(db),
+        qa_engine=QaEngine(db),
+    )
+    summary = await orch.run(["AAPL", "MSFT"])
+
+    # Both names ingested (two distinct payloads actually flowed through).
+    assert summary.ingested == 2
+    # When MSFT was fetched, AAPL's payload was already dead — the prior name was released before the
+    # next name's payload entered RAM (one payload resident at a time).
+    assert facts.prior_dead_at_fetch[_MSFT_CIK] is True, (
+        "AAPL companyfacts was still alive when MSFT was fetched — the backfill would hold two payloads "
+        "at once, breaking the one-payload-at-a-time bound"
+    )
+    # And after the whole run, neither name's payload survives.
+    import gc
+
+    gc.collect()
+    assert facts.parsed_refs["0000320193"]() is None
+    assert facts.parsed_refs[_MSFT_CIK]() is None
