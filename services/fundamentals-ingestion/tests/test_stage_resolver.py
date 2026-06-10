@@ -294,6 +294,112 @@ def test_shares_outstanding_from_dei_cover_page() -> None:
     assert sh[0].period_type == "instant"
 
 
+# ── IFRS / 20-F foreign-filer mapping (preserve ifrs-full + alias) ────────────
+def test_ifrs_profit_loss_maps_to_net_income() -> None:
+    # The TSM fix end-to-end: a 20-F IFRS filer tags net income as ifrs-full:ProfitLoss (NO us-gaap
+    # income tag at all). With the registry alias the resolver falls through the us-gaap candidates
+    # (all absent) to ifrs-full:ProfitLoss and stages net_income — not null.
+    payload = _facts({
+        "ProfitLoss": {"units": {"USD": [
+            {"start": "2021-01-01", "end": "2021-12-31", "val": 21350000000,
+             "accn": "tsm-21", "fy": 2021, "fp": "FY", "form": "20-F"},
+        ]}},
+        "Revenue": {"units": {"USD": [
+            {"start": "2021-01-01", "end": "2021-12-31", "val": 56800000000,
+             "accn": "tsm-21", "fy": 2021, "fp": "FY", "form": "20-F"},
+        ]}},
+    }, taxonomy="ifrs-full")
+    res = resolve_metrics(parse_company_facts(payload), cik="1046179")
+    ni = [f for f in res.facts if f.metric == "net_income"]
+    assert len(ni) == 1
+    assert ni[0].raw_tag == "ifrs-full:ProfitLoss"      # selected the IFRS tag, not null
+    assert ni[0].value == 21350000000.0
+    rev = [f for f in res.facts if f.metric == "total_revenue"]
+    assert len(rev) == 1 and rev[0].raw_tag == "ifrs-full:Revenue"
+    assert rev[0].value == 56800000000.0
+    assert not res.conflicts
+
+
+def test_ifrs_balance_sheet_instants_map_to_canonical_metrics() -> None:
+    # The IFRS balance-sheet aliases resolve too: Equity/Assets/Liabilities (instants) → their canonical
+    # metrics, so QMJ's ROE (net_income / total_equity) has both legs for an IFRS filer.
+    payload = _facts({
+        "Equity": {"units": {"USD": [
+            {"end": "2021-12-31", "val": 67000000000, "accn": "tsm-21",
+             "fy": 2021, "fp": "FY", "form": "20-F"},
+        ]}},
+        "Assets": {"units": {"USD": [
+            {"end": "2021-12-31", "val": 120000000000, "accn": "tsm-21",
+             "fy": 2021, "fp": "FY", "form": "20-F"},
+        ]}},
+    }, taxonomy="ifrs-full")
+    res = resolve_metrics(parse_company_facts(payload), cik="1046179")
+    by_metric = {f.metric: f for f in res.facts}
+    assert by_metric["total_equity"].raw_tag == "ifrs-full:Equity"
+    assert by_metric["total_equity"].value == 67000000000.0 and by_metric["total_equity"].period_type == "instant"
+    assert by_metric["total_assets"].raw_tag == "ifrs-full:Assets"
+
+
+def test_us_gaap_preferred_over_ifrs_for_dual_tagger() -> None:
+    # A dual-tagger (rare, but possible — a filer carrying both taxonomies) must keep the us-gaap value:
+    # the IFRS alias sits AFTER the us-gaap tags in the candidate order, so us-gaap stays preferred. The
+    # two are listed as candidates for the same metric, so when both are present AND their values agree
+    # the resolver picks the higher-priority us-gaap tag cleanly.
+    payload = {"cik": 320193, "entityName": "Dual Co", "facts": {
+        "us-gaap": {"NetIncomeLoss": {"units": {"USD": [
+            {"start": "2021-01-01", "end": "2021-12-31", "val": 100000000000,
+             "accn": "d-21", "fy": 2021, "fp": "FY", "form": "10-K"},
+        ]}}},
+        "ifrs-full": {"ProfitLoss": {"units": {"USD": [
+            {"start": "2021-01-01", "end": "2021-12-31", "val": 100000000000,
+             "accn": "d-21", "fy": 2021, "fp": "FY", "form": "10-K"},
+        ]}}},
+    }}
+    res = resolve_metrics(parse_company_facts(payload), cik="320193")
+    ni = [f for f in res.facts if f.metric == "net_income"]
+    assert len(ni) == 1 and ni[0].raw_tag == "us-gaap:NetIncomeLoss"   # us-gaap wins the tie
+    assert not res.conflicts
+
+
+def test_fail_closed_when_neither_us_gaap_nor_ifrs_full_tagged() -> None:
+    # Fail-closed is UNCHANGED by the IFRS aliasing: a filer whose income is tagged under NEITHER a
+    # registered us-gaap candidate NOR a registered ifrs-full candidate yields NO net_income fact — never
+    # a fabricated value. Here the only fact is an ifrs-full tag the registry does NOT list as a
+    # net_income candidate (NewIfrsConcept), so it is dropped at the resolver's candidate_set membership
+    # check exactly as an unmapped us-gaap tag would be.
+    payload = _facts({
+        "ProfitLossFromContinuingOperationsUnmapped": {"units": {"USD": [
+            {"start": "2021-01-01", "end": "2021-12-31", "val": 21350000000,
+             "accn": "tsm-21", "fy": 2021, "fp": "FY", "form": "20-F"},
+        ]}},
+    }, taxonomy="ifrs-full")
+    res = resolve_metrics(parse_company_facts(payload), cik="1046179")
+    assert [f for f in res.facts if f.metric == "net_income"] == []   # no fact, not a fabricated 0
+    assert not res.conflicts
+
+
+def test_ifrs_value_agreement_guard_still_fires() -> None:
+    # The value-agreement guard treats an IFRS candidate exactly like a us-gaap one: when us-gaap and
+    # ifrs-full income tags are BOTH present for the same period but DISAGREE, no fact is emitted and the
+    # conflict is surfaced — fail-closed, not a silent pick of the higher-priority tag.
+    payload = {"cik": 320193, "entityName": "Conflict Co", "facts": {
+        "us-gaap": {"NetIncomeLoss": {"units": {"USD": [
+            {"start": "2021-01-01", "end": "2021-12-31", "val": 100000000000,
+             "accn": "c-21", "fy": 2021, "fp": "FY", "form": "10-K"},
+        ]}}},
+        "ifrs-full": {"ProfitLoss": {"units": {"USD": [
+            {"start": "2021-01-01", "end": "2021-12-31", "val": 60000000000,   # disagrees by 40%
+             "accn": "c-21", "fy": 2021, "fp": "FY", "form": "10-K"},
+        ]}}},
+    }}
+    res = resolve_metrics(parse_company_facts(payload), cik="320193")
+    assert [f for f in res.facts if f.metric == "net_income"] == []   # suppressed
+    conflicts = [c for c in res.conflicts if c.metric == "net_income"]
+    assert len(conflicts) == 1
+    assert conflicts[0].tag_a == "us-gaap:NetIncomeLoss"
+    assert conflicts[0].tag_b == "ifrs-full:ProfitLoss"
+
+
 # ── fact identity key ─────────────────────────────────────────────────────────
 def test_fact_key_carries_full_identity() -> None:
     # The resolver keys on (cik, raw_tag, unit, period_start, period_end, dim_signature, accn).

@@ -22,6 +22,20 @@
 # short-term-borrowings debt build; GrossProfit; NetCashProvidedByUsedInOperatingActivities;
 # dei:EntityCommonStockSharesOutstanding) are the standard edgartools/SEC-DEI choices.
 #
+# IFRS / 20-F FOREIGN FILERS. A foreign private issuer filing a 20-F/40-F reports under IFRS, so its
+# facts are tagged in the `ifrs-full` taxonomy (`ifrs-full:ProfitLoss`, not `us-gaap:NetIncomeLoss`) —
+# preserved at parse by `download/edgar.py`'s `PRESERVED_TAXONOMIES`. Each metric's `default` list adds
+# its `ifrs-full:*` equivalent AFTER the us-gaap tags, so a domestic filer (which tags only us-gaap) is
+# unaffected and a dual-tagger keeps the us-gaap value (us-gaap stays preferred), while a pure-IFRS
+# filer (e.g. TSM) falls through the us-gaap candidates — all absent — to the IFRS tag. This is the SAME
+# preference-ordered fallback the resolver already does between us-gaap tags; the value-agreement guard
+# and fail-closed selection are unchanged (a name that tags NEITHER yields no fact, never a fabricated
+# value). The IFRS element names are from the public IFRS Taxonomy (ProfitLoss/Revenue/Equity/Assets/
+# Liabilities/CurrentAssets/CurrentLiabilities/Borrowings/GrossProfit + the operating-cash-flow line).
+# Aliases are added only to the `default` (general-template) lists — the curated-US foreign filers are
+# general-template names; the empty sector overrides (e.g. a bank's `gross_profit: []`) keep their
+# fail-closed "no tag for this sector" meaning and are NOT given IFRS tags.
+#
 # WHAT THE REGISTRY DOES NOT DO. Order is preference only — the resolver still applies the value-
 # agreement guard (it will NOT silently prefer tag A over tag B if both are present for the same period
 # with DISAGREEING values; that is a data-quality signal, surfaced, not merged). Instant-vs-duration is
@@ -47,8 +61,9 @@ metrics:
   net_income:
     default:
       - us-gaap:NetIncomeLoss
-      - us-gaap:ProfitLoss            # IFRS-filer / consolidated-incl-NCI fallback
+      - us-gaap:ProfitLoss            # consolidated-incl-NCI fallback (still a us-gaap element)
       - us-gaap:NetIncomeLossAvailableToCommonStockholdersBasic
+      - ifrs-full:ProfitLoss          # 20-F IFRS foreign filer (e.g. TSM) — profit or loss for the period
 
   total_revenue:
     default:
@@ -57,6 +72,7 @@ metrics:
       - us-gaap:Revenues
       - us-gaap:SalesRevenueNet
       - us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax
+      - ifrs-full:Revenue           # 20-F IFRS foreign filer top line
     sectors:
       bank:
         # A bank's top line is net interest + noninterest income, not product sales.
@@ -78,6 +94,7 @@ metrics:
   gross_profit:
     default:
       - us-gaap:GrossProfit
+      - ifrs-full:GrossProfit       # 20-F IFRS foreign filer
     # Banks / insurers do not report a gross-profit line; absent for those templates (NaN-excluded
     # downstream, never fabricated). An empty candidate list ⇒ the resolver yields no fact for it.
     sectors:
@@ -88,6 +105,7 @@ metrics:
     default:
       - us-gaap:NetCashProvidedByUsedInOperatingActivities
       - us-gaap:NetCashProvidedByUsedInOperatingActivitiesContinuingOperations
+      - ifrs-full:CashFlowsFromUsedInOperatingActivities   # 20-F IFRS foreign filer operating cash flow
 
   # ── Balance sheet (instants) ────────────────────────────────────────────────
   total_equity:
@@ -95,21 +113,26 @@ metrics:
       - us-gaap:StockholdersEquity
       # Includes noncontrolling interest — preferred only when the parent-only tag is absent.
       - us-gaap:StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest
+      - ifrs-full:Equity            # 20-F IFRS foreign filer total equity
 
   total_assets:
     default:
       - us-gaap:Assets
+      - ifrs-full:Assets            # 20-F IFRS foreign filer total assets
 
   total_liabilities:
     default:
       - us-gaap:Liabilities
       # Some filers only tag Liabilities+Equity; the resolver does NOT subtract here (that derivation,
       # if ever wanted, is the normalizer's — staging only SELECTS a reported tag).
+      - ifrs-full:Liabilities       # 20-F IFRS foreign filer total liabilities
 
   current_assets:
     default:
       - us-gaap:AssetsCurrent
-    # Banks / insurers run unclassified balance sheets (no current/non-current split) — absent.
+      - ifrs-full:CurrentAssets     # 20-F IFRS foreign filer current assets
+    # Banks / insurers run unclassified balance sheets (no current/non-current split) — absent. The
+    # empty override is fail-closed ("no tag for this sector") and is NOT given an IFRS tag.
     sectors:
       bank: []
       insurance: []
@@ -117,6 +140,7 @@ metrics:
   current_liabilities:
     default:
       - us-gaap:LiabilitiesCurrent
+      - ifrs-full:CurrentLiabilities  # 20-F IFRS foreign filer current liabilities
     sectors:
       bank: []
       insurance: []
@@ -130,6 +154,10 @@ metrics:
       - us-gaap:LongTermDebtAndCapitalLeaseObligations
       - us-gaap:LongTermDebt
       - us-gaap:DebtCurrent
+      # IFRS borrowings: the closest single *reported* total a 20-F filer tags. Same "select, don't sum"
+      # semantics — total interest-bearing borrowings first, then the long-term component.
+      - ifrs-full:Borrowings
+      - ifrs-full:LongtermBorrowings
 
   # ── Cover page (instant; own knowledge_ts = filing date) ─────────────────────
   shares_outstanding:
