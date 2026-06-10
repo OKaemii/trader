@@ -69,8 +69,10 @@ DEFAULT_STALE_AFTER_DAYS_ANNUAL = 400
 # Form types that mark an ANNUAL reporting cadence. 20-F / 40-F are the foreign-private-issuer annual
 # reports (the TSM case); 10-K is the domestic annual. EDGAR amendments carry a `/A` suffix (`10-K/A`,
 # `20-F/A`), so classification matches on the form PREFIX (before any `/A`). A name is treated as an
-# annual filer only when its newest filing is one of these AND it has filed no recent 10-Q (a name that
-# files quarterly always has a recent 10-Q → it keeps the 135-day window even just after its 10-K).
+# annual filer when it has filed one of these AND has filed no recent 10-Q — NOT when one of these is the
+# single newest filing (a 20-F filer posts newer 6-K/8-K/Form-4 current reports, so the annual form is
+# rarely the latest). A name that files quarterly always has a recent 10-Q → it keeps the 135-day window
+# even just after its 10-K.
 _ANNUAL_FORM_PREFIXES = ("20-F", "40-F", "10-K")
 _QUARTERLY_FORM_PREFIX = "10-Q"
 
@@ -113,19 +115,20 @@ GROUP BY inst.t212_ticker
 # new migration. The `filings_instrument_lookup (instrument_id, accepted_ts DESC)` index already covers
 # the per-instrument acceptance ordering.
 #
-# Rather than `DISTINCT ON … LIMIT 1` (which surfaces only the single newest form and can't see "no
-# recent 10-Q"), this aggregates per ticker into the two timestamps the classifier needs:
-#   * `newest_filing_ts`  = MAX(accepted_ts) over ALL forms — to know what the latest filing IS.
-#   * `newest_annual_ts`  = MAX(accepted_ts) of an annual form (20-F/40-F/10-K, amendments included via
-#                           the `/A`-tolerant prefix match) — non-null ⇒ this name files annual reports.
+# What matters is the FILING CADENCE — does the name file 10-Qs? — not which single form is newest. A
+# real 20-F/10-K filer's recent filings are dominated by NEWER 6-K/8-K/Form-4 current reports, so "the
+# newest filing is the annual form" is almost never true and is the wrong test (it misclassified every
+# real annual filer as quarterly). So rather than `DISTINCT ON … LIMIT 1`, this aggregates per ticker into
+# the two presence-of-cadence timestamps the classifier needs:
+#   * `newest_annual_ts`    = MAX(accepted_ts) of an annual form (20-F/40-F/10-K, amendments included via
+#                             the `/A`-tolerant prefix match) — non-null ⇒ this name files annual reports.
 #   * `newest_quarterly_ts` = MAX(accepted_ts) of a 10-Q (or 10-Q/A) — non-null ⇒ a quarterly cadence.
-# The classifier (`_is_annual_cadence`) then derives annual-vs-quarterly from these three. A name with NO
-# filing rows at all (never resolved a CIK, UK foreign issuer) simply does not appear → the caller falls
-# back to the quarterly window, the pre-A2 behaviour (never widen a window on absent data).
+# The classifier (`_is_annual_cadence`) derives annual (has-annual ∧ no-recent-10-Q) vs quarterly from
+# these two. A name with NO filing rows at all (never resolved a CIK, UK foreign issuer) simply does not
+# appear → the caller falls back to the quarterly window, the pre-A2 behaviour (never widen on absent data).
 _FILING_CADENCE_BY_TICKER_SQL = """
 SELECT
     inst.t212_ticker                                                            AS t212_ticker,
-    MAX(fl.accepted_ts)                                                         AS newest_filing_ts,
     MAX(fl.accepted_ts) FILTER (
         WHERE split_part(fl.form_type, '/', 1) = ANY($2::text[])
     )                                                                           AS newest_annual_ts,
@@ -163,25 +166,34 @@ def _is_annual_cadence(cadence: Optional[dict], *, now_ms: int, annual_ms: int) 
     """Classify a name as an ANNUAL filer from its filing cadence (a `_FILING_CADENCE_BY_TICKER_SQL` row,
     or None when it has no filings on record).
 
-    A name is annual only when BOTH hold:
-      * its newest filing overall is an annual form (`newest_filing_ts == newest_annual_ts`), and
+    A name is annual when BOTH hold:
+      * it has filed an annual form (`newest_annual_ts` present — a 10-K/20-F/40-F, amendments included),
+        and
       * it has filed no 10-Q within the annual window (no `newest_quarterly_ts`, or that 10-Q is itself
         older than `annual_ms` — i.e. the name used to file quarterly but no longer does).
-    Everything else — a quarterly filer (recent 10-Q), or a name with no filing rows at all — is treated
-    as quarterly. Defaulting to quarterly on absent/ambiguous data is deliberate: A2 only ever WIDENS a
-    window for a name we positively know files annually, never on missing data (which would silently let
-    a stale quarterly name look fresh and break the safe-to-retire gate)."""
+
+    Crucially this does NOT require the annual form to be the *newest filing overall*: a real 20-F/10-K
+    filer's `filings.recent` is dominated by NEWER 6-K/8-K/Form-4 current reports, so the latest filing is
+    almost never the annual report itself. Keying on "newest filing == the annual form" misclassified
+    every real annual filer (TSM) as quarterly. The honest discriminator is filing CADENCE — does the name
+    file 10-Qs? A name with an annual report and no recent 10-Q reports once a year (a 20-F foreign private
+    issuer files 6-K interims, never a 10-Q); a name with a recent 10-Q reports quarterly.
+
+    Everything else — a quarterly filer (recent 10-Q), or a name with no annual form / no filing rows at
+    all — is treated as quarterly. Defaulting to quarterly on absent/ambiguous data is deliberate: A2 only
+    ever WIDENS a window for a name we positively know files annually, never on missing data (which would
+    silently let a stale quarterly name look fresh and break the safe-to-retire gate)."""
     if cadence is None:
         return False
-    newest_filing = cadence.get("newest_filing_ts")
     newest_annual = cadence.get("newest_annual_ts")
     newest_quarterly = cadence.get("newest_quarterly_ts")
 
-    # Newest filing isn't an annual form (or there's no annual form at all) ⇒ not an annual filer.
-    if newest_annual is None or newest_filing is None or newest_annual != newest_filing:
+    # No annual form on record ⇒ not an annual filer (a name that has only ever filed 6-K/8-K, or nothing).
+    if newest_annual is None:
         return False
-    # An annual newest filing, but a 10-Q landed within the annual window ⇒ still a quarterly cadence
-    # (e.g. a name mid-transition that files both). Only the absence of a *recent* 10-Q makes it annual.
+    # Files an annual report but ALSO a 10-Q within the annual window ⇒ still a quarterly cadence (a
+    # domestic name files both a 10-K and 10-Qs; the recent 10-Q keeps it on the tighter window). Only the
+    # absence of a *recent* 10-Q makes a name a once-a-year filer.
     if newest_quarterly is not None and (now_ms - newest_quarterly) <= annual_ms:
         return False
     return True

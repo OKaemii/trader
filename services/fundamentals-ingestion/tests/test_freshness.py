@@ -126,11 +126,13 @@ class _FreshnessFakeTimescale(FakeTimescale):
             return [{"t212_ticker": tk, "last_stored_at": ms} for tk, ms in by_ticker.items()]
 
         # Filing cadence per curated ticker: from security_master.filings JOIN instruments, grouped by
-        # t212_ticker, with three MAX(accepted_ts) aggregates — overall / annual-form-only / 10-Q-only.
-        # $2 = the annual-form prefix list, $3 = the quarterly prefix. The form-type prefix match mirrors
-        # the SQL's split_part(form_type, '/', 1). Mirrors _FILING_CADENCE_BY_TICKER_SQL.
+        # t212_ticker, with two MAX(accepted_ts) aggregates — annual-form-only / 10-Q-only. $2 = the
+        # annual-form prefix list, $3 = the quarterly prefix. The form-type prefix match mirrors the SQL's
+        # split_part(form_type, '/', 1). Mirrors _FILING_CADENCE_BY_TICKER_SQL — which keys on filing
+        # CADENCE (does the name file 10-Qs?), NOT which single form is newest, so a name with NEWER
+        # 6-K/8-K/Form-4 current reports than its 20-F still surfaces a non-null newest_annual_ts.
         if "from security_master.filings fl" in q and "group by inst.t212_ticker" in q \
-                and "newest_filing_ts" in q:
+                and "newest_annual_ts" in q:
             tickers = set(args[0])
             annual_prefixes = set(args[1])
             quarterly_prefix = args[2]
@@ -145,10 +147,8 @@ class _FreshnessFakeTimescale(FakeTimescale):
                     continue
                 prefix = str(f["form_type"]).split("/", 1)[0]
                 cur = cad.setdefault(
-                    tk, {"t212_ticker": tk, "newest_filing_ts": None,
-                         "newest_annual_ts": None, "newest_quarterly_ts": None},
+                    tk, {"t212_ticker": tk, "newest_annual_ts": None, "newest_quarterly_ts": None},
                 )
-                cur["newest_filing_ts"] = _max_opt(cur["newest_filing_ts"], accepted)
                 if prefix in annual_prefixes:
                     cur["newest_annual_ts"] = _max_opt(cur["newest_annual_ts"], accepted)
                 if prefix == quarterly_prefix:
@@ -456,9 +456,58 @@ async def test_annual_filer_not_stale_while_quarterly_filer_uses_135() -> None:
 
 
 @pytest.mark.asyncio
+async def test_annual_filer_with_newer_current_reports_still_classifies_annual() -> None:
+    """The REALISTIC 20-F shape that the prior classifier got wrong. A foreign private issuer files its
+    annual 20-F, then a stream of NEWER current reports (6-K interims, an 8-K, a Form-4) — so the name's
+    *newest filing overall* is a 6-K/Form-4, NOT the 20-F. The classifier MUST key on filing CADENCE
+    (has an annual form, no recent 10-Q), not on "the newest filing is the annual form": the latter test
+    misclassified every real annual filer as quarterly (135d) → still flagged stale + force-re-ingested
+    every --heal cycle, defeating the card. Here the 20-F is the OLDEST filing on record yet the name is
+    annual and NOT stale at 200 days, while a 10-Q filer at the same age IS stale."""
+    mongo = _FakeMongo(["AAPL_US_EQ", "TSM_US_EQ"])
+    db = _FreshnessFakeTimescale()
+    now = 1_000_000 * _DAY
+    age = 200 * _DAY  # between the 135-day quarterly and the 400-day annual windows
+
+    # AAPL: a domestic 10-Q filer at the same 200-day age → stale under the 135-day quarterly window.
+    _seed_instrument(db, instrument_id=1, t212_ticker="AAPL_US_EQ")
+    _seed_fact(db, instrument_id=1, metric="net_income", observation_ts=now - age, knowledge_ts=now - age + _DAY)
+    _seed_filing(db, instrument_id=1, form_type="10-Q", accepted_ts=now - age + _DAY)
+
+    # TSM: a 20-F foreign private issuer. Its 20-F is the OLDEST filing; NEWER 6-K interims + an 8-K + a
+    # Form-4 all post-date it (insider/ownership current reports a 20-F filer routinely files). The
+    # newest filing overall is the Form-4 — NOT the 20-F. No 10-Q is ever filed (the 20-F-filer hallmark).
+    _seed_instrument(db, instrument_id=2, t212_ticker="TSM_US_EQ")
+    _seed_fact(db, instrument_id=2, metric="net_income", observation_ts=now - age, knowledge_ts=now - age + _DAY)
+    _seed_filing(db, instrument_id=2, form_type="20-F", accepted_ts=now - age)          # the annual report (oldest)
+    _seed_filing(db, instrument_id=2, form_type="6-K", accepted_ts=now - 90 * _DAY)     # a newer interim
+    _seed_filing(db, instrument_id=2, form_type="8-K", accepted_ts=now - 40 * _DAY)     # newer still
+    _seed_filing(db, instrument_id=2, form_type="4", accepted_ts=now - 10 * _DAY)       # newest filing overall
+
+    audit = await freshness_audit(
+        db, mongo, now_ms=now, stale_after_ms=stale_after_ms_from_days(None),
+        annual_stale_after_ms=annual_stale_after_ms_from_days(None), last_ingest_run=None,
+    )
+    by_symbol = {n["symbol"]: n for n in audit["names"]}
+
+    tsm = by_symbol["TSM"]
+    # The regression guard: annual even though the newest filing is a 6-K/Form-4, not the 20-F.
+    assert tsm["filing_cadence"] == "annual"
+    assert tsm["stale"] is False                       # 200d < 400d annual window — NOT re-ingested
+
+    aapl = by_symbol["AAPL"]
+    assert aapl["filing_cadence"] == "quarterly"
+    assert aapl["stale"] is True                       # 200d > 135d quarterly window
+
+    # Only AAPL is stale → universe not retirable; TSM is held fresh by the correct annual window.
+    assert audit["covered"] == 2 and audit["stale"] == 1 and audit["retirable"] is False
+
+
+@pytest.mark.asyncio
 async def test_annual_filer_beyond_annual_window_is_still_stale() -> None:
     """An annual filer gets a WIDER window, not an infinite one: a 20-F name whose fiscal period is older
-    than the 400-day annual window is still flagged stale (so a genuinely-abandoned name still heals)."""
+    than the 400-day annual window is still flagged stale (so a genuinely-abandoned name still heals).
+    Realistic shape: the 20-F is NOT the newest filing — a newer 6-K post-dates it — yet cadence is annual."""
     mongo = _FakeMongo(["TSM_US_EQ"])
     db = _FreshnessFakeTimescale()
     now = 1_000_000 * _DAY
@@ -467,6 +516,7 @@ async def test_annual_filer_beyond_annual_window_is_still_stale() -> None:
     _seed_fact(db, instrument_id=1, metric="net_income", observation_ts=now - 450 * _DAY,
                knowledge_ts=now - 449 * _DAY)
     _seed_filing(db, instrument_id=1, form_type="20-F", accepted_ts=now - 449 * _DAY)
+    _seed_filing(db, instrument_id=1, form_type="6-K", accepted_ts=now - 300 * _DAY)   # newer than the 20-F
 
     audit = await freshness_audit(
         db, mongo, now_ms=now, stale_after_ms=stale_after_ms_from_days(None),
@@ -479,16 +529,16 @@ async def test_annual_filer_beyond_annual_window_is_still_stale() -> None:
 
 @pytest.mark.asyncio
 async def test_annual_form_with_recent_10q_stays_quarterly() -> None:
-    """A name whose NEWEST filing is a 10-K but that ALSO files 10-Qs is a quarterly filer — the recent
-    10-Q keeps it on the 135-day window even though its latest filing is annual-shaped. (A domestic name
-    right after its annual 10-K, before the next 10-Q lands.)"""
+    """A name that files an annual 10-K but ALSO files 10-Qs is a quarterly filer — the recent 10-Q keeps
+    it on the 135-day window. (A domestic name right after its annual 10-K, before the next 10-Q lands;
+    the latest filing being the 10-K is irrelevant — cadence, not newest-form, drives the window.)"""
     mongo = _FakeMongo(["MSFT_US_EQ"])
     db = _FreshnessFakeTimescale()
     now = 1_000_000 * _DAY
     _seed_instrument(db, instrument_id=1, t212_ticker="MSFT_US_EQ")
     _seed_fact(db, instrument_id=1, metric="net_income", observation_ts=now - 200 * _DAY,
                knowledge_ts=now - 199 * _DAY)
-    # Newest filing is the 10-K (most recent accepted_ts), but a 10-Q sits just behind it (recent).
+    # The 10-K is the most recent filing, but a 10-Q sits just behind it (recent) → quarterly cadence.
     _seed_filing(db, instrument_id=1, form_type="10-Q", accepted_ts=now - 95 * _DAY)
     _seed_filing(db, instrument_id=1, form_type="10-K", accepted_ts=now - 30 * _DAY)
 
@@ -503,8 +553,9 @@ async def test_annual_form_with_recent_10q_stays_quarterly() -> None:
 
 @pytest.mark.asyncio
 async def test_amendment_form_classified_by_prefix() -> None:
-    """A 20-F/A amendment is an annual form (matched by the `/A`-tolerant prefix), so a name whose newest
-    filing is a 20-F/A still gets the annual window."""
+    """A 20-F/A amendment is an annual form (matched by the `/A`-tolerant prefix), so a name that files a
+    20-F/A (with newer 6-K current reports on top, as a real foreign filer has) still gets the annual
+    window — the amendment is counted as an annual form even though it isn't the newest filing."""
     mongo = _FakeMongo(["TSM_US_EQ"])
     db = _FreshnessFakeTimescale()
     now = 1_000_000 * _DAY
@@ -512,6 +563,7 @@ async def test_amendment_form_classified_by_prefix() -> None:
     _seed_fact(db, instrument_id=1, metric="net_income", observation_ts=now - 200 * _DAY,
                knowledge_ts=now - 199 * _DAY)
     _seed_filing(db, instrument_id=1, form_type="20-F/A", accepted_ts=now - 199 * _DAY)
+    _seed_filing(db, instrument_id=1, form_type="6-K", accepted_ts=now - 50 * _DAY)    # newer than the 20-F/A
 
     audit = await freshness_audit(
         db, mongo, now_ms=now, stale_after_ms=stale_after_ms_from_days(None),

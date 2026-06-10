@@ -114,6 +114,37 @@ async def test_heal_annual_filer_not_force_re_ingested(monkeypatch) -> None:
     assert subset == ["AAPL"]      # only the quarterly filer; the 20-F is not re-healed every cycle
 
 
+@pytest.mark.asyncio
+async def test_heal_annual_filer_with_newer_current_reports_not_re_ingested(monkeypatch) -> None:
+    """The REALISTIC --heal shape. A 20-F filer's newest filing is NOT its annual report — newer 6-K/8-K/
+    Form-4 current reports post-date the 20-F. Keying staleness on "newest filing is the annual form"
+    misclassified the name quarterly → it was force-re-ingested every heal cycle (the bug). With cadence-
+    based classification it is annual and fresh at 200 days → NOT in the heal subset; a 10-Q filer at the
+    same age still is. End-to-end through the REAL freshness_audit."""
+    mongo = _FakeMongo(["AAPL_US_EQ", "TSM_US_EQ"])
+    db = _FreshnessFakeTimescale()
+    now = 900_000 * _DAY
+    age = 200 * _DAY
+    monkeypatch.setattr(ingest.time, "time", lambda: now / 1000)  # freeze now_ms = now
+    # AAPL: a 10-Q filer at 200 days → stale under the 135-day window → healed.
+    _seed_instrument(db, instrument_id=1, t212_ticker="AAPL_US_EQ")
+    _seed_fact(db, instrument_id=1, metric="net_income", observation_ts=now - age, knowledge_ts=now - age + _DAY)
+    _seed_filing(db, instrument_id=1, form_type="10-Q", accepted_ts=now - age + _DAY)
+    # TSM: a 20-F annual filer whose 20-F is the OLDEST filing; newer 6-K/8-K/Form-4 post-date it (newest
+    # filing overall is the Form-4). No 10-Q. Same 200-day-old period → fresh under the 400-day annual
+    # window → must be SKIPPED by heal, not re-ingested every cycle.
+    _seed_instrument(db, instrument_id=2, t212_ticker="TSM_US_EQ")
+    _seed_fact(db, instrument_id=2, metric="net_income", observation_ts=now - age, knowledge_ts=now - age + _DAY)
+    _seed_filing(db, instrument_id=2, form_type="20-F", accepted_ts=now - age)
+    _seed_filing(db, instrument_id=2, form_type="6-K", accepted_ts=now - 90 * _DAY)
+    _seed_filing(db, instrument_id=2, form_type="8-K", accepted_ts=now - 40 * _DAY)
+    _seed_filing(db, instrument_id=2, form_type="4", accepted_ts=now - 10 * _DAY)
+    _patch_freshness_sources(monkeypatch, timescale=db, mongo=mongo)
+
+    subset = await ingest._filter_stale_symbols(["AAPL", "TSM"], _args(heal=True))
+    assert subset == ["AAPL"]      # the 20-F filer is NOT re-healed despite newer non-annual filings
+
+
 # ── _filter_stale_symbols (end-to-end against the real freshness_audit) ─────────────────────────────
 def _patch_freshness_sources(monkeypatch, *, timescale, mongo) -> None:
     """Point `_filter_stale_symbols`'s two lazily-imported seams at in-memory fakes: the singleton
