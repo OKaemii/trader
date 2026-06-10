@@ -97,8 +97,16 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--stale-after-days",
         type=int,
         default=None,
-        help="Staleness window in days for --heal (a covered name whose freshest fiscal period is older "
-             "is healed). Absent ⇒ FUNDAMENTALS_STALE_AFTER_DAYS (default 135). Ignored without --heal.",
+        help="QUARTERLY staleness window in days for --heal (a 10-Q filer whose freshest fiscal period is "
+             "older is healed). Absent ⇒ FUNDAMENTALS_STALE_AFTER_DAYS (default 135). Ignored without --heal.",
+    )
+    p.add_argument(
+        "--annual-stale-after-days",
+        type=int,
+        default=None,
+        help="ANNUAL staleness window in days for --heal (a 20-F/40-F/10-K once-a-year filer; keyed off "
+             "the name's filing cadence). Absent ⇒ FUNDAMENTALS_STALE_AFTER_DAYS_ANNUAL (default 400). "
+             "Keeps an annual filer from being force-re-ingested every heal cycle. Ignored without --heal.",
     )
     return p.parse_args(argv)
 
@@ -246,7 +254,7 @@ async def _resolve_symbols(args: argparse.Namespace) -> list[str]:
 
 
 def _stale_after_days(args: argparse.Namespace) -> Optional[int]:
-    """The self-heal staleness window in days: the `--stale-after-days` flag, else
+    """The self-heal QUARTERLY staleness window in days: the `--stale-after-days` flag, else
     `FUNDAMENTALS_STALE_AFTER_DAYS`, else None (⇒ `stale_after_ms_from_days` applies the 135-day
     default). A non-positive/unparseable env is ignored (the default window can never be silently
     disabled — that would make every name look fresh and heal nothing)."""
@@ -259,6 +267,26 @@ def _stale_after_days(args: argparse.Namespace) -> Optional[int]:
         return int(raw)
     except ValueError:
         log.warning("[ingest] FUNDAMENTALS_STALE_AFTER_DAYS=%r is not an int; using the default window", raw)
+        return None
+
+
+def _annual_stale_after_days(args: argparse.Namespace) -> Optional[int]:
+    """The self-heal ANNUAL staleness window in days (for 20-F/40-F/10-K once-a-year filers): the
+    `--annual-stale-after-days` flag, else `FUNDAMENTALS_STALE_AFTER_DAYS_ANNUAL`, else None (⇒
+    `annual_stale_after_ms_from_days` applies the 400-day default). Same fail-safe as the quarterly knob
+    — a non-positive/unparseable env falls back to the default window, never "never stale"."""
+    if args.annual_stale_after_days is not None:
+        return args.annual_stale_after_days
+    raw = os.getenv("FUNDAMENTALS_STALE_AFTER_DAYS_ANNUAL", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning(
+            "[ingest] FUNDAMENTALS_STALE_AFTER_DAYS_ANNUAL=%r is not an int; using the default annual window",
+            raw,
+        )
         return None
 
 
@@ -279,19 +307,27 @@ async def _filter_stale_symbols(symbols: list[str], args: argparse.Namespace) ->
     (as `_resolve_symbols`/`_effective_user_agent` do) and uses the already-open singleton asyncpg pool."""
     from motor.motor_asyncio import AsyncIOMotorClient
 
-    from src.freshness import freshness_audit, stale_after_ms_from_days
+    from src.freshness import (
+        annual_stale_after_ms_from_days,
+        freshness_audit,
+        stale_after_ms_from_days,
+    )
     from src.security_master.pool import get_pool
 
     now_ms = int(time.time() * 1000)
     stale_after_ms = stale_after_ms_from_days(_stale_after_days(args))
+    annual_stale_after_ms = annual_stale_after_ms_from_days(_annual_stale_after_days(args))
 
     pool = await get_pool()
     mongo_url = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
     mongo_db_name = os.getenv("MONGODB_DB", "trader")
     client = AsyncIOMotorClient(mongo_url)
     try:
+        # Same per-name window selection the …/freshness endpoint uses, so a 20-F annual filer gets the
+        # 400-day window here too and stops being force-re-ingested every heal cycle.
         audit = await freshness_audit(
-            pool, client[mongo_db_name], now_ms=now_ms, stale_after_ms=stale_after_ms
+            pool, client[mongo_db_name], now_ms=now_ms, stale_after_ms=stale_after_ms,
+            annual_stale_after_ms=annual_stale_after_ms,
         )
     finally:
         client.close()
@@ -300,8 +336,9 @@ async def _filter_stale_symbols(symbols: list[str], args: argparse.Namespace) ->
     subset = [s for s in symbols if s in stale_set]
     log.info(
         "[ingest] --heal: %d/%d coverage symbols missing/stale (covered=%d, stale=%d of %d curated; "
-        "stale_after_ms=%d)",
+        "stale_after_ms=%d annual_stale_after_ms=%d)",
         len(subset), len(symbols), audit["covered"], audit["stale"], audit["universe"], stale_after_ms,
+        annual_stale_after_ms,
     )
     return subset
 
