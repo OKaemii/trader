@@ -13,7 +13,7 @@ import { getRuntimeEnv } from '../../runtime-env.ts';
 import type { UniverseManager } from '../universe/application/UniverseManager.ts';
 import { MongoInstrumentMeta } from '../universe/infrastructure/MongoInstrumentMeta.ts';
 import type { MarketDataProvider } from '../bars/infrastructure/providers/market-data-provider.ts';
-import { aggregateBars, getBars, invalidateBars, type RangeKey } from '@trader/shared-bars';
+import { aggregateBars, getBars, getBarAtOrBefore, invalidateBars, type RangeKey } from '@trader/shared-bars';
 import { backfillTickers, CACHE_INVALIDATED_TOPIC } from '../bars/infrastructure/backfill.ts';
 import { backfillDailyHistory } from '../bars/infrastructure/daily-history.ts';
 import { REDIS_STREAMS, POLL_INTERVAL_OPTIONS, type BarInterval, type OHLCVBar, type PollIntervalKey } from '@trader/shared-types';
@@ -586,6 +586,41 @@ export function createInternalBarsRouter(universeManager: UniverseManager): Hono
         out[ticker] = await readBarsSeries(redis, db, ticker, interval, range, asOf);
       }
       return c.json({ interval, range, asOf: asOf ?? null, bars: out });
+    },
+  );
+
+  // Single adjusted-close-at-or-before read for many tickers — the OOM-safe input fundamentals-api's
+  // PIT market-cap / dividend-yield enrichment uses INSTEAD of POSTing the bars batch with
+  // range='max' and picking the latest bar from a deep series client-side. For each ticker we take
+  // the close of the single latest daily bar at/<= asOf (getBarAtOrBefore — a DESC LIMIT-1 read with
+  // NO now-anchored lower bound, so it reaches a 2006 as-of without the chunk-fanning scan that
+  // exhausted Timescale's lock table → 'out of shared memory' → a 500). The persisted daily `close`
+  // IS the adjusted close (the total-return series momentum differences), so the returned number is
+  // literally what momentum sees — the same identity the market-cap arithmetic needs. A name with no
+  // qualifying bar (unseeded daily series / nothing <= asOf) returns null → the caller's market cap is
+  // then ABSENT (never fabricated). `fundamentals-api` is an allowed caller (mirrors the bars routes);
+  // a 403 here would surface as a 500 to the user when the enrichment runs.
+  r.post(
+    '/internal/api/market-data/adjusted-close-at',
+    parseInternalHeaders('strategy-engine', 'fundamentals-api'),
+    zValidator('json', MarketDataContracts.AdjustedCloseAtRequestSchema, (result, c) => {
+      if (!result.success) return c.json({ error: 'invalid body', issues: result.error.issues }, 400);
+    }),
+    async (c) => {
+      const body = c.req.valid('json');
+      const interval = body.interval ?? 'daily';
+      const asOf     = body.asOf;
+      const opts = asOf !== undefined ? { asOf } : {};
+
+      const db    = await getMongoDb();
+      const redis = await getRedisClient();
+      const closes: Record<string, number | null> = {};
+      // Per-ticker single-row reads are cheap and Redis-cached; serial keeps it predictable.
+      for (const ticker of body.tickers) {
+        const bar = await getBarAtOrBefore(redis as never, db, ticker, interval, opts);
+        closes[ticker] = bar && Number.isFinite(bar.close) ? bar.close : null;
+      }
+      return c.json({ interval, asOf: asOf ?? null, closes });
     },
   );
 
