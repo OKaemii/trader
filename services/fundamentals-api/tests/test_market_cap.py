@@ -13,9 +13,9 @@ from __future__ import annotations
 from src.market_cap import (
     FX_LAST_GOOD_KEY,
     FX_LAST_TS_KEY,
-    adjusted_close_at_or_before,
     apply_dividend_yield,
     apply_pit_market_cap,
+    close_from_response,
     compute_market_cap_gbp,
     currency_of,
     fx_rate_from_redis_values,
@@ -111,30 +111,26 @@ def test_fx_rate_missing_or_garbage_rejected() -> None:
     assert FX_LAST_TS_KEY == "fx:GBPUSD:lastTs"
 
 
-# ── as-of adjusted close = latest bar at/<= as_of ────────────────────────────────
-def _bar(ts: int, close: float) -> dict:
-    return {"timestamp": ts, "open": close, "high": close, "low": close, "close": close, "volume": 0}
+# ── adjusted close from the endpoint's per-ticker value (the server already did the at/<= as_of pick) ──
+def test_close_from_response_passes_a_finite_positive_value() -> None:
+    # The endpoint returns the close directly (the DESC LIMIT-1 read happened server-side).
+    assert close_from_response(30.0) == 30.0
+    assert close_from_response("20.5") == 20.5   # numeric strings tolerated
 
 
-def test_adjusted_close_picks_latest_at_or_before_as_of() -> None:
-    bars = [_bar(100, 10.0), _bar(200, 20.0), _bar(300, 30.0)]
-    # as_of between the 2nd and 3rd bar → the 2nd bar's close (the close momentum would have seen).
-    assert adjusted_close_at_or_before(bars, as_of_ms=250) == 20.0
-    # as_of exactly on a bar → that bar.
-    assert adjusted_close_at_or_before(bars, as_of_ms=200) == 20.0
-    # no as_of → the latest bar.
-    assert adjusted_close_at_or_before(bars, as_of_ms=None) == 30.0
+def test_close_from_response_none_for_null_or_no_bar() -> None:
+    # A null close (no bar at/<= as_of, unseeded ticker) → None → the name's market cap is absent.
+    assert close_from_response(None) is None
 
 
-def test_adjusted_close_none_when_no_bar_before_as_of() -> None:
-    bars = [_bar(300, 30.0)]
-    assert adjusted_close_at_or_before(bars, as_of_ms=200) is None   # earliest bar is after as_of
-    assert adjusted_close_at_or_before([], as_of_ms=None) is None    # unseeded ticker
-
-
-def test_adjusted_close_tolerates_unordered_and_malformed_rows() -> None:
-    bars = [_bar(300, 30.0), {"timestamp": "bad"}, _bar(100, 10.0), {"close": 5.0}]
-    assert adjusted_close_at_or_before(bars, as_of_ms=None) == 30.0  # malformed rows skipped, sorted
+def test_close_from_response_rejects_nonpositive_nonfinite_garbage() -> None:
+    # A 0 / negative / NaN / non-number is never a real adjusted close — drop it (never a fabricated cap).
+    assert close_from_response(0.0) is None
+    assert close_from_response(-5.0) is None
+    assert close_from_response(float("nan")) is None
+    assert close_from_response(float("inf")) is None
+    assert close_from_response("not-a-number") is None
+    assert close_from_response({"close": 5.0}) is None
 
 
 # ── line-item override: drop the scalar, never fabricate ─────────────────────────
