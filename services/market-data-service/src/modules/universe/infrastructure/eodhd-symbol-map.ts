@@ -33,9 +33,24 @@ function indexByMarket(rawInstruments: T212Instrument[]): {
 }
 
 const EODHD_EXCHANGE_TO_MARKET: Record<string, 'US' | 'LSE'> = { US: 'US', LSE: 'LSE' };
-// EODHD uses post-rebrand codes (META); T212 keeps the pre-rebrand shortName (FB). Reverse of
-// the forward SYMBOL_RENAMES in eodhd-client.
-const REVERSE_RENAMES: Record<string, string> = { META: 'FB' };
+
+// Ticker renames where the EODHD post-rebrand CODE is the SAME symbol the broker now lists, but
+// the broker's instrument feed may still echo the pre-rebrand shortName for back-compat. Keyed by
+// the EODHD code; the value is the LEGACY shortName to ALSO try when indexing the T212 catalog.
+//   FB→META: Trading212 renamed the instrument FB→META in 2021 (operator-confirmed); META_US_EQ is
+//   the correct, orderable T212 ticker (it coincides with EDGAR CIK 0001326801). The prior
+//   REVERSE_RENAMES={META:'FB'} forced Meta back to the dead FB_US_EQ — that was the bug: it
+//   trusted a stale pre-2021 assumption over the live broker reality. We still try the legacy `FB`
+//   shortName so Meta resolves even if the broker's metadata lags, but we EMIT the canonical
+//   `META_US_EQ` (built from the EODHD code below), never the stale matched ticker.
+const EODHD_CODE_TO_LEGACY_SHORTNAME: Record<string, string> = { META: 'FB' };
+
+// Build the canonical, orderable T212 ticker for an EODHD code in the given market. The universe
+// ticker IS the order ticker (it flows registry→market:raw→signal→OrderDispatcher→T212 unchanged),
+// so it must be the broker's CURRENT listing form — `SYMBOL_US_EQ` (US) / `SYMBOLl_EQ` (LSE).
+function canonicalT212Ticker(code: string, market: 'US' | 'LSE'): string {
+  return market === 'US' ? `${code}_US_EQ` : `${code}l_EQ`;
+}
 
 export function mapEodhdToT212(
   candidates: ScanCandidate[],
@@ -48,12 +63,19 @@ export function mapEodhdToT212(
     const market = EODHD_EXCHANGE_TO_MARKET[c.exchange.toUpperCase()];
     if (!market) { dropped++; continue; }
     const code = c.code.toUpperCase();
-    const lookups = REVERSE_RENAMES[code] ? [code, REVERSE_RENAMES[code]!] : [code];
+    // Index the broker catalog by the CURRENT code first, then any legacy shortName the broker may
+    // still echo for a renamed instrument — so we locate the row (for its name) regardless of which
+    // shortName the broker returns. A renamed code ALWAYS emits the canonical ticker (e.g. the
+    // EODHD `META` candidate → `META_US_EQ`), decoupling "which shortName T212 returned" from the
+    // orderable ticker; a row matched only via the legacy shortName must not resurrect the dead one.
+    const legacy = EODHD_CODE_TO_LEGACY_SHORTNAME[code];
+    const lookups = legacy ? [code, legacy] : [code];
     let inst: T212Instrument | undefined;
     for (const l of lookups) { inst = byMarket[market][l]; if (inst) break; }
     if (!inst) { dropped++; continue; }
+    const ticker = legacy ? canonicalT212Ticker(code, market) : inst.ticker;
     mapped.push({
-      ticker:       inst.ticker,
+      ticker,
       eodhdSymbol:  `${c.code}.${c.exchange}`,
       name:         c.name || inst.name,
       marketCapGbp: c.marketCapGbp,
