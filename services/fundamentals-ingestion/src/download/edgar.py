@@ -74,10 +74,19 @@ _SEC_PER_SECONDS = 1.0
 # buffer, so allow a generous window.
 _DEFAULT_TIMEOUT_S = 60.0
 
-# Only the two financial taxonomies are preserved in the raw zone (the plan: "every us-gaap:* / dei:*
-# fact"). Other taxonomies in a companyfacts payload (e.g. srt:*, invest:*) are not part of the
-# fundamentals contract and are skipped — full preservation is scoped to the financial reporting set.
-PRESERVED_TAXONOMIES = ("us-gaap", "dei")
+# The financial-reporting taxonomies preserved verbatim in the raw zone. Other taxonomies in a
+# companyfacts payload (e.g. srt:*, invest:*) are not part of the fundamentals contract and are
+# skipped — full preservation is scoped to the financial reporting set.
+#   * us-gaap / dei — every domestic (10-K/10-Q) filer's facts + the DEI cover-page entity facts.
+#   * ifrs-full — a foreign private issuer filing a 20-F/40-F under IFRS tags its income/balance-sheet
+#     facts in the IFRS taxonomy (e.g. `ifrs-full:ProfitLoss`, not `us-gaap:NetIncomeLoss`), so without
+#     this taxonomy those facts are dropped at parse and an IFRS filer (e.g. TSM) staged null for
+#     net_income/revenue. Preservation here is load-bearing: a registry alias (metric_registry.yaml)
+#     can only SELECT a tag the raw zone kept — it cannot recover a fact dropped at parse time. The
+#     parser is taxonomy-agnostic (`_facts_from_units` keys nothing on the taxonomy name), so adding
+#     the name preserves ifrs-full facts byte-for-byte alongside us-gaap/dei; the resolver's value-
+#     agreement guard and fail-closed selection are unchanged (a name tagging neither yields no fact).
+PRESERVED_TAXONOMIES = ("us-gaap", "dei", "ifrs-full")
 
 
 def edgar_rate_limiter(reqs_per_sec: Optional[int] = None) -> RateLimiter:
@@ -237,7 +246,8 @@ def _facts_from_units(taxonomy: str, tag: str, units: Any) -> list[RawFact]:
 
 def parse_company_facts(payload: Any) -> list[RawFact]:
     """Parse a companyfacts document (`{cik, entityName, facts: {taxonomy: {tag: {units}}}}`) into a
-    flat list of RawFacts across the preserved taxonomies (us-gaap, dei).
+    flat list of RawFacts across the preserved taxonomies (us-gaap, dei, ifrs-full — the IFRS taxonomy
+    a 20-F/40-F foreign filer reports under).
 
     Total function over decoded JSON: a non-dict body, a missing `facts` block, or a malformed
     taxonomy/tag yields an empty list / is skipped rather than raising — a single bad tag must not
@@ -358,7 +368,8 @@ class EdgarFactsClient:
             return None
 
     async def fetch_company_facts(self, cik: Any) -> list[RawFact]:
-        """All us-gaap/dei facts for a CIK from the companyfacts API. Empty list on any failure."""
+        """All us-gaap/dei/ifrs-full facts for a CIK from the companyfacts API (ifrs-full covers a 20-F
+        IFRS foreign filer). Empty list on any failure."""
         url = COMPANY_FACTS_URL.format(cik=pad_cik(cik))
         resp = await self._get(url)
         if resp is None:

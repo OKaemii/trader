@@ -224,10 +224,12 @@ global:
     # Also the seed on a fresh deployment before the monthly T212 refresh succeeds.
     # Tickers use T212's suffixed form so order placement and position reconciliation match
     # T212's payload format directly. Yahoo translation handles the suffix via
-    # yahoo-client.parseT212Ticker (`_US_EQ` → bare, `l_EQ` → `.L`, etc.). META retains its
-    # T212 legacy `FB_US_EQ` symbol; the SYMBOL_RENAMES map in yahoo-client.ts rewrites it
-    # to Yahoo's `META`.
-    tickerUniverse: "AAPL_US_EQ,MSFT_US_EQ,GOOGL_US_EQ,AMZN_US_EQ,NVDA_US_EQ,FB_US_EQ,TSLA_US_EQ,JPM_US_EQ,JNJ_US_EQ,UNH_US_EQ,V_US_EQ,PG_US_EQ,MA_US_EQ,HD_US_EQ,CVX_US_EQ,MRK_US_EQ,ABBV_US_EQ,PEP_US_EQ,KO_US_EQ,AVGO_US_EQ,LLY_US_EQ,COST_US_EQ,MCD_US_EQ,BAC_US_EQ,TMO_US_EQ,ABT_US_EQ,WMT_US_EQ,CSCO_US_EQ,XOM_US_EQ,CRM_US_EQ,ACN_US_EQ,DHR_US_EQ,NEE_US_EQ,INTC_US_EQ,NFLX_US_EQ,AMD_US_EQ,QCOM_US_EQ,TXN_US_EQ,INTU_US_EQ,CAT_US_EQ,HON_US_EQ,AMGN_US_EQ,SBUX_US_EQ,IBM_US_EQ,GILD_US_EQ,AXP_US_EQ,GS_US_EQ,MS_US_EQ,BLK_US_EQ,SPGI_US_EQ,SGLNl_EQ,IUKDl_EQ,SUPRl_EQ,SRSAl_EQ,VFEMl_EQ,XUSEl_EQ,SSLNl_EQ"
+    # yahoo-client.parseT212Ticker (`_US_EQ` → bare, `l_EQ` → `.L`, etc.). Meta is carried under its
+    # CURRENT symbol `META_US_EQ` (universe hygiene — the 2022 FB→META rebrand). The legacy `FB`
+    # still resolves for historical/replay reads: the fundamentals-ingestion TICKER_ALIASES map bridges
+    # FB→CIK, and the market-data SYMBOL_RENAMES map maps a residual `FB_US_EQ` to Yahoo/TwelveData's
+    # `META` — so a pre-rename reference never dangles.
+    tickerUniverse: "AAPL_US_EQ,MSFT_US_EQ,GOOGL_US_EQ,AMZN_US_EQ,NVDA_US_EQ,META_US_EQ,TSLA_US_EQ,JPM_US_EQ,JNJ_US_EQ,UNH_US_EQ,V_US_EQ,PG_US_EQ,MA_US_EQ,HD_US_EQ,CVX_US_EQ,MRK_US_EQ,ABBV_US_EQ,PEP_US_EQ,KO_US_EQ,AVGO_US_EQ,LLY_US_EQ,COST_US_EQ,MCD_US_EQ,BAC_US_EQ,TMO_US_EQ,ABT_US_EQ,WMT_US_EQ,CSCO_US_EQ,XOM_US_EQ,CRM_US_EQ,ACN_US_EQ,DHR_US_EQ,NEE_US_EQ,INTC_US_EQ,NFLX_US_EQ,AMD_US_EQ,QCOM_US_EQ,TXN_US_EQ,INTU_US_EQ,CAT_US_EQ,HON_US_EQ,AMGN_US_EQ,SBUX_US_EQ,IBM_US_EQ,GILD_US_EQ,AXP_US_EQ,GS_US_EQ,MS_US_EQ,BLK_US_EQ,SPGI_US_EQ,SGLNl_EQ,IUKDl_EQ,SUPRl_EQ,SRSAl_EQ,VFEMl_EQ,XUSEl_EQ,SSLNl_EQ"
     # Max active universe size (DEFAULT — portal-overridable at runtime via the Market Data config
     # page → portal_market_config; the override wins per-refresh, no restart). Changing the effective
     # size invalidates prior backtest_results — re-run validation before re-enabling topology_v1 or

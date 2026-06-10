@@ -82,6 +82,26 @@ export const InternalBarsResponseSchema = z.object({
 });
 export type InternalBarsResponse = z.infer<typeof InternalBarsResponseSchema>;
 
+// Single adjusted-close-at-or-before read for many tickers — the OOM-safe input the PIT
+// market-cap enrichment (fundamentals-api) uses INSTEAD of pulling the whole `range='max'`
+// series and picking the latest bar client-side. Returns one close (or null) per ticker, so the
+// caller never holds a deep historical series in memory and the server never runs the chunk-fanning
+// scan. `asOf` is the bi-temporal knowledge-time cutoff (omitted = live).
+export const AdjustedCloseAtRequestSchema = z.object({
+    tickers: z.array(z.string().min(1)),
+    interval: BarIntervalSchema.optional(),
+    asOf: z.number().int().positive().optional(),
+});
+export type AdjustedCloseAtRequest = z.infer<typeof AdjustedCloseAtRequestSchema>;
+
+export const AdjustedCloseAtResponseSchema = z.object({
+    interval: BarIntervalSchema,
+    asOf: z.number().nullable(),
+    // ticker → adjusted close at/<= asOf, or null when no bar qualifies (unseeded / nothing <= asOf).
+    closes: z.record(z.string(), z.number().nullable()),
+});
+export type AdjustedCloseAtResponse = z.infer<typeof AdjustedCloseAtResponseSchema>;
+
 // One swing-screener candidate: the technical signals it fired + a score (see screen.ts).
 export const SwingScreenRowSchema = z.object({
     ticker: z.string(),

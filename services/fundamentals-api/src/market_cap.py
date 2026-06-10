@@ -18,14 +18,19 @@ fabricated 0).
 
 ═══ THE IN-CLUSTER READ PATHS (the card asks these be documented + reachable) ═══
 
-* **As-of adjusted close** — `MarketDataReader.adjusted_close_as_of`. Reads market-data-service's
-  internal bars endpoint `GET http://market-data-service:3002/internal/api/market-data/bars/{ticker}?interval=daily&range=&asOf=`
-  with an internal HS256 JWT (`quant_core.http.internal_jwt.mint_internal_jwt`, the SAME mint
-  strategy-engine's `MarketDataClient` uses). The endpoint's bar `close` IS the persisted
-  `adjusted_close` (the total-return series momentum differences — CLAUDE.md "persisted `close` =
-  provider `adjusted_close`"), so this is literally the same number momentum sees. We take the close of
-  the latest bar at/<= as_of. `asOf` is the bars-convention knowledge-time cutoff (camelCase), so the bar
-  read is itself point-in-time (a later-revised close is invisible before its knowledge_ts). NOTE:
+* **As-of adjusted close** — `MarketDataReader.adjusted_closes_as_of` (whole-universe, one round-trip) /
+  `adjusted_close_as_of` (single, a thin wrapper over it). POSTs market-data-service's dedicated single-bar
+  endpoint `POST http://market-data-service:3002/internal/api/market-data/adjusted-close-at` with
+  `{tickers, interval:'daily', asOf}` and an internal HS256 JWT (`quant_core.http.internal_jwt.mint_internal_jwt`,
+  the SAME mint strategy-engine's `MarketDataClient` uses). That endpoint runs the OOM-safe DESC LIMIT-1
+  `getBarAtOrBefore` read per ticker (no now-anchored lower bound) and returns ONE adjusted close per name
+  in a `{closes: {ticker: number|null}}` map. The returned `close` IS the persisted `adjusted_close` (the
+  total-return series momentum differences — CLAUDE.md "persisted `close` = provider `adjusted_close`"), so
+  this is literally the same number momentum sees, at/<= as_of. We previously read the whole `range='max'`
+  series and picked the latest bar client-side; that read carried a now-anchored lower bound that matched
+  every Timescale chunk back to ~1926 → lock-table exhaustion → 'out of shared memory' → a 500 that left the
+  market cap absent (NVDA £0). `asOf` is the bars-convention knowledge-time cutoff (camelCase), so the read
+  is itself point-in-time (a later-revised close is invisible before its knowledge_ts). NOTE:
   market-data-service must allow `fundamentals-api` as an internal caller on that route (a one-line
   allowlist add on the route — done in this task).
 
@@ -87,10 +92,12 @@ _FX_MAX = 1.5
 # absent rather than perpetually fresh. Overridable for tests.
 _FX_MAX_STALE_MS = 26 * 3600_000
 
-# The market-data internal bars range we fetch for an as-of close. 'max' so a deep historical as_of
-# (years back, the research/replay regime) still has a bar at/<= as_of; the read-through Redis cache on
-# market-data's side keeps repeated reads cheap. Daily interval (the persisted adjusted series).
-_BARS_RANGE = "max"
+# The market-data internal interval we fetch the as-of adjusted close from (the persisted daily series).
+# There is NO range parameter any more: we ask the dedicated single-bar `adjusted-close-at` endpoint for
+# the ONE latest bar at/<= as_of (a DESC LIMIT-1 read with no lower bound), so a deep historical as_of and
+# 'now' both touch one row. The old `range='max'` read pulled the whole series and matched every Timescale
+# chunk back to ~1926 → lock-table exhaustion → 'out of shared memory' → a 500 that left the market cap
+# absent (NVDA £0). market-data's read-through Redis cache still keeps repeated reads cheap.
 _BARS_INTERVAL = "daily"
 
 # The internal-JWT caller name this service mints as. market-data-service's bars + dividend-yield routes
@@ -222,28 +229,23 @@ def apply_dividend_yield(
     return out
 
 
-def adjusted_close_at_or_before(bars: list[dict], as_of_ms: Optional[int]) -> Optional[float]:
-    """The adjusted close of the latest daily bar at/<= `as_of_ms` (None = latest available), pure.
+def close_from_response(value: object) -> Optional[float]:
+    """Normalise one ticker's adjusted close from the `adjusted-close-at` endpoint's `closes` map, pure.
 
-    `bars` are market-data-service's internal-bars rows ({timestamp, open, high, low, close, volume},
-    `close` already the persisted adjusted close). With `as_of_ms`: pick the bar with the greatest
-    timestamp not exceeding it (the close momentum would have seen as-of). Without it: the latest bar.
-    None when there is no qualifying bar (unseeded ticker / nothing at/<= as_of) → the name's market cap
-    is then absent. Defensive against unordered input (sorts by timestamp)."""
-    candidates = []
-    for b in bars:
-        try:
-            ts = int(b["timestamp"])
-            close = float(b["close"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if as_of_ms is not None and ts > as_of_ms:
-            continue
-        candidates.append((ts, close))
-    if not candidates:
+    The endpoint already did the at/<= as_of pick server-side (the DESC LIMIT-1 read), so it returns the
+    close value directly — this helper just validates it: a finite, strictly-positive float passes; a
+    null (no bar at/<= as_of), a non-number, or a non-positive/non-finite value → None, so the name's
+    market cap is ABSENT (NaN-excluded, never a fabricated 0). Replaces the old list-picker now that the
+    server returns one close instead of the whole series."""
+    if value is None:
         return None
-    candidates.sort(key=lambda tc: tc[0])
-    return candidates[-1][1]
+    try:
+        close = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if not _finite_positive(close):
+        return None
+    return close
 
 
 class MarketDataReader:
@@ -300,43 +302,30 @@ class MarketDataReader:
     async def adjusted_close_as_of(self, ticker: str, as_of_ms: Optional[int]) -> Optional[float]:
         """The as-of adjusted daily close for `ticker` (the SAME series momentum uses), or None.
 
-        Reads market-data-service's internal bars endpoint with the internal JWT, passing `asOf` so the
-        bar read is itself point-in-time. Returns the close of the latest bar at/<= as_of. Any failure
-        (HTTP error, no bars, market-data down) degrades to None — the name's market cap is then absent
-        that cycle, never fabricated. For the whole-universe hot path prefer `adjusted_closes_as_of`
-        (one round-trip)."""
-        import httpx
-
-        url = (
-            f"{self._base_url}/internal/api/market-data/bars/{ticker}"
-            f"?interval={_BARS_INTERVAL}&range={_BARS_RANGE}"
-        )
-        if as_of_ms is not None:
-            url += f"&asOf={as_of_ms}"
-        try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                r = await client.get(url, headers=self._auth_header())
-                r.raise_for_status()
-                payload = r.json()
-        except Exception as exc:  # noqa: BLE001 — a bars read failure degrades to None
-            log.warning("[market_cap] adjusted-close read failed for %s: %s", ticker, exc)
-            return None
-        return adjusted_close_at_or_before(payload.get("bars") or [], as_of_ms)
+        Thin wrapper over the batch read (`adjusted_closes_as_of`) so the single- and whole-universe
+        paths hit ONE endpoint with ONE OOM-safe read shape. Returns the close of the latest bar at/<=
+        as_of, or None on any failure / no bar — the name's market cap is then absent (never fabricated).
+        For the whole-universe hot path prefer `adjusted_closes_as_of` directly (one round-trip)."""
+        closes = await self.adjusted_closes_as_of([ticker], as_of_ms)
+        return closes.get(ticker)
 
     async def adjusted_closes_as_of(
         self, tickers: list[str], as_of_ms: Optional[int]
     ) -> dict[str, float]:
         """As-of adjusted closes for MANY tickers in ONE round-trip (the whole-universe hot path) via
-        market-data-service's batch bars endpoint (`POST /internal/api/market-data/bars`). Returns only
-        the names with a resolvable close at/<= as_of — a name with no bar (unseeded / nothing ≤ as_of) is
-        simply absent (its market cap is then absent, never fabricated). Any failure degrades to {} (every
-        name's market cap is absent that cycle). Empty on no tickers."""
+        market-data-service's dedicated single-bar endpoint
+        (`POST /internal/api/market-data/adjusted-close-at`). That endpoint runs the OOM-safe DESC LIMIT-1
+        `getBarAtOrBefore` read per ticker (no now-anchored lower bound) and returns ONE close per name —
+        so neither side pulls the deep `range='max'` series that exhausted Timescale's lock table. Returns
+        only the names with a resolvable close at/<= as_of — a name with a null close (unseeded / nothing ≤
+        as_of) is simply absent (its market cap is then absent, never fabricated). Any failure degrades to
+        {} (every name's market cap is absent that cycle). Empty on no tickers."""
         if not tickers:
             return {}
         import httpx
 
-        url = f"{self._base_url}/internal/api/market-data/bars"
-        body: dict = {"tickers": tickers, "interval": _BARS_INTERVAL, "range": _BARS_RANGE}
+        url = f"{self._base_url}/internal/api/market-data/adjusted-close-at"
+        body: dict = {"tickers": tickers, "interval": _BARS_INTERVAL}
         if as_of_ms is not None:
             body["asOf"] = as_of_ms
         try:
@@ -346,12 +335,12 @@ class MarketDataReader:
                 )
                 r.raise_for_status()
                 payload = r.json()
-        except Exception as exc:  # noqa: BLE001 — a batch bars read failure degrades to {}
+        except Exception as exc:  # noqa: BLE001 — an adjusted-close read failure degrades to {}
             log.warning("[market_cap] batch adjusted-close read failed: %s", exc)
             return {}
         out: dict[str, float] = {}
-        for t, raw_bars in (payload.get("bars") or {}).items():
-            close = adjusted_close_at_or_before(raw_bars or [], as_of_ms)
+        for t, raw_close in (payload.get("closes") or {}).items():
+            close = close_from_response(raw_close)
             if close is not None:
                 out[t] = close
         return out

@@ -28,10 +28,10 @@ import type { RedisClientType } from 'redis';
 import type { OHLCVBar, BarInterval } from '@trader/shared-types';
 import { COLLECTIONS } from '@trader/shared-mongo';
 import { getPgPool } from '@trader/shared-pg';
-import { getBarsFromPg, pgCacheKey } from './pg-bar-reader.ts';
+import { getBarsFromPg, getBarAtOrBeforePg, pgCacheKey, pgAtCacheKey } from './pg-bar-reader.ts';
 
 export { hashBarContent } from './content-hash.ts';
-export { getBarsFromPg, getLastClosePg, pgCacheKey } from './pg-bar-reader.ts';
+export { getBarsFromPg, getBarAtOrBeforePg, getLastClosePg, pgCacheKey, pgAtCacheKey } from './pg-bar-reader.ts';
 export { computeMissingRanges, coverageOf } from './coverage.ts';
 export type { MissingRange } from './coverage.ts';
 
@@ -148,6 +148,14 @@ interface CachedSeries {
   bars: OHLCVBar[];
 }
 
+// Single-bar cache (getBarAtOrBefore). Distinct shape from CachedSeries — a single bar (or null),
+// keyed under a distinct `:at:` segment so it never collides with the windowed-series entries.
+interface CachedBar {
+  v: 2;
+  cachedAt: number;
+  bar: OHLCVBar | null;
+}
+
 // 60s buckets. Live readers all want "now" ± a few seconds, and a 60s bucket keeps
 // cache hit rate high without serving more than a minute of stale data. Backtests
 // pass exact asOf values (wall-clock minutes from a replay clock) that fall on aligned
@@ -160,6 +168,20 @@ function asOfBucket(asOf: number | undefined): string {
 function cacheKey(ticker: string, interval: BarInterval, range: RangeKey, asOf?: number): string {
   return `bars:v2:${ticker}:${interval}:${range}:${asOfBucket(asOf)}`;
 }
+
+function atCacheKey(ticker: string, interval: BarInterval, asOf?: number): string {
+  return `bars:v2:${ticker}:${interval}:at:${asOfBucket(asOf)}`;
+}
+
+// at-or-before window bounds (ms). The single-bar read is bounded BELOW at the anchor (`asOf`, or
+// `now` for live) so the two backends share one semantics: the latest bar within the window, the
+// dense steady-state served by the primary, a long pre-asOf hole cleared by the one wider fallback.
+// This bound is load-bearing on Timescale (it stops the per-chunk lock fan that exhausted the lock
+// table on a deep daily series → "out of shared memory"; see pg-bar-reader.ts); on Mongo it keeps
+// the result identical across `BARS_BACKEND`. Mirrors AT_PRIMARY_WINDOW_MS / AT_WIDE_WINDOW_MS there.
+const AT_DAY_MS = 24 * 60 * 60 * 1000;
+const AT_PRIMARY_WINDOW_MS = 400 * AT_DAY_MS;
+const AT_WIDE_WINDOW_MS = 5 * 365 * AT_DAY_MS;
 
 function metaKey(ticker: string, interval: BarInterval): string {
   return `bars:v2:meta:${ticker}:${interval}`;
@@ -279,6 +301,95 @@ async function getBarsFromMongo(
 }
 
 /**
+ * The single latest bar at/<= a knowledge instant (or the latest bar live), dispatching to the
+ * active backend per `BARS_BACKEND`. Returns `null` when none qualifies.
+ *
+ * This is the OOM-safe read the PIT market-cap / dividend-yield enrichment uses INSTEAD of
+ * `getBars(..., 'max', { asOf })`: it carries a bounded window anchored at `asOf` (NOT at `now`),
+ * so a deep historical as-of and 'now' both touch one row from a bounded slice of chunks via a
+ * `DESC … LIMIT 1` read. The old `range='max'` lower-bound scan matched every chunk back to ~1926
+ * → Timescale lock-table exhaustion → "out of shared memory" → a 500 to the caller; the asOf-
+ * anchored window prunes chunk-exclusion on BOTH bounds so the lock fan never spans the hypertable.
+ * The live windowed strategy reads are untouched — this is an additive read used only by enrichment.
+ *
+ * @param db  MongoDB handle. Required when `BARS_BACKEND=mongo` (the default); may be `undefined`
+ *           when `BARS_BACKEND=timescale`.
+ */
+export async function getBarAtOrBefore(
+  redis: Pick<RedisClientType, 'get' | 'setEx'>,
+  db: Db | undefined,
+  ticker: string,
+  interval: BarInterval,
+  opts: GetBarsOpts = {},
+): Promise<OHLCVBar | null> {
+  if (activeBackend() === 'timescale') {
+    return getBarAtOrBeforePg(redis, ticker, interval, opts);
+  }
+  if (!db) {
+    throw new Error('[shared-bars] getBarAtOrBefore: db parameter required when BARS_BACKEND=mongo (the default)');
+  }
+  return getBarAtOrBeforeFromMongo(redis, db, ticker, interval, opts);
+}
+
+async function getBarAtOrBeforeFromMongo(
+  redis: Pick<RedisClientType, 'get' | 'setEx'>,
+  db: Db,
+  ticker: string,
+  interval: BarInterval,
+  opts: GetBarsOpts,
+): Promise<OHLCVBar | null> {
+  const asOf = opts.asOf;
+  const key = atCacheKey(ticker, interval, asOf);
+  try {
+    const cached = await redis.get(key);
+    if (cached) {
+      const parsed = JSON.parse(cached) as CachedBar;
+      if (parsed.v === 2 && 'bar' in parsed) return parsed.bar;
+    }
+  } catch (err) {
+    console.warn(`[shared-bars] at-cache read failed for ${key}:`, err);
+  }
+
+  const coll = db.collection(COLLECTIONS.OHLCV_BARS);
+  const isLive = asOf === undefined;
+  const anchor = isLive ? Date.now() : asOf;
+
+  // One bounded read in `(anchor - windowMs, anchor]`. Live filters the unsuperseded fast lane;
+  // as-of additionally filters `knowledge_ts <= anchor`. `sort(observation_ts DESC, knowledge_ts
+  // DESC).limit(1)` already returns the newest observation's latest-knowledge row — no `$group`
+  // stage is needed (a single row, not a per-observation pick). Same shape as the PG single-row read.
+  const queryWindow = async (windowMs: number): Promise<OHLCVBar | null> => {
+    const lowerBound = anchor - windowMs;
+    const filter: Record<string, unknown> = {
+      ticker,
+      interval,
+      observation_ts: { $lte: anchor, $gt: lowerBound },
+    };
+    if (isLive) filter.is_superseded = false;
+    else filter.knowledge_ts = { $lte: anchor };
+    const docs = await coll
+      .find(filter)
+      .sort({ observation_ts: -1, knowledge_ts: -1 })
+      .limit(1)
+      .toArray();
+    return docs[0] ? docToBar(docs[0]) : null;
+  };
+
+  // Primary window first; expand once to the bounded wide window on a miss (a long pre-asOf hole).
+  let bar = await queryWindow(AT_PRIMARY_WINDOW_MS);
+  if (!bar) bar = await queryWindow(AT_WIDE_WINDOW_MS);
+
+  try {
+    const payload: CachedBar = { v: 2, cachedAt: Date.now(), bar };
+    await redis.setEx(key, CACHE_TTL_SECONDS, JSON.stringify(payload));
+  } catch (err) {
+    console.warn(`[shared-bars] at-cache write failed for ${key}:`, err);
+  }
+
+  return bar;
+}
+
+/**
  * Latest close for a ticker at the given interval. Convenience over getBars('30d')
  * for callers that only need the most recent price (e.g. dispatcher drift gate).
  * Returns null if no bars are cached or stored. Pass `opts.asOf` to ask "what was
@@ -363,6 +474,11 @@ export async function invalidateBars(
     keys.push(cacheKey(ticker, interval, r));
     keys.push(pgCacheKey(ticker, interval, r));
   }
+  // The single-bar at-or-before live caches (Mongo + PG namespaces) — the live bucket only; as-of
+  // buckets are minute-resolution and decay on their 1h TTL (their asOf is in the past, so a new
+  // write doesn't change what they should return).
+  keys.push(atCacheKey(ticker, interval));
+  keys.push(pgAtCacheKey(ticker, interval));
   keys.push(metaKey(ticker, interval));
   let removed = 0;
   for (const k of keys) {

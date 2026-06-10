@@ -56,14 +56,43 @@ def test_bank_revenue_override_differs_from_default() -> None:
     assert reg.candidates("total_revenue", "bank") != reg.candidates("total_revenue")
 
 
+def test_ifrs_aliases_present_and_after_us_gaap() -> None:
+    # Each core metric carries its ifrs-full:* foreign-filer alias in the general default, positioned
+    # AFTER every us-gaap candidate so us-gaap stays preferred for a dual-tagger. Pins the A3 contract
+    # the resolver relies on (a 20-F IFRS filer falls through to the IFRS tag).
+    reg = default_registry()
+    ifrs_by_metric = {
+        "net_income": "ifrs-full:ProfitLoss",
+        "total_revenue": "ifrs-full:Revenue",
+        "total_equity": "ifrs-full:Equity",
+        "total_assets": "ifrs-full:Assets",
+        "total_liabilities": "ifrs-full:Liabilities",
+        "current_assets": "ifrs-full:CurrentAssets",
+        "current_liabilities": "ifrs-full:CurrentLiabilities",
+        "total_debt": "ifrs-full:Borrowings",
+        "gross_profit": "ifrs-full:GrossProfit",
+        "cash_flow_ops": "ifrs-full:CashFlowsFromUsedInOperatingActivities",
+    }
+    for metric, ifrs_tag in ifrs_by_metric.items():
+        cands = reg.candidates(metric)
+        assert ifrs_tag in cands, f"{metric} missing {ifrs_tag}"
+        us_gaap_idxs = [i for i, t in enumerate(cands) if t.startswith("us-gaap:")]
+        assert us_gaap_idxs, f"{metric} has no us-gaap candidate to anchor ordering"
+        # Every us-gaap candidate precedes the IFRS alias (us-gaap stays preferred).
+        assert max(us_gaap_idxs) < cands.index(ifrs_tag), f"{metric}: IFRS alias must follow us-gaap"
+    # The dei cover-page share count is NOT given an IFRS alias (IFRS filers still tag DEI).
+    assert reg.candidates("shares_outstanding") == ("dei:EntityCommonStockSharesOutstanding",)
+
+
 def test_empty_sector_override_means_no_tag() -> None:
     # gross_profit / current_assets have an empty bank override → "no tag for a bank" (not a fall-through
-    # to the general default). The resolver yields nothing for it; the factor NaN-excludes it.
+    # to the general default). The resolver yields nothing for it; the factor NaN-excludes it. The empty
+    # override is fail-closed and is NOT given an IFRS alias.
     reg = default_registry()
     assert reg.candidates("gross_profit", "bank") == ()
     assert reg.candidates("current_assets", "bank") == ()
-    # General still has the tag.
-    assert reg.candidates("gross_profit") == ("us-gaap:GrossProfit",)
+    # General still leads with the us-gaap tag (the IFRS alias is an appended foreign-filer fallback).
+    assert reg.candidates("gross_profit")[0] == "us-gaap:GrossProfit"
 
 
 def test_unknown_sector_falls_back_to_general() -> None:

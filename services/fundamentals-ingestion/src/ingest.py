@@ -143,6 +143,7 @@ async def _build_orchestrator(user_agent: str):
     from src.qa.engine import QaEngine
     from src.raw_store.writer import RawFactsWriter
     from src.security_master.edgar_submissions import EdgarSubmissionsClient
+    from src.security_master.openfigi import OpenFigiClient
     from src.security_master.pool import get_pool
     from src.security_master.writers import SecurityMasterWriter
 
@@ -151,6 +152,10 @@ async def _build_orchestrator(user_agent: str):
     limiter = edgar_rate_limiter()
     submissions = EdgarSubmissionsClient(user_agent=user_agent, limiter=limiter)
     facts = EdgarFactsClient(user_agent=user_agent, limiter=limiter)
+    # OpenFIGI gets its OWN rate budget (it is a different API + host), built from OPENFIGI_API_KEY when
+    # set. It is the last-resort IDENTIFY hop for a symbol the SEC map + alias table both miss — it logs
+    # the FIGI so an operator can add an alias; it never supplies a CIK, so it cannot itself resolve.
+    openfigi = OpenFigiClient()
 
     pool = await get_pool()
     return IngestionOrchestrator(
@@ -160,6 +165,7 @@ async def _build_orchestrator(user_agent: str):
         raw_writer=RawFactsWriter(pool),
         fundamentals_writer=FundamentalsWriter(pool),
         qa_engine=QaEngine(pool),
+        openfigi_client=openfigi,
     )
 
 

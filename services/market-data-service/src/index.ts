@@ -20,7 +20,7 @@ import { TwelveDataProvider } from './modules/bars/infrastructure/providers/twel
 import { configureEodhdClient, getEodhdClient } from './modules/bars/infrastructure/providers/eodhd-client.ts';
 import type { MarketDataProvider } from './modules/bars/infrastructure/providers/market-data-provider.ts';
 import { FxClient, TwelveDataFxProvider } from '@trader/shared-fx';
-import { aggregateBars, invalidateBarsBulk, getBars } from '@trader/shared-bars';
+import { aggregateBars, invalidateBarsBulk, getBarAtOrBefore } from '@trader/shared-bars';
 import {
   HolidayCache, NyseIcalProvider, UkGovBankHolidayProvider, EodhdExchangeHolidayProvider,
   StaticFallbackProvider, STATIC_FALLBACK,
@@ -755,10 +755,14 @@ const corporateActionsRefresher = new CorporateActionsRefreshScheduler(
 app.route('/', createCorporateActionsRouter(corporateActionsStore, corporateActionsRefresher, async (ticker, asOfMs) => {
   const redis = await getRedisClient();
   const db = await getMongoDb();
-  // 'max' so a historical backfill as-of date still has a daily bar to price against; the read is
-  // bi-temporal (asOf bounds the knowledge_ts), so no future close leaks in.
-  const bars = await getBars(redis as never, db, ticker, 'daily', 'max', { asOf: asOfMs });
-  return closeAtOrBefore(bars, asOfMs);
+  // The single latest daily bar at/<= asOf via getBarAtOrBefore — a DESC LIMIT-1 read with no
+  // now-anchored lower bound. This replaces the old getBars(..., 'max', { asOf }) series read, whose
+  // lower bound matched every chunk back to ~1926 and could exhaust Timescale's lock table on a deep
+  // backfill as-of. The read stays bi-temporal (asOf bounds the knowledge_ts), so no future close
+  // leaks in. closeAtOrBefore on the single bar still prefers its rawClose (the unadjusted price the
+  // yield denominator needs), returning null when no bar qualifies.
+  const bar = await getBarAtOrBefore(redis as never, db, ticker, 'daily', { asOf: asOfMs });
+  return bar ? closeAtOrBefore([bar], asOfMs) : null;
 }));
 
 // News — `news` store (EODHD News feed, incremental sync §I) + the admin GET
