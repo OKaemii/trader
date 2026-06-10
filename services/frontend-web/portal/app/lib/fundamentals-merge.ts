@@ -26,13 +26,27 @@ export interface FreshnessName {
   stale: boolean
 }
 
+// A curated US name that files NOTHING with the SEC (an unsponsored ADR like TCEHY) — excluded from the
+// EDGAR-eligible denominator (so never counted `missing`) and surfaced as a documented degrade-to-Yahoo
+// exception, mirroring how an LSE/foreign name with no US CIK is already accepted (epic Task A4).
+export interface NoEdgarName {
+  symbol: string
+  reason: string
+}
+
 export interface FreshnessAudit {
+  // `universe`/`covered`/`missing`/`stale`/`coverage_pct`/`retirable` are over the EDGAR-eligible
+  // denominator (curated universe − the no_edgar set); `names[]` carries only the eligible names.
   universe: number
   covered: number
   missing: number
   stale: number
   coverage_pct: number
   retirable: boolean
+  // The excluded no-EDGAR exception set (epic Task A4). Optional so an older payload (pre-A4) still
+  // parses — absent ⇒ no exceptions surfaced, the panel simply omits the line.
+  no_edgar_count?: number
+  no_edgar?: NoEdgarName[]
   last_ingest_run: { state?: string; finished_at_ms?: number | null } | null
   names: FreshnessName[]
 }
@@ -217,13 +231,17 @@ export interface FundamentalsSummary {
   yahooServed: number | null
   nullServed: number | null
   lastCycleMs: number | null
-  // warehouse coverage
+  // warehouse coverage (over the EDGAR-eligible denominator — see FreshnessAudit)
   covered: number | null
   universe: number | null
   stale: number | null
   retirable: boolean | null
   lastIngestRunMs: number | null
   lastIngestRunState: string | null
+  // The no-EDGAR exception set (epic Task A4): names excluded from the eligible denominator because they
+  // file nothing with the SEC, so they degrade to Yahoo. Always an array (empty when none / freshness cold)
+  // so the panel can render "N names degrade to Yahoo (no SEC filings): …" without a null guard.
+  noEdgar: NoEdgarName[]
 }
 
 export function buildSummary(
@@ -254,5 +272,8 @@ export function buildSummary(
     retirable: freshness?.retirable ?? null,
     lastIngestRunMs: freshness?.last_ingest_run?.finished_at_ms ?? null,
     lastIngestRunState: freshness?.last_ingest_run?.state ?? null,
+    // Pass the exception list straight through (empty when absent/cold); the count is derivable from
+    // its length, so we keep the single source of truth here rather than trusting a separate scalar.
+    noEdgar: freshness?.no_edgar ?? [],
   }
 }
