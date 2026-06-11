@@ -172,6 +172,18 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const AT_PRIMARY_WINDOW_MS = 400 * DAY_MS; // ~57 7-day chunks — the steady-state fast lane.
 const AT_WIDE_WINDOW_MS = 5 * 365 * DAY_MS; // ~260 7-day chunks — the bounded fallback, still safe.
 
+// Depth-probe window. The depth-check (getDailyDepthPg) walks [floor, now] in windows of this size so
+// no single COUNT/MIN aggregate spans the whole hypertable (an unbounded aggregate would lock every
+// chunk → the same OOM the at-or-before read had to kill — see the regression in at-or-before.test.ts).
+// 2 years ≈ 104 7-day chunks per window: a bounded lock footprint per query, and ~18 windows to cover
+// a 1990→now span (the deep floor below) — cheap, index-backed by bars_asof_lookup.
+const DEPTH_WINDOW_DAYS = 730;
+const DEPTH_WINDOW_MS = DEPTH_WINDOW_DAYS * DAY_MS;
+// Default deep floor: 1990-01-01 UTC. Deeper than SPY's 1993 inception (the deepest series a 35y
+// DAILY_BACKFILL_YEARS seeds), so the walk always starts before any real bar; a name whose oldest bar
+// is 2006 simply yields empty (chunk-pruned, cheap) windows from 1990→2006 before its first row.
+const DEPTH_FLOOR_MS = Date.UTC(1990, 0, 1);
+
 /**
  * Cache key for the single-bar at-or-before read. Distinct `:at:` segment so it never
  * collides with the windowed-series keys (`pgCacheKey`) — a series read and a single-bar
@@ -280,6 +292,46 @@ export async function getBarAtOrBeforePg(
   }
 
   return bar;
+}
+
+/**
+ * Persisted daily-series depth for one ticker on Timescale: `{ oldest, count }` over the UNSUPERSEDED
+ * rows (the live series), computed via bounded-window walking so no single query plan spans the whole
+ * hypertable (the OOM the card exists to avoid — see DEPTH_WINDOW_MS / the at-or-before regression).
+ * `oldest` is the minimum `observation_ts` (UTC ms) or null when the name has no daily bars; `count`
+ * is the unsuperseded row total. `floorMs` defaults to the 1990 deep floor; raise it for a shallower
+ * (cheaper) probe. No Redis cache: this is an operator depth audit, not a hot path.
+ */
+export async function getDailyDepthPg(
+  ticker: string,
+  interval: BarInterval,
+  floorMs: number = DEPTH_FLOOR_MS,
+): Promise<{ oldest: number | null; count: number }> {
+  const pool = getPgPool();
+  const nowMs = Date.now();
+  let oldest: number | null = null;
+  let count = 0;
+  // Walk forward in bounded windows. Each query is bounded on BOTH sides of the time dimension, so
+  // the planner prunes to that window's chunks — never the full hypertable's lock table.
+  for (let lo = floorMs; lo < nowMs; lo += DEPTH_WINDOW_MS) {
+    const hi = Math.min(lo + DEPTH_WINDOW_MS, nowMs + DAY_MS); // +1d so the newest bar's window is inclusive
+    const { rows } = await pool.query<{ n: string; oldest: string | null }>(
+      `SELECT count(*)::bigint AS n, min(observation_ts) AS oldest
+         FROM bars
+        WHERE ticker = $1
+          AND interval = $2
+          AND is_superseded = FALSE
+          AND observation_ts >= $3
+          AND observation_ts < $4`,
+      [ticker, interval, lo, hi],
+    );
+    const n = Number(rows[0]?.n ?? 0);
+    if (n > 0) {
+      count += n;
+      if (oldest === null && rows[0]?.oldest != null) oldest = Number(rows[0].oldest);
+    }
+  }
+  return { oldest, count };
 }
 
 /**
