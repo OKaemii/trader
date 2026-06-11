@@ -71,13 +71,20 @@ def _pick_instance(index_payload: Any) -> Optional[str]:
 
     import re
 
-    dated = re.compile(r"^[a-z0-9]+-\d{8}\.(htm|xml)$", re.IGNORECASE)
+    # The modern inline-XBRL instance is `{ticker}-{YYYYMMDD}.htm` (a classic pre-inline filing ships a
+    # `{ticker}-{YYYYMMDD}.xml`). Require a PURE-ALPHA prefix AND a plausible `YYYYMMDD` date (19xx/20xx)
+    # so a filing exhibit like `exb101-12312019.htm` — digit-laden prefix, MMDDYYYY date — is never
+    # mistaken for the instance. That mis-pick silently nulled Mastercard's shares: the exhibit carries
+    # no per-class share facts, so the derivation fail-closed on a name that should have recovered.
+    dated = re.compile(r"^[a-z]+-(19|20)\d{6}\.(htm|xml)$", re.IGNORECASE)
     preferred = [n for n in names if dated.match(n)]
     if preferred:
         # A 10-K/10-Q ships exactly one dated instance; if several match, the .htm inline instance wins.
         preferred.sort(key=lambda n: (not n.lower().endswith(".htm"), n))
         return preferred[0]
-    skip = re.compile(r"(^R\d+\.htm$)|(filingsummary)|(-index\.html?$)|(^index\.)", re.IGNORECASE)
+    # Fallback: any `.htm` that isn't a rendered R-file, the FilingSummary, the index page, or an
+    # exhibit (`ex…`) — so we never fall back onto an exhibit when no dated instance stem is present.
+    skip = re.compile(r"(^R\d+\.htm$)|(filingsummary)|(-index\.html?$)|(^index\.)|(^ex)", re.IGNORECASE)
     htmls = [n for n in names if n.lower().endswith(".htm") and not skip.search(n)]
     return htmls[0] if htmls else None
 
