@@ -27,7 +27,18 @@ export type BackfillRequest = z.infer<typeof BackfillRequestSchema>;
 // whose `days` is bounded by the 60d 5m provider cap.
 export const BackfillDailyRequestSchema = z.object({
     tickers: z.array(z.string()).optional(),
-    years: z.number().int().min(1).max(30).optional(),
+    // Ceiling 40 (was 30) so the deep operator backfill can reach DAILY_BACKFILL_YEARS (35 → SPY's
+    // 1993 inception). When omitted in deep mode the handler defaults years to DAILY_BACKFILL_YEARS;
+    // otherwise to backfillDailyHistory's own default.
+    years: z.number().int().min(1).max(40).optional(),
+    // Target set: omitted/`active` → the active universe (existing behaviour); `curated-us` → the
+    // curated-US subset only (the deep-backfill driver's scope — the names the PIT reads need). An
+    // explicit `tickers` list always wins over `scope`.
+    scope: z.enum(["active", "curated-us"]).optional(),
+    // Operator-gated DEEP mode: defaults `years` to DAILY_BACKFILL_YEARS (35) when years is omitted,
+    // so a single call seeds the full deep series. Still gap-aware (each missing date fetched once
+    // then zero) — `deep` only changes the default depth, not the fetch strategy.
+    deep: z.boolean().optional(),
     // Gap-aware by default (fetch only uncovered daily dates). `force: true` re-downloads the
     // whole multi-year span to repair a suspected-bad span — never the default. See §I.
     force: z.boolean().optional(),

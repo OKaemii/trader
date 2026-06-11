@@ -13,7 +13,7 @@ import { getRuntimeEnv } from '../../runtime-env.ts';
 import type { UniverseManager } from '../universe/application/UniverseManager.ts';
 import { MongoInstrumentMeta } from '../universe/infrastructure/MongoInstrumentMeta.ts';
 import type { MarketDataProvider } from '../bars/infrastructure/providers/market-data-provider.ts';
-import { aggregateBars, getBars, getBarAtOrBefore, invalidateBars, type RangeKey } from '@trader/shared-bars';
+import { aggregateBars, getBars, getBarAtOrBefore, getDailyDepth, invalidateBars, type RangeKey } from '@trader/shared-bars';
 import { backfillTickers, CACHE_INVALIDATED_TOPIC } from '../bars/infrastructure/backfill.ts';
 import { backfillDailyHistory } from '../bars/infrastructure/daily-history.ts';
 import { REDIS_STREAMS, POLL_INTERVAL_OPTIONS, type BarInterval, type OHLCVBar, type PollIntervalKey } from '@trader/shared-types';
@@ -68,6 +68,15 @@ const MAX_UNIVERSE_SIZE = 500;
 // from the persisted daily series. Both are derived-on-read in aggregateBars.
 const VALID_INTERVALS: BarInterval[] = ['5m', '15m', '1h', '4h', 'daily', 'weekly'];
 const VALID_RANGES: RangeKey[]     = ['30d', '60d', '90d', '180d', '1y', '2y', '5y', 'max'];
+
+// The curated-US subset of the active universe — the names whose deep daily series the PIT
+// market-cap / momentum reads depend on (the EDGAR-fundamentals coverage set is US-only too). A
+// US T212 ticker is the `_US_EQ` suffix; LSE (`l_EQ`) and any other suffix are excluded (no deep
+// US daily-series claim there). Used by the depth-check + deep-backfill driver when the caller
+// doesn't pass an explicit `tickers` list. Pure (testable) — selection only, no I/O.
+export function curatedUsTickers(activeTickers: string[]): string[] {
+  return activeTickers.filter((t) => /_US_EQ$/.test(t));
+}
 
 // Read a downsampled OHLCV series for one ticker. Long-horizon views (`daily`, `weekly`)
 // read the persisted `interval:'daily'` series directly — aggregating 5m would cap at the
@@ -310,9 +319,20 @@ export function createAdminRouter(
 
   // ── Backfill long-range DAILY history (Yahoo, multi-year) ──────────────────
   // POST /api/admin/market-data/backfill-daily
-  // body: { tickers?: string[], years?: number }  (tickers omitted → active universe)
-  // Seeds the persisted interval:'daily' series that strategy lookbacks read (12-1 momentum
-  // etc.). Yahoo-sourced + free, decoupled from the metered 5m provider.
+  // body: { tickers?: string[], years?: number, scope?: 'active'|'curated-us', deep?: boolean, force?: boolean }
+  // Seeds the persisted interval:'daily' series that strategy lookbacks + the PIT market-cap read
+  // (12-1 momentum, adjusted-close-at). Yahoo-sourced + free, decoupled from the metered 5m provider.
+  //
+  // This IS the capstone's operator-gated DEEP-backfill driver — it only runs when called (no cron),
+  // and it drives the EXISTING gap-aware backfillDailyHistory, so each missing daily date is fetched
+  // ONCE then costs zero on a re-run (idempotent). The operator seeds the full curated-US deep series
+  // to ~2006/1993 with:
+  //   POST /admin/api/market-data/backfill-daily  { "scope": "curated-us", "deep": true }
+  //     → scope picks the curated-US subset of the active universe; deep defaults years to
+  //       DAILY_BACKFILL_YEARS (35 → SPY's 1993 inception). Verify depth after via
+  //       GET /admin/api/market-data/daily-depth.
+  // Selection precedence: explicit body.tickers > scope ('curated-us' | 'active') > active universe.
+  // Depth: body.years > (deep || curated-us ⇒ DAILY_BACKFILL_YEARS) > backfillDailyHistory's default.
   r.post(
     '/admin/api/market-data/backfill-daily',
     zValidator('json', MarketDataContracts.BackfillDailyRequestSchema, (result, c) => {
@@ -320,17 +340,34 @@ export function createAdminRouter(
     }),
     async (c) => {
       const body = c.req.valid('json');
+      // Selection: explicit list wins; else scope chooses the curated-US subset or the whole universe.
       const tickers = body.tickers && body.tickers.length > 0
         ? body.tickers
-        : universeManager.activeTickers;
-      if (tickers.length === 0) return c.json({ error: 'no tickers (universe empty and no body.tickers)' }, 400);
+        : body.scope === 'curated-us'
+          ? curatedUsTickers(universeManager.activeTickers)
+          : universeManager.activeTickers;
+      if (tickers.length === 0) {
+        const why = body.scope === 'curated-us'
+          ? 'no curated-US names in the active universe'
+          : 'universe empty';
+        return c.json({ error: `no tickers (${why} and no body.tickers)` }, 400);
+      }
+      // Deep mode (explicit `deep`, or implied by the curated-US deep-backfill scope) seeds the full
+      // series: default years to DAILY_BACKFILL_YEARS when the caller didn't pin one. An explicit
+      // body.years always wins. Falls through to backfillDailyHistory's own default otherwise.
+      const deep = body.deep === true || body.scope === 'curated-us';
+      const years = body.years
+        ?? (deep ? Number(process.env.DAILY_BACKFILL_YEARS ?? 35) : undefined);
       const db = await getMongoDb();
       const redis = await getRedisClient();
       const results = await backfillDailyHistory(db, redis, tickers, {
-        ...(body.years !== undefined ? { years: body.years } : {}),
+        ...(years !== undefined ? { years } : {}),
         forceRefetch: body.force ?? false,
       });
       return c.json({
+        scope:   body.scope ?? 'active',
+        deep,
+        years:   years ?? null,
         tickers: results.length,
         bars:    results.reduce((acc, r) => acc + r.upserted, 0),
         failures: results.filter((r) => r.error).length,
@@ -423,6 +460,41 @@ export function createAdminRouter(
       else coverage[k] = { count: 0, revisions: (row as Record<string, number>).revisions ?? 0 };
     }
     return c.json({ coverage });
+  });
+
+  // ── Daily-series depth (oldest observation + count, per curated-US name) ─────
+  // GET /api/admin/market-data/daily-depth[?tickers=A_US_EQ,B_US_EQ][&interval=daily]
+  // Proves how far back the persisted daily series reaches for each curated-US name — the
+  // depth-check the capstone deep-backfill is verified against. Returns
+  // { interval, tickers, depth: { ticker: { oldest, count } } } where `oldest` is the minimum
+  // unsuperseded observation_ts (UTC ms, null = no daily bars) and `count` is the unsuperseded
+  // row total. Omit `tickers` to probe the curated-US subset of the active universe; pass an
+  // explicit list for an ad-hoc check.
+  //
+  // OOM-safety is the whole point: this does NOT run the `range='max'` / unbounded-aggregate read
+  // that exhausted Timescale's lock table (NVIDIA £0). getDailyDepth walks bounded time windows so
+  // no single query plan spans the whole hypertable — see @trader/shared-bars getDailyDepthPg.
+  r.get('/admin/api/market-data/daily-depth', async (c) => {
+    const interval = (c.req.query('interval') ?? 'daily') as BarInterval;
+    if (!VALID_INTERVALS.includes(interval)) {
+      return c.json({ error: `invalid interval (one of ${VALID_INTERVALS.join(',')})` }, 400);
+    }
+    const tickersRaw = c.req.query('tickers');
+    const tickers = tickersRaw && tickersRaw.trim() !== ''
+      ? tickersRaw.split(',').map((t) => t.trim()).filter(Boolean)
+      : curatedUsTickers(universeManager.activeTickers);
+    if (tickers.length === 0) {
+      return c.json({ error: 'no tickers (no curated-US names in the active universe and no ?tickers=)' }, 400);
+    }
+    const db = await getMongoDb();
+    const depth: Record<string, { oldest: number | null; count: number }> = {};
+    // Serial, not parallelised: each name's read already walks several bounded windows; running them
+    // one ticker at a time keeps the concurrent chunk-lock footprint minimal (the conservative choice
+    // for the read that the prior OOM came from). The depth audit is operator-driven, not a hot path.
+    for (const ticker of tickers) {
+      depth[ticker] = await getDailyDepth(db, ticker, interval);
+    }
+    return c.json({ interval, tickers: tickers.length, depth });
   });
 
   // ── Read bars (downsampled view) ───────────────────────────────────────────
