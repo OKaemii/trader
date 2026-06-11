@@ -155,3 +155,20 @@ def test_apply_dividend_yield_sets_clears_keeps_zero() -> None:
     # None / NaN → absent (no honest yield), never a fabricated 0.
     assert apply_dividend_yield({"dividend_yield": 0.02}, None) == {}
     assert apply_dividend_yield({"dividend_yield": 0.02}, float("nan")) == {}
+
+
+# ── dual-class recovery coverage (epic post-pit-coverage-bugs, Task 9) ─────────────
+def test_recovered_dual_class_shares_yield_nonnull_market_cap() -> None:
+    # META staged null shares pre-fix (companyfacts drops the per-class facts) → null cap. With the
+    # consolidated count recovered from the XBRL instance, the identity computes a real GBP cap.
+    recovered_meta_shares = 2_196_045_588 + 342_377_716   # Class A + Class B (1:1)
+    mc = compute_market_cap_gbp(adjusted_close=480.0, shares_outstanding=recovered_meta_shares,
+                                fx_to_gbp_rate=0.79)
+    assert mc is not None
+    assert mc == 480.0 * recovered_meta_shares * 0.79
+
+
+def test_unrecovered_dual_class_still_drops_to_none() -> None:
+    # A name that fail-closed (e.g. Visa as-converted unresolved) keeps null shares → cap absent (the
+    # surface renders '—', never a fabricated £0).
+    assert compute_market_cap_gbp(adjusted_close=480.0, shares_outstanding=None, fx_to_gbp_rate=0.79) is None

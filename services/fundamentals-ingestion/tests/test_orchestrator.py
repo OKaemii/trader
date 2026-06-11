@@ -672,3 +672,107 @@ async def test_prior_payload_dropped_before_next_name_is_fetched() -> None:
     gc.collect()
     assert facts.parsed_refs["0000320193"]() is None
     assert facts.parsed_refs[_MSFT_CIK]() is None
+
+
+# ── dual-class share recovery (epic post-pit-coverage-bugs, Task 8) ────────────────
+# The orchestrator routes a dual-class name that staged NO consolidated shares onto the XBRL-instance
+# fetch, writes the per-class share facts to the raw zone, and appends ONE derived consolidated
+# shares_outstanding fact to the StageResult (or leaves it null + degrades to Yahoo, fail-closed).
+from src.download.edgar import RawFact as _RawFact
+from src.stage.class_shares import META_CIK as _META_CIK
+from src.stage.class_shares import VISA_CIK as _VISA_CIK
+from src.stage.resolver import InterpretedFact as _IFact
+from src.stage.resolver import StageResult as _StageResult
+
+_AXIS = "us-gaap:StatementClassOfStockAxis"
+
+
+class _FakeClassShares:
+    """Returns canned per-class RawFacts, recording the (cik, accession) it was asked for."""
+
+    def __init__(self, facts: list) -> None:
+        self._facts = facts
+        self.calls: list = []
+
+    async def fetch_class_shares(self, cik, accession, period_end_ms):
+        self.calls.append((cik, accession, period_end_ms))
+        return list(self._facts)
+
+
+def _class_share(member: str, value: float, *, unit: str = "shares", tag: str = "EntityCommonStockSharesOutstanding"):
+    return _RawFact(
+        taxonomy="dei", tag=tag, period_type="instant", period_start=None, period_end=_ms("2024-03-31"),
+        value=value, unit=unit, currency=None, accession_number="A1", fiscal_year=None,
+        fiscal_period=None, form=None, context_id="c", dim_signature=f"{_AXIS}={member}",
+    )
+
+
+def _non_shares_staged() -> "_StageResult":
+    f = _IFact(metric="net_income", cik=_META_CIK, value=1.0, unit="USD", currency="USD",
+               period_start=None, period_end=_ms("2024-03-31"), period_type="duration",
+               fiscal_year=2024, fiscal_period="Q1", dim_signature="", is_segment=False,
+               raw_tag="us-gaap:NetIncomeLoss", accession_number="A1", knowledge_ts=None)
+    return _StageResult(facts=(f,), conflicts=())
+
+
+@pytest.mark.asyncio
+async def test_dual_class_recovery_appends_consolidated_and_writes_raw() -> None:
+    db = FakeTimescale()
+    orch = _orchestrator(db)
+    orch._class_shares = _FakeClassShares([
+        _class_share("us-gaap:CommonClassAMember", 2_196_045_588),
+        _class_share("us-gaap:CommonClassBMember", 342_377_716),
+    ])
+    accn_facts = [_class_share("us-gaap:CommonClassAMember", 2_196_045_588)]  # only used for period_end
+    staged, raw = await orch._recover_dual_class_shares(
+        _non_shares_staged(), accn_facts, cik=_META_CIK, accession="A1", filing_id=7, accepted_ts=_ms("2024-04-25"))
+    shares = [f for f in staged.facts if f.metric == "shares_outstanding"]
+    assert len(shares) == 1
+    assert shares[0].value == 2_196_045_588 + 342_377_716
+    assert shares[0].dim_signature == "" and shares[0].raw_tag.startswith("derived:")
+    assert raw == 2                              # both per-class share facts written to the raw zone
+    assert orch._class_shares.calls and orch._class_shares.calls[0][0] == _META_CIK
+
+
+@pytest.mark.asyncio
+async def test_dual_class_recovery_skips_non_dual_class_name() -> None:
+    db = FakeTimescale()
+    orch = _orchestrator(db)
+    orch._class_shares = _FakeClassShares([_class_share("us-gaap:CommonClassAMember", 1)])
+    base = _non_shares_staged()
+    staged, raw = await orch._recover_dual_class_shares(
+        base, [], cik="0000320193", accession="A1", filing_id=7, accepted_ts=1)  # AAPL, not dual-class
+    assert staged is base and raw == 0
+    assert orch._class_shares.calls == []        # never fetched
+
+
+@pytest.mark.asyncio
+async def test_dual_class_recovery_noop_when_shares_already_staged() -> None:
+    db = FakeTimescale()
+    orch = _orchestrator(db)
+    orch._class_shares = _FakeClassShares([_class_share("us-gaap:CommonClassAMember", 1)])
+    already = _StageResult(
+        facts=(_IFact(metric="shares_outstanding", cik=_META_CIK, value=2.5e9, unit="shares", currency=None,
+                      period_start=None, period_end=_ms("2024-03-31"), period_type="instant",
+                      fiscal_year=None, fiscal_period=None, dim_signature="", is_segment=False,
+                      raw_tag="us-gaap:CommonStockSharesOutstanding", accession_number="A1", knowledge_ts=None),),
+        conflicts=())
+    staged, raw = await orch._recover_dual_class_shares(
+        already, [], cik=_META_CIK, accession="A1", filing_id=7, accepted_ts=1)
+    assert staged is already and raw == 0 and orch._class_shares.calls == []
+
+
+@pytest.mark.asyncio
+async def test_dual_class_visa_failclosed_writes_raw_but_no_consolidated() -> None:
+    db = FakeTimescale()
+    orch = _orchestrator(db)
+    # Visa per-class shares but NO conversion ratios → as-converted unresolved → fail-closed (no fact).
+    orch._class_shares = _FakeClassShares([
+        _class_share("us-gaap:CommonClassAMember", 1_659_709_932),
+        _class_share("v:CommonClassBMember", 245_000_000),
+    ])
+    accn_facts = [_class_share("us-gaap:CommonClassAMember", 1_659_709_932)]
+    staged, raw = await orch._recover_dual_class_shares(
+        _non_shares_staged(), accn_facts, cik=_VISA_CIK, accession="A1", filing_id=7, accepted_ts=1)
+    assert [f for f in staged.facts if f.metric == "shares_outstanding"] == []  # fail-closed → Yahoo
+    assert raw == 2                              # per-class shares still preserved in the raw zone

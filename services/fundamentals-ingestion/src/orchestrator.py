@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from src.download.edgar import EdgarFactsClient, RawFact
+from src.download.edgar_class_shares import EdgarClassSharesClient
 from src.normalize.sectors import TEMPLATE_GENERAL, template_for_sic
 from src.normalize.writer import SOURCE_PIT_EDGAR, FundamentalsWriter
 from src.qa.engine import QaEngine
@@ -58,6 +59,7 @@ from src.security_master.edgar_submissions import (
     CompanySubmissions,
     EdgarSubmissionsClient,
     TickerMapEntry,
+    pad_cik,
 )
 from src.security_master.openfigi import OpenFigiClient
 from src.security_master.ticker_aliases import TickerAlias, resolve_alias
@@ -71,7 +73,8 @@ from src.security_master.writers import (
     SecurityMasterWriter,
     country_for_ticker,
 )
-from src.stage.resolver import resolve_metrics
+from src.stage.class_shares import DUAL_CLASS_CIKS, derive_consolidated_shares
+from src.stage.resolver import StageResult, resolve_metrics
 
 log = logging.getLogger("fundamentals-ingestion.orchestrator")
 
@@ -181,6 +184,7 @@ class IngestionOrchestrator:
         fundamentals_writer: FundamentalsWriter,
         qa_engine: QaEngine,
         openfigi_client: Optional[OpenFigiClient] = None,
+        class_shares_client: Optional[EdgarClassSharesClient] = None,
         source: str = SOURCE_PIT_EDGAR,
     ) -> None:
         self._submissions = submissions_client
@@ -189,6 +193,11 @@ class IngestionOrchestrator:
         self._raw = raw_writer
         self._fundamentals = fundamentals_writer
         self._qa = qa_engine
+        # OPTIONAL dual-class share recovery (epic post-pit-coverage-bugs). When wired, a dual-class
+        # name (META/V/MA/Alphabet) that staged NO consolidated shares from companyfacts gets its
+        # per-class share facts fetched from the filing's XBRL instance and a consolidated value
+        # derived. None ⇒ the recovery is off (every existing test path is byte-for-byte unchanged).
+        self._class_shares = class_shares_client
         # OPTIONAL OpenFIGI fallback (sub-step 4). Used only to IDENTIFY a symbol the SEC map + alias
         # table both miss — a brand-new filer can post-date even a daily SEC snapshot. OpenFIGI returns
         # a FIGI, NOT a CIK, so it cannot itself complete the no_cik resolution (we never fabricate a
@@ -344,6 +353,15 @@ class IngestionOrchestrator:
             filing_id, accepted_ts = filing_lineage
 
             staged = resolve_metrics(accn_facts, cik=cik, sector=sector)
+            # Dual-class share recovery: companyfacts drops the per-class share facts a name like META
+            # tags, so `staged` has no shares_outstanding (→ null market cap). Fetch them from the
+            # filing's XBRL instance and derive a consolidated value (fail-closed). Adds a fact to
+            # `staged` (or leaves it untouched + degrades to Yahoo) before the bi-temporal write.
+            staged, dc_raw = await self._recover_dual_class_shares(
+                staged, accn_facts, cik=cik, accession=accn,
+                filing_id=filing_id, accepted_ts=accepted_ts,
+            )
+            raw_written += dc_raw
             if not staged.facts and not staged.conflicts:
                 continue  # this filing carried no canonical-metric facts (e.g. a non-financial form)
             filings_with_facts += 1
@@ -375,6 +393,54 @@ class IngestionOrchestrator:
             canonical_inserted=canon_inserted, canonical_revisions=canon_revisions,
             canonical_skipped=canon_skipped, quarantined=quarantined,
         )
+
+    async def _recover_dual_class_shares(
+        self,
+        staged: StageResult,
+        accn_facts: list[RawFact],
+        *,
+        cik: str,
+        accession: str,
+        filing_id: int,
+        accepted_ts: int,
+    ) -> tuple[StageResult, int]:
+        """For a dual-class name that staged NO consolidated shares, recover the per-class share facts
+        from the filing's XBRL instance and append a single derived consolidated `shares_outstanding`
+        fact to `staged`. Returns `(staged_or_augmented, raw_rows_written)`.
+
+        No-ops (returns `staged` unchanged) when: recovery isn't wired, the name isn't dual-class, a
+        consolidated shares fact already staged (e.g. the us-gaap fallback), the instance fetch returns
+        nothing, or the derivation fail-closes (unreconciled / Visa as-converted unresolved) — in which
+        case the name keeps its null shares and degrades to the Yahoo live-fallback. The per-class
+        SHARE facts are written to the raw zone (real reported facts companyfacts dropped — honest
+        preservation, hash-gated); the conversion-ratio facts are transient derivation inputs only."""
+        if self._class_shares is None or pad_cik(cik) not in DUAL_CLASS_CIKS:
+            return staged, 0
+        if any(f.metric == "shares_outstanding" for f in staged.facts):
+            return staged, 0
+        period_end = max((f.period_end for f in accn_facts), default=None)
+        if period_end is None:
+            return staged, 0
+        class_facts = await self._class_shares.fetch_class_shares(cik, accession, period_end)
+        if not class_facts:
+            return staged, 0
+        share_facts = [f for f in class_facts if f.unit == "shares"]
+        raw_written = (
+            await self._raw.write_facts(share_facts, filing_id=filing_id, knowledge_ts=accepted_ts)
+            if share_facts else 0
+        )
+        derived = derive_consolidated_shares(class_facts, cik=cik, accession=accession)
+        if derived is None:
+            log.info(
+                "[orchestrator] dual-class %s accn %s: shares unreconciled — fail-closed (→ Yahoo)",
+                cik, accession,
+            )
+            return staged, raw_written
+        log.info(
+            "[orchestrator] dual-class %s accn %s: derived consolidated shares=%.0f from %d classes",
+            cik, accession, derived.value or 0.0, len(share_facts),
+        )
+        return StageResult(facts=staged.facts + (derived,), conflicts=staged.conflicts), raw_written
 
     async def _upsert_entity(
         self, symbol: str, submissions: CompanySubmissions, *, sector: str,
