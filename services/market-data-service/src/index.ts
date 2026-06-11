@@ -168,7 +168,7 @@ export function latestPerTicker(bars: OHLCVBar[], targetInterval: BarInterval): 
 //   • the gate naturally rolls over for the next day after >24h idle
 // We aggregate today's persisted 5m bars (UTC-day fold) — by the time state==CLOSED, the
 // session's final 5m bars have already been persisted by the regular poll path.
-async function maybeEmitDailyAtClose(
+export async function maybeEmitDailyAtClose(
   redis: Awaited<ReturnType<typeof getRedisClient>>,
   groups: { US: string[]; LSE: string[] },
   cycleCounter: number,
