@@ -124,6 +124,22 @@ def test_pick_instance_none_when_no_instance() -> None:
     assert _pick_instance({}) is None
 
 
+def test_pick_instance_excludes_exhibit_picks_real_instance() -> None:
+    # Mastercard's filings list `exb101-MMDDYYYY.htm` exhibits alongside the real `ma-YYYYMMDD.htm`
+    # instance. The exhibit (digit-laden prefix + MMDDYYYY date) must NOT be picked -- it carries no
+    # per-class share facts, which silently nulled MA's shares before this fix.
+    index = {"directory": {"item": [
+        {"name": "exb101-03312024.htm"}, {"name": "R1.htm"}, {"name": "ma-20240331.htm"},
+    ]}}
+    assert _pick_instance(index) == "ma-20240331.htm"
+
+
+def test_pick_instance_does_not_fall_back_onto_an_exhibit() -> None:
+    # Only an exhibit present (no dated instance stem) -> None, never the exhibit.
+    index = {"directory": {"item": [{"name": "exb101-12312019.htm"}, {"name": "R1.htm"}]}}
+    assert _pick_instance(index) is None
+
+
 @pytest.mark.asyncio
 async def test_fetch_class_shares_through_mock_transport() -> None:
     import httpx
