@@ -294,6 +294,114 @@ def test_shares_outstanding_from_dei_cover_page() -> None:
     assert sh[0].period_type == "instant"
 
 
+# ── Dual-class share-count fallback (GOOGL/GOOG) ──────────────────────────────
+def test_shares_outstanding_falls_back_to_us_gaap_consolidated_when_dei_absent() -> None:
+    # The GOOGL case end-to-end. A dual-class filer reports the dei cover-page count ONCE PER SHARE
+    # CLASS (dimensioned); SEC's companyfacts feed drops every dimensioned fact, so the dei tag is
+    # ENTIRELY ABSENT from the payload. The filer DOES carry an undimensioned consolidated total under
+    # `us-gaap:CommonStockSharesOutstanding` (= Class A+B+C combined). With the registry fallback the
+    # resolver falls through the absent dei candidate to the us-gaap consolidated instant and stages a
+    # real shares_outstanding — not null. (Verified against GOOGL companyfacts: a single undimensioned
+    # fact per period.)
+    payload = {"cik": 1652044, "entityName": "Alphabet Inc.", "facts": {"us-gaap": {
+        "CommonStockSharesOutstanding": {"units": {"shares": [
+            {"end": "2026-03-31", "val": 12116000000, "accn": "g-26q1", "fy": 2026, "fp": "Q1",
+             "form": "10-Q"},
+        ]}},
+    }}}
+    res = resolve_metrics(parse_company_facts(payload), cik="1652044")
+    sh = [f for f in res.facts if f.metric == "shares_outstanding"]
+    assert len(sh) == 1
+    assert sh[0].raw_tag == "us-gaap:CommonStockSharesOutstanding"   # fell back to the consolidated total
+    assert sh[0].value == 12116000000.0 and sh[0].currency is None
+    assert sh[0].period_type == "instant"
+    assert sh[0].dim_signature == "" and sh[0].is_segment is False    # consolidated, not a segment
+    assert not res.conflicts
+
+
+def test_shares_outstanding_dei_preferred_over_us_gaap_when_both_present() -> None:
+    # Single-class behaviour is UNCHANGED by the fallback. A name (AAPL) carries BOTH the dei cover-page
+    # count and the us-gaap consolidated total at DIFFERENT cover/balance-sheet dates (different
+    # period_end ⇒ different buckets ⇒ no value-agreement collision). The dei tag is highest priority,
+    # so each period resolves off its own tag and the dei cover-page fact is the canonical PIT count.
+    payload = {"cik": 320193, "entityName": "Apple Inc.", "facts": {
+        "dei": {"EntityCommonStockSharesOutstanding": {"units": {"shares": [
+            {"end": "2026-04-17", "val": 14687356000, "accn": "a-26q2", "fy": 2026, "fp": "Q2",
+             "form": "10-Q"},
+        ]}}},
+        "us-gaap": {"CommonStockSharesOutstanding": {"units": {"shares": [
+            {"end": "2026-03-28", "val": 14667688000, "accn": "a-26q2", "fy": 2026, "fp": "Q2",
+             "form": "10-Q"},
+        ]}}},
+    }}
+    res = resolve_metrics(parse_company_facts(payload), cik="320193")
+    sh = {f.period_end: f for f in res.facts if f.metric == "shares_outstanding"}
+    assert len(sh) == 2  # two distinct cover/balance-sheet dates, one fact each
+    cover = sh[_ms("2026-04-17")]
+    assert cover.raw_tag == "dei:EntityCommonStockSharesOutstanding" and cover.value == 14687356000.0
+    bs = sh[_ms("2026-03-28")]
+    assert bs.raw_tag == "us-gaap:CommonStockSharesOutstanding" and bs.value == 14667688000.0
+    assert not res.conflicts
+
+
+def test_shares_outstanding_fail_closed_when_only_class_dimensioned_facts() -> None:
+    # The V/MA/META case: the filer reports the recent share count ONLY per share class (dimensioned),
+    # and SEC's companyfacts feed drops every dimensioned fact — so NEITHER undimensioned candidate
+    # (dei nor the us-gaap consolidated total) is present. The resolver stages NO consolidated
+    # shares_outstanding — a null PIT cap (→ surfaces render '—'), never a fabricated value. We model
+    # the dropped-dimensioned reality by handing the resolver only class-dimensioned RawFacts (what a
+    # richer source would carry) and asserting they are isolated as segments, never summed into a
+    # consolidated total.
+    class_a = RawFact(
+        taxonomy="dei", tag="EntityCommonStockSharesOutstanding", period_type="instant",
+        period_start=None, period_end=_ms("2026-01-28"), value=2200000000.0,
+        unit="shares", currency=None, accession_number="m-26", fiscal_year=2026,
+        fiscal_period="FY", form="10-K",
+        dim_signature="StatementClassOfStockAxis=CommonClassAMember",
+    )
+    class_b = RawFact(
+        taxonomy="dei", tag="EntityCommonStockSharesOutstanding", period_type="instant",
+        period_start=None, period_end=_ms("2026-01-28"), value=350000000.0,
+        unit="shares", currency=None, accession_number="m-26", fiscal_year=2026,
+        fiscal_period="FY", form="10-K",
+        dim_signature="StatementClassOfStockAxis=CommonClassBMember",
+    )
+    res = resolve_metrics([class_a, class_b], cik="1326801")
+    consolidated = [f for f in res.facts if f.metric == "shares_outstanding" and not f.is_segment]
+    assert consolidated == []   # no consolidated total — fail-closed, NOT class_a + class_b summed
+    # The per-class facts surface as isolated segments (never merged), proving no fabricated sum.
+    segs = {f.dim_signature: f.value for f in res.facts
+            if f.metric == "shares_outstanding" and f.is_segment}
+    assert segs == {
+        "StatementClassOfStockAxis=CommonClassAMember": 2200000000.0,
+        "StatementClassOfStockAxis=CommonClassBMember": 350000000.0,
+    }
+    assert not res.conflicts
+
+
+def test_shares_outstanding_value_agreement_guard_on_same_period_disagreement() -> None:
+    # Data-quality guard for the fallback: if BOTH undimensioned tags land on the SAME period_end but
+    # their values DISAGREE beyond tolerance (a mis-tag / restatement conflict), the resolver suppresses
+    # the consolidated emission and surfaces the conflict — it does not silently prefer the dei value.
+    # Fail-closed, identical to the revenue/IFRS guards.
+    payload = {"cik": 320193, "entityName": "Conflict Co", "facts": {
+        "dei": {"EntityCommonStockSharesOutstanding": {"units": {"shares": [
+            {"end": "2026-03-31", "val": 14000000000, "accn": "c-26", "fy": 2026, "fp": "Q1",
+             "form": "10-Q"},
+        ]}}},
+        "us-gaap": {"CommonStockSharesOutstanding": {"units": {"shares": [
+            {"end": "2026-03-31", "val": 12000000000, "accn": "c-26", "fy": 2026, "fp": "Q1",
+             "form": "10-Q"},   # disagrees by ~14% at the same period_end
+        ]}}},
+    }}
+    res = resolve_metrics(parse_company_facts(payload), cik="320193")
+    assert [f for f in res.facts if f.metric == "shares_outstanding"] == []   # suppressed
+    conflicts = [c for c in res.conflicts if c.metric == "shares_outstanding"]
+    assert len(conflicts) == 1
+    assert conflicts[0].tag_a == "dei:EntityCommonStockSharesOutstanding"
+    assert conflicts[0].tag_b == "us-gaap:CommonStockSharesOutstanding"
+
+
 # ── IFRS / 20-F foreign-filer mapping (preserve ifrs-full + alias) ────────────
 def test_ifrs_profit_loss_maps_to_net_income() -> None:
     # The TSM fix end-to-end: a 20-F IFRS filer tags net income as ifrs-full:ProfitLoss (NO us-gaap

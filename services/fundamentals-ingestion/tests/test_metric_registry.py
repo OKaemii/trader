@@ -36,9 +36,16 @@ def test_default_registry_is_cached_singleton() -> None:
     assert default_registry() is default_registry()
 
 
-def test_shares_outstanding_maps_to_dei_tag_only() -> None:
+def test_shares_outstanding_prefers_dei_then_us_gaap_consolidated() -> None:
+    # The PIT share count prefers the dei cover-page count; the us-gaap consolidated balance-sheet total
+    # is a FALLBACK after it (recovers a dual-class filer whose dei fact is class-dimensioned away — the
+    # GOOGL/GOOG case — where companyfacts drops the dimensioned dei facts but keeps the undimensioned
+    # us-gaap consolidated total). dei stays highest-priority so single-class behaviour is unchanged.
     reg = default_registry()
-    assert reg.candidates("shares_outstanding") == ("dei:EntityCommonStockSharesOutstanding",)
+    assert reg.candidates("shares_outstanding") == (
+        "dei:EntityCommonStockSharesOutstanding",
+        "us-gaap:CommonStockSharesOutstanding",
+    )
 
 
 def test_revenue_default_preference_order() -> None:
@@ -80,8 +87,12 @@ def test_ifrs_aliases_present_and_after_us_gaap() -> None:
         assert us_gaap_idxs, f"{metric} has no us-gaap candidate to anchor ordering"
         # Every us-gaap candidate precedes the IFRS alias (us-gaap stays preferred).
         assert max(us_gaap_idxs) < cands.index(ifrs_tag), f"{metric}: IFRS alias must follow us-gaap"
-    # The dei cover-page share count is NOT given an IFRS alias (IFRS filers still tag DEI).
-    assert reg.candidates("shares_outstanding") == ("dei:EntityCommonStockSharesOutstanding",)
+    # The share-count candidates are NOT given an IFRS alias (IFRS filers still tag the DEI cover page;
+    # the us-gaap consolidated total is a dual-class fallback, not a foreign-filer one).
+    assert reg.candidates("shares_outstanding") == (
+        "dei:EntityCommonStockSharesOutstanding",
+        "us-gaap:CommonStockSharesOutstanding",
+    )
 
 
 def test_empty_sector_override_means_no_tag() -> None:
