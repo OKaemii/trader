@@ -562,8 +562,9 @@ function FundamentalsSummaryCard({ summary }: { summary: ReturnType<typeof build
             </span>
           )}
         </span>
-        <span className="text-gray-300">
+        <span className="text-gray-300" title="Covered / EDGAR-eligible curated US names (the no-EDGAR exception names below are excluded from this denominator)">
           PIT coverage: <span className="font-semibold text-gray-100">{coverage}</span>
+          <span className="text-gray-500"> eligible</span>
         </span>
         <span className="text-gray-300">
           stale:{' '}
@@ -593,6 +594,25 @@ function FundamentalsSummaryCard({ summary }: { summary: ReturnType<typeof build
           ) : null}
         </span>
       </div>
+
+      {/* No-EDGAR exception list (epic Task A4) — curated US names that file nothing with the SEC (an
+          unsponsored ADR like TCEHY). They are EXCLUDED from the eligible coverage denominator above (so
+          never counted "missing" and never blocking retirable) and listed here as a documented
+          degrade-to-Yahoo exception — the US analogue of the already-accepted LSE/foreign no-CIK names. */}
+      {summary.noEdgar.length > 0 && (
+        <p className="mt-3 text-xs text-gray-400" data-testid="fundamentals-no-edgar">
+          {summary.noEdgar.length} name{summary.noEdgar.length === 1 ? '' : 's'} degrade to Yahoo (no SEC
+          filings):{' '}
+          {summary.noEdgar.map((n, i) => (
+            <span key={n.symbol}>
+              {i > 0 && ', '}
+              <span className="font-mono text-amber-300" title={n.reason}>
+                {n.symbol}
+              </span>
+            </span>
+          ))}
+        </p>
+      )}
     </div>
   )
 }

@@ -188,6 +188,7 @@ describe('buildSummary', () => {
     expect(s.retirable).toBe(false)
     expect(s.lastIngestRunMs).toBe(5_000)
     expect(s.lastIngestRunState).toBe('done')
+    expect(s.noEdgar).toEqual([]) // no exceptions in the base fixture
   })
 
   it('is all-null when both reads are null', () => {
@@ -196,6 +197,20 @@ describe('buildSummary', () => {
     expect(s.pitServed).toBeNull()
     expect(s.covered).toBeNull()
     expect(s.retirable).toBeNull()
+    expect(s.noEdgar).toEqual([]) // always an array (panel renders without a null guard)
+  })
+
+  it('passes the no_edgar exception list through (epic Task A4)', () => {
+    const s = buildSummary(
+      freshness({
+        no_edgar_count: 1,
+        no_edgar: [{ symbol: 'TCEHY', reason: 'unsponsored ADR — files nothing with the SEC' }],
+      }),
+      source(),
+    )
+    expect(s.noEdgar).toEqual([
+      { symbol: 'TCEHY', reason: 'unsponsored ADR — files nothing with the SEC' },
+    ])
   })
 
   it('sums multiple pit/yahoo buckets so a per-form source key still rolls up', () => {

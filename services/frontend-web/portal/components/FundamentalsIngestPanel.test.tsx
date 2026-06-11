@@ -19,6 +19,12 @@ const freshness: FreshnessAudit = {
   stale: 1,
   coverage_pct: 66.67,
   retirable: false,
+  // The EDGAR-eligible denominator excludes a no-EDGAR name (epic Task A4): TCEHY files nothing with the
+  // SEC, so it degrades to Yahoo and is surfaced as an exception, not counted missing.
+  no_edgar_count: 1,
+  no_edgar: [
+    { symbol: 'TCEHY', reason: 'unsponsored ADR — Tencent (HKEX 0700) files nothing with the SEC' },
+  ],
   last_ingest_run: { state: 'done', finished_at_ms: NOW - 60_000 },
   names: [
     {
@@ -93,6 +99,31 @@ describe('FundamentalsIngestPanel — summary + per-ticker table (card 149)', ()
     // retirable: no (missing=1)
     expect(within(summary).getByText(/retirable:/)).toBeInTheDocument()
     expect(within(summary).getByText('no')).toBeInTheDocument()
+  })
+
+  it('surfaces the no-EDGAR exception list beside the audit (epic Task A4)', () => {
+    renderPanel()
+    const noEdgar = screen.getByTestId('fundamentals-no-edgar')
+    // "N names degrade to Yahoo (no SEC filings): …" — the documented degrade-to-Yahoo exception.
+    expect(noEdgar).toHaveTextContent(/1 name degrade to Yahoo \(no SEC filings\):/)
+    const sym = within(noEdgar).getByText('TCEHY')
+    expect(sym).toBeInTheDocument()
+    // the curated reason is on the symbol's tooltip (title), not silently dropped
+    expect(sym).toHaveAttribute('title', expect.stringContaining('unsponsored ADR'))
+  })
+
+  it('omits the no-EDGAR line when there are no exceptions', () => {
+    render(
+      <ModeProvider initial="quant">
+        <FundamentalsIngestPanel
+          initialStatus={null}
+          initialConfig={null}
+          initialFreshness={{ ...freshness, no_edgar_count: 0, no_edgar: [] }}
+          initialSource={source}
+        />
+      </ModeProvider>,
+    )
+    expect(screen.queryByTestId('fundamentals-no-edgar')).not.toBeInTheDocument()
   })
 
   it('renders the per-ticker table with BOTH clock columns', () => {

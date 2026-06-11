@@ -1,9 +1,15 @@
 """Per-name PIT coverage + freshness audit — the "is the curated US universe fully ingested, and how
 current is each name?" surface (epic Task 4).
 
-This is the gate that proves it is **safe to retire Yahoo** for US names: once every curated US name is
-covered (`covered == universe`) and none is stale (`stale == 0`), `retirable` flips true and the live
-strategy seam no longer needs the Yahoo fallback for US.
+This is the gate that proves it is **safe to retire Yahoo** for US names: once every **EDGAR-eligible**
+curated US name is covered and none is stale (`missing == 0 and stale == 0` over that denominator),
+`retirable` flips true and the live strategy seam no longer needs the Yahoo fallback for those names. The
+denominator is `edgar_eligible = curated US universe − NO_EDGAR` (epic Task A4): a handful of curated names
+genuinely file NOTHING with the SEC (an unsponsored ADR like TCEHY — `security_master/no_edgar.py`), so they
+will FOREVER be uncovered. Counting them as `missing` would make the gate unreachable (no amount of ingesting
+satisfies a name that does not file) and would read as a silent coverage gap. So they are EXCLUDED from
+`missing`/`stale`/`retirable` and surfaced in a distinct `no_edgar` block WITH reasons — a documented,
+accepted degrade-to-Yahoo exception (exactly like an LSE/foreign name with no US CIK), not a `missing` name.
 
 Distinct from `status.py` (which reports a GLOBAL coverage count + a single ingestion-lag number): this
 walks the curated universe **name by name** so a single missing or stale filer is visible. The two
@@ -42,6 +48,7 @@ import logging
 from typing import Optional
 
 from src.coverage import COVERAGE_UNIVERSE_ONLY, load_coverage
+from src.security_master.no_edgar import NO_EDGAR
 
 log = logging.getLogger("fundamentals-ingestion.freshness")
 
@@ -246,12 +253,22 @@ async def freshness_audit(
     omitted `annual_stale_after_ms` defaults to the 400-day annual window; it is floored at the quarterly
     window so an annual filer is never treated as more time-sensitive than a quarterly one.
 
-    Returns `{universe, covered, missing, stale, coverage_pct, retirable, last_ingest_run, names:[…]}`,
-    where `retirable = (missing == 0 and stale == 0)` is the safe-to-retire-Yahoo gate. `last_ingest_run`
-    is the run store's latest force-ingest payload (injected by the endpoint, not a DB read — mirrors
-    `status.build_status`'s `last_run`).
+    The EDGAR-eligible denominator (epic Task A4). The curated universe is partitioned into
+    `edgar_eligible = universe − NO_EDGAR` and the excluded NO_EDGAR set. `covered`/`missing`/`stale`/
+    `coverage_pct`/`retirable` and `names[]` are all computed over `edgar_eligible` ONLY, and `universe` is
+    the eligible count — so a name that genuinely files nothing with the SEC (an unsponsored ADR like TCEHY)
+    is NEVER counted `missing` (it would otherwise block `retirable` forever and read as a silent gap). The
+    excluded names are surfaced verbatim in a distinct `no_edgar:[{symbol, reason}]` block so the portal
+    renders them as a documented degrade-to-Yahoo exception, not a `missing` name.
 
-    A cold (un-backfilled) warehouse yields every curated name uncovered/stale with zero coverage — that
+    Returns `{universe, covered, missing, stale, coverage_pct, retirable, no_edgar_count, no_edgar:[…],
+    last_ingest_run, names:[…]}`, where `retirable = (missing == 0 and stale == 0)` over the eligible
+    denominator is the safe-to-retire-Yahoo gate. `universe` is the EDGAR-eligible count (excludes
+    NO_EDGAR); `no_edgar_count` + `no_edgar` carry the excluded set. `last_ingest_run` is the run store's
+    latest force-ingest payload (injected by the endpoint, not a DB read — mirrors `status.build_status`'s
+    `last_run`).
+
+    A cold (un-backfilled) warehouse yields every eligible name uncovered/stale with zero coverage — that
     is the correct pre-backfill state, not an error. A Timescale-unreachable read raises (the endpoint
     turns it into a 503, mirroring `/status`)."""
     # The annual window defaults to 400d and is floored at the quarterly window (an annual filer is never
@@ -265,8 +282,20 @@ async def freshness_audit(
 
     universe = await _curated_us_universe(mongo_db)
     universe_sorted = sorted(set(universe))
-    # The T212 join keys for the per-name reads; map back to the bare symbol for the output.
-    tickers = [_t212_us(sym) for sym in universe_sorted]
+
+    # Partition the curated universe into the EDGAR-eligible denominator and the excluded NO_EDGAR set
+    # (epic Task A4). A NO_EDGAR name files nothing with the SEC, so it can never be covered from EDGAR —
+    # excluding it from `edgar_eligible` keeps it OUT of `missing`/`stale`/`retirable` and the per-name
+    # `names[]` table, and surfaces it in its own `no_edgar` block instead. The match is on the bare symbol
+    # (NO_EDGAR keys are bare uppercase, the same alphabet the coverage read returns). Membership is checked
+    # case-insensitively for safety though the coverage read already upper-cases.
+    excluded = [sym for sym in universe_sorted if sym.upper() in NO_EDGAR]
+    edgar_eligible = [sym for sym in universe_sorted if sym.upper() not in NO_EDGAR]
+    no_edgar_names = [{"symbol": sym, "reason": NO_EDGAR[sym.upper()]} for sym in excluded]
+
+    # The T212 join keys for the per-name reads; map back to the bare symbol for the output. Only the
+    # EDGAR-eligible names are read/walked — a NO_EDGAR name is never joined against `fundamentals`.
+    tickers = [_t212_us(sym) for sym in edgar_eligible]
 
     newest_by_ticker: dict[str, dict] = {}
     last_stored_by_ticker: dict[str, Optional[int]] = {}
@@ -289,7 +318,7 @@ async def freshness_audit(
     names: list[dict] = []
     covered_count = 0
     stale_count = 0
-    for sym in universe_sorted:
+    for sym in edgar_eligible:
         ticker = _t212_us(sym)
         agg = newest_by_ticker.get(ticker)
         covered = agg is not None
@@ -340,7 +369,10 @@ async def freshness_audit(
             "stale": stale,
         })
 
-    n = len(universe_sorted)
+    # The denominator is the EDGAR-eligible set (curated universe − NO_EDGAR), so coverage/missing/stale and
+    # the retirable gate are computed only over names that CAN be ingested from EDGAR — a NO_EDGAR name is
+    # never counted missing (it would block the gate forever) and never inflates the staleness count.
+    n = len(edgar_eligible)
     missing = n - covered_count
     coverage_pct = round(100.0 * covered_count / n, 2) if n else 0.0
     return {
@@ -349,8 +381,14 @@ async def freshness_audit(
         "missing": missing,
         "stale": stale_count,
         "coverage_pct": coverage_pct,
-        # The headline gate: every curated US name ingested AND none stale ⇒ Yahoo can be retired for US.
+        # The headline gate: every EDGAR-eligible curated US name ingested AND none stale ⇒ Yahoo can be
+        # retired for US (the NO_EDGAR names always degrade to Yahoo — they are not part of this gate).
         "retirable": missing == 0 and stale_count == 0,
+        # The excluded set — names that file nothing with the SEC — surfaced with reasons so the portal
+        # renders a documented degrade-to-Yahoo exception, NOT a silent `missing`. `no_edgar_count` is the
+        # scalar for the summary; `no_edgar` carries the per-name reasons.
+        "no_edgar_count": len(no_edgar_names),
+        "no_edgar": no_edgar_names,
         "last_ingest_run": last_ingest_run,
         "names": names,
     }

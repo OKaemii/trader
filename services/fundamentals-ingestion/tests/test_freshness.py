@@ -22,6 +22,7 @@ from src.freshness import (
     freshness_audit,
     stale_after_ms_from_days,
 )
+from src.security_master.no_edgar import is_no_edgar, no_edgar_reason
 from tests.fakes import FakeTimescale
 
 _DAY = 86_400_000
@@ -663,3 +664,121 @@ async def test_heal_filter_uses_per_form_window() -> None:
     stale_set = {n["symbol"] for n in audit["names"] if n["stale"]}
     assert "AAPL" in stale_set       # quarterly filer at 200d → healed
     assert "TSM" not in stale_set    # annual filer at 200d → NOT healed every cycle (the A2 fix)
+
+
+# ── NO_EDGAR exception set + EDGAR-eligible denominator (A4 core) ─────────────────────────────────────
+def test_no_edgar_set_seeds_tcehy_and_excludes_names_with_a_cik() -> None:
+    """The curated NO_EDGAR set: TCEHY (unsponsored ADR, files nothing with the SEC) is enumerated WITH a
+    reason; META and SPCX — which DO have a CIK — must NOT be in the set (the card's explicit anti-trap:
+    `missing` ≠ `no_edgar`)."""
+    assert is_no_edgar("TCEHY") is True
+    assert is_no_edgar("tcehy") is True                  # case-tolerant
+    assert no_edgar_reason("TCEHY") and "unsponsored" in no_edgar_reason("TCEHY").lower()
+    # Names that resolve to a real CIK are coverage gaps that ingest closes — never no-EDGAR.
+    assert is_no_edgar("META") is False
+    assert is_no_edgar("SPCX") is False
+    assert no_edgar_reason("META") is None
+    assert is_no_edgar("AAPL") is False                  # a normal filer
+
+
+@pytest.mark.asyncio
+async def test_no_edgar_name_excluded_from_missing_and_surfaced_with_reason() -> None:
+    """A NO_EDGAR name (TCEHY) in the curated universe is NOT counted `missing` (it files nothing with the
+    SEC, so it can never be covered from EDGAR) and is surfaced in a distinct `no_edgar` block WITH its
+    reason — never as a silent missing row in `names[]`. The eligible denominator excludes it."""
+    # Curated universe = AAPL (eligible, covered+fresh) + TCEHY (no-EDGAR exception).
+    mongo = _FakeMongo(["AAPL_US_EQ", "TCEHY_US_EQ"])
+    db = _FreshnessFakeTimescale()
+    now = 1_000_000 * _DAY
+    _seed_instrument(db, instrument_id=1, t212_ticker="AAPL_US_EQ")
+    _seed_fact(db, instrument_id=1, metric="net_income", observation_ts=now, knowledge_ts=now + _DAY)
+
+    audit = await freshness_audit(
+        db, mongo, now_ms=now, stale_after_ms=stale_after_ms_from_days(None),
+        annual_stale_after_ms=annual_stale_after_ms_from_days(None), last_ingest_run=None,
+    )
+
+    # The denominator is EDGAR-eligible only: AAPL counts, TCEHY does not.
+    assert audit["universe"] == 1                         # eligible = {AAPL}; TCEHY excluded
+    assert audit["covered"] == 1
+    assert audit["missing"] == 0                          # TCEHY is NOT a missing name
+    assert audit["coverage_pct"] == 100.0
+
+    # TCEHY never appears in the per-name table (not a silent `covered:false` row).
+    symbols = {n["symbol"] for n in audit["names"]}
+    assert symbols == {"AAPL"}
+    assert "TCEHY" not in symbols
+
+    # It IS surfaced in the no_edgar block, with its reason.
+    assert audit["no_edgar_count"] == 1
+    no_edgar = {e["symbol"]: e["reason"] for e in audit["no_edgar"]}
+    assert set(no_edgar) == {"TCEHY"}
+    assert "unsponsored" in no_edgar["TCEHY"].lower()
+
+
+@pytest.mark.asyncio
+async def test_retirable_over_eligible_denominator_despite_no_edgar_name() -> None:
+    """`retirable` is computed over the EDGAR-eligible denominator: every eligible name covered + fresh ⇒
+    retirable TRUE, even though a NO_EDGAR name in the universe is (and forever will be) uncovered. Under
+    the OLD whole-universe denominator the uncovered TCEHY would be `missing` and pin `retirable=False`
+    forever — the bug this card fixes."""
+    mongo = _FakeMongo(["AAPL_US_EQ", "MSFT_US_EQ", "TCEHY_US_EQ"])
+    db = _FreshnessFakeTimescale()
+    now = 500_000 * _DAY
+    for iid, tk in ((1, "AAPL_US_EQ"), (2, "MSFT_US_EQ")):
+        _seed_instrument(db, instrument_id=iid, t212_ticker=tk)
+        _seed_fact(db, instrument_id=iid, metric="net_income", observation_ts=now - 10 * _DAY,
+                   knowledge_ts=now - 9 * _DAY)
+    # TCEHY: no instrument, no fact — uncovered, exactly the no-EDGAR reality. It must NOT block retirable.
+
+    audit = await freshness_audit(
+        db, mongo, now_ms=now, stale_after_ms=stale_after_ms_from_days(None),
+        annual_stale_after_ms=annual_stale_after_ms_from_days(None), last_ingest_run=None,
+    )
+    assert audit["universe"] == 2 and audit["covered"] == 2     # eligible {AAPL, MSFT}; TCEHY excluded
+    assert audit["missing"] == 0 and audit["stale"] == 0
+    assert audit["retirable"] is True                           # eligible complete+fresh ⇒ retirable
+    assert audit["no_edgar_count"] == 1                         # TCEHY documented, not missing
+
+
+@pytest.mark.asyncio
+async def test_no_edgar_name_not_in_heal_stale_set() -> None:
+    """The `--heal` `_filter_stale_symbols` keys on `{n['symbol'] for n in names if stale}`. Because a
+    NO_EDGAR name is excluded from `names[]`, it is never in that stale set — so heal does NOT force-
+    re-ingest TCEHY every cycle (which would burn an EDGAR round-trip only to skip it as no_cik). A real
+    stale eligible name (MSFT, fiscal period 200d old, quarterly) IS in the set."""
+    mongo = _FakeMongo(["MSFT_US_EQ", "TCEHY_US_EQ"])
+    db = _FreshnessFakeTimescale()
+    now = 1_000_000 * _DAY
+    _seed_instrument(db, instrument_id=1, t212_ticker="MSFT_US_EQ")
+    _seed_fact(db, instrument_id=1, metric="net_income", observation_ts=now - 200 * _DAY,
+               knowledge_ts=now - 199 * _DAY)
+    _seed_filing(db, instrument_id=1, form_type="10-Q", accepted_ts=now - 199 * _DAY)
+    # TCEHY uncovered — would be "stale by definition" if it were in the eligible walk; it isn't.
+
+    audit = await freshness_audit(
+        db, mongo, now_ms=now, stale_after_ms=stale_after_ms_from_days(None),
+        annual_stale_after_ms=annual_stale_after_ms_from_days(None), last_ingest_run=None,
+    )
+    stale_set = {n["symbol"] for n in audit["names"] if n["stale"]}
+    assert "MSFT" in stale_set        # a genuinely-stale eligible name → healed
+    assert "TCEHY" not in stale_set   # the no-EDGAR exception → never force-re-ingested
+
+
+@pytest.mark.asyncio
+async def test_universe_with_only_no_edgar_names_is_vacuously_retirable() -> None:
+    """A curated universe consisting solely of NO_EDGAR names yields an empty eligible denominator (every
+    name degrades to Yahoo): zeros + vacuously retirable (no eligible name to keep on Yahoo), with the
+    excluded names still surfaced. Mirrors the empty-universe case but via the exclusion path."""
+    mongo = _FakeMongo(["TCEHY_US_EQ"])
+    db = _FreshnessFakeTimescale()
+    audit = await freshness_audit(
+        db, mongo, now_ms=10 * _DAY, stale_after_ms=stale_after_ms_from_days(None),
+        annual_stale_after_ms=annual_stale_after_ms_from_days(None), last_ingest_run=None,
+    )
+    assert audit["universe"] == 0 and audit["covered"] == 0 and audit["missing"] == 0
+    assert audit["names"] == []
+    assert audit["coverage_pct"] == 0.0
+    assert audit["retirable"] is True              # no eligible name to keep on Yahoo
+    assert audit["no_edgar_count"] == 1
+    assert audit["no_edgar"][0]["symbol"] == "TCEHY"
