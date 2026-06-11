@@ -202,7 +202,12 @@ async function maybeEmitDailyAtClose(
         })
         .toArray();
       if (docs.length === 0) {
-        log.warn(`[market-data] daily-emit ${market} ${utcDate}: no 5m bars found — skipping`);
+        // Release the gate so a later cycle retries once today's 5m bars land. An early
+        // CLOSED-state cycle (or a pod restart) can run this BEFORE the EOD poll has fetched
+        // today's bars; without the release the gate burned here blocks the real emit for 25h,
+        // so market:raw:daily never publishes and the strategy-engine never cycles that day.
+        await redis.del(gateKey).catch(() => {});
+        log.warn(`[market-data] daily-emit ${market} ${utcDate}: no 5m bars found — gate released, will retry`);
         continue;
       }
       // Group by ticker then aggregate-to-daily so aggregateBars sees one ticker's bars
@@ -234,7 +239,8 @@ async function maybeEmitDailyAtClose(
         if (last) dailyBars.push(last);
       }
       if (dailyBars.length === 0) {
-        log.warn(`[market-data] daily-emit ${market} ${utcDate}: aggregation produced 0 bars`);
+        await redis.del(gateKey).catch(() => {});
+        log.warn(`[market-data] daily-emit ${market} ${utcDate}: aggregation produced 0 bars — gate released`);
         continue;
       }
       await persistBars(dailyBars, 'daily');
@@ -933,11 +939,19 @@ async function bootstrap(): Promise<void> {
       writer: new QuoteWriter(),
       activeTickers: () => universeManager.activeTickers,
       latestBar: async (ticker) => {
+        // Bound the scan to recent chunks. `bars` is one shared hypertable across intervals,
+        // so an unbounded `ORDER BY observation_ts DESC LIMIT 1` cannot chunk-exclude on
+        // `interval` and locks EVERY chunk at executor startup — once the deep daily series
+        // grew the hypertable to 1991→now, that exhausts the lock table (53200 / out of shared
+        // memory). 5m bars are provider-capped at ~60d, so a 90d lower bound prunes
+        // chunk-exclusion to a handful of recent chunks (the same bound-the-read fix as getBarAtOrBefore).
+        const since = Date.now() - 90 * 24 * 60 * 60 * 1000;
         const { rows } = await getPgPool().query<{ high: number; low: number; close: number }>(
           `SELECT high, low, close FROM bars
            WHERE ticker = $1 AND interval = '5m' AND is_superseded = FALSE
+             AND observation_ts >= $2
            ORDER BY observation_ts DESC LIMIT 1`,
-          [ticker],
+          [ticker, since],
         );
         return rows.length ? { high: Number(rows[0]!.high), low: Number(rows[0]!.low), close: Number(rows[0]!.close) } : null;
       },
