@@ -22,7 +22,7 @@ import { GenericContainer, type StartedTestContainer } from 'testcontainers';
 import { closePgPool, getPgPool, runMigrations } from '@trader/shared-pg';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { getBarAtOrBefore } from '../index.ts';
+import { getBarAtOrBefore, getDailyDepth } from '../index.ts';
 
 const dockerAvailable = await isDockerAvailable();
 const TEST_TIMEOUT_MS = 120_000;
@@ -491,6 +491,69 @@ describe.skipIf(!dockerAvailable)('getBarAtOrBefore — many-chunk lock-table OO
     const chunkScans = (plan.match(/_hyper_\d+_\d+_chunk/g) ?? []).length;
     // ~57 chunks for a 400d window; assert it's a small bounded slice, nowhere near the full ~1000.
     expect(chunkScans).toBeLessThan(120);
+  });
+
+  // ── Depth-check (getDailyDepth) on the SAME deep many-chunk series ──────────────────────────────
+  // The capstone depth-check proves how far back the daily series reaches. It must compute
+  // {oldest, count} WITHOUT the unbounded aggregate that OOMs (the card's explicit constraint).
+
+  it('the NAIVE unbounded min()/count() aggregate exhausts the lock table (why the walk is required)', async () => {
+    const pool = getPgPool();
+    // This is the query the card warns against: `SELECT min(observation_ts), count(*) … WHERE
+    // ticker=$1 AND interval='daily' AND is_superseded=FALSE` with NO time bound. On the deep series
+    // its plan touches every chunk and locks them all at executor startup → "out of shared memory"
+    // (SQLSTATE 53200) under the tight lock budget — exactly the failure getDailyDepth's bounded
+    // walk avoids. If this ever STOPS erroring, the bounded walk's necessity should be re-checked.
+    await expect(
+      pool.query(
+        `SELECT min(observation_ts) AS oldest, count(*)::bigint AS n
+           FROM bars
+          WHERE ticker = $1 AND interval = $2 AND is_superseded = FALSE`,
+        ['A', 'daily'],
+      ),
+    ).rejects.toMatchObject({ code: '53200' });
+  });
+
+  it('getDailyDepth returns the 2006 oldest + full count over the deep series WITHOUT OOMing', async () => {
+    process.env.BARS_BACKEND = 'timescale';
+    const depth = await getDailyDepth(undefined, 'A', 'daily');
+    // Oldest reaches the 2006 floor of the seeded series (within a chunk of 2006-01-01).
+    expect(depth.oldest).not.toBeNull();
+    expect(depth.oldest!).toBeLessThanOrEqual(Date.UTC(2006, 0, 8));
+    expect(depth.oldest!).toBeGreaterThanOrEqual(Date.UTC(2006, 0, 1));
+    // The seeded series is one bar per day 2006→now → thousands of rows; assert it counted the lot
+    // (well past any single window), proving the bounded walk accumulates across windows.
+    expect(depth.count).toBeGreaterThan(5000);
+  }, TEST_TIMEOUT_MS);
+
+  it('EXPLAIN of the depth WINDOW query prunes to a bounded chunk count (each walk step is bounded)', async () => {
+    const pool = getPgPool();
+    // The total chunk count of the deep series (2006→now @ 7-day chunks ≈ 1000+) — the count the
+    // naive unbounded aggregate would lock. The bounded window step must touch a small FRACTION of it.
+    const { rows: totalRows } = await pool.query(
+      `SELECT count(*)::int AS n FROM timescaledb_information.chunks WHERE hypertable_name = 'bars'`,
+    );
+    const totalChunks = totalRows[0].n as number;
+
+    // One step of the depth walk: a bounded [lo, hi) window. Chunk exclusion must keep it to a small
+    // slice — the per-query lock footprint that keeps the walk OOM-safe.
+    const lo = Date.UTC(2006, 0, 1);
+    const hi = lo + 730 * day; // the 2y DEPTH_WINDOW
+    const { rows } = await pool.query(
+      `EXPLAIN (FORMAT TEXT)
+       SELECT count(*)::bigint AS n, min(observation_ts) AS oldest
+         FROM bars
+        WHERE ticker = $1 AND interval = $2 AND is_superseded = FALSE
+          AND observation_ts >= $3 AND observation_ts < $4`,
+      ['A', 'daily', lo, hi],
+    );
+    const plan = rows.map((r) => r['QUERY PLAN'] as string).join('\n');
+    const chunkScans = (plan.match(/_hyper_\d+_\d+_chunk/g) ?? []).length;
+    // A 730d window is ~210 chunk-scan nodes — a small slice of the ~1000+ total. The point is that
+    // chunk exclusion PRUNES (the window step never plans over the whole hypertable like the naive
+    // aggregate above): assert it's well under a third of the full series.
+    expect(chunkScans).toBeGreaterThan(0);
+    expect(chunkScans).toBeLessThan(totalChunks / 3);
   });
 });
 

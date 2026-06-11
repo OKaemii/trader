@@ -28,10 +28,10 @@ import type { RedisClientType } from 'redis';
 import type { OHLCVBar, BarInterval } from '@trader/shared-types';
 import { COLLECTIONS } from '@trader/shared-mongo';
 import { getPgPool } from '@trader/shared-pg';
-import { getBarsFromPg, getBarAtOrBeforePg, pgCacheKey, pgAtCacheKey } from './pg-bar-reader.ts';
+import { getBarsFromPg, getBarAtOrBeforePg, getDailyDepthPg, pgCacheKey, pgAtCacheKey } from './pg-bar-reader.ts';
 
 export { hashBarContent } from './content-hash.ts';
-export { getBarsFromPg, getBarAtOrBeforePg, getLastClosePg, pgCacheKey, pgAtCacheKey } from './pg-bar-reader.ts';
+export { getBarsFromPg, getBarAtOrBeforePg, getDailyDepthPg, getLastClosePg, pgCacheKey, pgAtCacheKey } from './pg-bar-reader.ts';
 export { computeMissingRanges, coverageOf } from './coverage.ts';
 export type { MissingRange } from './coverage.ts';
 
@@ -387,6 +387,53 @@ async function getBarAtOrBeforeFromMongo(
   }
 
   return bar;
+}
+
+export interface DailyDepth {
+  /** Minimum unsuperseded `observation_ts` (UTC ms), or null when the name has no bars. */
+  oldest: number | null;
+  /** Count of unsuperseded rows (the live series) for (ticker, interval). */
+  count: number;
+}
+
+/**
+ * Persisted daily-series depth for one ticker — `{ oldest, count }` over the UNSUPERSEDED rows —
+ * dispatching to the active backend per `BARS_BACKEND`. This is the depth-check the capstone uses to
+ * prove how far back the daily series reaches WITHOUT the `range='max'` read that exhausted
+ * Timescale's lock table (see getBarAtOrBefore). On Timescale the read walks bounded time windows so
+ * no single aggregate plan spans the whole hypertable (an unbounded `min()/count()` would lock every
+ * chunk → the same OOM); on Mongo it is a single `$group` (no lock-table failure mode there). Both
+ * count only the live (unsuperseded) revision per observation, matching every other live read.
+ *
+ * @param db  MongoDB handle. Required when `BARS_BACKEND=mongo` (the default); may be `undefined`
+ *           when `BARS_BACKEND=timescale`.
+ */
+export async function getDailyDepth(
+  db: Db | undefined,
+  ticker: string,
+  interval: BarInterval = 'daily',
+): Promise<DailyDepth> {
+  if (activeBackend() === 'timescale') {
+    return getDailyDepthPg(ticker, interval);
+  }
+  if (!db) {
+    throw new Error('[shared-bars] getDailyDepth: db parameter required when BARS_BACKEND=mongo (the default)');
+  }
+  const coll = db.collection(COLLECTIONS.OHLCV_BARS);
+  const agg = await coll.aggregate([
+    { $match: { ticker, interval, is_superseded: false } },
+    { $group: { _id: null, oldest: { $min: '$observation_ts' }, count: { $sum: 1 } } },
+  ]).toArray();
+  const row = agg[0] as { oldest?: unknown; count?: number } | undefined;
+  if (!row) return { oldest: null, count: 0 };
+  // observation_ts is stored as a number on the Timescale path and as a Date on legacy Mongo writes;
+  // normalise either to UTC ms so the returned shape matches the PG reader exactly.
+  const oldestRaw = row.oldest;
+  const oldest =
+    oldestRaw == null ? null
+    : oldestRaw instanceof Date ? oldestRaw.getTime()
+    : Number(oldestRaw);
+  return { oldest: Number.isFinite(oldest as number) ? (oldest as number) : null, count: row.count ?? 0 };
 }
 
 /**
