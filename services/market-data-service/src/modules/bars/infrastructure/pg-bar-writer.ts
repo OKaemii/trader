@@ -27,6 +27,36 @@ export interface WriteBarRevisionsStats {
 }
 
 /**
+ * Maximum bars per write batch. The write path bounds itself by `observation_ts`
+ * for the same reason getBarAtOrBefore bounds its read (epic pit-coverage-completeness
+ * §C1, the range='max' read-path twin of this fix): a deep backfill (~7545 daily bars
+ * spanning 2006→now) handed to writeBarRevisionsPg as one array makes the batched
+ * "latest revision" lookup probe `(ticker, observation_ts)` keys across the ENTIRE
+ * 2006→now span. TimescaleDB cannot prune chunks for an IN-list straddling the whole
+ * range, so the planner opens an index scan — and takes a lock — on every one of the
+ * ~1500+ 7-day chunks at executor startup. That overflows the shared lock table
+ * (`max_locks_per_transaction`) → "out of shared memory" / SQLSTATE 53200 /
+ * LockAcquireExtended, and the DUAL_WRITE Timescale write fails while the Mongo write
+ * still succeeds (so the deep series lands in Mongo but not the timescale read store).
+ *
+ * The fix is two parts working together (sorting + batching alone is NOT enough — see
+ * writeBatchPg): bars are sorted by `observation_ts` and split into bounded batches so a
+ * batch's observation span is contiguous and narrow (~250 days), and each batch's lookup
+ * then carries an explicit LITERAL `observation_ts BETWEEN min AND max` bound that
+ * TimescaleDB CAN use for chunk exclusion (the opaque IN-list cannot). Each lookup thus
+ * touches only that batch's ~36 7-day chunks, under the lock budget regardless of how deep
+ * the full series is. The live poll path (1 bar/ticker/day) is a single tiny batch and is
+ * unaffected.
+ *
+ * Overridable via PG_BAR_WRITE_BATCH_SIZE for an operator that needs to tune it to a
+ * different chunk_time_interval / lock budget; 250 is a sane default.
+ */
+export const WRITE_BATCH_SIZE = (() => {
+  const raw = Number(process.env.PG_BAR_WRITE_BATCH_SIZE);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 250;
+})();
+
+/**
  * Batch-fetch the *first-print* close per (ticker, observation_ts) for the incoming
  * bars. "First-print" = the row with the smallest `knowledge_ts` at that observation.
  *
@@ -70,9 +100,12 @@ export async function fetchFirstPrintClosesPg(
  * Persist a batch of bars bi-temporally into Timescale. Idempotent on repeat
  * application: re-running on the same provider response writes zero rows.
  *
- * Performance shape: one batched SELECT for prior-revision hashes, then a per-bar
- * decision. Cosmetic skips never check out a pool client; only genuine revisions
- * (or first-prints) open a transaction.
+ * Performance shape: bars are sorted by `observation_ts` and committed in bounded
+ * WRITE_BATCH_SIZE batches. Each batch runs its own scoped "latest revision" lookup
+ * (over a contiguous, narrow `observation_ts` span) and per-bar transactions, so no
+ * single statement touches more chunks than its ~250-day window holds — see
+ * WRITE_BATCH_SIZE for why this bound is load-bearing. Cosmetic skips never check out
+ * a pool client; only genuine revisions (or first-prints) open a transaction.
  */
 export async function writeBarRevisionsPg(
   bars: OHLCVBar[],
@@ -87,20 +120,60 @@ export async function writeBarRevisionsPg(
   };
   if (bars.length === 0) return stats;
 
-  const pool = getPgPool();
-
   // Pre-compute hashes once. The writer accepts producer-side bars without
   // content_hash set; we hash them here. Bars that already carry a hash are
   // trusted (the validator has already canonicalised them).
+  // Sort by observation_ts so each bounded batch's lookup IN-list is contiguous in
+  // time — the property that keeps chunk-locking under the budget (see WRITE_BATCH_SIZE).
   const incoming = bars
     .filter((b) => Number.isFinite(b.observation_ts))
-    .map((bar) => ({ bar, hash: bar.content_hash ?? hashBarContent(bar) }));
+    .map((bar) => ({ bar, hash: bar.content_hash ?? hashBarContent(bar) }))
+    .sort((a, b) => a.bar.observation_ts - b.bar.observation_ts);
   if (incoming.length === 0) return stats;
 
-  // Single fetch of the current latest revision per (ticker, observation_ts).
-  // Bounded by the partial-unique index bars_latest_unique — sub-ms at universe scale.
-  const tickers   = incoming.map(({ bar }) => bar.ticker);
-  const obsTsList = incoming.map(({ bar }) => bar.observation_ts);
+  for (let i = 0; i < incoming.length; i += WRITE_BATCH_SIZE) {
+    const batch = incoming.slice(i, i + WRITE_BATCH_SIZE);
+    await writeBatchPg(batch, interval, now, stats);
+  }
+
+  return stats;
+}
+
+/**
+ * Persist one bounded batch of (already-sorted, already-hashed) bars. Mutates `stats`.
+ * Each call's "latest revision" lookup probes only this batch's narrow, contiguous
+ * `observation_ts` span, and each bar's supersede+insert+audit stays atomic in its own
+ * transaction (the bi-temporal invariant is per-bar, so it holds within any batch).
+ */
+async function writeBatchPg(
+  batch: Array<{ bar: OHLCVBar; hash: string }>,
+  interval: BarInterval,
+  now: number,
+  stats: WriteBarRevisionsStats,
+): Promise<void> {
+  if (batch.length === 0) return;
+  const pool = getPgPool();
+
+  // Single fetch of the current latest revision per (ticker, observation_ts) — scoped
+  // to this batch only. The batch is sorted by observation_ts, so an explicit
+  // `observation_ts BETWEEN min AND max` range narrows the read to that span. The bounds
+  // are inlined as integer LITERALS (not bind params) and this is load-bearing: the
+  // `(ticker, observation_ts) IN (SELECT unnest(...))` list is OPAQUE to the planner (it
+  // can't read the array's value range at plan time), so without an explicit time bound
+  // the read opens — and locks — every chunk of a deep hypertable before resolving the
+  // membership test → "out of shared memory" / SQLSTATE 53200. A *parameterized* range
+  // doesn't reliably help either: node-postgres flips to a generic plan after a few
+  // executions, and a generic plan can't prune chunks from a bind param. Literal bounds
+  // force plan-time constraint exclusion to the batch's ~250-day slice (~36 7-day chunks)
+  // on every execution; the IN-list then selects the exact keys within it. `minObsTs`/
+  // `maxObsTs` are finite-checked JS numbers (filtered upstream) coerced to decimal, so
+  // the inline is injection-safe (never user input — our own bar timestamps). Bounded by
+  // the partial-unique index bars_latest_unique.
+  const tickers   = batch.map(({ bar }) => bar.ticker);
+  const obsTsList = batch.map(({ bar }) => bar.observation_ts);
+  // Sorted ascending ⇒ first is min, last is max (a guarded read for noUncheckedIndexedAccess).
+  const minLiteral = BigInt(Math.trunc(obsTsList[0]!)).toString();
+  const maxLiteral = BigInt(Math.trunc(obsTsList[obsTsList.length - 1]!)).toString();
 
   const { rows: latest } = await pool.query<{
     ticker: string; observation_ts: string; content_hash: string;
@@ -109,6 +182,8 @@ export async function writeBarRevisionsPg(
      FROM bars
      WHERE interval = $1
        AND is_superseded = FALSE
+       AND observation_ts >= ${minLiteral}
+       AND observation_ts <= ${maxLiteral}
        AND (ticker, observation_ts) IN (
          SELECT unnest($2::text[]), unnest($3::bigint[])
        )`,
@@ -118,7 +193,7 @@ export async function writeBarRevisionsPg(
     latest.map((row) => [`${row.ticker}|${row.observation_ts}`, row.content_hash]),
   );
 
-  for (const { bar, hash } of incoming) {
+  for (const { bar, hash } of batch) {
     const key = `${bar.ticker}|${bar.observation_ts}`;
     const priorHash = latestByKey.get(key);
     if (priorHash === hash) {
@@ -140,7 +215,11 @@ export async function writeBarRevisionsPg(
 
       if (isRevision) {
         // Flip the prior latest row. The partial-unique index guarantees there's
-        // exactly one such row to flip.
+        // exactly one such row to flip. (A hypertable UPDATE inherently locks every
+        // chunk at plan time — TimescaleDB can't chunk-exclude DML — but that is a
+        // single bounded ~chunk-count lock set per revision, well within the production
+        // lock table; the lock-fan that overflowed it was the bulk-write LOOKUP above,
+        // which this fix bounds. Revisions are also rare on a deep series.)
         await client.query(
           `UPDATE bars
               SET is_superseded = TRUE
@@ -190,6 +269,4 @@ export async function writeBarRevisionsPg(
       client.release();
     }
   }
-
-  return stats;
 }
