@@ -162,6 +162,22 @@ metrics:
   # ── Cover page (instant; own knowledge_ts = filing date) ─────────────────────
   shares_outstanding:
     # The canonical PIT share count is the DEI cover-page fact (entity-level, as-of the cover date) —
-    # NOT a us-gaap weighted-average (that is a flow used for EPS). Per the spec: dei tag only.
+    # NOT a us-gaap weighted-average (that is a flow used for EPS).
+    #
+    # Dual-class fallback. A multi-class company (GOOGL/GOOG) reports the DEI cover-page count ONCE PER
+    # SHARE CLASS, each tagged with a share-class dimension. SEC's companyfacts feed exposes ONLY
+    # undimensioned consolidated facts (the parser hardcodes dim_signature='' for this reason), so the
+    # per-class dei facts never reach staging and `dei:EntityCommonStockSharesOutstanding` resolves to
+    # NULL → a null PIT market cap (market_cap = price × shares × fx drops the key). Such filers instead
+    # carry an undimensioned CONSOLIDATED balance-sheet total under `us-gaap:CommonStockSharesOutstanding`
+    # (verified against GOOGL companyfacts: a single undimensioned fact per period = Class A+B+C combined,
+    # equal to issued — no treasury). Listing it AFTER the dei tag keeps single-class behaviour identical
+    # (dei present ⇒ dei wins; the value-agreement guard only fires on a same-period collision, and dei
+    # cover-page vs us-gaap balance-sheet dates almost never coincide and agree when they do), while
+    # recovering a real consolidated count for a dual-class filer whose dei fact is class-dimensioned away.
+    # OUTSTANDING (not Issued) is the market-cap concept; fail-closed is preserved — a filer reporting
+    # NEITHER undimensioned tag (V/MA/META carry only class-dimensioned facts companyfacts drops) yields
+    # no consolidated fact, never a fabricated value.
     default:
       - dei:EntityCommonStockSharesOutstanding
+      - us-gaap:CommonStockSharesOutstanding
