@@ -138,6 +138,7 @@ async def _build_orchestrator(user_agent: str):
     writers/QA engine over the singleton pool. Imports the drivers lazily so this module imports clean
     without asyncpg/httpx; opens the pool exactly once (get_pool is the process singleton)."""
     from src.download.edgar import EdgarFactsClient, edgar_rate_limiter
+    from src.download.edgar_class_shares import EdgarClassSharesClient
     from src.normalize.writer import FundamentalsWriter
     from src.orchestrator import IngestionOrchestrator
     from src.qa.engine import QaEngine
@@ -152,6 +153,9 @@ async def _build_orchestrator(user_agent: str):
     limiter = edgar_rate_limiter()
     submissions = EdgarSubmissionsClient(user_agent=user_agent, limiter=limiter)
     facts = EdgarFactsClient(user_agent=user_agent, limiter=limiter)
+    # Dual-class share recovery shares the SAME limiter (the per-IP SEC budget spans the Archives host
+    # too) — fetches a filing's XBRL instance only for the dual-class names that stage null shares.
+    class_shares = EdgarClassSharesClient(user_agent=user_agent, limiter=limiter)
     # OpenFIGI gets its OWN rate budget (it is a different API + host), built from OPENFIGI_API_KEY when
     # set. It is the last-resort IDENTIFY hop for a symbol the SEC map + alias table both miss — it logs
     # the FIGI so an operator can add an alias; it never supplies a CIK, so it cannot itself resolve.
@@ -166,6 +170,7 @@ async def _build_orchestrator(user_agent: str):
         fundamentals_writer=FundamentalsWriter(pool),
         qa_engine=QaEngine(pool),
         openfigi_client=openfigi,
+        class_shares_client=class_shares,
     )
 
 
