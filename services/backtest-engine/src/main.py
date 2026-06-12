@@ -34,6 +34,11 @@ from .application.validator import DEFAULT_BENCHMARK_TICKERS, Validator
 MONGODB_URL = os.getenv('MONGODB_URL', 'mongodb://localhost:27017')
 MONGODB_DB = os.getenv('MONGODB_DB', 'trader')
 INTERNAL_TOKEN = os.getenv('INTERNAL_SERVICE_TOKEN', '')
+# The PIT fundamentals lake (per-CIK Parquet) read-only mount for warehouse-source backtests. The
+# harvester owns the RW mount; backtest-engine mounts it RO (the k8s mount lands in Task 22). Until
+# the harvester has bootstrapped, the lake store degrades a cold path to {} per name (a degraded —
+# not broken — backtest), so the default points at the eventual mount path with no further guard.
+FUNDAMENTALS_LAKE_DIR = os.getenv('FUNDAMENTALS_LAKE_DIR', '/srv/fundamentals-lake')
 
 _db = None
 _job_runner = None
@@ -73,40 +78,63 @@ async def _load_validation_history(req: dict) -> dict:
 
     grid_override = await resolve_search_grid(_db, req.get('strategy_id', 'factor_rank_v1'))
 
-    # Warehouse PIT fundamentals (Task 15): build the DuckDB-backed per-step provider so the
+    # PIT fundamentals from the LAKE (Task 12): build the lake-backed per-step provider so the
     # main-process replay reads TRUE point-in-time fundamentals (knowledge_ts ≤ as_of, market cap
-    # computed price×shares×fx). DuckDB lives in the SAME process (the run step is to_thread, not a
-    # process pool), so the connection-bearing provider passes through ctx without pickling. Built
-    # here (load phase) so a missing/absent warehouse is caught before the off-loop compute starts.
+    # computed price×shares×fx). The lake store + the warehouse bars connection live in the SAME
+    # process (the run step is to_thread, not a process pool), so the connection-bearing provider
+    # passes through ctx without pickling. Built here (load phase) so it is constructed before the
+    # off-loop compute starts; a cold lake degrades to {} per name (a degraded backtest, not a break).
     pit_fundamentals = _build_pit_fundamentals(req) if req.get('fundamentals_source') == 'warehouse' else None
     return {'prices': prices, 'benchmark_bars': bench_bars, 'constituents': constituents,
             'grid_override': grid_override, 'pit_fundamentals': pit_fundamentals}
 
 
 def _build_pit_fundamentals(req: dict):
-    """Build a WarehousePitFundamentals over the DuckDB warehouse for a `fundamentals_source=warehouse`
-    validation run (Task 15).
+    """Build a `LakePitFundamentals` over the PIT lake for a `fundamentals_source=warehouse` run
+    (Task 12 — backtest reads the lake directly).
 
-    Opens the `WarehouseReader` (DuckDB views over the snapshot Parquet, incl. the `fundamentals` +
-    `bars` views Task 15 registers) and wraps its connection. The provider re-resolves fundamentals
-    as-of at every replay step; uncovered names degrade to {} (the forward-only contract).
+    The lake is now the single PIT fundamentals store, so replay reads it just like the live
+    read-API: a per-CIK Parquet `Store` (`FUNDAMENTALS_LAKE_DIR`, RO-mounted in Task 22) supplies the
+    as-of LINE ITEMS (knowledge_ts ≤ as_of, the same 14-key contract), and the market-cap PRICE leg
+    reads the SAME warehouse `bars` view momentum reads (bars stay in the warehouse snapshot — only
+    the fundamentals snapshot was dropped). The provider re-resolves fundamentals as-of at every
+    replay step; uncovered/non-US/unknown names degrade to {} (the forward-only contract).
 
-    INJECTION GAPS (deliberate, documented — see the plan §7 / Task 13 release notes):
-      • resolve_instrument (ticker → instrument_id): the security master lives in Timescale
-        (`security_master.instruments`), NOT in the snapshotted DuckDB warehouse, so it is NOT wired
-        here yet — the default resolver returns None ⇒ every name unresolved ⇒ {} until a security-
-        master snapshot (or an in-process Timescale lookup) is injected. Pre-backfill the warehouse is
-        empty anyway, so this is the honest no-op landing; a later task injects the resolver.
-      • fx_to_gbp: GBP-identity default (LSE names compute fully; USD market caps need a historical
-        GBP/USD series the warehouse doesn't yet snapshot — the FX-series gap). USD names drop
-        market_cap_gbp (NaN-excluded) until an FX series is injected.
-    The wiring + the real-DuckDB as-of SQL are what Task 15 proves; the resolver/FX injection is the
-    remaining seam to fill once the warehouse is backfilled with security_master + an FX series."""
-    from quant_core.fundamentals.warehouse import WarehousePitFundamentals
+    BARS WIRING. quant-core's lake package has no warehouse connection, so the price leg is injected:
+    a closure over the `WarehouseReader` bars view running the SAME at-or-before-as-of close query the
+    warehouse reader used (`interval='daily'`, latest knowledge_ts ≤ as_of). The bars view keys on the
+    T212 ticker, so the closure is handed the original ticker string (the provider passes it through).
+
+    INJECTION GAP (carried forward, NOT fixed here — plan §7 / the Task-13 follow-up):
+      • fx_to_gbp: GBP-identity default (LSE/GBP-native names compute fully; USD market caps need a
+        historical GBP/USD series the warehouse doesn't yet snapshot — the FX-series gap). USD names
+        drop market_cap_gbp (NaN-excluded) until an FX series is injected. This is the SAME documented
+        limitation the warehouse path carried; this task does not wire the historical FX series.
+    Pre-bootstrap (the harvester lands in Task 22) the lake is cold ⇒ every name degrades to {} — a
+    degraded backtest, not a break (it merges incrementally; the lake fills once the harvester runs)."""
+    from quant_core.fundamentals.lake.replay import LakePitFundamentals
+    from quant_core.fundamentals.lake.store import Store
+    from quant_core.fundamentals.warehouse import _SELECT_CLOSE_AS_OF
     from .infrastructure.duckdb_reader import WarehouseReader
 
-    reader = WarehouseReader()   # DEFAULT_WAREHOUSE_DIR; empty stub views pre-backfill ⇒ {} per name
-    return WarehousePitFundamentals(reader._con)   # resolver=None, fx=GBP-identity (documented gaps)
+    store = Store(FUNDAMENTALS_LAKE_DIR)   # cold lake (pre-bootstrap) degrades to {} per name
+    reader = WarehouseReader()             # DEFAULT_WAREHOUSE_DIR; bars view (fundamentals snapshot dropped)
+
+    def _bars_close_as_of(ticker: str, as_of_ms: int):
+        """Latest daily adjusted close at/<= as_of from the warehouse `bars` view (bi-temporal) — the
+        market-cap price leg. Mirrors `WarehousePitFundamentals._adjusted_close_as_of`: the same
+        at-or-before-as-of `LIMIT 1` query, degrading to None on a missing/empty bars view so a cold
+        warehouse never breaks the read (the market cap is simply dropped for that name)."""
+        try:
+            row = reader._con.execute(_SELECT_CLOSE_AS_OF, [ticker, as_of_ms, as_of_ms]).fetchone()
+        except Exception:  # noqa: BLE001 — a missing/empty bars view must not break the replay read
+            return None
+        if not row or row[0] is None:
+            return None
+        return float(row[0])
+
+    # resolver/identity is the adapter inside LakePitFundamentals; fx defaults to GBP-identity.
+    return LakePitFundamentals(store, bars_close_as_of=_bars_close_as_of)
 
 
 async def _run_validator(ctx: dict, req: dict, progress) -> dict:
@@ -242,7 +270,8 @@ class ValidationRunRequest(BaseModel):
     tickers: Optional[list[str]] = None    # default: curated S&P 100 (ignored if survivorship_free)
     survivorship_free: bool = False        # use point-in-time index_constituents membership
     fundamentals_source: str = 'auto'      # 'auto' (Yahoo static approximate) | 'warehouse' (true PIT
-                                           # fundamentals from the DuckDB warehouse, re-resolved per step)
+                                           # fundamentals from the PIT lake, re-resolved per step — the
+                                           # request value stays 'warehouse' for API/portal compatibility)
     rebalance_days: int = 7
     n_folds: int = 5
     embargo_days: int = 21

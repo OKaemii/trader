@@ -54,9 +54,12 @@ class WarehouseReader:
         'risk_rejections',
         'fills_history',
         'reconciliation_log',
-        # PIT fundamentals (0009_fundamentals.sql; snapshotter TABLES). `fundamentals` is the as-of
-        # read surface a warehouse backtest pivots into line items; the other two ride along for the
-        # audit trail. Absent partitions register as empty views (pre-backfill warehouse → {}).
+        # PIT fundamentals (0009_fundamentals.sql). NOTE: the snapshotter no longer emits these tables
+        # (epic pit-fundamentals-lake-rearchitecture, Task 12 — backtest reads the PIT lake directly
+        # via LakePitFundamentals, not the warehouse snapshot), so these views now register as empty
+        # (no partitions). `get_fundamentals` below stays as the raw as-of primitive (still unit-tested
+        # against a directly-seeded parquet) but is no longer on any production read path; the bars
+        # view above is what the backtest still reads from the warehouse.
         'fundamentals',
         'fundamentals_revisions_log',
         'fundamentals_raw_facts',

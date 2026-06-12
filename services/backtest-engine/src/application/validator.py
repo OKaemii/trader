@@ -238,8 +238,9 @@ class Validator:
         param_grid: Optional[dict] = None,   # portal searchGrid override; None ⇒ parameter_space()
         seed: int = 0,                       # MT19937 base; 0 reproduces the original 0.. / 10000.. streams
         mcpt_early_stop: bool = True,        # decision-bounded sequential stop (verdict-identical to full N)
-        pit_fundamentals=None,               # WarehousePitFundamentals over the DuckDB warehouse (Task 15);
-                                             # when set, the main-process replay reads TRUE PIT per step
+        pit_fundamentals=None,               # a FundamentalsAsOf PIT provider (LakePitFundamentals over the
+                                             # lake, Task 12); when set, the main-process replay reads TRUE
+                                             # PIT per step (the seam is provider-agnostic — any FundamentalsAsOf)
         progress: ProgressSink = NullProgress(),
     ) -> dict:
         step = max(1, rebalance_days) * DAY_MS
@@ -293,9 +294,9 @@ class Validator:
         )
 
         # Fundamentals for quality-screening strategies (high_velocity). Two paths:
-        #   • WAREHOUSE PIT (pit_fundamentals supplied, Task 15): wrap the main-process reader with the
-        #     per-step true-PIT reader (re-resolves as-of at EVERY replay step from the DuckDB
-        #     warehouse). Covered names stamp 'point_in_time'; uncovered degrade to {} (no proxy).
+        #   • LAKE PIT (pit_fundamentals supplied, Task 12): wrap the main-process reader with the
+        #     per-step true-PIT reader (re-resolves as-of at EVERY replay step from the PIT lake).
+        #     Covered names stamp 'point_in_time'; uncovered degrade to {} (no proxy).
         #   • STATIC APPROXIMATE (default): one current `company_fundamentals` snapshot applied at
         #     every step — a documented look-ahead approximation (Yahoo has no as-of fundamentals).
         # The fail-closed QMJ screen yields an empty backtest if neither resolves — honest, not faked.
@@ -308,7 +309,7 @@ class Validator:
                 # cross the spawn boundary anyway; those nulls keep the spawn-safe static snapshot.
                 real_reader = PitFundamentalsBarsReader(real_reader, pit_fundamentals)
                 data_quality += (f"; fundamentals={PitFundamentalsBarsReader.FUNDAMENTALS_DATA_QUALITY} "
-                                 "(warehouse PIT, re-resolved as-of per replay step; uncovered names ⇒ {}); "
+                                 "(lake PIT, re-resolved as-of per replay step; uncovered names ⇒ {}); "
                                  "MCPT permutation nulls use the static approximate snapshot")
                 # Best-effort static snapshot still loaded for the spawn-safe MCPT-null path.
                 fundamentals_snapshot = await load_fundamentals_snapshot(list(panel.tickers))
