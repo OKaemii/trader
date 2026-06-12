@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from 'react'
 import { FundamentalsSourceTag } from '@/components/FundamentalsSourceTag'
+import { FreshnessTag } from '@/components/FreshnessTag'
 import { MarketBadge } from '@/components/MarketBadge'
 import { TickerChip } from '@/components/TickerChip'
 
@@ -45,8 +46,13 @@ type MarketFilter = 'ALL' | 'US' | 'LSE'
 type SortKey = 'cap' | 'ticker' | 'sector' | 'roe'
 
 export function ScannerPanel({
-  initialSnapshot, initialHealth, initialPie,
-}: { initialSnapshot: Snapshot; initialHealth: Health | null; initialPie: Pie | null }) {
+  initialSnapshot, initialHealth, initialPie, freshness,
+}: {
+  initialSnapshot: Snapshot; initialHealth: Health | null; initialPie: Pie | null
+  // Market-level freshness for the cap column (last-close × shares): "as of the last US session ·
+  // Not live" when the US market is closed. Absent ⇒ no tag.
+  freshness?: { asOf: number | null; stale: boolean | null }
+}) {
   const [snapshot, setSnapshot] = useState<Snapshot>(initialSnapshot)
   const [health, setHealth] = useState<Health | null>(initialHealth)
   const [busy, setBusy] = useState<'scan' | 'fund' | null>(null)
@@ -117,7 +123,10 @@ export function ScannerPanel({
   return (
     <section className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400">Scan &amp; quality funnel</h2>
+        <div className="flex items-center gap-2">
+          <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400">Scan &amp; quality funnel</h2>
+          {freshness && <FreshnessTag asOf={freshness.asOf} stale={freshness.stale} />}
+        </div>
         <div className="flex gap-2">
           <button onClick={runScan} disabled={busy !== null} className="rounded bg-gray-800 px-3 py-1.5 text-sm text-gray-100 transition-colors hover:bg-gray-700 disabled:opacity-50">
             {busy === 'scan' ? 'Scanning…' : 'Run scan'}

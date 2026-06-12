@@ -637,12 +637,19 @@ const healthHandler = async (c: import('hono').Context) => {
   // Session-aware surface. Best-effort: if the calendars aren't yet bootstrapped
   // (very early in the lifecycle) we return what we have rather than 500.
   const session_states: Partial<Record<Market, MarketState>> = {};
+  // The observation_ts the latest bar SHOULD have given each market's most recent completed session.
+  // Consumers (e.g. the portal freshness tag) compare a datum's observation_ts against this to mark
+  // "not live" when the data predates the latest session — a name/strategy that missed the last close.
+  const expected_latest_bar_ts: Partial<Record<Market, number | null>> = {};
   let next_session_open_ts: number | null = null;
   let session_gate_skipping = false;
   let holiday_source_health: any[] = [];
   try {
     const universeMarkets = ['US', 'LSE'] as Market[];
     const states = await Promise.all(universeMarkets.map(async (m) => [m, await marketStateOf(calendarFor(m), Date.now())] as const));
+    await Promise.all(universeMarkets.map(async (m) => {
+      expected_latest_bar_ts[m] = await expectedLatestBarMs(calendarFor(m), Date.now()).catch(() => null);
+    }));
     let anyPollable = false;
     for (const [m, s] of states) {
       session_states[m] = s;
@@ -668,6 +675,7 @@ const healthHandler = async (c: import('hono').Context) => {
     total_cycles:          pollStats.totalCycles,
     next_poll_ts:          nextPollTs,
     session_states,
+    expected_latest_bar_ts,
     session_gate_skipping,
     next_session_open_ts,
     gate_skips_total:      pollStats.gateSkipsTotal,

@@ -7,6 +7,7 @@ import { ResearchNotes } from '@/components/ResearchNotes'
 import { StrategyExposureTable, type StrategyExposureRow } from '@/components/StrategyExposureTable'
 import { ThreeCol } from '@/components/layout/ThreeCol'
 import { fetchResearchNote } from '@/app/lib/research-notes'
+import { freshnessFor } from '@/app/lib/freshness-server'
 import type { SignalProgressDTO } from '@/types/trader'
 import { SignalLifecycle } from '@/types/trader'
 
@@ -67,7 +68,13 @@ async function fetchBars(symbol: string) {
 async function fetchScores(symbol: string): Promise<FactorScores> {
   const r = await authedFetch(`/admin/api/strategy/scores?ticker=${encodeURIComponent(symbol)}`)
   if (!r.ok) return {}
-  return (await r.json().catch(() => ({}))) as FactorScores
+  const body = (await r.json().catch(() => ({}))) as FactorScores
+  // Stamp the freshness verdict so the SSR-seeded bars show the "as of <time> · Not live" tag on
+  // first paint (the client-fetch path is stamped by the scores proxy).
+  if (body && typeof body === 'object' && typeof body.observation_ts === 'number') {
+    body.stale = (await freshnessFor(body.observation_ts, body.ticker ?? symbol)).stale
+  }
+  return body
 }
 
 // "Active" = a signal still in the live pipeline (not a terminal Closed/Failed/Cancelled row). The
