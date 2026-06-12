@@ -371,29 +371,31 @@ const tickerAdapter = new Trading212TickerAdapter();
 function partitionT212ByMarket(
   t212Tickers: readonly string[],
 ): Record<Market | 'OTHER', string[]> {
-  const identified: { t212: string; id: TickerIdentity }[] = [];
+  const identities: TickerIdentity[] = [];
+  const t212ById = new Map<TickerIdentity, string>();
   const other: string[] = [];
   for (const t212 of t212Tickers) {
     try {
-      identified.push({ t212, id: tickerAdapter.fromT212(t212) });
+      const id = tickerAdapter.fromT212(t212);
+      identities.push(id);
+      // Remember each identity's ORIGINAL T212 string so the downstream buckets carry it
+      // byte-for-byte (not a `toT212`-re-serialized form). Keyed by object reference — the
+      // exact identity instances are what `partitionByMarket` returns below.
+      t212ById.set(id, t212);
     } catch {
       // Not a tradable US/LSE equity form — keep the OTHER bucket the gate already warned on.
       other.push(t212);
     }
   }
-  // `partitionByMarket` is the canonical, parity-tested routing (id.market only). We mirror its
-  // routing over the identified pairs so the downstream buckets carry each ticker's ORIGINAL
-  // T212 string (byte-identical to today's, in input order) rather than a re-serialized form.
-  const byMarket = partitionByMarket(identified.map((e) => e.id));
-  const out: Record<Market | 'OTHER', string[]> = { US: [], LSE: [], OTHER: other };
-  for (const { t212, id } of identified) {
-    out[id.market].push(t212);
-  }
-  // Defensive parity check: per-market counts must match the canonical partition exactly.
-  if (out.US.length !== byMarket.US.length || out.LSE.length !== byMarket.LSE.length) {
-    throw new Error('[market-data] partition bridge diverged from partitionByMarket');
-  }
-  return out;
+  // `partitionByMarket` is the canonical, parity-tested routing (id.market only). Map its
+  // per-market identity lists back to their original T212 strings — order is preserved (the
+  // partition keeps input order, and the bucket is the same identity instances we mapped).
+  const byMarket = partitionByMarket(identities);
+  return {
+    US:    byMarket.US.map((id) => t212ById.get(id)!),
+    LSE:   byMarket.LSE.map((id) => t212ById.get(id)!),
+    OTHER: other,
+  };
 }
 
 async function pollLoop(): Promise<void> {
