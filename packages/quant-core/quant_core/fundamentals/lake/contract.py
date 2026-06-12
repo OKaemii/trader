@@ -47,7 +47,7 @@ import math
 from datetime import date, datetime, timezone
 
 from quant_core.fundamentals.contract import LINE_ITEMS, SOURCE_PIT_EDGAR
-from quant_core.fundamentals.lake.metrics import metric_series
+from quant_core.fundamentals.lake.metrics import metric_series, template_for_sic
 from quant_core.ticker_identity import TickerIdentity
 
 # Only US listings file with SEC EDGAR — the lake's sole jurisdiction. A non-US identity fails closed.
@@ -106,17 +106,25 @@ def _date_to_ms(d: date) -> int:
     return int(datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp() * 1000)
 
 
-def _latest_point(store, cik: int, metric: str, freq: str, as_of_ms: int) -> dict | None:
+def _latest_point(
+    store, cik: int, metric: str, freq: str, as_of_ms: int, sector: str | None = None
+) -> dict | None:
     """The last (most recent ``end``) point of a metric's as-of series, or None when the series is
     empty. ``metric_series`` already returns points sorted by ``end`` ascending and PIT-filtered by the
     store, so the final element is the most recent value knowable at the cutoff. A point is the full
     dict (``value`` / ``start`` / ``end`` / ``filed`` / ``accession`` / ``form`` and — for
-    non-derived rows — ``knowledge_ts``), so callers can read provenance off it, not just the value."""
-    points = metric_series(store, cik, metric, freq, as_of_ms)["points"]
+    non-derived rows — ``knowledge_ts``), so callers can read provenance off it, not just the value.
+
+    ``sector`` selects the registry's per-sector concept override (a bank's "revenue" is net interest
+    income, not product sales; a bank has no gross-profit line at all). Forwarded VERBATIM to
+    ``metric_series`` — ``None``/``"general"`` ⇒ the default concept list."""
+    points = metric_series(store, cik, metric, freq, as_of_ms, sector=sector)["points"]
     return points[-1] if points else None
 
 
-def ttm_or_annual(store, cik: int, metric: str, as_of_ms: int) -> dict | None:
+def ttm_or_annual(
+    store, cik: int, metric: str, as_of_ms: int, sector: str | None = None
+) -> dict | None:
     """A flow leg's representative point: prefer the latest TTM, fall back to the latest annual, else
     None.
 
@@ -126,22 +134,27 @@ def ttm_or_annual(store, cik: int, metric: str, as_of_ms: int) -> dict | None:
     figure than its last annual) and is PIT-safe — ``metrics.ttm`` carries ``filed = max(inputs)`` so a
     derived TTM never appears before all four quarters were public. A name with < 4 consecutive
     quarters as-of (or non-additive) yields no TTM → annual fallback; a name with neither → None →
-    the leg is omitted by the caller."""
-    ttm = _latest_point(store, cik, metric, "ttm", as_of_ms)
+    the leg is omitted by the caller. ``sector`` selects the registry override (see
+    :func:`_latest_point`)."""
+    ttm = _latest_point(store, cik, metric, "ttm", as_of_ms, sector=sector)
     if ttm is not None:
         return ttm
-    return _latest_point(store, cik, metric, "a", as_of_ms)
+    return _latest_point(store, cik, metric, "a", as_of_ms, sector=sector)
 
 
-def latest_instant(store, cik: int, metric: str, as_of_ms: int) -> dict | None:
+def latest_instant(
+    store, cik: int, metric: str, as_of_ms: int, sector: str | None = None
+) -> dict | None:
     """An instant (balance-sheet / cover-page) leg's representative point: the latest period_end ≤
     as_of, or None. ``freq`` is irrelevant for an instant metric (``metric_series`` ignores it for
     STOCK kinds), so any value is fine — ``"q"`` chosen arbitrarily. Returns the full point for the
-    same provenance reason as :func:`ttm_or_annual`."""
-    return _latest_point(store, cik, metric, "q", as_of_ms)
+    same provenance reason as :func:`ttm_or_annual`. ``sector`` selects the registry override (a bank /
+    insurer runs an unclassified balance sheet, so ``current_assets`` / ``current_liabilities`` are
+    fail-closed empty for those templates)."""
+    return _latest_point(store, cik, metric, "q", as_of_ms, sector=sector)
 
 
-def earnings_stability(store, cik: int, as_of_ms: int) -> float | None:
+def earnings_stability(store, cik: int, as_of_ms: int, sector: str | None = None) -> float | None:
     """Inverse coefficient of variation of annual net income — a higher value = steadier earnings.
 
     Definition (note 5 of the plan): over the last ``_EARNINGS_STABILITY_YEARS`` (5) as-of ANNUAL
@@ -172,8 +185,11 @@ def earnings_stability(store, cik: int, as_of_ms: int) -> float | None:
     this leg is PIT-correct by the same axis as every other. The MEAN is signed (a name with genuinely
     negative average earnings yields a negative stability, correctly penalising it under the
     QualityFactor sign); only the magnitude of the stddev governs the dispersion penalty.
+
+    ``sector`` selects the registry override for ``net_income`` (the contract layer threads the entity
+    SIC template through, same as every other leg) — ``None``/``"general"`` ⇒ the default concept list.
     """
-    annual = metric_series(store, cik, "net_income", "a", as_of_ms)["points"]
+    annual = metric_series(store, cik, "net_income", "a", as_of_ms, sector=sector)["points"]
     # The trailing N annual periods (the series is sorted by `end` ascending → take the tail).
     values = [p["value"] for p in annual[-_EARNINGS_STABILITY_YEARS:]]
     if len(values) < _EARNINGS_STABILITY_MIN_PERIODS:
@@ -226,21 +242,31 @@ def pit_line_items(
         return {}, None, None, None  # cold lake / unknown / private name
     cik = ent["cik"]
 
+    # Sector template from the entity SIC (the Task-6 gotcha — `pit_line_items` was sector-blind, so
+    # financial-sector filers resolved on the default us-gaap tags). Read the SIC off `entities.parquet`
+    # via `store.profile` and map it to the registry template (`bank`/`insurance`/`reit`/`utility`, else
+    # `general`); thread it into every leg so a bank's "revenue" resolves from `RevenuesNetOfInterest…`
+    # and its (non-existent) `gross_profit`/`current_assets` fail closed via the registry's empty
+    # overrides — instead of mis-resolving the manufacturer default. A cold/absent profile ⇒ `general`
+    # (the safe default; `template_for_sic(None)` already handles it).
+    profile = store.profile(cik)
+    sector = template_for_sic(profile.get("sic") if profile is not None else None)
+
     # Assemble the legs, keeping each chosen POINT (not just its value) so observation_ts/knowledge_ts
     # can be derived from the representative legs' provenance.
     points: dict[str, dict] = {}
     for m in FLOW_METRICS:
-        p = ttm_or_annual(store, cik, m, as_of_ms)
+        p = ttm_or_annual(store, cik, m, as_of_ms, sector=sector)
         if p is not None:
             points[m] = p
     for m in INSTANT_METRICS:
-        p = latest_instant(store, cik, m, as_of_ms)
+        p = latest_instant(store, cik, m, as_of_ms, sector=sector)
         if p is not None:
             points[m] = p
 
     line_items: dict[str, float] = {m: p["value"] for m, p in points.items()}
 
-    es = earnings_stability(store, cik, as_of_ms)
+    es = earnings_stability(store, cik, as_of_ms, sector=sector)
     if es is not None:
         line_items["earnings_stability"] = es
 
