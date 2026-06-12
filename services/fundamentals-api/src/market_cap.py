@@ -253,7 +253,7 @@ class MarketDataReader:
     adjusted daily close (market-data-service internal bars) and the GBP/USD rate (shared Redis) — plus
     the PIT dividend-yield leg. Injected into the resolver so the arithmetic stays pure/testable.
 
-    `redis` is the resolver's existing singleton client (`src.pool.get_redis`); None disables the FX read
+    `redis` is the resolver's existing singleton client (`src.store.get_redis`); None disables the FX read
     (USD names then get no market cap — GBP names still do, rate 1.0). All reads degrade to None on any
     failure (a cold market-data-service / Redis blip must never fail a fundamentals read — the name's
     market cap is simply absent that cycle)."""

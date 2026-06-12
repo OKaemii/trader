@@ -1,56 +1,56 @@
-"""fundamentals-api — the read-side of the PIT Fundamentals Warehouse (epic Task 11).
+"""fundamentals-api — the read-side of the PIT Fundamentals **lake** (epic Task 10).
 
-Serves the point-in-time fundamentals the live seam (strategy-engine, epic Task 14) and the headline
-`get_pit_fundamentals(symbols, as_of)` guarantee read off the bi-temporal `fundamentals` table the
-write-side (fundamentals-ingestion, Tasks 4-9) lands. The look-ahead guard is in SQL (`knowledge_ts <=
-asOf` in the resolver query), never in app code.
+Serves the point-in-time fundamentals the live seam (strategy-engine) and the headline
+`get_pit_fundamentals(symbols, as_of)` guarantee read off the per-CIK Parquet **lake** the harvester
+lands — the Timescale `fundamentals` hypertable (the old `fundamentals-ingestion` write-side) is
+retired. The HTTP contract is BYTE-COMPATIBLE: the seam consumers parse the same `{fundamentals:{ticker:
+{<14 snake_case line_items>, source, observation_ts, knowledge_ts}}, asOf, count}` shape; only the engine
+under it changed. The look-ahead guard is still in SQL (`knowledge_ts <= as_of` in the lake store's
+DuckDB query — `quant_core.fundamentals.lake.store`), never in app code.
 
 INGRESS — the chosen collision-free mount (the card's critical constraint). The read API mounts under a
 DISTINCT prefix `/admin/api/fundamentals-pit` (admin) + `/internal/api/fundamentals-pit` (the seam hot
 path) so it:
-  * does NOT steal `/internal/api/fundamentals`, which market-data-service already serves today (the
-    Yahoo QMJ path strategy-engine reads in-cluster — NOT via the ingress; different mechanism), nor
-  * collide with `/admin/api/fundamentals-ingest` (the write-side service, epic Task 3), nor
+  * does NOT steal `/internal/api/fundamentals`, which market-data-service serves today, nor
+  * collide with `/admin/api/fundamentals-ingest` (the harvester's status surface, epic Task 9), nor
   * the bare `/admin/api/fundamentals` (which 307s to the portal today).
-nginx ingress longest-prefix matching keeps all three distinct: `/admin/api/fundamentals-pit`,
-`/admin/api/fundamentals-ingest`, and the bare `/admin/api/fundamentals` are mutually non-prefixing, so
-each resolves to its own backend. Task 14's live seam calls this service IN-CLUSTER
-(`http://fundamentals-api:8011/internal/api/fundamentals-pit?…`), not through the ingress; exposing
-`/internal/api/fundamentals-pit` on the ingress too is harmless (and lets the headline `/pit` QA run).
+nginx ingress longest-prefix matching keeps all three distinct. The live seam calls this service
+IN-CLUSTER (`http://fundamentals-api:8011/internal/api/fundamentals-pit?…`), not through the ingress;
+exposing `/internal/api/fundamentals-pit` on the ingress too is harmless (and lets the headline `/pit`
+QA run).
 
-GAP-2 MARKET CAP (epic Task 12). `market_cap_gbp` is NOT a stored provider scalar — for every covered
-name it is COMPUTED point-in-time as `adjusted_close(as_of) × shares_outstanding(as_of) × fx_to_gbp`
-(the same adjusted price series momentum uses, the dei cover-page shares fact, and the platform's GBP/USD
+GAP-2 MARKET CAP. `market_cap_gbp` is NOT a stored scalar — for every covered name it is COMPUTED
+point-in-time as `adjusted_close(as_of) × shares_outstanding(as_of) × fx_to_gbp` (the same adjusted
+price series momentum uses, the dei cover-page shares fact from the lake, and the platform's GBP/USD
 rate) inside the resolver's enrichment step, and the PIT `dividend_yield` leg is wired in alongside so
 Value's three legs share one as-of basis. The in-cluster read paths (market-data-service internal bars
 for the as-of close, shared Redis for FX, market-data-service `/internal/api/dividend-yield` for the
-yield) live in `src/market_cap.py`; the value/quality factor-input computation behind
-`/admin/api/fundamentals-pit/factors` lives in `src/factors.py`.
+yield) live in `src/market_cap.py` (LAKE-AGNOSTIC, kept verbatim); the value/quality factor-input
+computation behind `/admin/api/fundamentals-pit/factors` lives in `src/factors.py` (also verbatim).
 
-The app is thin (mirrors backtest-engine / fundamentals-ingestion `main.py`): the resolver + pool +
-security-master + market-cap modules are side-effect-free and open no socket on import; the DB/HTTP
-drivers (asyncpg, redis, httpx) are imported lazily inside the request handlers so the module-import
-smoke test stays driver-free and `/health` is independent of the warehouse being up. The cluster has no
-fundamentals rows until the operator runs the Task-9 backfill, so a live read legitimately returns empty
-(200 with `{}` per name) — that is correct, not a failure; the resolver's correctness is proven by the
-unit suite.
+The app is thin: the resolver + store + market-cap modules are side-effect-light and open no socket on
+import; the lake drivers (duckdb/pyarrow via quant-core's `[lake]` extra) + the HTTP/Redis drivers
+(httpx, redis) are imported lazily/at-construction inside `src/store.py` + the request handlers, so the
+module-import smoke test stays driver-light and `/health` is independent of the lake being populated.
+The lake is partially populated while the harvester bootstraps, so a not-yet-normalized name
+legitimately returns `{}` per name (200) — that is correct, not a failure; the resolver's correctness is
+proven by the unit suite over a fixture lake.
 """
 from __future__ import annotations
 
 import os
 import time
-from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Gauge, Histogram, generate_latest
 
-# Connection coordinates the read path uses, read at boot purely so a missing/odd var is VISIBLE here at
-# startup (mirrors fundamentals-ingestion's main.py). The app opens no socket on import — the authoritative
-# reads + the singleton pool/redis-client construction live in `src/pool.py` (`get_pool`/`get_redis`),
-# which re-read these envs; these module constants are the boot-visibility surface only.
-TIMESCALE_URL = os.getenv("TIMESCALE_URL", "postgresql://localhost:5432/trader_ts")
+# Coordinates the read path uses, read at boot purely so a missing/odd var is VISIBLE here at startup.
+# The app opens no socket on import — the authoritative reads + the singleton lake-Store/redis-client
+# construction live in `src/store.py` (`get_store`/`get_redis`), which re-read these envs; these module
+# constants are the boot-visibility surface only.
+FUNDAMENTALS_LAKE_DIR = os.getenv("FUNDAMENTALS_LAKE_DIR", "/srv/fundamentals-lake")
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 
 SERVICE_NAME = "fundamentals-api"
@@ -137,28 +137,28 @@ def _parse_tickers(raw: Optional[str]) -> list[str]:
 
 
 async def _build_resolver():
-    """Construct the as-of resolver with the SINGLETON Timescale pool + Redis client + the security-master
-    resolver + the Gap-2 market-data reader. The pool (`get_pool`) and the Redis client (`get_redis`) are
-    process singletons — they own connection pools and MUST be reused across requests (building a Redis
-    client per request, on the seam hot path, would leak a connection pool each call). Lazy imports keep
-    the module-import smoke test driver-free (asyncpg/redis/httpx are only needed to serve a read, not to
-    import the app); a Redis-build failure inside `get_redis` degrades to an uncached (still-correct)
-    resolver, never a failed request.
+    """Construct the as-of resolver with the SINGLETON lake `Store` + Redis client + the Gap-2
+    market-data reader. The lake `Store` (`get_store`) and the Redis client (`get_redis`) are process
+    singletons — the Store owns a (non-thread-safe) DuckDB connection and the Redis client owns a
+    connection pool, so both MUST be reused across requests (building a Redis client per request, on the
+    seam hot path, would leak a connection pool each call). Lazy imports keep the module-import smoke
+    test driver-light (duckdb/pyarrow/redis/httpx are only needed to serve a read, not to import the
+    app); a Redis-build failure inside `get_redis` degrades to an uncached (still-correct) resolver,
+    never a failed request.
 
     The `MarketDataReader` shares the singleton Redis client (for the published GBP/USD rate — the
     consumer-side FX path) and calls market-data-service's internal bars + dividend-yield endpoints
     in-cluster (with the internal JWT) for the as-of adjusted close + the PIT dividend-yield leg, so the
-    resolver can override `market_cap_gbp` with the computed PIT value (price×shares×fx)."""
+    resolver can override `market_cap_gbp` with the computed PIT value (price×shares×fx). The reader is
+    UNCHANGED from the Timescale build — it is lake-agnostic (it operates on the resolved line items)."""
     from src.market_cap import MarketDataReader
-    from src.pool import get_pool, get_redis
     from src.resolver import FundamentalsResolver
-    from src.security_master import SecurityMasterResolver
+    from src.store import get_redis, get_store
 
-    pool = await get_pool()
-    sec = SecurityMasterResolver(pool)
+    store = get_store()
     redis = get_redis()
     market_data = MarketDataReader(redis=redis)
-    return FundamentalsResolver(pool, sec, redis=redis, market_data=market_data)
+    return FundamentalsResolver(store, redis=redis, market_data=market_data)
 
 
 async def _resolve_payload(tickers: list[str], as_of_ms: Optional[int]) -> dict:
@@ -178,17 +178,19 @@ async def _resolve_payload(tickers: list[str], as_of_ms: Optional[int]) -> dict:
 @app.get("/internal/api/fundamentals-pit")
 async def internal_fundamentals(
     tickers: Optional[str] = Query(
-        default=None, description="Comma-separated T212 tickers (e.g. AAPL_US_EQ,MSFT_US_EQ)."
+        default=None,
+        description="Comma-separated tickers — legacy T212 (AAPL_US_EQ) OR bare (AAPL); the adapter "
+        "accepts both during the storage-migration transition.",
     ),
     asOf: Optional[int] = Query(  # noqa: N803 — the wire param is camelCase asOf (matches bars/pg-bar-reader)
         default=None,
-        description="Knowledge-time cutoff (UTC ms). Omit = 'as of now' (the partial-unique fast lane).",
+        description="Knowledge-time cutoff (UTC ms). Omit = 'as of now' (live).",
     ),
 ) -> JSONResponse:
-    """The seam HOT PATH (epic Task 14 calls this in-cluster). Per-ticker point-in-time line items as
-    known at `asOf` (omit for live). Look-ahead is impossible: the resolver's as-of query filters
-    `knowledge_ts <= asOf` in SQL. Degrades a cold-warehouse error to a JSON 503 (a read over a possibly-
-    unseeded warehouse must not surface as a bare 500); `/health` stays independent of the warehouse."""
+    """The seam HOT PATH (the live strategy host calls this in-cluster). Per-ticker point-in-time line
+    items as known at `asOf` (omit for live). Look-ahead is impossible: the lake store's read filters
+    `knowledge_ts <= asOf` in SQL. Degrades a cold-lake error to a JSON 503 (a read over a partially-
+    populated lake must not surface as a bare 500); `/health` stays independent of the lake."""
     try:
         payload = await _resolve_payload(_parse_tickers(tickers), asOf)
         return JSONResponse(content=payload)
@@ -202,7 +204,8 @@ async def internal_fundamentals(
 @app.get("/admin/api/fundamentals-pit/pit")
 async def admin_pit(
     symbols: Optional[str] = Query(
-        default=None, description="Comma-separated symbols (T212 tickers, e.g. AAPL_US_EQ,MSFT_US_EQ)."
+        default=None,
+        description="Comma-separated symbols — legacy T212 (AAPL_US_EQ) OR bare (AAPL).",
     ),
     as_of: Optional[int] = Query(
         default=None,
@@ -210,9 +213,9 @@ async def admin_pit(
     ),
 ) -> JSONResponse:
     """THE HEADLINE — `get_pit_fundamentals(symbols, as_of)`. Returns only facts whose `knowledge_ts ≤
-    as_of` (no look-ahead — the guard is in the resolver's SQL). Same backing resolver as the internal
+    as_of` (no look-ahead — the guard is in the lake store's SQL). Same backing resolver as the internal
     seam path; this admin surface is the operator/QA view of the PIT guarantee. Accepts both `as_of` (the
-    plan's headline spelling) here; the internal seam uses `asOf` (the bars/pg-bar-reader spelling)."""
+    headline spelling) here; the internal seam uses `asOf` (the bars/pg-bar-reader spelling)."""
     try:
         payload = await _resolve_payload(_parse_tickers(symbols), as_of)
         return JSONResponse(content=payload)
@@ -227,21 +230,21 @@ async def admin_pit(
 async def admin_factors(
     universe: Optional[str] = Query(
         default=None,
-        description="Comma-separated T212 tickers to compute factor inputs for (e.g. AAPL_US_EQ,MSFT_US_EQ).",
+        description="Comma-separated tickers (T212 or bare) to compute factor inputs for.",
     ),
     as_of: Optional[int] = Query(
         default=None,
         description="Knowledge-time cutoff (UTC ms). Omit = live. Factor inputs use ONLY facts knowable ≤ as_of.",
     ),
 ) -> JSONResponse:
-    """The computed value/quality factor INPUTS per name (epic Task 12) — the operator/QA view of the
-    point-in-time legs the Value/Quality factors z-score. For each name: the resolved PIT line items
-    (with `market_cap_gbp` already OVERRIDDEN by the computed price×shares×fx value — Gap 2 — and the PIT
+    """The computed value/quality factor INPUTS per name — the operator/QA view of the point-in-time
+    legs the Value/Quality factors z-score. For each name: the resolved PIT line items (with
+    `market_cap_gbp` already OVERRIDDEN by the computed price×shares×fx value — Gap 2 — and the PIT
     `dividend_yield` leg wired in), the six factor legs (earnings_yield/book_to_market/dividend_yield/
     roe/gross_margin/leverage) computed with the EXACT `_safe_ratio` semantics the live factor uses, plus
     the raw drivers + provenance. A leg whose inputs are unavailable is `null` (the factor NaN-excludes
-    it — never a fabricated 0). The cluster has no fundamentals rows until the operator backfill, so a
-    live call legitimately returns the names with empty factor inputs (200, not an error)."""
+    it — never a fabricated 0). A not-yet-normalized name (the lake still bootstrapping) legitimately
+    returns empty factor inputs (200, not an error)."""
     try:
         from src.factors import compute_factor_inputs
 
@@ -268,108 +271,38 @@ async def admin_factors(
 
 @app.get("/admin/api/fundamentals-pit/coverage")
 async def admin_coverage() -> JSONResponse:
-    """Coverage summary over the canonical `fundamentals` table: distinct instruments with at least one
-    current fact, total current facts, and the oldest observation period covered. The operator's "how
-    much has the backfill landed" view. Degrades a cold/empty warehouse to a 200 with zeroes (an unseeded
-    warehouse legitimately has none — that is not an error) and a Timescale-unreachable error to a 503."""
-    try:
-        from src.pool import get_pool
+    """Coverage summary over the lake: the number of covered CIKs (one `facts/cik=*.parquet` file per
+    name the harvester has normalized) + the entity count. The operator's "how much has the harvester
+    landed" headline — read as a file count, no per-file parse and no glob on the hot read path. Degrades
+    a cold lake (no `facts/` dir yet — the harvester is still bootstrapping) to a 200 with zeroes (the
+    correct pre-bootstrap state, not an error) and any unexpected filesystem error to a 503.
 
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT
-                    COUNT(DISTINCT instrument_id)        AS instruments,
-                    COUNT(*)                             AS facts,
-                    MIN(observation_ts)                  AS oldest_observation_ts,
-                    MAX(knowledge_ts)                    AS newest_knowledge_ts
-                FROM fundamentals
-                WHERE is_superseded = FALSE
-                """
-            )
+    The DEEP coverage/freshness view (per-name staleness, `retirable`, the `no_edgar` block) lives on the
+    harvester's `/admin/api/fundamentals-ingest/freshness` (epic Task 9) — that reads each file's MAX
+    period_end; this headline stays a cheap file-count so the seam service never fans out over the lake.
+    The `oldest_observation_ts`/`newest_knowledge_ts` keys are retained (None) for shape continuity with
+    the pre-cutover surface; a deep period scan is intentionally the harvester's job, not this hot path's.
+    """
+    try:
+        from src.store import lake_dir
+
+        from pathlib import Path
+
+        lake = Path(lake_dir())
+        facts = lake / "facts"
+        covered = sum(1 for _ in facts.glob("cik=*.parquet")) if facts.is_dir() else 0
+        entities = (lake / "entities.parquet").exists()
         return JSONResponse(
             content={
-                "instruments": int(row["instruments"] or 0),
-                "facts": int(row["facts"] or 0),
-                "oldest_observation_ts": (
-                    int(row["oldest_observation_ts"]) if row["oldest_observation_ts"] is not None else None
-                ),
-                "newest_knowledge_ts": (
-                    int(row["newest_knowledge_ts"]) if row["newest_knowledge_ts"] is not None else None
-                ),
+                "instruments": covered,
+                "facts": covered,  # one per-CIK fact file per covered name (the cheap headline count)
+                "entities_present": entities,
+                "oldest_observation_ts": None,  # deep period scan is the harvester /freshness surface
+                "newest_knowledge_ts": None,
             }
         )
-    except Exception as exc:  # noqa: BLE001 — a Timescale-unreachable read degrades to 503, never a bare 500
+    except Exception as exc:  # noqa: BLE001 — an unexpected filesystem error degrades to 503, never a bare 500
         return JSONResponse(
             status_code=503,
             content={"detail": f"coverage unavailable: {type(exc).__name__}: {exc}"},
-        )
-
-
-@app.get("/admin/api/fundamentals-pit/quarantine")
-async def admin_quarantine(
-    since_ms: Optional[int] = Query(
-        default=None, description="Only count quarantine events at/after this UTC-ms instant (omit = all time)."
-    ),
-    limit: int = Query(
-        default=50, ge=1, le=500, description="Max recent quarantine rows to sample."
-    ),
-) -> JSONResponse:
-    """QA quarantine view (by-reason counts + a recent sample) over `fundamentals_quarantine` — the
-    facts/filings the write-side QA engine + writer held out of the canonical table. The plan offers
-    EITHER a read-side quarantine surface here OR reusing the write-side ingestion endpoint; this serves
-    it from the read side (operators land on the read API for the PIT surface) over the same table. A
-    Timescale-unreachable error degrades to a JSON 503."""
-    try:
-        from src.pool import get_pool
-
-        pool = await get_pool()
-        rows_by_reason: dict[str, int] = {}
-        sample: list[dict] = []
-        async with pool.acquire() as conn:
-            reason_rows = await conn.fetch(
-                """
-                SELECT reason, COUNT(*) AS n
-                FROM fundamentals_quarantine
-                WHERE ($1::bigint IS NULL OR (EXTRACT(EPOCH FROM occurred_at) * 1000) >= $1)
-                GROUP BY reason
-                ORDER BY n DESC, reason ASC
-                """,
-                since_ms,
-            )
-            for r in reason_rows:
-                rows_by_reason[r["reason"]] = int(r["n"])
-            recent = await conn.fetch(
-                """
-                SELECT event_id, occurred_at, instrument_id, filing_id, reason, payload
-                FROM fundamentals_quarantine
-                WHERE ($1::bigint IS NULL OR (EXTRACT(EPOCH FROM occurred_at) * 1000) >= $1)
-                ORDER BY occurred_at DESC
-                LIMIT $2
-                """,
-                since_ms, limit,
-            )
-            for r in recent:
-                sample.append(
-                    {
-                        "event_id": int(r["event_id"]),
-                        "instrument_id": (int(r["instrument_id"]) if r["instrument_id"] is not None else None),
-                        "filing_id": (int(r["filing_id"]) if r["filing_id"] is not None else None),
-                        "reason": r["reason"],
-                        "payload": r["payload"],
-                    }
-                )
-        return JSONResponse(
-            content={
-                "total": sum(rows_by_reason.values()),
-                "by_reason": rows_by_reason,
-                "recent": sample,
-                "generated_at": datetime.now(timezone.utc).isoformat(),
-            }
-        )
-    except Exception as exc:  # noqa: BLE001 — a warehouse outage degrades to 503, never a bare 500
-        return JSONResponse(
-            status_code=503,
-            content={"detail": f"quarantine report unavailable: {type(exc).__name__}: {exc}"},
         )

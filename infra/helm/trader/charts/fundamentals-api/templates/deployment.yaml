@@ -23,27 +23,11 @@ spec:
             - secretRef:
                 name: trader-secrets
           env:
-            # Timescale (the bi-temporal `fundamentals` as-of READ surface — epic Task 7's write target).
-            # Password from the secret, URL assembled like backtest-engine/fundamentals-ingestion so the
-            # resolver points at trader_ts.
-            - name: TIMESCALEDB_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: trader-secrets
-                  key: TIMESCALEDB_PASSWORD
-            - name: TIMESCALE_URL
-              value: "postgresql://trader:$(TIMESCALEDB_PASSWORD)@timescaledb-postgresql:5432/trader_ts"
-            # Mongo coordinates (parity with the write-side service; the resolver itself reads Timescale,
-            # but the var is wired so a future Mongo-backed surface surfaces a missing var at boot).
-            - name: MONGODB_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: trader-secrets
-                  key: MONGODB_PASSWORD
-            - name: MONGODB_URL
-              value: "mongodb://trader:$(MONGODB_PASSWORD)@mongodb-headless:27017/trader?authSource=trader&directConnection=true"
-            - name: MONGODB_DB
-              value: trader
+            # NOTE: the Timescale + Mongo env (TIMESCALE_URL / MONGODB_URL) were removed in the lake
+            # rewrite (epic Task 10) — the resolver now reads the per-CIK Parquet lake (RO mount below)
+            # via the quant-core lake reader and holds NO Postgres/Mongo connection. The lake dir +
+            # Redis + market-data-service URL below are the resolver's only external coordinates.
+            #
             # Redis read-through cache fronting the as-of resolver (mirrors pg-bar-reader.ts) AND the
             # consumer-side FX path for the Gap-2 PIT market cap: market-data-service publishes the GBP/USD
             # rate to fx:GBPUSD:lastGood here, which the MarketDataReader reads for fx_to_gbp. The Bitnami
@@ -66,14 +50,12 @@ spec:
             - name: MARKET_DATA_SERVICE_URL
               value: "http://market-data-service:3002"
             # PIT fundamentals LAKE dir — where the lake-backed resolver (epic Task 10) reads per-CIK
-            # Parquet. ADDITIVE/forward-looking: the CURRENT Timescale-backed resolver ignores it, so the
-            # env + the RO mount below are harmless on today's image; they are in place so the Task-10
-            # lake rewrite reads the harvester's lake the moment it deploys (no second infra change).
+            # Parquet. LOAD-BEARING: the resolver reads the harvester's lake from here on every request.
             - name: FUNDAMENTALS_LAKE_DIR
               value: /srv/fundamentals-lake
           # The PIT fundamentals lake (per-CIK Parquet written by fundamentals-harvester), READ-ONLY —
-          # fundamentals-api never writes the lake; the harvester is its sole writer. Harmless on the
-          # current Timescale-backed image (nothing reads it yet); load-bearing after Task 10.
+          # fundamentals-api never writes the lake; the harvester is its sole writer. Load-bearing: the
+          # resolver's only fundamentals source.
           volumeMounts:
             - name: fundamentals-lake
               mountPath: /srv/fundamentals-lake

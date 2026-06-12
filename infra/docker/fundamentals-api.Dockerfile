@@ -2,12 +2,14 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Shared quant-core package first — one source of truth for the sci stack AND the fundamentals contract
-# (quant_core.fundamentals: LINE_ITEMS / market_of / SOURCE_*) the resolver pivots its long facts INTO.
-# Heavy layer (giotto-tda etc.), cached separately so a service-code edit doesn't re-resolve it.
-# quant-core also supplies the asyncpg pin the Timescale reader uses.
+# Shared quant-core package first — one source of truth for the sci stack, the fundamentals contract
+# (quant_core.fundamentals: LINE_ITEMS / market_of / SOURCE_*), AND the lake read engine
+# (quant_core.fundamentals.lake) the resolver reads through. The [lake] extra pulls duckdb + pyarrow (the
+# DuckDB-over-Parquet PIT reader) — the lake replaced the Timescale hypertable, so the service installs
+# [lake] and no longer needs asyncpg. Heavy layer (giotto-tda etc.), cached separately so a service-code
+# edit doesn't re-resolve it.
 COPY packages/quant-core ./packages/quant-core
-RUN pip install --no-cache-dir ./packages/quant-core
+RUN pip install --no-cache-dir './packages/quant-core[lake]'
 
 COPY services/fundamentals-api/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
