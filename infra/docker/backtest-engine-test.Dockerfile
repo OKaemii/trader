@@ -9,10 +9,13 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# quant-core with the [test] (pytest + pytest-asyncio) and [http] (httpx) extras. Heavy layer
-# (giotto-tda) cached separately so re-runs after editing a test only re-execute the pytest layer.
+# quant-core with the [test] (pytest + pytest-asyncio), [http] (httpx), and [lake] (pyarrow) extras.
+# [lake] is added so the PIT fundamentals-lake schema (quant_core.fundamentals.lake.schema, which
+# imports pyarrow) is importable in the gate — the lake calendar suite is pure stdlib, but the schema
+# sanity test exercises the pyarrow schema. Heavy layer (giotto-tda) cached separately so re-runs after
+# editing a test only re-execute the pytest layer.
 COPY packages/quant-core ./packages/quant-core
-RUN pip install --no-cache-dir './packages/quant-core[http,test]'
+RUN pip install --no-cache-dir './packages/quant-core[http,test,lake]'
 
 # backtest-engine runtime deps (pymongo for job_runner, pandas, etc.) — also re-pins pytest.
 COPY services/backtest-engine/requirements.txt .
