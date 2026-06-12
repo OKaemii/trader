@@ -16,6 +16,16 @@
 # Same pin as quant-core's [http] extra and the other EDGAR callers, to avoid a split.
 httpx==0.27.2
 
+# Thin FastAPI status surface (src/app.py) — the portal's read-only window into the lake (status / config /
+# freshness / runs + force-sweep). Same pins as the read-side services (fundamentals-api / backtest-engine),
+# to avoid a split; starlette (FastAPI's ASGI core, which backs TestClient + JSONResponse) is pulled
+# transitively by this fastapi pin, matching how those services declare it. uvicorn runs the app's HTTP
+# server in the deployed pod; the status surface shares the lake RW mount with the harvest loop — wired by
+# the chart (a later card). The PR gate already has fastapi via backtest-engine's requirements + httpx via
+# quant-core[http], so the TestClient suite needs no extra gate install.
+fastapi==0.111.0
+uvicorn==0.30.1
+
 # Test-only
 pytest==8.3.3
 pytest-asyncio==0.24.0
