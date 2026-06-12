@@ -22,10 +22,12 @@ WHY a hand-rolled calendar (kept from the original):
     `pandas_market_calendars`/`exchange_calendars` are NOT dependencies of the python gate (a pure
     pytest image). So this is the documented minimal NYSE-session next-open helper.
   * Self-contained UTC→ET (no `zoneinfo`/system tzdata — `python:3.12-slim` ships none) via the US
-    Eastern DST rule: EDT (UTC-4) from the 2nd-Sunday-of-March 02:00 local to the 1st-Sunday-of-November
-    02:00 local; EST (UTC-5) otherwise. The DST transition only shifts the wall-clock offset; the SESSION
-    is 09:30–16:00 ET on every trading day regardless, so the derivation only needs the offset + the
-    session-open wall time + the weekend/holiday closures.
+    Eastern DST rule, YEAR-DEPENDENT because the schedule changed in 2007 and EDGAR filings reach back
+    to ~1994: EDT (UTC-4) from the 2nd-Sunday-of-March to the 1st-Sunday-of-November for 2007+, but from
+    the 1st-Sunday-of-April to the last-Sunday-of-October for 1987-2006 (`_is_edt`); EST (UTC-5)
+    otherwise. The DST transition only shifts the wall-clock offset; the SESSION is 09:30–16:00 ET on
+    every trading day regardless, so the derivation only needs the offset + the session-open wall time +
+    the weekend/holiday closures.
 
 HOLIDAYS ARE COMPUTED BY RULE, not a static table — because a fundamentals backfill ingests DECADES of
 filings (a 10-K from 2010 is the common case, not the exception), so a forward-only 2-year table (what
@@ -161,13 +163,31 @@ def _nyse_full_closures(year: int) -> frozenset[date]:
 def _is_edt(dt_utc: datetime) -> bool:
     """Is the given UTC instant within US Eastern Daylight Time?
 
-    EDT runs from the 2nd Sunday of March at 02:00 LOCAL (07:00 UTC under the pre-transition EST
-    offset) to the 1st Sunday of November at 02:00 LOCAL (06:00 UTC under the pre-transition EDT
-    offset). Compared in UTC against those exact transition instants. (The 2nd-Sun-Mar / 1st-Sun-Nov
-    rule is the post-2007 US DST schedule — the era any EDGAR-sourced filing lives in.)"""
+    The US DST schedule CHANGED in 2007 (Energy Policy Act of 2005), and EDGAR-sourced filings reach
+    back to ~1994 (a deep full-universe backfill ingests decades of 10-Ks), so the boundary must be
+    year-dependent — a single rule would mis-offset every filing in the spring/autumn weeks where the
+    two schedules disagree, and on the bulk-`filed` path that error is one-directional EARLIER (a
+    look-ahead leak, the unsafe direction):
+      * **2007+**: EDT from the 2nd Sunday of March 02:00 LOCAL to the 1st Sunday of November 02:00.
+      * **1987-2006**: EDT from the 1st Sunday of APRIL 02:00 LOCAL to the LAST Sunday of OCTOBER 02:00.
+    (Pre-1987 had yet another rule; EDGAR's structured-fact era starts ~1994, comfortably inside the
+    1987-2006 regime, so the two branches cover every filing the lake can ingest.) Both transitions are
+    compared in UTC against the exact instants: the spring flip is 07:00 UTC (02:00 local under the
+    pre-transition EST -5 offset), the autumn flip 06:00 UTC (02:00 local under the pre-transition EDT
+    -4 offset) — the offset wall-time is the same on both schedules; only the DATE of the flip moved."""
     y = dt_utc.year
-    dst_start = datetime(y, 3, _nth_weekday(y, 3, 6, 2).day, 7, 0, tzinfo=timezone.utc)
-    dst_end = datetime(y, 11, _nth_weekday(y, 11, 6, 1).day, 6, 0, tzinfo=timezone.utc)
+    if y >= 2007:
+        start_day = _nth_weekday(y, 3, 6, 2)   # 2nd Sunday of March
+        start_month = 3
+        end_day = _nth_weekday(y, 11, 6, 1)    # 1st Sunday of November
+        end_month = 11
+    else:
+        start_day = _nth_weekday(y, 4, 6, 1)   # 1st Sunday of April (pre-2007 schedule)
+        start_month = 4
+        end_day = _last_weekday(y, 10, 6)      # last Sunday of October (pre-2007 schedule)
+        end_month = 10
+    dst_start = datetime(y, start_month, start_day.day, 7, 0, tzinfo=timezone.utc)
+    dst_end = datetime(y, end_month, end_day.day, 6, 0, tzinfo=timezone.utc)
     return dst_start <= dt_utc < dst_end
 
 

@@ -29,25 +29,30 @@ from __future__ import annotations
 import pyarrow as pa
 
 # The per-CIK fact-row schema. Column ORDER and TYPES are the on-disk contract — the harvester writes
-# exactly these columns (in this order) and the DuckDB read engine reads them by name. `start`/`accepted_ts`
-# are the only nullable columns by intent (instant facts have no period start; the bulk path has no
-# acceptance time); `knowledge_ts` is NON-null because the read axis must always resolve.
+# exactly these columns (in this order) and the DuckDB read engine reads them by name. Nullability is
+# part of the contract and declared EXPLICITLY (not left to pyarrow's nullable=True default): `start`
+# and `accepted_ts` are the only nullable columns by intent (instant facts have no period start; the
+# bulk-zip path has no acceptance time), while `knowledge_ts` is `nullable=False` because it is the PIT
+# read axis — the read filter `knowledge_ts <= :as_of` silently DROPS nulls, so a null read-axis value
+# is a latent look-ahead-adjacent hole; the non-null flag makes a writer that ever emits one fail loudly
+# at write time rather than vanish the row from PIT reads (`derive_knowledge_ts` is total — it never
+# returns None — so a correct writer is unaffected). Every other column is non-null by intent too.
 SCHEMA = pa.schema(
     [
-        ("cik", pa.int32()),
-        ("taxonomy", pa.string()),    # us-gaap | ifrs-full | dei | srt
-        ("concept", pa.string()),     # e.g. Revenues
-        ("unit", pa.string()),        # USD | shares | USD/shares
-        ("start", pa.date32()),       # null for instant (balance-sheet) facts
-        ("end", pa.date32()),         # period_end / instant date
-        ("value", pa.float64()),
-        ("fy", pa.int16()),
-        ("fp", pa.string()),          # FY | Q1..Q4 (as tagged by the filer)
-        ("form", pa.string()),        # 10-K | 10-Q | 10-K/A | 20-F | ...
-        ("accession", pa.string()),   # full lineage back to the raw filing
-        ("filed", pa.date32()),       # SEC filing date (the coarse, day-granularity PIT axis)
-        ("accepted_ts", pa.int64()),  # EDGAR acceptanceDateTime, UTC ms — NULLABLE (bulk path has none)
-        ("knowledge_ts", pa.int64()),  # DERIVED next-NYSE-session-open availability, UTC ms — NON-null
-        ("frame", pa.string()),
+        pa.field("cik", pa.int32(), nullable=False),
+        pa.field("taxonomy", pa.string(), nullable=False),   # us-gaap | ifrs-full | dei | srt
+        pa.field("concept", pa.string(), nullable=False),    # e.g. Revenues
+        pa.field("unit", pa.string(), nullable=False),       # USD | shares | USD/shares
+        pa.field("start", pa.date32(), nullable=True),       # null for instant (balance-sheet) facts
+        pa.field("end", pa.date32(), nullable=False),        # period_end / instant date
+        pa.field("value", pa.float64(), nullable=False),
+        pa.field("fy", pa.int16(), nullable=False),
+        pa.field("fp", pa.string(), nullable=False),         # FY | Q1..Q4 (as tagged by the filer)
+        pa.field("form", pa.string(), nullable=False),       # 10-K | 10-Q | 10-K/A | 20-F | ...
+        pa.field("accession", pa.string(), nullable=False),  # full lineage back to the raw filing
+        pa.field("filed", pa.date32(), nullable=False),      # SEC filing date (coarse, day-granularity)
+        pa.field("accepted_ts", pa.int64(), nullable=True),  # EDGAR acceptanceDateTime, UTC ms — bulk path has none
+        pa.field("knowledge_ts", pa.int64(), nullable=False),  # DERIVED next-NYSE-session-open availability, UTC ms — the read axis
+        pa.field("frame", pa.string(), nullable=True),       # the SEC `frame` tag — absent on many facts
     ]
 )
