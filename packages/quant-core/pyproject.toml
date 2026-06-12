@@ -25,11 +25,12 @@ test = ["pytest==8.3.3", "pytest-asyncio==0.24.0"]
 # Only the WarehouseBarsReader needs DuckDB (backtest replay from the parquet warehouse).
 # Kept optional so the live host (strategy-engine) doesn't pull a heavy dep it never uses.
 warehouse = ["duckdb==1.1.3"]
-# The PIT fundamentals lake (quant_core.fundamentals.lake) writes/reads per-CIK Parquet via pyarrow.
-# Kept optional (separate from the live host's [http]) so a caller needing only the knowledge_ts
-# calendar — which is pure stdlib — does not drag in pyarrow; the harvester / fundamentals-api /
-# backtest opt into it. Pin floor matches the prototype harvester (pyarrow>=16).
-lake = ["pyarrow>=16,<18"]
+# The PIT fundamentals lake (quant_core.fundamentals.lake) writes per-CIK Parquet via pyarrow and
+# reads it back through DuckDB (the lake store's PIT query). Kept optional (separate from the live
+# host's [http]) so a caller needing only the knowledge_ts calendar — which is pure stdlib — does not
+# drag in pyarrow/duckdb; the harvester / fundamentals-api / backtest opt into it. pyarrow pin floor
+# matches the prototype harvester (>=16); duckdb pinned to the same 1.1.3 already used by [warehouse].
+lake = ["pyarrow>=16,<18", "duckdb==1.1.3"]
 http = ["httpx==0.27.2"]
 
 [tool.setuptools.packages.find]
