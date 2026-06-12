@@ -333,6 +333,9 @@ importers:
       '@trader/shared-types':
         specifier: workspace:*
         version: link:../../packages/shared-types
+      '@trader/ticker-identity':
+        specifier: workspace:*
+        version: link:../../packages/ticker-identity
       hono:
         specifier: ^4.3.0
         version: 4.12.19

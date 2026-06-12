@@ -28,6 +28,7 @@ import {
   soonestNextOpen, expectedLatestBarMs, soonestEodPollInstant,
   type Market, type MarketState, type ExchangeCalendar,
 } from '@trader/shared-calendar';
+import { Trading212TickerAdapter, type TickerIdentity } from '@trader/ticker-identity';
 import { backfillTickers, tickersMissingHistory, healMissingHistory } from './modules/bars/infrastructure/backfill.ts';
 import { backfillDailyHistory, tickersMissingDailyHistory } from './modules/bars/infrastructure/daily-history.ts';
 import { runEodhdDailyFeed } from './modules/bars/infrastructure/eodhd-daily-feed.ts';
@@ -357,6 +358,44 @@ function calendarFor(market: Market): ExchangeCalendar {
   throw new Error(`calendarFor: unsupported market ${market}`);
 }
 
+// The session gate routes on the canonical `(symbol, market)` identity (shared-calendar's
+// `partitionByMarket`), but this loop still reads the universe as Trading212-form strings
+// (the legacy `instrument_registry` — the storage migration to bare symbol+market is a later
+// epic card). This bridge converts those strings to identities at the boundary and hands the
+// downstream pipeline back the SAME `Record<Market|'OTHER', string[]>` of T212 strings it
+// always consumed (the Mongo `bars.ticker` `$in` query, heal, and fetchRecent all still key on
+// the broker form), so routing is unchanged: a ticker the adapter can't parse (a CFD/crypto
+// pair) is the OTHER bucket — exactly where the old `/_US_EQ$/` `/l_EQ$/` regex put it.
+const tickerAdapter = new Trading212TickerAdapter();
+
+function partitionT212ByMarket(
+  t212Tickers: readonly string[],
+): Record<Market | 'OTHER', string[]> {
+  const identified: { t212: string; id: TickerIdentity }[] = [];
+  const other: string[] = [];
+  for (const t212 of t212Tickers) {
+    try {
+      identified.push({ t212, id: tickerAdapter.fromT212(t212) });
+    } catch {
+      // Not a tradable US/LSE equity form — keep the OTHER bucket the gate already warned on.
+      other.push(t212);
+    }
+  }
+  // `partitionByMarket` is the canonical, parity-tested routing (id.market only). We mirror its
+  // routing over the identified pairs so the downstream buckets carry each ticker's ORIGINAL
+  // T212 string (byte-identical to today's, in input order) rather than a re-serialized form.
+  const byMarket = partitionByMarket(identified.map((e) => e.id));
+  const out: Record<Market | 'OTHER', string[]> = { US: [], LSE: [], OTHER: other };
+  for (const { t212, id } of identified) {
+    out[id.market].push(t212);
+  }
+  // Defensive parity check: per-market counts must match the canonical partition exactly.
+  if (out.US.length !== byMarket.US.length || out.LSE.length !== byMarket.LSE.length) {
+    throw new Error('[market-data] partition bridge diverged from partitionByMarket');
+  }
+  return out;
+}
+
 async function pollLoop(): Promise<void> {
   const redis = await getRedisClient();
   await ensureConsumerGroup(redis, REDIS_STREAMS.MARKET_RAW, 'market-data-service');
@@ -407,7 +446,7 @@ async function pollLoop(): Promise<void> {
     // whether to fetch this cycle. Markets in REGULAR/PRE/POST poll; CLOSED skips.
     // When all relevant markets skip, the cycle is a no-op (log + sleep), saving
     // ~30% of weekly Yahoo calls on weekends + ~10h/weekday of asymmetric closures.
-    const groups = partitionByMarket(activeTickers);
+    const groups = partitionT212ByMarket(activeTickers);
     log.info(`[market-data] partition: US=${groups.US.length} LSE=${groups.LSE.length} OTHER=${groups.OTHER.length}`);
     if (groups.OTHER.length > 0) {
       log.warn(`[market-data] ${groups.OTHER.length} ticker(s) in OTHER bucket — not pollable. Sample: ${groups.OTHER.slice(0, 10).join(',')}`);
