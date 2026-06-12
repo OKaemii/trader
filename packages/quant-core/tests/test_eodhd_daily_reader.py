@@ -88,10 +88,13 @@ def test_parse_eod_empty_or_malformed_payload():
 def test_to_eodhd_symbol_mapping_us_and_lse_and_index():
     # Bare US passthrough → `.US`.
     assert to_eodhd_symbol("AAPL") == "AAPL.US"
-    # Dotless share class → EODHD dash form (BRKB → BRK-B), matching the live client.
+    # Dotless share class → EODHD's dashed share-class spelling (BRKB → BRK-B). This is an
+    # EODHD-symbol-spelling concern, not a corporate rename (the Yahoo reader spells it the same).
     assert to_eodhd_symbol("BRKB") == "BRK-B.US"
-    # Legacy rename FB → META (US).
+    # Corporate rename FB → META (US), taken from the canonical adapter (apply_rename), not a local
+    # table — for the bare form AND the T212 form.
     assert to_eodhd_symbol("FB") == "META.US"
+    assert to_eodhd_symbol("FB_US_EQ") == "META.US"
     # S&P 500 index caret → the EODHD INDX exchange.
     assert to_eodhd_symbol("^GSPC") == "GSPC.INDX"
     # Benchmark ETF (bare US) → `.US`.
@@ -103,8 +106,9 @@ def test_to_eodhd_symbol_mapping_us_and_lse_and_index():
     assert to_eodhd_symbol("VODl_EQ") == "VOD.LSE"
     # Yahoo-style `.L` suffix normalised to `.LSE`.
     assert to_eodhd_symbol("BP.L") == "BP.LSE"
-    # An already-EODHD symbol passes through unchanged.
+    # An already-EODHD symbol passes through unchanged (incl. a dotted share class).
     assert to_eodhd_symbol("AAPL.US") == "AAPL.US"
+    assert to_eodhd_symbol("BRK.B.US") == "BRK.B.US"
 
 
 @pytest.mark.asyncio

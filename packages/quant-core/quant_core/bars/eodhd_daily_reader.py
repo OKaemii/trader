@@ -35,23 +35,41 @@ import os
 from typing import Optional
 
 from ..strategy.contract import HistoryView
-from ..ticker_identity import Trading212TickerAdapter
+from ..ticker_identity import TickerIdentity, Trading212TickerAdapter
 from ..types import OHLCVBar
 
 _EODHD_BASE = "https://eodhd.com/api"
 
 _ADAPTER = Trading212TickerAdapter()
 
-# Legacy-rename + share-class map so the curated universe resolves on EODHD. Mirrors the live
-# TS client's SYMBOL_RENAMES (FB→META) plus the dotless-share-class convention (EODHD US spells a
-# share class with a dash: BRKB → BRK-B, matching the Yahoo reader's BRKB → BRK-B). The bare
-# DEFAULT_SP100 carries both forms, so both must resolve.
-_SYMBOL_RENAMES = {"FB": "META", "BRKB": "BRK-B"}
+# EODHD share-class SPELLING map — distinct from a corporate rename. EODHD's US feed spells a
+# dotless share class with a dash (Berkshire's bare `BRKB` → `BRK-B`); the curated DEFAULT_SP100
+# carries the dotless form, so it must be translated to the EODHD symbol. This is purely an
+# EODHD-symbol-spelling concern, NOT a corporate rename — the legacy FB→META rename is owned by the
+# canonical adapter (`apply_rename`) and applied through it below, so the two never drift. The
+# Yahoo reader spells the same class `BRK-B` (Yahoo also uses a dash); a dotted `BRK.B_US_EQ` T212
+# ticker would already carry `BRK.B` through the adapter and is left as EODHD's dotted form.
+_EODHD_SPELLING = {"BRKB": "BRK-B"}
 
 # Index symbols the validator passes as benchmarks (Yahoo-native carets) → the EODHD INDX form.
 # The walk-forward path benchmarks against ^GSPC (the S&P 500 index); EODHD lists it as GSPC.INDX.
 # The MCPT benchmark suite (SPY + 11 sector SPDRs) are bare US ETF symbols → handled as US below.
 _INDEX_MAP = {"^GSPC": "GSPC.INDX", "^DJI": "DJI.INDX", "^IXIC": "IXIC.INDX"}
+
+
+def _to_eodhd(ident: TickerIdentity) -> str:
+    """A resolved ``TickerIdentity`` → its EODHD ``SYMBOL.EXCHANGE``. Applies the canonical
+    (market-aware) corporate rename via the adapter, THEN the EODHD share-class spelling, so the
+    rename stays single-sourced in ``apply_rename`` and only the EODHD-symbol spelling is local.
+
+    An empty symbol can't be renamed (``apply_rename`` rejects it); pass it through so a malformed
+    input degrades to an unresolvable EODHD symbol → an empty fetch (the same drop-out the Yahoo
+    reader produced), never a crash inside the prefetch fan-out."""
+    sym = ident.symbol
+    if sym:
+        sym = _ADAPTER.apply_rename(ident).symbol
+        sym = _EODHD_SPELLING.get(sym, sym)
+    return f"{sym}.LSE" if ident.market == "LSE" else f"{sym}.US"
 
 
 def to_eodhd_symbol(ticker: str) -> str:
@@ -61,28 +79,34 @@ def to_eodhd_symbol(ticker: str) -> str:
     benchmark symbols (``SPY`` → ``SPY.US``; the ``^GSPC`` index → ``GSPC.INDX``). T212-shaped
     tickers are accepted defensively via the canonical adapter: ``AAPL_US_EQ`` → ``AAPL.US``;
     ``VODl_EQ`` → ``VOD.LSE``. A Yahoo-style ``BP.L`` is normalised to ``BP.LSE`` so a mixed-source
-    universe still resolves.
+    universe still resolves. The corporate rename (FB→META) is taken from the adapter; the EODHD
+    share-class spelling (BRKB→BRK-B) is layered on top.
+
+    NOTE on the fractional ``d`` suffix: the live TS ``normalizeBaseSymbol`` strips a trailing
+    ``d`` (T212's fractional-share marker) as well as ``l``; the canonical ``from_t212`` here does
+    not, so a fractional T212 ticker (``AAPLd_US_EQ``) would not resolve. The research universe
+    (``DEFAULT_SP100`` / ``UNIVERSE_INCLUDE_*``) is bare symbols with no fractional marker, so this
+    path is never reached — left to the adapter rather than re-deriving a suffix rule here.
     """
     t = ticker.strip()
     # Index symbols (Yahoo carets) map to the EODHD INDX exchange.
     if t in _INDEX_MAP:
         return _INDEX_MAP[t]
     # Yahoo LSE suffix `.L` → EODHD `.LSE` (e.g. BP.L → BP.LSE). Other dotted symbols (already an
-    # EODHD SYMBOL.EXCHANGE) pass through unchanged.
+    # EODHD SYMBOL.EXCHANGE, e.g. AAPL.US / BRK.B.US) pass through unchanged.
     if "." in t:
         base, _, suffix = t.partition(".")
         if suffix.upper() == "L":
-            return f"{_SYMBOL_RENAMES.get(base, base)}.LSE"
+            return _to_eodhd(TickerIdentity(symbol=base, market="LSE"))
         return t
     # T212-shaped forms (`_US_EQ` / `l_EQ`) route through the one suffix parser. A bare symbol that
-    # is not a T212 ticker raises there — caught below and treated as a bare US listing.
+    # is not a T212 ticker raises there — caught below and treated as a bare US listing (the curated
+    # default; an LSE listing arrives as the `l_EQ` form).
     try:
         ident = _ADAPTER.from_t212(t)
     except ValueError:
-        base = _SYMBOL_RENAMES.get(t, t)
-        return f"{base}.US"  # bare symbol ⇒ US listing (the curated default; LSE comes via l_EQ)
-    base = _SYMBOL_RENAMES.get(ident.symbol, ident.symbol)
-    return f"{base}.LSE" if ident.market == "LSE" else f"{base}.US"
+        ident = TickerIdentity(symbol=t, market="US")
+    return _to_eodhd(ident)
 
 
 def _price_scale(eodhd_symbol: str) -> float:
@@ -205,19 +229,23 @@ class EodhdDailyBarsReader:
         # bars are included. period=d daily, order=a oldest-first.
         from datetime import datetime, timezone
 
-        from_iso = datetime.fromtimestamp(max(0, start_ms) / 1000 - 86_400, tz=timezone.utc).strftime("%Y-%m-%d")
-        to_iso = datetime.fromtimestamp(end_ms / 1000 + 86_400, tz=timezone.utc).strftime("%Y-%m-%d")
+        # Floor the WHOLE epoch-seconds expression at 0 (not just start_ms) so a near-epoch window
+        # never produces a pre-1970 `from` bound that EODHD rejects (matches the Yahoo reader clamp).
+        from_iso = datetime.fromtimestamp(max(0, start_ms // 1000 - 86_400), tz=timezone.utc).strftime("%Y-%m-%d")
+        to_iso = datetime.fromtimestamp(end_ms // 1000 + 86_400, tz=timezone.utc).strftime("%Y-%m-%d")
         url = f"{self._base_url}/eod/{eodhd_symbol}"
         params = {
             "from": from_iso, "to": to_iso, "period": "d", "order": "a",
             "api_token": self._api_key, "fmt": "json",
         }
         last_exc: Optional[Exception] = None
+        rate_limited = False
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             for attempt in range(self._max_retries):
                 try:
                     r = await client.get(url, params=params)
                     if r.status_code == 429 or r.status_code >= 500:
+                        rate_limited = True  # record so an all-retries-throttled drop still logs
                         await asyncio.sleep(0.5 * (2 ** attempt))
                         continue
                     r.raise_for_status()
@@ -226,12 +254,15 @@ class EodhdDailyBarsReader:
                 except Exception as exc:  # noqa: BLE001 — degrade to empty, never crash the backtest
                     last_exc = exc
                     await asyncio.sleep(0.5 * (2 ** attempt))
-        if last_exc is not None:
-            # One ticker failing must not abort the whole run; the caller treats empty as "no data
-            # for this ticker" (it drops out of the universe for that period).
+        # One ticker failing must not abort the whole run; the caller treats empty as "no data for
+        # this ticker" (it drops out of the universe for that period). Log either an exception OR a
+        # persistent 429/5xx (the metered EODHD budget can throttle a wide prefetch — without this
+        # the name would vanish from the panel with no diagnostic).
+        if last_exc is not None or rate_limited:
             import logging
 
-            logging.getLogger(__name__).warning("eodhd daily fetch failed for %s: %s", eodhd_symbol, last_exc)
+            reason = last_exc if last_exc is not None else "persistent 429/5xx (rate-limited)"
+            logging.getLogger(__name__).warning("eodhd daily fetch failed for %s: %s", eodhd_symbol, reason)
         return []
 
     async def _ensure(self, ticker: str, start_ms: int, end_ms: int) -> list[OHLCVBar]:
