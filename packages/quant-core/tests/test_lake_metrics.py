@@ -33,6 +33,7 @@ from datetime import date
 
 from quant_core.fundamentals.contract import LINE_ITEMS
 from quant_core.fundamentals.lake.metrics import (
+    DERIVED,
     METRICS,
     SECTOR_TEMPLATES,
     merged_series,
@@ -191,15 +192,24 @@ def test_dual_tagger_prefers_us_gaap_over_ifrs():
     assert pts[-1]["taxonomy"] == "us-gaap"
 
 
-def test_ifrs_aliases_after_us_gaap_in_every_metric():
-    """Structural invariant: no us-gaap tag follows an ifrs-full tag in any default fallback list."""
+def _assert_us_gaap_before_ifrs(label: str, concepts: list) -> None:
+    seen_ifrs = False
+    for taxonomy, _ in concepts:
+        if taxonomy == "ifrs-full":
+            seen_ifrs = True
+        elif taxonomy == "us-gaap":
+            assert not seen_ifrs, f"{label}: us-gaap tag follows ifrs-full"
+
+
+def test_ifrs_aliases_after_us_gaap_in_every_metric_and_sector_override():
+    """Structural invariant: no us-gaap tag follows an ifrs-full tag in ANY fallback list — the
+    `default` concept list AND every sector override (the override lists bypass the
+    `_ifrs_after_us_gaap` per-list wrap, so the import-time `_validate_sector_overrides_ifrs_order`
+    pass + this test are what keep a future mis-ordered override from silently mis-prioritising)."""
     for metric, spec in METRICS.items():
-        seen_ifrs = False
-        for taxonomy, _ in spec["concepts"]:
-            if taxonomy == "ifrs-full":
-                seen_ifrs = True
-            elif taxonomy == "us-gaap":
-                assert not seen_ifrs, f"{metric}: us-gaap tag follows ifrs-full"
+        _assert_us_gaap_before_ifrs(metric, spec["concepts"])
+        for tmpl, override in spec.get("sectors", {}).items():
+            _assert_us_gaap_before_ifrs(f"{metric}.sectors.{tmpl}", override)
 
 
 # --------------------------------------------------------------------------------------------------- #
@@ -411,3 +421,120 @@ def test_merged_series_first_concept_claims_period():
     assert len(rows) == 1
     assert rows[0]["value"] == 4000  # the priority-0 contract tag, not Revenues
     assert rows[0]["concept"] == "RevenueFromContractWithCustomerExcludingAssessedTax"
+
+
+def test_merged_series_does_not_mutate_store_rows():
+    """`merged_series` stamps provenance on a COPY — the store's returned row is left untouched (so a
+    store that caches/shares row objects is not corrupted, and `derived`/`concept` don't leak)."""
+
+    class _SharedRowStore(FakeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            # A single shared row object the "store" hands back on every call (the worst case).
+            self._row = {"start": _d("2023-01-01"), "end": _d("2023-12-31"), "value": 4000.0,
+                         "filed": _d("2024-02-15"), "accession": "X", "form": "10-K"}
+
+        def pit_series(self, cik, taxonomy, concept, unit, as_of, instant):
+            return [self._row] if (taxonomy, concept) == ("us-gaap", "Revenues") else []
+
+    store = _SharedRowStore()
+    out = merged_series(store, 1, METRICS["total_revenue"], AS_OF_NOW)
+    assert out and out[0]["concept"] == "Revenues" and out[0]["derived"] is False
+    # The store's own row must NOT have gained provenance keys.
+    assert "concept" not in store._row
+    assert "derived" not in store._row
+    assert "taxonomy" not in store._row
+
+
+# --------------------------------------------------------------------------------------------------- #
+# Robustness — a malformed null-start duration row degrades to omission, never crashes                 #
+# --------------------------------------------------------------------------------------------------- #
+def test_split_periods_skips_null_start_rows():
+    """A duration row with no `start` (a malformed fact, or an instant that slipped into a duration
+    query) is SKIPPED, not fed to `_dur` (which would raise `date - None`)."""
+    rows = [
+        {"start": None, "end": _d("2023-12-31"), "value": 1},          # malformed — skipped
+        {"start": _d("2023-01-01"), "end": _d("2023-03-31"), "value": 2},  # real quarter
+    ]
+    quarters, annual = split_periods(rows)
+    assert len(quarters) == 1 and quarters[0]["value"] == 2
+    assert annual == []
+
+
+def test_metric_series_flow_with_null_start_row_degrades_not_crashes():
+    """A FLOW metric whose store returns a null-start row degrades to the well-formed periods only —
+    the whole name's fundamentals must not raise (the `metric_series` → `split_periods` path)."""
+
+    class _NullStartStore(FakeStore):
+        def pit_series(self, cik, taxonomy, concept, unit, as_of, instant):
+            if (taxonomy, concept) == ("us-gaap", "Revenues"):
+                return [
+                    {"start": None, "end": _d("2023-12-31"), "value": 9999.0,
+                     "filed": _d("2024-02-15"), "accession": "BAD", "form": "10-K"},
+                    {"start": _d("2023-01-01"), "end": _d("2023-03-31"), "value": 90.0,
+                     "filed": _d("2023-05-01"), "accession": "Q1", "form": "10-Q"},
+                ]
+            return []
+
+    pts = metric_series(_NullStartStore(), 1, "total_revenue", "q", AS_OF_NOW)["points"]
+    ends = {p["end"].isoformat() for p in pts}
+    assert "2023-12-31" not in ends  # the null-start row was dropped
+    assert ends == {"2023-03-31"}
+
+
+# --------------------------------------------------------------------------------------------------- #
+# DERIVED metrics (free_cash_flow = cash_flow_ops - capex) — consumed by the read-API /metrics+/facts  #
+# --------------------------------------------------------------------------------------------------- #
+def test_free_cash_flow_is_a_derived_metric():
+    assert DERIVED["free_cash_flow"] == ("cash_flow_ops", "-", "capex")
+
+
+def _seed_quarterly_flow(store: FakeStore, concept: str, vals: dict[str, float]) -> None:
+    """Seed quarterly + FY rows for a flow concept so Q4 derivation has its inputs. `vals` maps the
+    period end (MM-DD or 'FY') to a value; 'FY' is the annual 10-K row."""
+    cal = {"Q1": ("2023-01-01", "2023-03-31", "2023-05-01"),
+           "Q2": ("2023-04-01", "2023-06-30", "2023-08-01"),
+           "Q3": ("2023-07-01", "2023-09-30", "2023-11-01")}
+    for q, (start, end, filed) in cal.items():
+        if q in vals:
+            store.add("us-gaap", concept, end, vals[q], filed, q, "10-Q", start=start)
+    if "FY" in vals:
+        store.add("us-gaap", concept, "2023-12-31", vals["FY"], "2024-02-15", "FY10K", "10-K",
+                  start="2023-01-01")
+
+
+def test_free_cash_flow_subtracts_aligned_periods():
+    """Quarterly FCF = cash_flow_ops - capex per aligned (start,end); derived Q4 aligns on both legs."""
+    s = FakeStore()
+    _seed_quarterly_flow(s, "NetCashProvidedByUsedInOperatingActivities",
+                         {"Q1": 200, "Q2": 220, "Q3": 240, "FY": 1000})  # derived Q4 = 340
+    _seed_quarterly_flow(s, "PaymentsToAcquirePropertyPlantAndEquipment",
+                         {"Q1": 50, "Q2": 55, "Q3": 60, "FY": 250})       # derived Q4 = 85
+    pts = metric_series(s, 1, "free_cash_flow", "q", AS_OF_NOW)["points"]
+    by_end = {p["end"].isoformat(): p for p in pts}
+    assert by_end["2023-03-31"]["value"] == 200 - 50    # 150
+    assert by_end["2023-12-31"]["value"] == 340 - 85    # 255 (derived Q4 of each leg)
+    assert by_end["2023-12-31"]["derived"] is True
+    assert "-" in by_end["2023-03-31"]["concept"]       # the concept string records the op
+
+
+def test_free_cash_flow_annual():
+    """Annual FCF aligns the two legs' annual rows."""
+    s = FakeStore()
+    s.add("us-gaap", "NetCashProvidedByUsedInOperatingActivities", "2023-12-31", 1000,
+          "2024-02-15", "C1", "10-K", start="2023-01-01")
+    s.add("us-gaap", "PaymentsToAcquirePropertyPlantAndEquipment", "2023-12-31", 250,
+          "2024-02-15", "C2", "10-K", start="2023-01-01")
+    pts = metric_series(s, 1, "free_cash_flow", "a", AS_OF_NOW)["points"]
+    assert pts[-1]["value"] == 750
+    # filed carry = max of the two legs' filed dates.
+    assert pts[-1]["filed"] == _d("2024-02-15")
+
+
+def test_free_cash_flow_omits_period_with_only_one_leg():
+    """A period where only one leg reports (no aligned counterpart) is dropped — no half-derived FCF."""
+    s = FakeStore()
+    # cash_flow_ops annual present; capex annual ABSENT for the same period.
+    s.add("us-gaap", "NetCashProvidedByUsedInOperatingActivities", "2023-12-31", 1000,
+          "2024-02-15", "C1", "10-K", start="2023-01-01")
+    assert metric_series(s, 1, "free_cash_flow", "a", AS_OF_NOW)["points"] == []

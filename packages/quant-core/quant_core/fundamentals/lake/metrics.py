@@ -50,6 +50,15 @@ from datetime import date, timedelta
 
 FLOW, STOCK = "flow", "stock"  # duration vs instant facts
 
+# The as-of cutoff is forwarded VERBATIM to `store.pit_series` and never operated on here (this module
+# only does arithmetic on row fields — `start`/`end`/`filed`). Its concrete type is therefore the
+# STORE's contract, not this module's: the prototype store filtered `filed <= as_of` (a `date`); the
+# real lake store (Task 5) filters `knowledge_ts <= as_of_ms` (int64 epoch-ms, see `lake.schema`), and
+# the Task-6 contract layer holds `as_of_ms` (int). So the type is deliberately `int | date` — this
+# layer is axis-agnostic and must not pin it to one, or the annotation would lie to a caller passing
+# epoch-ms. (A `date` is accepted unchanged for the prototype/fixture path.)
+AsOf = int | date
+
 # Accepted taxonomies, for reference. us-gaap is preferred; ifrs-full backs 20-F/40-F foreign
 # filers; dei carries the cover-page share count; srt appears on some supplementary facts. The
 # ordering INSIDE each metric's `concepts` list is what enforces us-gaap-preferred / ifrs-fallback —
@@ -218,6 +227,19 @@ DERIVED: dict[str, tuple[str, str, str]] = {
     "free_cash_flow": ("cash_flow_ops", "-", "capex"),
 }
 
+def _validate_sector_overrides_ifrs_order() -> None:
+    """The us-gaap-before-ifrs invariant must hold for the SECTOR OVERRIDE lists too —
+    `_ifrs_after_us_gaap` guards only each metric's `default`/`concepts` list at construction, so
+    without this pass a future registry sync that put an ifrs-full tag ahead of a us-gaap tag in, say,
+    a bank override would import and run while silently mis-prioritising the wrong tag for a
+    dual-tagging bank. Run at import so a mis-ordered override fails loudly (same as the default)."""
+    for spec in METRICS.values():
+        for override in spec.get("sectors", {}).values():
+            _ifrs_after_us_gaap(override)
+
+
+_validate_sector_overrides_ifrs_order()
+
 
 def _concepts_for(spec: dict, sector: str | None) -> list[tuple[str, str]]:
     """Pick the concept fallback list for a metric, honouring a sector template when one is supplied
@@ -238,7 +260,7 @@ def _concepts_for(spec: dict, sector: str | None) -> list[tuple[str, str]]:
 # --------------------------------------------------------------------------------------------------- #
 # Series assembly (all inputs are already PIT-filtered by the store — see module docstring)            #
 # --------------------------------------------------------------------------------------------------- #
-def merged_series(store, cik: int, spec: dict, as_of: date,
+def merged_series(store, cik: int, spec: dict, as_of: AsOf,
                   sector: str | None = None) -> list[dict]:
     """Union the (sector-selected) fallback concepts; per fiscal period, the highest-priority tag
     PRESENT wins. The store returns each concept's PIT-filtered rows; the first concept that supplies
@@ -250,8 +272,10 @@ def merged_series(store, cik: int, spec: dict, as_of: date,
         for r in rows:
             key = (r["start"], r["end"])
             if key not in by_period:
-                r["taxonomy"], r["concept"], r["derived"] = taxonomy, concept, False
-                by_period[key] = r
+                # Stamp provenance on a COPY, never the store's returned row: the module promises it
+                # "never touches the lake", and a real store that caches/shares row objects would be
+                # corrupted by an in-place write (the value would leak across as-of reads / metrics).
+                by_period[key] = {**r, "taxonomy": taxonomy, "concept": concept, "derived": False}
     return sorted(by_period.values(), key=lambda r: r["end"])
 
 
@@ -261,9 +285,16 @@ def _dur(r: dict) -> int:
 
 def split_periods(rows: list[dict]) -> tuple[list[dict], list[dict]]:
     """Classify duration facts by length (robust to odd fiscal calendars — NVIDIA's late-January
-    year-end, 53-week retail years): ~90-day windows are quarters, ~365-day windows are annuals."""
-    quarters = [r for r in rows if 75 <= _dur(r) <= 105]
-    annual = [r for r in rows if 340 <= _dur(r) <= 385]
+    year-end, 53-week retail years): ~90-day windows are quarters, ~365-day windows are annuals.
+
+    Only DURATION rows reach here (a STOCK metric returns before `split_periods` in `metric_series`),
+    and a well-formed duration fact always carries a `start`. A row with no `start` (a malformed
+    EDGAR fact, or an instant concept that slipped into a duration query) is SKIPPED rather than
+    crashing `_dur` with `date - None` — the whole name's fundamentals must degrade to omission, not
+    raise. (`_dur` itself is never handed a null `start` because of this filter.)"""
+    duration = [r for r in rows if r.get("start") is not None]
+    quarters = [r for r in duration if 75 <= _dur(r) <= 105]
+    annual = [r for r in duration if 340 <= _dur(r) <= 385]
     return quarters, annual
 
 
@@ -322,7 +353,7 @@ def ttm(quarters: list[dict]) -> list[dict]:
     return out
 
 
-def metric_series(store, cik: int, metric: str, freq: str, as_of: date,
+def metric_series(store, cik: int, metric: str, freq: str, as_of: AsOf,
                   sector: str | None = None) -> dict:
     """Public entrypoint: the standardized, PIT-correct series for one metric.
 
