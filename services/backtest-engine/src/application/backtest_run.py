@@ -8,10 +8,10 @@ granularity** so a many-core box isn't capped at `n_folds`:
   wave 2 — `n_folds` primary OOS replays + `ablations × n_folds` ablation OOS replays;
   scoring — PBO / DSR / IC gates + benchmark overlay (serial, cheap).
 
-`_load_backtest_history` (event loop) prefetches adjusted daily bars, resolves the portal grid
-override, and materialises everything into a fully-picklable ctx; the workers rebuild an
+`_load_backtest_history` (event loop) prefetches adjusted daily bars from EODHD `/eod`, resolves the
+portal grid override, and materialises everything into a fully-picklable ctx; the workers rebuild an
 `InMemoryBarsReader` from it (same substrate the MCPT validator uses — behaviour-equivalent to the
-old warm `YahooDailyBarsReader`, just serialisable).
+warm `EodhdDailyBarsReader`, just serialisable).
 """
 from __future__ import annotations
 
@@ -176,7 +176,7 @@ async def _load_backtest_history(db, req: dict) -> dict:
     step = max(1, rebalance_days) * DAY_MS
     ppy = max(1, round(365.0 / max(1, rebalance_days)))
     universe = [t.strip() for t in (req.get('tickers') or DEFAULT_SP100) if t and t.strip()]
-    data_source = (f"yahoo_daily adjusted; universe={'request' if req.get('tickers') else 'sp100_default'} "
+    data_source = (f"eodhd_daily adjusted; universe={'request' if req.get('tickers') else 'sp100_default'} "
                    f"(current-membership, survivorship-biased); benchmark={benchmark}")
 
     grid_override = await resolve_search_grid(db, strategy_id)
@@ -184,7 +184,7 @@ async def _load_backtest_history(db, req: dict) -> dict:
     folds = WalkForwardValidator(start, end, N_FOLDS, EMBARGO_DAYS).valid_folds(
         min_oos_ms=MIN_OOS_PERIODS * step, min_train_ms=MIN_TRAIN_PERIODS * step)
 
-    reader = make_bars_reader('yahoo_daily')
+    reader = make_bars_reader('eodhd_daily')
     await reader.prefetch(universe + [benchmark], start, end)
     bars: dict[str, list] = {}
     for t in universe:
