@@ -26,6 +26,12 @@ httpx==0.27.2
 fastapi==0.111.0
 uvicorn==0.30.1
 
+# Prometheus exposition for the status surface's /metrics (liveness gauge + request-latency histogram),
+# scraped by the central ServiceMonitor exactly like fundamentals-api. Same pin as the read-side services
+# to avoid a split. The PR gate already installs this pin (for the ingestion/api suites) before the
+# harvester suite runs, so the TestClient import resolves in the gate as in the deployed image.
+prometheus-client==0.20.0
+
 # Test-only
 pytest==8.3.3
 pytest-asyncio==0.24.0

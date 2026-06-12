@@ -1,11 +1,14 @@
-"""Thin FastAPI status surface for the fundamentals-harvester — the portal's read-only window into the
-lake's write path, plus a force-sweep trigger.
+"""FastAPI surface for the fundamentals-harvester — the portal's window into the lake's write path, a
+force-sweep trigger, AND (in the deployed pod) the host process for the bootstrap+sweep write loop.
 
-The harvester's real work is the bootstrap-then-loop in `src/main.py` (a long-lived Deployment that owns
-the lake RW mount). This app is a SEPARATE thin shell the portal Operations panel calls; it does NOT run
-the harvest loop. It reads the lake's on-disk state (`status.py`) + the per-CIK fact recency
-(`freshness.py`) — both pure over the lake `Path`, so the surface has no database and (apart from the
-force-sweep trigger) never constructs the EDGAR client.
+The harvester's real work is the bootstrap-then-loop in `src/main.py` (the lake's single writer). In the
+deployed Deployment (replicas:1) that loop runs as a BACKGROUND asyncio task started by this app on
+startup — gated on `HARVESTER_RUN_LOOP`, which the Helm chart sets — so `uvicorn app:app` is the one
+entrypoint that both owns the lake RW mount AND serves this status API. The status routes themselves read
+the lake's on-disk state (`status.py`) + the per-CIK fact recency (`freshness.py`) — both pure over the
+lake `Path`, so the read surface has no database and (apart from the loop + the force-sweep trigger) never
+constructs the EDGAR client. With `HARVESTER_RUN_LOOP` unset (the TestClient suite), this module is a thin
+read-only status shell — the loop is not launched and no EDGAR client / network is touched on import.
 
 Routes — all under the `/admin/api/fundamentals-ingest` ingress prefix the portal already fans out to (no
 new ingress; the bare `/health` is aliased under the prefix because nginx-ingress routes by prefix only):
@@ -33,8 +36,9 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, Gauge, Histogram, generate_latest
 
 import freshness
 import status as status_mod
@@ -50,6 +54,45 @@ log = logging.getLogger("fundamentals-harvester.app")
 
 app = FastAPI(title=SERVICE_NAME, version="0.1.0")
 
+# ── Prometheus metrics ────────────────────────────────────────────────────────────
+# The central ServiceMonitor (infra/helm/trader/templates/servicemonitors.yaml) scrapes /metrics on
+# every trader FastAPI service. `_up` is the always-on liveness signal (1 while the app serves);
+# `_request_latency` is the per-route request-duration histogram (the status-surface p50/p95 source).
+# Labelled by route TEMPLATE + status class so the cardinality stays bounded (no raw path in the labels).
+# Mirrors fundamentals-api / strategy-engine's /metrics shape. The harvest LOOP's deep counters
+# (entities normalized, sweep CIK counts) are NOT exposed here — they live in the lake's on-disk state,
+# surfaced by /status + /runs; this scrape covers process liveness + status-API request latency.
+_up = Gauge("fundamentals_harvester_up", "1 while the fundamentals-harvester process is serving.")
+_up.set(1)
+_request_latency = Histogram(
+    "fundamentals_harvester_request_duration_seconds",
+    "fundamentals-harvester HTTP request duration by route + status class (p50/p95 source).",
+    ["route", "status"],
+)
+
+
+@app.middleware("http")
+async def _observe_latency(request: Request, call_next):
+    """Time every request into `_request_latency`, keyed on the matched route TEMPLATE (not the raw path)
+    so the histogram's label cardinality is bounded. An unmatched path (404) falls back to a stable
+    sentinel; the /metrics scrape itself is skipped (self-measurement is noise)."""
+    start = time.perf_counter()
+    response = await call_next(request)
+    route = request.scope.get("route")
+    template = getattr(route, "path", None) or "<unmatched>"
+    if template != "/metrics":
+        _request_latency.labels(route=template, status=f"{response.status_code // 100}xx").observe(
+            time.perf_counter() - start
+        )
+    return response
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+def metrics() -> Response:
+    """Prometheus exposition (scraped by the central ServiceMonitor). Liveness gauge + the request-latency
+    histogram. Mirrors fundamentals-api's /metrics shape."""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
 
 @app.exception_handler(Exception)
 async def _json_error_handler(_request, exc: Exception) -> JSONResponse:
@@ -57,6 +100,54 @@ async def _json_error_handler(_request, exc: Exception) -> JSONResponse:
     — never a bare HTML stack trace the portal can't parse."""
     log.exception("unhandled error")
     return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})
+
+
+# --------------------------------------------------------------------------- #
+# Harvest loop — co-hosted with the status surface in ONE process             #
+# --------------------------------------------------------------------------- #
+# The deployed harvester is a SINGLE Deployment (replicas:1 — the lake's single writer) that must do two
+# jobs at once: (1) own the lake RW mount and run the bootstrap-then-sweep write loop (`src/main.py`), and
+# (2) serve this thin status API the portal Operations panel reads. Rather than two containers fighting
+# over the RWO lake mount, the loop runs as a BACKGROUND asyncio task on this app's startup, on the same
+# event loop the API serves from — so `uvicorn app:app` is the one entrypoint and `/health` answers
+# immediately (the long, hours-deep bulk bootstrap proceeds in the background, never blocking the probe).
+#
+# Gated on `HARVESTER_RUN_LOOP` (the chart sets it; tests never do) so importing this module for the
+# TestClient status-surface suite does NOT launch the write loop or construct the EDGAR client (which
+# fails closed without a real EDGAR_USER_AGENT and would hit the network). `main` is imported lazily
+# inside the hook for the same reason — module import stays network-free.
+_loop_task: Optional[asyncio.Task] = None
+
+
+def _run_loop_enabled() -> bool:
+    return os.environ.get("HARVESTER_RUN_LOOP", "").strip().lower() in {"1", "true", "yes"}
+
+
+@app.on_event("startup")
+async def _start_harvest_loop() -> None:
+    """Launch the bootstrap+sweep write loop as a background task on the serving event loop.
+
+    Only when `HARVESTER_RUN_LOOP` is set — the single-writer Deployment. A bootstrap/sweep crash inside
+    `main.main()` is logged by the loop's own per-sweep guard and the task keeps running; an unexpected
+    fatal that ends the task is logged here via the done-callback (the pod's restart then re-runs an
+    unfinished bootstrap, which is crash-safe via the sentinel)."""
+    global _loop_task
+    if not _run_loop_enabled():
+        log.info("harvest loop disabled (HARVESTER_RUN_LOOP unset) — status surface only")
+        return
+    import main as harvester_main  # lazy: no EDGAR client / network at module import
+
+    log.info("starting harvest loop (bootstrap-then-sweep) as a background task")
+    _loop_task = asyncio.create_task(harvester_main.main())
+
+    def _on_done(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            log.error("harvest loop exited with %s — pod restart will resume", type(exc).__name__, exc_info=exc)
+
+    _loop_task.add_done_callback(_on_done)
 
 
 def _now_ms() -> int:
