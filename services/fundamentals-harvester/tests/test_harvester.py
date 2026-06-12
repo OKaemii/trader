@@ -207,6 +207,142 @@ def test_write_company_facts_schema_columns_match_lake_contract(tmp_path) -> Non
 
 
 # --------------------------------------------------------------------------- #
+# Fail-closed omission on dirty facts (the SCHEMA nullable=False columns)      #
+# --------------------------------------------------------------------------- #
+# The lake SCHEMA marks value/end/accession/filed/fy/fp/form as nullable=False. Real EDGAR
+# companyfacts do NOT guarantee all of them on every observation, so an unfiltered row would make
+# `Table.from_pylist(..., schema=SCHEMA)` raise ArrowInvalid and abort the whole per-CIK write. These
+# tests pin the fail-closed behavior: a fact missing a required field is DROPPED, never written as a
+# null and never crashing the write. (This is the gap that originally let a None fy/fp/form ship.)
+# Sentinel marking "remove this key entirely" in `_fact(**overrides)` (distinct from passing None,
+# which sets the key to a null value). Defined BEFORE the parametrize lists that reference it.
+_ABSENT = object()
+
+
+def _fact(**overrides) -> dict:
+    """A complete, valid observation dict; pass a field=None or field=_ABSENT to make it dirty."""
+    base = {
+        "start": "2023-01-01",
+        "end": "2023-12-31",
+        "val": 1.0,
+        "fy": 2023,
+        "fp": "FY",
+        "form": "10-K",
+        "accn": "0000320193-24-000077",
+        "filed": "2024-02-02",
+        "frame": "CY2023",
+    }
+    for k, v in overrides.items():
+        if v is _ABSENT:
+            base.pop(k, None)
+        else:
+            base[k] = v
+    return base
+
+
+def _cf_with(*facts: dict, cik: int = 320193) -> dict:
+    return {"cik": cik, "facts": {"us-gaap": {"Revenues": {"units": {"USD": list(facts)}}}}}
+
+
+@pytest.mark.parametrize(
+    "dirty",
+    [
+        {"fy": None},
+        {"fy": _ABSENT},
+        {"fp": None},
+        {"fp": _ABSENT},
+        {"form": None},
+        {"form": _ABSENT},
+        {"end": _ABSENT},
+        {"end": None},
+        {"accn": _ABSENT},
+        {"accn": None},
+        {"filed": _ABSENT},
+        {"filed": None},
+        {"filed": ""},
+        {"val": None},
+        {"val": _ABSENT},
+    ],
+)
+def test_fact_rows_drops_facts_missing_a_non_null_column(dirty) -> None:
+    """A single fact missing any nullable=False field is dropped (fail-closed), not emitted as null."""
+    rows = list(normalize.fact_rows(_cf_with(_fact(**dirty)), None))
+    assert rows == []
+
+
+def test_fact_rows_keeps_good_drops_dirty_in_same_doc() -> None:
+    """A companyfacts mixing a complete fact with a dirty one yields ONLY the complete fact."""
+    good = _fact(end="2022-12-31", accn="0000320193-23-000064")
+    dirty = _fact(end="2023-12-31", fy=None)  # missing fy -> would violate the non-null schema
+    rows = list(normalize.fact_rows(_cf_with(good, dirty), None))
+    assert len(rows) == 1
+    assert rows[0]["end"] == date(2022, 12, 31)
+
+
+def test_write_company_facts_with_dirty_facts_does_not_raise(tmp_path) -> None:
+    """The end-to-end write must not raise ArrowInvalid when the doc carries dirty facts — the
+    fail-closed filter keeps every persisted row schema-valid. This is the exact crash that, on the
+    unguarded bulk path, would have aborted the whole bootstrap before the sentinel."""
+    cf = _cf_with(_fact(), _fact(end="2022-12-31", fp=None), _fact(end="2021-12-31", val=None))
+    n = normalize.write_company_facts(tmp_path, cf, None)
+    assert n == 1  # only the one fully-valid fact persisted
+    path = tmp_path / "facts" / "cik=0000320193.parquet"
+    tbl = pq.read_table(path)
+    assert tbl.num_rows == 1
+    # No null leaked into a non-null column.
+    for col in ("end", "value", "fy", "fp", "form", "accession", "filed", "knowledge_ts"):
+        assert tbl.column(col).null_count == 0
+
+
+def test_bulk_loop_skips_malformed_entity(tmp_path, monkeypatch) -> None:
+    """The bulk-bootstrap per-entity guard must skip an entity whose write raises and STILL write the
+    sentinel — so one bad entity never causes the permanent re-bootstrap crash-loop the sentinel
+    exists to prevent. We force write_company_facts to raise for a poisoned CIK and assert bootstrap
+    completes (sentinel present) with the good entities written."""
+    monkeypatch.setattr(main, "LAKE", tmp_path)
+    monkeypatch.setattr(main, "WATCHLIST", [])  # full-universe bulk path
+
+    # Pre-place the bulk zip so download is skipped; two good entities + one poisoned.
+    bulk = tmp_path / "bulk" / "companyfacts.zip"
+    bulk.parent.mkdir(parents=True, exist_ok=True)
+    import zipfile
+
+    with zipfile.ZipFile(bulk, "w") as z:
+        z.writestr("CIK0000320193.json", _to_json(_cf_with(_fact(), cik=320193)))
+        z.writestr("CIK0000789019.json", _to_json(_cf_with(_fact(), cik=789019)))
+        z.writestr("CIK0000111111.json", _to_json(_cf_with(_fact(), cik=111111)))
+
+    real_write = normalize.write_company_facts
+
+    def poisoned_write(lake, cf, accepted=None):
+        if int(cf["cik"]) == 789019:
+            raise RuntimeError("simulated normalize failure for one entity")
+        return real_write(lake, cf, accepted)
+
+    # bootstrap imports write_company_facts into main's namespace -> patch it there.
+    monkeypatch.setattr(main, "write_company_facts", poisoned_write)
+
+    class _FakeEdgar:
+        async def company_tickers(self):
+            return {}
+
+    asyncio.run(main.bootstrap(_FakeEdgar()))
+
+    # Despite the poisoned entity, the sentinel IS written (bootstrap completed, no crash-loop).
+    assert (tmp_path / main.SENTINEL).exists()
+    # The two good entities landed; the poisoned one did not.
+    assert (tmp_path / "facts" / "cik=0000320193.parquet").exists()
+    assert (tmp_path / "facts" / "cik=0000111111.parquet").exists()
+    assert not (tmp_path / "facts" / "cik=0000789019.parquet").exists()
+
+
+def _to_json(obj: dict) -> str:
+    import json as _json
+
+    return _json.dumps(obj)
+
+
+# --------------------------------------------------------------------------- #
 # Bootstrap-completion sentinel gating                                        #
 # --------------------------------------------------------------------------- #
 def test_sentinel_absent_triggers_bootstrap(tmp_path, monkeypatch) -> None:

@@ -80,16 +80,38 @@ def fact_rows(cf: dict, accepted_by_accession: dict[str, int] | None = None):
         for concept, body in concepts.items():
             for unit, observations in (body.get("units") or {}).items():
                 for o in observations:
+                    # FAIL-CLOSED OMISSION: the lake SCHEMA marks `value`, `end`, `accession`,
+                    # `filed`, `fy`, `fp`, `form` as nullable=False (the read-axis + period-frame +
+                    # lineage columns). EDGAR does NOT guarantee all of them on every observation —
+                    # the reference parser (services/fundamentals-ingestion/src/download/edgar.py)
+                    # `continue`s on a missing `end`/`accn`/`fp`/`form` for exactly this reason. A
+                    # row that can't populate a required column would make `Table.from_pylist(...,
+                    # schema=SCHEMA)` raise ArrowInvalid and abort the WHOLE per-CIK write (and, on
+                    # the unguarded bulk path, the whole bootstrap). So DROP the one incomplete fact
+                    # — never a fabricated value, never a vanished CIK. `start`/`accepted_ts`/`frame`
+                    # are the only nullable columns and are passed through as-is.
                     val = o.get("val")
-                    if val is None:
+                    end = o.get("end")
+                    accn = o.get("accn")
+                    filed_raw = o.get("filed")
+                    fy = o.get("fy")
+                    fp = o.get("fp")
+                    form = o.get("form")
+                    if (
+                        val is None
+                        or not end
+                        or not accn
+                        or not filed_raw
+                        or fy is None
+                        or not fp
+                        or not form
+                    ):
                         continue
-                    accn = o["accn"]
-                    key = (taxonomy, concept, unit, o.get("start"), o["end"], accn)
+                    key = (taxonomy, concept, unit, o.get("start"), end, accn)
                     if key in seen:
                         continue
                     seen.add(key)
-                    fy = o.get("fy")
-                    filed = _d(o["filed"])
+                    filed = _d(filed_raw)
                     accepted_ts = accepted_by_accession.get(accn)
                     yield {
                         "cik": cik,
@@ -97,11 +119,11 @@ def fact_rows(cf: dict, accepted_by_accession: dict[str, int] | None = None):
                         "concept": concept,
                         "unit": unit,
                         "start": _d(o.get("start")),
-                        "end": _d(o["end"]),
+                        "end": _d(end),
                         "value": float(val),
-                        "fy": int(fy) if fy is not None else None,
-                        "fp": o.get("fp"),
-                        "form": o.get("form"),
+                        "fy": int(fy),
+                        "fp": fp,
+                        "form": form,
                         "accession": accn,
                         "filed": filed,
                         "accepted_ts": accepted_ts,

@@ -47,9 +47,13 @@ FORMS = {"10-K", "10-Q", "10-K/A", "10-Q/A", "20-F", "20-F/A", "40-F", "6-K"}
 
 # The bootstrap-completion sentinel. The prototype skipped bootstrap when ANY facts/*.parquet existed
 # — but a crash mid-bulk-load (one file written, 14,999 missing) would then be mistaken for "done",
-# leaving permanent gaps. Instead the FULL bulk pass writes this marker as its very last act; `main`
-# bootstraps unless it exists, so a partial bootstrap re-runs (crash-safe resume). The marker is
-# absent in WATCHLIST mode by design (watchlist is not full-universe coverage).
+# leaving permanent gaps. Instead the FULL bulk pass (and the watchlist pass) writes this marker as
+# its very last act; `main` bootstraps unless it exists, so a partial/crashed bootstrap re-runs
+# (crash-safe resume). BOTH modes write it so a healthy bootstrap is not re-run on every pod restart;
+# it marks "the configured bootstrap completed", NOT "the lake covers the whole universe" — under a
+# WATCHLIST it means only the watchlist names were harvested (expanding WATCHLIST after the first run
+# does not re-bootstrap the added names; production uses full-universe, where the sweep then keeps
+# every filed CIK fresh).
 SENTINEL = "bootstrap_complete.json"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -159,6 +163,7 @@ async def bootstrap(edgar: Edgar) -> None:
         log.info("bootstrap: downloading %s", Edgar.BULK_COMPANYFACTS)
         await edgar.download(Edgar.BULK_COMPANYFACTS, bulk)
     written = 0
+    skipped = 0
     with zipfile.ZipFile(bulk) as z:
         names = z.namelist()
         for i, name in enumerate(names, 1):
@@ -167,14 +172,26 @@ async def bootstrap(edgar: Edgar) -> None:
             except json.JSONDecodeError:
                 continue
             if cf.get("facts"):
-                write_company_facts(LAKE, cf)  # accepted_by_accession=None -> filed fallback
-                written += 1
+                # Guard EACH entity: a single malformed companyfacts (an unexpected shape the
+                # per-fact fail-closed filter doesn't anticipate) must NOT abort the whole bulk pass
+                # before the sentinel is written — that would leave no sentinel, re-bootstrap on
+                # restart against the cached zip, and crash at the same entity forever (the exact
+                # permanent-gap crash-loop the sentinel exists to prevent). Log and move on, like the
+                # sweep path's per-CIK guard.
+                try:
+                    write_company_facts(LAKE, cf)  # accepted_by_accession=None -> filed fallback
+                    written += 1
+                except Exception:
+                    skipped += 1
+                    log.exception("bootstrap: entity %s failed to normalize, skipping", name)
             if i % 1000 == 0:
-                log.info("bootstrap: %d/%d entities normalized", i, len(names))
+                log.info("bootstrap: %d/%d entities normalized (%d skipped)", i, len(names), skipped)
     _write_sentinel(written)
     log.info(
-        "bootstrap: done — %d entities normalized, sentinel written; entity metadata fills in via sweeps",
+        "bootstrap: done — %d entities normalized (%d skipped), sentinel written; "
+        "entity metadata fills in via sweeps",
         written,
+        skipped,
     )
 
 
