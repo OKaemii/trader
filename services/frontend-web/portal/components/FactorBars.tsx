@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useState } from 'react'
+import { FreshnessTag } from './FreshnessTag'
 
 // Per-symbol research-factor percentile bars (research-trading-os Task 24 §E). The four
 // strategy-independent research factors — Momentum / Quality / Value / Volatility — each shown
@@ -31,6 +32,9 @@ export interface FactorCell {
 export interface FactorScores {
   ticker?: string
   observation_ts?: number
+  /** Freshness verdict stamped by the scores proxy: true = not live (older than the last session) ·
+   *  false = live · null/undefined = undeterminable. Drives the "as of <time> · Not live" header tag. */
+  stale?: boolean | null
   factors?: Partial<Record<FactorKey, FactorCell>>
 }
 
@@ -129,9 +133,14 @@ export function FactorBars({
 
   return (
     <div className="space-y-3 rounded-lg bg-gray-900 p-4">
-      <div className="flex items-baseline justify-between">
+      <div className="flex items-baseline justify-between gap-2">
         <h2 className="text-sm font-semibold text-white">Factor percentiles</h2>
-        <span className="text-[10px] uppercase tracking-wide text-gray-500">vs universe</span>
+        <div className="flex items-center gap-2">
+          {typeof scores?.observation_ts === 'number' && (
+            <FreshnessTag asOf={scores.observation_ts} stale={scores.stale ?? null} />
+          )}
+          <span className="text-[10px] uppercase tracking-wide text-gray-500">vs universe</span>
+        </div>
       </div>
       {hasAnyFactor ? (
         <div className="space-y-2">

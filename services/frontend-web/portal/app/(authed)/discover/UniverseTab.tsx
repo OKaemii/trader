@@ -1,5 +1,6 @@
 import { getUniverseOverrides } from '@/app/actions/admin'
 import { authedFetch } from '@/app/lib/auth-fetch'
+import { marketFreshness } from '@/app/lib/freshness-server'
 import { UniverseEditor } from '@/components/UniverseEditor'
 import { ScannerPanel } from '@/components/ScannerPanel'
 import { UniverseOverview } from '@/components/UniverseOverview'
@@ -10,11 +11,12 @@ import { BarHistoryExplorer } from '@/components/BarHistoryExplorer'
 // strategy's selected basket) lives here so there is one place to see what the universe is and why
 // each name is in it. SSR-seed everything. Only the page title/chrome is hoisted to WorkspaceShell.
 export async function UniverseTab() {
-  const [result, snapRes, healthRes, pieRes] = await Promise.all([
+  const [result, snapRes, healthRes, pieRes, scanFreshness] = await Promise.all([
     getUniverseOverrides(),
     authedFetch('/admin/api/market-data/scanner/snapshot'),
     authedFetch('/admin/api/market-data/scanner/feed-health'),
     authedFetch('/admin/api/signals/pies/strategy/high_velocity_v1'),   // selected basket (best-effort)
+    marketFreshness('US'),   // the scanner's caps are last-close × shares → "as of last US session · Not live" when closed
   ])
 
   if (!result.ok) {
@@ -50,7 +52,7 @@ export async function UniverseTab() {
       </p>
 
       {snapshot
-        ? <ScannerPanel initialSnapshot={snapshot} initialHealth={health} initialPie={pie} />
+        ? <ScannerPanel initialSnapshot={snapshot} initialHealth={health} initialPie={pie} freshness={scanFreshness} />
         : <UniverseOverview instruments={detailed} updatedAt={result.data.updatedAt} />}
 
       <UniverseEditor initial={result.data} />
