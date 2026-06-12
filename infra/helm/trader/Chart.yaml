@@ -32,5 +32,7 @@ dependencies:
     version: ">=0.0.0"
   - name: fundamentals-api
     version: ">=0.0.0"
+  - name: fundamentals-harvester
+    version: ">=0.0.0"
   - name: frontend-web
     version: ">=0.0.0"
