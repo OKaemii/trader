@@ -10,6 +10,7 @@ import {
 import type { ExchangeCalendar, HolidayTable } from '../calendar.ts';
 import { nyseCalendar } from '../nyse.ts';
 import { lseCalendar } from '../lse.ts';
+import { Trading212TickerAdapter, type TickerIdentity } from '@trader/ticker-identity';
 
 // Minimal HolidayCache stub. Tests inject their own tables per-year per-market.
 function stubCache(tables: Partial<Record<string, HolidayTable>> = {}) {
@@ -180,18 +181,63 @@ describe('marketStateOf — 2027 weekend shifts (static fallback)', () => {
 });
 
 describe('partitionByMarket', () => {
-  it('splits a mixed universe by suffix', () => {
-    const groups = partitionByMarket(['AAPL_US_EQ', 'VODl_EQ', 'MSFT_US_EQ', 'BPl_EQ', 'BTC_USDT']);
-    expect(groups.US).toEqual(['AAPL_US_EQ', 'MSFT_US_EQ']);
-    expect(groups.LSE).toEqual(['VODl_EQ', 'BPl_EQ']);
-    expect(groups.OTHER).toEqual(['BTC_USDT']);
+  it('splits a mixed universe by the identity market field', () => {
+    const ids: TickerIdentity[] = [
+      { symbol: 'AAPL', market: 'US' },
+      { symbol: 'VOD', market: 'LSE' },
+      { symbol: 'MSFT', market: 'US' },
+      { symbol: 'BP', market: 'LSE' },
+    ];
+    const groups = partitionByMarket(ids);
+    expect(groups.US).toEqual([
+      { symbol: 'AAPL', market: 'US' },
+      { symbol: 'MSFT', market: 'US' },
+    ]);
+    expect(groups.LSE).toEqual([
+      { symbol: 'VOD', market: 'LSE' },
+      { symbol: 'BP', market: 'LSE' },
+    ]);
   });
 
   it('returns empty arrays for empty input', () => {
     const groups = partitionByMarket([]);
     expect(groups.US).toEqual([]);
     expect(groups.LSE).toEqual([]);
-    expect(groups.OTHER).toEqual([]);
+  });
+
+  // Parity guard: the identity partition must reproduce the OLD suffix-regex split exactly.
+  // We bridge the legacy T212-form set the same way the poll loop now does — fromT212 per
+  // ticker, routing an unparseable form (the adapter throws) to an OTHER bucket — then assert
+  // the US/LSE membership matches what `/_US_EQ$/` and `/l_EQ$/` produced before this change.
+  it('reproduces the legacy suffix split for a representative T212 set', () => {
+    const adapter = new Trading212TickerAdapter();
+    const t212 = ['AAPL_US_EQ', 'VODl_EQ', 'MSFT_US_EQ', 'BPl_EQ', 'SHELl_EQ', 'BTC_USDT'];
+
+    // Old behaviour, recomputed inline from the exact regexes the old function used.
+    const expected = { US: [] as string[], LSE: [] as string[], OTHER: [] as string[] };
+    for (const t of t212) {
+      if (/_US_EQ$/.test(t)) expected.US.push(t);
+      else if (/l_EQ$/.test(t)) expected.LSE.push(t);
+      else expected.OTHER.push(t);
+    }
+
+    // New bridge: parse each form to an identity (OTHER = adapter rejection), partition, map back.
+    const ids: TickerIdentity[] = [];
+    const other: string[] = [];
+    for (const t of t212) {
+      try {
+        ids.push(adapter.fromT212(t));
+      } catch {
+        other.push(t);
+      }
+    }
+    const groups = partitionByMarket(ids);
+    const usT212 = groups.US.map((id) => adapter.toT212(id));
+    const lseT212 = groups.LSE.map((id) => adapter.toT212(id));
+
+    expect(usT212).toEqual(expected.US);          // ['AAPL_US_EQ', 'MSFT_US_EQ']
+    expect(lseT212).toEqual(expected.LSE);         // ['VODl_EQ', 'BPl_EQ', 'SHELl_EQ']
+    expect(other).toEqual(expected.OTHER);         // ['BTC_USDT']
   });
 });
 

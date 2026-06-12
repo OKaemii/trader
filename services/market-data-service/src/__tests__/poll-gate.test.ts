@@ -10,6 +10,7 @@ import {
   nyseCalendar, lseCalendar,
   type ExchangeCalendar, type HolidayTable, type Market, type MarketState,
 } from '@trader/shared-calendar';
+import { Trading212TickerAdapter, type TickerIdentity } from '@trader/ticker-identity';
 
 function stubCache(tables: Partial<Record<string, HolidayTable>> = {}) {
   return {
@@ -24,14 +25,27 @@ function stubCache(tables: Partial<Record<string, HolidayTable>> = {}) {
   } as any;
 }
 
-interface Decision { market: Market; tickers: string[]; state: MarketState }
+interface Decision { market: Market; tickers: TickerIdentity[]; state: MarketState }
 
+const adapter = new Trading212TickerAdapter();
+
+// Mirror the pollLoop's bridge: the universe is read as Trading212-form strings, converted to
+// identities at the boundary (an unparseable form — a crypto pair — is dropped, exactly as the
+// loop routes it to OTHER, which yields no market decision), then partitioned on id.market.
 async function decisions(
   tickers: readonly string[],
   cals: Record<Market, ExchangeCalendar>,
   nowMs: number,
 ): Promise<{ active: Decision[]; all: Decision[] }> {
-  const groups = partitionByMarket(tickers);
+  const identities: TickerIdentity[] = [];
+  for (const t of tickers) {
+    try {
+      identities.push(adapter.fromT212(t));
+    } catch {
+      /* OTHER — not a tradable US/LSE form; no decision, same as the gate's OTHER bucket */
+    }
+  }
+  const groups = partitionByMarket(identities);
   const all: Decision[] = [];
   for (const m of ['US', 'LSE'] as Market[]) {
     if (groups[m].length === 0) continue;

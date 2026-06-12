@@ -25,6 +25,7 @@
     "@trader/shared-pg": "workspace:*",
     "@trader/shared-redis": "workspace:*",
     "@trader/shared-types": "workspace:*",
+    "@trader/ticker-identity": "workspace:*",
     "hono": "^4.3.0",
     "mongodb": "^6.5.0",
     "redis": "^4.7.0",
