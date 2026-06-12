@@ -98,6 +98,19 @@ COPY services/warehouse-snapshotter/src ./warehouse_snapshotter/src
 COPY services/warehouse-snapshotter/conftest.py ./warehouse_snapshotter/conftest.py
 COPY services/warehouse-snapshotter/tests ./warehouse_snapshotter/tests
 
+# fundamentals-harvester suite (PIT Fundamentals LAKE write-path, epic Task 8). Deps-clean: the
+# harvester modules import only pyarrow ([lake], installed above), httpx ([http], installed above),
+# and the installed `quant_core` (the lake SCHEMA + the knowledge_ts calendar) — NO extra pip install
+# is needed. The tests are network-free (pure parsing/derivation + tmp-lake writes) and never
+# construct the EDGAR client (which fails closed without a real EDGAR_USER_AGENT), so no UA env is set
+# here. Isolated under ./fundamentals_harvester so the harvester's bare intra-package imports
+# (`import main`, `import normalize`) resolve via its own conftest (which puts both the service root
+# and its `src/` on sys.path) without colliding with backtest-engine's `src` at /app — the same
+# isolated-dir approach as the suites above.
+COPY services/fundamentals-harvester/src ./fundamentals_harvester/src
+COPY services/fundamentals-harvester/conftest.py ./fundamentals_harvester/conftest.py
+COPY services/fundamentals-harvester/tests ./fundamentals_harvester/tests
+
 # quant-core suite imports the installed package; backtest suite imports src.* (conftest puts
 # /app on the path). PYTHONDONTWRITEBYTECODE keeps the layer clean. -p no:cacheprovider avoids a
 # read-only-fs cache complaint. A non-zero exit here fails the build = the gate.
@@ -107,6 +120,7 @@ RUN python -m pytest quant_core_tests -q -p no:cacheprovider \
  && (cd strategy_engine && python -m pytest tests -q -p no:cacheprovider) \
  && (cd fundamentals_ingestion && python -m pytest tests -q -p no:cacheprovider) \
  && (cd fundamentals_api && python -m pytest tests -q -p no:cacheprovider) \
- && (cd warehouse_snapshotter && python -m pytest tests -q -p no:cacheprovider)
+ && (cd warehouse_snapshotter && python -m pytest tests -q -p no:cacheprovider) \
+ && (cd fundamentals_harvester && python -m pytest tests -q -p no:cacheprovider)
 
 CMD ["true"]
