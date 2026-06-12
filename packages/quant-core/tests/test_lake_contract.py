@@ -253,15 +253,19 @@ def lake(tmp_path: Path) -> Path:
 def test_covered_us_name_resolves_all_legs_with_canonical_spellings(lake: Path) -> None:
     s = Store(lake)
     li, source, obs, kts = pit_line_items(s, TickerIdentity("FULL", "US"), AS_OF)
-    # 4 flows + 7 instants + earnings_stability = 12 keys (market_cap_gbp/dividend_yield are the API's)
-    assert len(li) >= 12
+    # 4 flows + 7 instants + earnings_stability = EXACTLY 12 keys for a fully-covered name
+    # (market_cap_gbp/dividend_yield are the API's Gap-2 enrichment, never produced here).
     expected = {
         "net_income", "total_revenue", "gross_profit", "cash_flow_ops",
         "total_equity", "total_assets", "total_liabilities", "current_assets",
         "current_liabilities", "total_debt", "shares_outstanding", "earnings_stability",
     }
-    assert expected <= set(li)
-    # every key is a real LINE_ITEMS member (canonical snake_case)
+    assert len(li) >= 12
+    # exact set equality — catches a MISSING leg AND a spuriously-produced extra leg (e.g. a real
+    # LINE_ITEMS key that leaked in, which a `<= LINE_ITEMS` subset check alone would pass).
+    assert set(li) == expected
+    # every key is a real LINE_ITEMS member (canonical snake_case) — redundant with the equality but
+    # documents the contract-vocabulary constraint explicitly.
     assert set(li) <= set(LINE_ITEMS)
     # the enriched legs are NOT produced here
     assert "market_cap_gbp" not in li
@@ -342,12 +346,28 @@ def test_missing_leg_is_omitted_not_zero(lake: Path) -> None:
     assert source == SOURCE_PIT_EDGAR
 
 
-def test_no_leg_value_is_ever_zero_coerced(lake: Path) -> None:
-    """No assembled leg is a coerced 0 — every present value is a genuine resolved fact. (Guards the
-    fail-closed dict-comp: a None-valued leg must drop, not become 0.)"""
-    s = Store(lake)
-    li, _, _, _ = pit_line_items(s, TickerIdentity("FULL", "US"), AS_OF)
-    assert all(v is not None for v in li.values())
+def test_genuine_zero_value_is_preserved_not_dropped(tmp_path: Path) -> None:
+    """The fail-closed omission drops a None-valued leg but MUST keep a genuine 0.0 — a debt-free
+    company reports total_debt = 0, and dropping it (a falsy-filter bug) would wrongly omit a real
+    fact. This pins `if v is not None` (not `if v`), the property the tautological all-not-None check
+    could not catch.
+    """
+    root = tmp_path / "zero"
+    root.mkdir()
+    k = _ms(2024, 2, 16)
+    # net_income (so the name resolves a leg) + a genuine zero total_debt instant.
+    _write_facts(root, 600, [
+        _annual(600, "NetIncomeLoss", 2023, 110.0, k),
+        _instant(600, "LongTermDebt", "2023-12-31", 0.0, k),
+    ])
+    _write_ticker_history(root, [
+        {"cik": 600, "ticker": "ZERO", "valid_from": date(2015, 1, 1), "valid_to": None},
+    ])
+    s = Store(root)
+    li, _, _, _ = pit_line_items(s, TickerIdentity("ZERO", "US"), AS_OF)
+    assert "total_debt" in li            # a genuine 0 is NOT dropped...
+    assert li["total_debt"] == 0.0       # ...and is the real 0, not coerced away
+    assert li["net_income"] == 110.0
 
 
 # --------------------------------------------------------------------------------------------------- #
@@ -403,8 +423,10 @@ def test_earnings_stability_uses_only_annuals_at_or_before_as_of(lake: Path, tmp
     s = Store(root)
     es_asof = earnings_stability(s, 900, AS_OF)             # FY2024 not yet knowable → 90/100/110
     assert es_asof == pytest.approx(100.0 / (200.0 / 3.0) ** 0.5, rel=1e-9)
-    es_future = earnings_stability(s, 900, _ms(2025, 6, 1))  # now FY2024=999 enters → different
-    assert es_future is not None and es_future != es_asof
+    es_future = earnings_stability(s, 900, _ms(2025, 6, 1))  # now FY2024=999 enters the window
+    # pin the EXACT 4-point population inverse-CV (90,100,110,999): mean 324.75, pop-std ≈389.34 →
+    # ≈0.834. A directional `!= es_asof` alone wouldn't catch a wrong tail-selection that still differs.
+    assert es_future == pytest.approx(0.8340982228254361, rel=1e-9)
 
 
 # --------------------------------------------------------------------------------------------------- #
@@ -453,3 +475,79 @@ def test_ttm_or_annual_falls_back_to_annual_without_four_quarters(lake: Path) ->
     point = ttm_or_annual(s, CIK_FULL, "net_income", AS_OF)
     assert point is not None
     assert point["value"] == 110.0   # latest annual (no quarters → no TTM)
+
+
+# --------------------------------------------------------------------------------------------------- #
+# 6. PIT provenance — knowledge_ts of a TTM-resolved leg is NOT under-reported                         #
+# --------------------------------------------------------------------------------------------------- #
+def test_knowledge_ts_reflects_a_ttm_legs_true_availability(tmp_path: Path) -> None:
+    """A TTM flow leg whose completing quarter is the LATEST-knowable fact must drive the bundle's
+    knowledge_ts — it cannot be under-reported to an earlier instant.
+
+    Regression for the metrics `ttm`/`with_derived_q4` knowledge_ts carry: the derived TTM point now
+    carries `knowledge_ts = max(input quarters)`, so when net_income resolves via a TTM whose Q4 is
+    knowable AFTER every balance-sheet instant, the bundle's max-knowledge_ts is that Q4 instant — not
+    the older instants'. Without the carry the TTM point had no knowledge_ts, the max excluded it, and
+    the seam advertised the bundle knowable too early (a look-ahead-adjacent provenance leak).
+    """
+    root = tmp_path / "ttmkts"
+    root.mkdir()
+    k_inst = _ms(2024, 5, 1)     # the balance-sheet instants are knowable here
+    q4_kts = _ms(2025, 2, 1)     # the TTM's completing Q4 is knowable LATER
+    quarters = [
+        ("2024-01-01", "2024-03-31", 50.0, _ms(2024, 5, 1)),
+        ("2024-04-01", "2024-06-30", 60.0, _ms(2024, 8, 1)),
+        ("2024-07-01", "2024-09-30", 70.0, _ms(2024, 11, 1)),
+        ("2024-10-01", "2024-12-31", 60.0, q4_kts),
+    ]
+    rows = [
+        _fact(cik=700, concept="NetIncomeLoss", value=v, start=s0, end=e0, knowledge_ts=k,
+              accession=f"Q-{e0}", form="10-Q", fp="Q")
+        for (s0, e0, v, k) in quarters
+    ]
+    # an older balance-sheet instant (knowable k_inst, BEFORE the Q4)
+    rows.append(_instant(700, "StockholdersEquity", "2024-09-30", 500.0, k_inst))
+    _write_facts(root, 700, rows)
+    _write_ticker_history(root, [
+        {"cik": 700, "ticker": "TKTS", "valid_from": date(2015, 1, 1), "valid_to": None},
+    ])
+    s = Store(root)
+    as_of = _ms(2025, 6, 1)
+    li, source, obs, kts = pit_line_items(s, TickerIdentity("TKTS", "US"), as_of)
+    assert li["net_income"] == 240.0           # resolved via the TTM
+    assert source == SOURCE_PIT_EDGAR
+    # the bundle's knowledge_ts is the LATER Q4 instant (the TTM leg now contributes it), NOT k_inst
+    assert kts == q4_kts
+
+
+def test_earnings_stability_flat_fractional_series_is_none(tmp_path: Path) -> None:
+    """Equal-but-FRACTIONAL annual net income (a converted-currency ADR) must read as flat → None,
+    not a ~1e15 outlier. The relative-tolerance guard catches the float-rounding case a bare
+    `stddev == 0` check would miss (mean rounds, so each residual is ~1e-6 not exactly 0)."""
+    root = tmp_path / "frac"
+    root.mkdir()
+    k1, k2, k3 = _ms(2022, 2, 16), _ms(2023, 2, 16), _ms(2024, 2, 16)
+    v = 7_777_777_777.77   # equal every year, but not exactly representable in float64
+    _write_facts(root, 800, [
+        _annual(800, "NetIncomeLoss", 2021, v, k1),
+        _annual(800, "NetIncomeLoss", 2022, v, k2),
+        _annual(800, "NetIncomeLoss", 2023, v, k3),
+    ])
+    s = Store(root)
+    assert earnings_stability(s, 800, AS_OF) is None
+
+
+def test_earnings_stability_low_but_real_variance_scores_normally(tmp_path: Path) -> None:
+    """A genuinely low-but-REAL earnings dispersion is NOT flattened to None — only the
+    float-rounding-flat case is. 1e9, 1e9+1000, 1e9-1000 has a real stddev → a large finite score."""
+    root = tmp_path / "lowvar"
+    root.mkdir()
+    k1, k2, k3 = _ms(2022, 2, 16), _ms(2023, 2, 16), _ms(2024, 2, 16)
+    _write_facts(root, 810, [
+        _annual(810, "NetIncomeLoss", 2021, 1_000_000_000.0, k1),
+        _annual(810, "NetIncomeLoss", 2022, 1_000_001_000.0, k2),
+        _annual(810, "NetIncomeLoss", 2023, 999_999_000.0, k3),
+    ])
+    s = Store(root)
+    es = earnings_stability(s, 810, AS_OF)
+    assert es is not None and es > 0     # a real (large) inverse-CV, not None

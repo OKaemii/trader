@@ -80,6 +80,10 @@ INSTANT_METRICS: tuple[str, ...] = (
 # to characterise variability honestly).
 _EARNINGS_STABILITY_YEARS = 5
 _EARNINGS_STABILITY_MIN_PERIODS = 3
+# Below this stddev/|mean| ratio the earnings are treated as flat (inverse-CV → meaningless ~∞). ~1e-9
+# is far above float64 rounding noise on the largest plausible net-income magnitudes (so an
+# equal-but-fractional series reads as flat) yet far below any genuine year-to-year earnings spread.
+_FLAT_EARNINGS_REL_TOL = 1e-9
 
 
 def _as_of_date(as_of_ms: int) -> date:
@@ -153,8 +157,15 @@ def earnings_stability(store, cik: int, as_of_ms: int) -> float | None:
     where the population form is the natural one). Returns ``None`` when:
       * fewer than ``_EARNINGS_STABILITY_MIN_PERIODS`` (3) annual points are knowable as-of — too few
         to characterise dispersion honestly; or
-      * the stddev is zero (perfectly flat earnings) — the inverse-CV would be a division by zero
-        (∞), which is meaningless as a "stability" score; None is the fail-closed value (the factor
+      * the earnings are EFFECTIVELY FLAT — the stddev is negligible relative to the scale of the
+        series (``stddev <= |mean| * _FLAT_EARNINGS_REL_TOL``), so the inverse-CV would be a near-∞
+        outlier with no economic meaning. A bare ``stddev == 0`` check is NOT enough: a name reporting
+        equal-but-FRACTIONAL net income (e.g. a converted-currency ADR at 7_777_777_777.77 every
+        year) yields a float64 mean that rounds, so each ``(v - mean)`` is ~1e-6 not exactly 0 and the
+        ratio explodes to ~1e15 — a fabricated "ultra-stable" score. The relative tolerance catches
+        the float-rounding flat case while leaving a genuinely low-but-real-variance name (real
+        dispersion ≫ rounding) to score normally; the cross-sectional factor layer winsorizes the
+        legitimate tail, so no magnitude CLAMP belongs here. None is the fail-closed value (the factor
         NaN-excludes it, never a fabricated number).
 
     Uses ONLY annual points ≤ as_of (the store's `knowledge_ts` filter guarantees no look-ahead), so
@@ -171,7 +182,11 @@ def earnings_stability(store, cik: int, as_of_ms: int) -> float | None:
     mean = sum(values) / n
     variance = sum((v - mean) ** 2 for v in values) / n  # population (ddof = 0)
     stddev = math.sqrt(variance)
-    if stddev == 0:
+    # Effectively-flat guard (relative tolerance, not bare `== 0`): negligible dispersion vs the
+    # series scale → the inverse-CV is a meaningless ~∞ outlier (the float-rounding case above). For an
+    # all-zero series (mean == 0) the bound is `stddev <= 0`, i.e. exact-flat only — correct, since a
+    # zero-mean series with any real spread has a legitimate (small) ratio.
+    if stddev <= abs(mean) * _FLAT_EARNINGS_REL_TOL:
         return None
     return mean / stddev
 
@@ -255,7 +270,12 @@ def pit_line_items(
 # A defensive sanity check that every metric this layer assembles is a real `LINE_ITEMS` member (so a
 # typo in FLOW_METRICS/INSTANT_METRICS that didn't match a `METRICS` key would still be caught here as
 # "not in the contract vocabulary"). `earnings_stability` is the contract-layer-computed leg; the
-# enriched market_cap_gbp/dividend_yield are added by the API. Run at import — a drift fails loudly.
-assert set(FLOW_METRICS) | set(INSTANT_METRICS) | {"earnings_stability"} <= set(LINE_ITEMS), (
-    "contract assembles a key outside LINE_ITEMS"
-)
+# enriched market_cap_gbp/dividend_yield are added by the API. Run at import — a drift fails loudly. A
+# real `raise` (not an `assert`) so the guard survives `python -O` / PYTHONOPTIMIZE, which strips
+# asserts: a mis-spelled line-item must never reach the byte-for-byte seam consumers under optimized
+# bytecode.
+_assembled = set(FLOW_METRICS) | set(INSTANT_METRICS) | {"earnings_stability"}
+if not _assembled <= set(LINE_ITEMS):
+    raise ValueError(
+        f"contract assembles keys outside LINE_ITEMS: {sorted(_assembled - set(LINE_ITEMS))}"
+    )
