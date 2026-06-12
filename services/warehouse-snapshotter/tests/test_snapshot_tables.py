@@ -1,13 +1,17 @@
-"""Snapshotter TABLES specs — the warehouse must snapshot the three PIT-fundamentals hypertables
-with the correct time columns so a warehouse-source backtest can read true point-in-time fundamentals
-(PIT-fundamentals epic Task 15).
+"""Snapshotter TABLES specs — after the PIT-fundamentals lake re-architecture (epic Task 12), the
+warehouse must NOT snapshot the fundamentals hypertables: the PIT lake (per-CIK Parquet, owned by the
+fundamentals-harvester) is the single PIT fundamentals store, and backtest replay reads it directly
+via quant_core.fundamentals.lake.replay.LakePitFundamentals. The `bars` snapshot is UNCHANGED — the
+backtest still reads daily bars from the warehouse (the price panel + the market-cap price leg).
 
 Deps-clean: conftest stubs psycopg/pyarrow, so importing `src.snapshot` here exercises only the pure
-`TABLES`/`TableSpec` metadata — no Timescale, no Parquet. The time columns are reconciled against
-0009_fundamentals.sql: `fundamentals` + `fundamentals_revisions_log` key on `observation_ts` (= fiscal
-period_end), `fundamentals_raw_facts` on `period_end`; all three are BIGINT-ms.
+`TABLES`/`TableSpec` metadata — no Timescale, no Parquet.
 """
 from src.snapshot import TABLES, TableSpec
+
+
+def _names() -> set[str]:
+    return {t.name for t in TABLES}
 
 
 def _spec(name: str) -> TableSpec:
@@ -16,32 +20,36 @@ def _spec(name: str) -> TableSpec:
     return matches[0]
 
 
-def test_fundamentals_tables_present_with_correct_time_columns():
-    """The three 0009_fundamentals.sql hypertables are snapshotted with their actual BIGINT-ms time
-    columns — `fundamentals`/`fundamentals_revisions_log` on observation_ts, raw facts on period_end."""
-    fundamentals = _spec("fundamentals")
-    assert fundamentals.time_column == "observation_ts"
-    assert fundamentals.time_is_bigint is True
-
-    revisions = _spec("fundamentals_revisions_log")
-    assert revisions.time_column == "observation_ts"
-    assert revisions.time_is_bigint is True
-
-    raw = _spec("fundamentals_raw_facts")
-    assert raw.time_column == "period_end"   # the raw zone's hypertable time dimension (0009)
-    assert raw.time_is_bigint is True
+def test_fundamentals_tables_are_not_snapshotted():
+    """The three 0009_fundamentals.sql hypertables are GONE from TABLES — the PIT lake is the single
+    fundamentals store backtest replay reads directly; nothing reads a fundamentals snapshot now."""
+    names = _names()
+    assert "fundamentals" not in names
+    assert "fundamentals_revisions_log" not in names
+    assert "fundamentals_raw_facts" not in names
+    # Defensive: no fundamentals-prefixed table sneaks back in.
+    assert not any(n.startswith("fundamentals") for n in names)
 
 
-def test_all_three_fundamentals_tables_registered():
-    """All three (not a subset) are in TABLES — a partial registration would silently truncate the
-    warehouse's fundamentals coverage."""
-    names = {t.name for t in TABLES}
-    assert {"fundamentals", "fundamentals_revisions_log", "fundamentals_raw_facts"} <= names
-
-
-def test_existing_bar_specs_unchanged():
-    """Regression guard: the bars specs Task 15 sits beside are untouched (bigint observation_ts)."""
+def test_bars_snapshot_is_unchanged():
+    """Regression guard: the `bars` snapshot the backtest's price panel + market-cap price leg depend
+    on is untouched (bigint observation_ts) — only the fundamentals branch was dropped."""
     bars = _spec("bars")
     assert bars.time_column == "observation_ts" and bars.time_is_bigint is True
     bar_rev = _spec("bar_revisions_log")
     assert bar_rev.time_column == "observation_ts" and bar_rev.time_is_bigint is True
+
+
+def test_audit_ledgers_still_snapshotted():
+    """The append-only audit/ops ledgers remain in TABLES (the fundamentals drop is surgical — it does
+    not touch any other table)."""
+    names = _names()
+    for table in (
+        "audit_log",
+        "data_quality_events",
+        "strategy_health_log",
+        "risk_rejections",
+        "fills_history",
+        "reconciliation_log",
+    ):
+        assert table in names
