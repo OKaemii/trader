@@ -1,8 +1,8 @@
 // Per-symbol Research Fundamentals tab data path (research-trading-os Task 27):
 //   GET /admin/api/market-data/fundamentals/:ticker  → stored QMJ line items + ratios + market cap
-//   (peek; no provider walk) PLUS best-effort Yahoo analyst estimates (additive — may trail, §H).
-// Plus the YahooAnalystEstimates extractor over a realistic quoteSummary shape (the parsing is the
-// risk surface, and it must degrade to null on any error rather than break the stored-line-item read).
+//   (peek; no provider walk) PLUS analyst estimates (currently the stubbed null placeholder —
+//   decision I, the Yahoo source was dropped). The analyst block is additive: a null must leave the
+//   stored line items rendering. Plus the StubAnalystEstimates placeholder (always null).
 
 process.env.JWT_SECRET = 'test-jwt-secret-min-16-chars';
 import { describe, it, expect, vi } from 'vitest';
@@ -17,12 +17,11 @@ vi.mock('@trader/shared-mongo', () => ({
 const { Hono } = await import('hono');
 const { signAccessToken } = await import('@trader/shared-auth');
 const { createFundamentalsRouter } = await import('../modules/fundamentals/routes.ts');
-const { YahooAnalystEstimates } = await import('../modules/fundamentals/infrastructure/YahooAnalystEstimates.ts');
+const { StubAnalystEstimates } = await import('../modules/fundamentals/infrastructure/StubAnalystEstimates.ts');
 import type { FundamentalsCache, FundamentalsDoc } from '../modules/fundamentals/application/FundamentalsCache.ts';
 import type { UniverseManager } from '../modules/universe/application/UniverseManager.ts';
 import type { FundamentalsRefreshScheduler } from '../modules/fundamentals/application/FundamentalsRefreshScheduler.ts';
 import type { AnalystEstimatesFetcher } from '../modules/fundamentals/routes.ts';
-import type { QuoteSummaryFetcher } from '../modules/bars/infrastructure/providers/yahoo-quote-summary.ts';
 
 const adminToken = async () => `Bearer ${await signAccessToken({ sub: 'admin-user', role: 'admin' })}`;
 
@@ -105,7 +104,10 @@ describe('GET /admin/api/market-data/fundamentals/:ticker', () => {
     expect(peek).not.toHaveBeenCalled();
   });
 
-  it('attaches best-effort analyst estimates and survives a fetcher that throws', async () => {
+  // The fetcher seam is preserved for a later PIT re-wire: a populated fetcher folds its estimates
+  // in, and a fetcher that throws degrades the analyst block to null without failing the read of the
+  // stored line items.
+  it('folds in a populated fetcher and survives a fetcher that throws', async () => {
     const good: AnalystEstimatesFetcher = {
       fetch: async () => ({
         priceTargetLow: 150, priceTargetMean: 200, priceTargetHigh: 250, numberOfAnalysts: 30,
@@ -118,7 +120,7 @@ describe('GET /admin/api/market-data/fundamentals/:ticker', () => {
     });
     expect((await okRes.json()).analyst.priceTargetMean).toBe(200);
 
-    const throwing: AnalystEstimatesFetcher = { fetch: async () => { throw new Error('yahoo down'); } };
+    const throwing: AnalystEstimatesFetcher = { fetch: async () => { throw new Error('provider down'); } };
     const res = await buildApp({ analyst: throwing }).request('/admin/api/market-data/fundamentals/AAPL_US_EQ', {
       headers: { Authorization: await adminToken() },
     });
@@ -129,83 +131,27 @@ describe('GET /admin/api/market-data/fundamentals/:ticker', () => {
   });
 });
 
-// ── YahooAnalystEstimates extractor ─────────────────────────────────────────────────────────────
-const QS_RESULT = {
-  financialData: {
-    targetLowPrice: { raw: 150.0 },
-    targetMeanPrice: { raw: 200.5 },
-    targetHighPrice: { raw: 260.0 },
-    numberOfAnalystOpinions: { raw: 32 },
-    recommendationMean: { raw: 1.9 },
-    recommendationKey: 'buy',
-  },
-  recommendationTrend: {
-    trend: [
-      { period: '0m', strongBuy: { raw: 10 }, buy: { raw: 12 }, hold: { raw: 6 }, sell: { raw: 2 }, strongSell: { raw: 0 } },
-      { period: '-1m', strongBuy: { raw: 9 }, buy: { raw: 11 }, hold: { raw: 7 }, sell: { raw: 2 }, strongSell: { raw: 1 } },
-    ],
-  },
-  earningsTrend: {
-    trend: [
-      { period: '0q', earningsEstimate: { growth: { raw: 0.05 } }, revenueEstimate: { growth: { raw: 0.03 } } },
-      { period: '0y', earningsEstimate: { growth: { raw: 0.10 } }, revenueEstimate: { growth: { raw: 0.07 } } },
-      { period: '+1y', earningsEstimate: { growth: { raw: 0.12 } }, revenueEstimate: { growth: { raw: 0.08 } } },
-    ],
-  },
-};
-
-class StubFetcher implements QuoteSummaryFetcher {
-  constructor(private readonly result: Record<string, unknown> | null) {}
-  async fetchModules(): Promise<Record<string, unknown> | null> { return this.result; }
-}
-
-describe('YahooAnalystEstimates extractor', () => {
-  it('parses price target, recommendation, and forward growth (current/next year only)', async () => {
-    const est = await new YahooAnalystEstimates(new StubFetcher(QS_RESULT)).fetch('AAPL_US_EQ');
-    expect(est).not.toBeNull();
-    expect(est!.priceTargetLow).toBe(150.0);
-    expect(est!.priceTargetMean).toBe(200.5);
-    expect(est!.priceTargetHigh).toBe(260.0);
-    expect(est!.numberOfAnalysts).toBe(32);
-    expect(est!.recommendationMean).toBe(1.9);
-    expect(est!.recommendationKey).toBe('buy');
-    // latest-period histogram only
-    expect(est!.recommendation).toEqual({ strongBuy: 10, buy: 12, hold: 6, sell: 2, strongSell: 0 });
-    // quarterly '0q' row dropped; only the annual forward rows survive
-    expect(est!.earningsGrowth).toEqual([{ period: '0y', growth: 0.10 }, { period: '+1y', growth: 0.12 }]);
-    expect(est!.revenueGrowth).toEqual([{ period: '0y', growth: 0.07 }, { period: '+1y', growth: 0.08 }]);
+// ── StubAnalystEstimates (placeholder) ──────────────────────────────────────────────────────────
+// Analyst estimates are not yet available from a PIT source (decision I); the stub always returns
+// null, which the route folds into the payload as `analyst: null` and the portal renders as a
+// "PIT-sourced — coming soon" placeholder. The interface survives for a later PIT-backed provider.
+describe('StubAnalystEstimates (placeholder)', () => {
+  it('always returns null (estimates not yet available) for any ticker', async () => {
+    const est = new StubAnalystEstimates();
+    expect(await est.fetch('AAPL_US_EQ')).toBeNull();
+    expect(await est.fetch('SHELl_EQ')).toBeNull();
+    expect(await est.fetch('ANYTHING')).toBeNull();
   });
 
-  it('returns null on a 404 (no result) without throwing', async () => {
-    const est = await new YahooAnalystEstimates(new StubFetcher(null)).fetch('AAPL_US_EQ');
-    expect(est).toBeNull();
-  });
-
-  it('returns null (not a throw) when the fetcher errors', async () => {
-    const thrower: QuoteSummaryFetcher = { fetchModules: async () => { throw new Error('session reset'); } };
-    const est = await new YahooAnalystEstimates(thrower).fetch('AAPL_US_EQ');
-    expect(est).toBeNull();
-  });
-
-  it('serves a successful result from the TTL cache (one upstream call across repeated fetches)', async () => {
-    let calls = 0;
-    const counting: QuoteSummaryFetcher = { fetchModules: async () => { calls++; return QS_RESULT; } };
-    const est = new YahooAnalystEstimates(counting);
-    const a = await est.fetch('AAPL_US_EQ');
-    const b = await est.fetch('AAPL_US_EQ');
-    expect(calls).toBe(1); // second fetch hit the cache
-    expect(b).toEqual(a);
-  });
-
-  it('does NOT cache a transient error — the next render retries', async () => {
-    let calls = 0;
-    const flaky: QuoteSummaryFetcher = {
-      fetchModules: async () => { calls++; if (calls === 1) throw new Error('session reset'); return QS_RESULT; },
-    };
-    const est = new YahooAnalystEstimates(flaky);
-    expect(await est.fetch('AAPL_US_EQ')).toBeNull(); // first call errors → null, not cached
-    const recovered = await est.fetch('AAPL_US_EQ'); // second call retries upstream and succeeds
-    expect(calls).toBe(2);
-    expect(recovered?.priceTargetMean).toBe(200.5);
+  it('satisfies the AnalystEstimatesFetcher seam (drops into the route unchanged)', async () => {
+    const fetcher: AnalystEstimatesFetcher = new StubAnalystEstimates();
+    const res = await buildApp({ analyst: fetcher }).request('/admin/api/market-data/fundamentals/AAPL_US_EQ', {
+      headers: { Authorization: await adminToken() },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // stored line items still render; the analyst block is the null placeholder
+    expect(body.raw.netIncome).toBe(100);
+    expect(body.analyst).toBeNull();
   });
 });

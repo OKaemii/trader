@@ -8,12 +8,13 @@ import { parseAdminHeaders, parseInternalHeaders } from '@trader/shared-auth/mid
 import type { FundamentalsCache } from './application/FundamentalsCache.ts';
 import type { FundamentalsRefreshScheduler } from './application/FundamentalsRefreshScheduler.ts';
 import type { UniverseManager } from '../universe/application/UniverseManager.ts';
-import type { YahooAnalystEstimates, AnalystEstimates } from './infrastructure/YahooAnalystEstimates.ts';
+import type { StubAnalystEstimates, AnalystEstimates } from './infrastructure/StubAnalystEstimates.ts';
 
-// Best-effort analyst-estimates fetcher seam. The Research Fundamentals tab's analyst panel is
-// additive (§E/§H) — display-only, may trail — so the dependency is optional: when it isn't wired
-// (e.g. a future provider swap), the per-ticker endpoint simply omits the `analyst` block rather
-// than failing the whole read of the stored QMJ line items.
+// Analyst-estimates fetcher seam. The Research Fundamentals tab's analyst panel is display-only and
+// optional: when the fetcher returns `null` (the current placeholder — the Yahoo source was dropped
+// per epic pit-fundamentals-lake-rearchitecture decision I, with no PIT source wired yet), the
+// per-ticker endpoint simply omits the `analyst` block rather than failing the read of the stored
+// QMJ line items. The interface is kept so a later PIT-backed provider drops in unchanged.
 export interface AnalystEstimatesFetcher {
   fetch(ticker: string): Promise<AnalystEstimates | null>;
 }
@@ -22,7 +23,7 @@ export function createFundamentalsRouter(
   cache: FundamentalsCache,
   universe: UniverseManager,
   refresher: FundamentalsRefreshScheduler,
-  analyst?: AnalystEstimatesFetcher | YahooAnalystEstimates,
+  analyst?: AnalystEstimatesFetcher | StubAnalystEstimates,
 ): Hono {
   const r = new Hono();
 
@@ -61,12 +62,12 @@ export function createFundamentalsRouter(
   });
 
   // Admin: the stored company_fundamentals (QMJ line items + ratios + market cap) for ONE ticker,
-  // plus best-effort Yahoo analyst estimates — the per-symbol Research Fundamentals tab. Registered
-  // AFTER the `coverage`/`refresh` literal paths so neither is captured by the `:ticker` param, and
-  // it additionally rejects those reserved words for defence in depth. `peek` reads the cached row
-  // only (no synchronous provider walk) — a missing row returns nulls (the tab shows "not yet
-  // fetched"), never a fabricated 0. The analyst block is additive: a Yahoo-session blip leaves it
-  // null and the stored line items still render.
+  // plus analyst estimates (currently a stubbed null placeholder — decision I) — the per-symbol
+  // Research Fundamentals tab. Registered AFTER the `coverage`/`refresh` literal paths so neither is
+  // captured by the `:ticker` param, and it additionally rejects those reserved words for defence in
+  // depth. `peek` reads the cached row only (no synchronous provider walk) — a missing row returns
+  // nulls (the tab shows "not yet fetched"), never a fabricated 0. The analyst block is additive: a
+  // null leaves the stored line items rendering and the tab shows the analyst placeholder.
   r.get('/admin/api/market-data/fundamentals/:ticker', parseAdminHeaders, async (c) => {
     const ticker = (c.req.param('ticker') ?? '').trim();
     if (!ticker || ticker === 'coverage' || ticker === 'refresh') {
@@ -83,7 +84,7 @@ export function createFundamentalsRouter(
       marketCapGbp: doc?.marketCapGbp ?? null,
       asOf:         doc?.asOf ?? null,
       source:       doc?.source ?? null,
-      analyst:      estimates,                  // null = Yahoo estimates unavailable (additive, §H)
+      analyst:      estimates,                  // null = estimates not yet available (placeholder, decision I)
     });
   });
 

@@ -1,17 +1,21 @@
-// Earnings composition root. Yahoo `calendarEvents` (free) is the only implemented provider today;
-// EODHD's earnings calendar is a future paid path, so `eodhd` logs and falls back to Yahoo rather
-// than failing — mirrors how the EODHD fundamentals provider stays dormant.
+// Earnings composition root. The Yahoo `calendarEvents` source was dropped (epic
+// pit-fundamentals-lake-rearchitecture, Thread C / decision I); no PIT-backed earnings-date source
+// is wired yet, so the store is fed a stubbed provider that returns no dates — the overlap-detector
+// degrades to a clean no-op. The `providerName` arg is retained (env-driven) for a later re-wire,
+// but every value currently resolves to the stub. EODHD's earnings calendar remains a future paid
+// path (not entitled).
 
 import { EarningsStore } from './application/EarningsStore.ts';
-import { YahooEarningsProvider } from './infrastructure/YahooEarningsProvider.ts';
+import { StubEarningsProvider } from './infrastructure/StubEarningsProvider.ts';
 import { log } from '../../logger.ts';
 
 export function buildEarningsStore(
     providerName: 'yahoo' | 'eodhd',
-    opts: { requestSpacingMs?: number } = {},
+    _opts: { requestSpacingMs?: number } = {},
 ): EarningsStore {
-    if (providerName === 'eodhd') {
-        log.warn('[earnings] EODHD earnings calendar not implemented; using Yahoo calendarEvents');
+    if (providerName !== 'yahoo') {
+        log.warn(`[earnings] provider '${providerName}' not implemented; using the no-op stub`);
     }
-    return new EarningsStore(new YahooEarningsProvider(undefined, opts.requestSpacingMs), 'yahoo');
+    // 'stub' source stamp; the stub never returns a date, so no doc is ever written with it.
+    return new EarningsStore(new StubEarningsProvider(), 'stub');
 }
