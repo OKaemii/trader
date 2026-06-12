@@ -2,13 +2,17 @@
 force-sweep trigger, AND (in the deployed pod) the host process for the bootstrap+sweep write loop.
 
 The harvester's real work is the bootstrap-then-loop in `src/main.py` (the lake's single writer). In the
-deployed Deployment (replicas:1) that loop runs as a BACKGROUND asyncio task started by this app on
+deployed Deployment (replicas:1) that loop runs on a DEDICATED BACKGROUND THREAD started by this app on
 startup — gated on `HARVESTER_RUN_LOOP`, which the Helm chart sets — so `uvicorn app:app` is the one
-entrypoint that both owns the lake RW mount AND serves this status API. The status routes themselves read
-the lake's on-disk state (`status.py`) + the per-CIK fact recency (`freshness.py`) — both pure over the
-lake `Path`, so the read surface has no database and (apart from the loop + the force-sweep trigger) never
-constructs the EDGAR client. With `HARVESTER_RUN_LOOP` unset (the TestClient suite), this module is a thin
-read-only status shell — the loop is not launched and no EDGAR client / network is touched on import.
+entrypoint that both owns the lake RW mount AND serves this status API. The loop runs on its OWN thread
+(not uvicorn's event loop) precisely so the bootstrap's CPU-bound synchronous Parquet writes never starve
+the `/health` handler — otherwise a long normalize burst would block the serving loop, the liveness probe
+would time out, and the kubelet would kill the pod mid-bootstrap (losing all progress). The status routes
+themselves read the lake's on-disk state (`status.py`) + the per-CIK fact recency (`freshness.py`) — both
+pure over the lake `Path`, so the read surface has no database and (apart from the loop + the force-sweep
+trigger) never constructs the EDGAR client. With `HARVESTER_RUN_LOOP` unset (the TestClient suite), this
+module is a thin read-only status shell — the loop is not launched and no EDGAR client / network is
+touched on import.
 
 Routes — all under the `/admin/api/fundamentals-ingest` ingress prefix the portal already fans out to (no
 new ingress; the bare `/health` is aliased under the prefix because nginx-ingress routes by prefix only):
@@ -32,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -107,47 +112,56 @@ async def _json_error_handler(_request, exc: Exception) -> JSONResponse:
 # --------------------------------------------------------------------------- #
 # The deployed harvester is a SINGLE Deployment (replicas:1 — the lake's single writer) that must do two
 # jobs at once: (1) own the lake RW mount and run the bootstrap-then-sweep write loop (`src/main.py`), and
-# (2) serve this thin status API the portal Operations panel reads. Rather than two containers fighting
-# over the RWO lake mount, the loop runs as a BACKGROUND asyncio task on this app's startup, on the same
-# event loop the API serves from — so `uvicorn app:app` is the one entrypoint and `/health` answers
-# immediately (the long, hours-deep bulk bootstrap proceeds in the background, never blocking the probe).
+# (2) serve this thin status API the portal Operations panel reads.
 #
-# Gated on `HARVESTER_RUN_LOOP` (the chart sets it; tests never do) so importing this module for the
-# TestClient status-surface suite does NOT launch the write loop or construct the EDGAR client (which
-# fails closed without a real EDGAR_USER_AGENT and would hit the network). `main` is imported lazily
-# inside the hook for the same reason — module import stays network-free.
-_loop_task: Optional[asyncio.Task] = None
+# The loop runs in a DEDICATED BACKGROUND OS THREAD with its OWN asyncio event loop — NOT as a task on
+# uvicorn's serving loop. This is load-bearing: the bulk bootstrap's normalize step does CPU-bound,
+# SYNCHRONOUS pyarrow Parquet writes per CIK (write_company_facts), which would block a shared event loop
+# for long stretches and starve the `/health` handler — the kubelet's liveness probe then times out and
+# kills the pod mid-bootstrap, losing all progress (the sentinel is written only after a FULL pass) →
+# an indefinite crash-loop that never completes. Running the loop on a separate thread keeps uvicorn's
+# HTTP loop free, so `/health` always answers instantly regardless of how busy the harvest is.
+#
+# The thread is a daemon (it must not block process shutdown) and is started once. Gated on
+# `HARVESTER_RUN_LOOP` (the chart sets it; tests never do) so importing this module for the TestClient
+# status-surface suite does NOT launch the write loop or construct the EDGAR client (which fails closed
+# without a real EDGAR_USER_AGENT and would hit the network). `main` is imported lazily inside the thread
+# target for the same reason — module import stays network-free.
+_loop_thread: Optional[threading.Thread] = None
 
 
 def _run_loop_enabled() -> bool:
     return os.environ.get("HARVESTER_RUN_LOOP", "").strip().lower() in {"1", "true", "yes"}
 
 
-@app.on_event("startup")
-async def _start_harvest_loop() -> None:
-    """Launch the bootstrap+sweep write loop as a background task on the serving event loop.
+def _harvest_loop_thread() -> None:
+    """Thread target: run the bootstrap+sweep loop on this thread's own event loop.
 
-    Only when `HARVESTER_RUN_LOOP` is set — the single-writer Deployment. A bootstrap/sweep crash inside
-    `main.main()` is logged by the loop's own per-sweep guard and the task keeps running; an unexpected
-    fatal that ends the task is logged here via the done-callback (the pod's restart then re-runs an
-    unfinished bootstrap, which is crash-safe via the sentinel)."""
-    global _loop_task
+    `main.main()` already owns the bootstrap-unless-sentinel + the infinite per-sweep loop with its own
+    per-iteration error guard, so a transient sweep failure never ends it. An unexpected fatal that
+    escapes `main()` is logged here; the loop ending leaves the status API serving (the pod stays up so
+    the failure is observable via logs/status, rather than crash-looping) until the next deploy/restart,
+    which re-runs an unfinished bootstrap (crash-safe via the sentinel)."""
+    import main as harvester_main  # lazy: no EDGAR client / network at module import
+
+    try:
+        asyncio.run(harvester_main.main())
+    except Exception:  # noqa: BLE001 — surface a fatal in logs; do NOT take the HTTP server down with it
+        log.exception("harvest loop exited unexpectedly — status API stays up; restart resumes bootstrap")
+
+
+@app.on_event("startup")
+def _start_harvest_loop() -> None:
+    """Launch the harvest loop on a dedicated daemon thread (single-writer Deployment, HARVESTER_RUN_LOOP
+    set). A sync hook is fine — it only spawns the thread and returns immediately, so uvicorn startup is
+    not blocked by the bootstrap."""
+    global _loop_thread
     if not _run_loop_enabled():
         log.info("harvest loop disabled (HARVESTER_RUN_LOOP unset) — status surface only")
         return
-    import main as harvester_main  # lazy: no EDGAR client / network at module import
-
-    log.info("starting harvest loop (bootstrap-then-sweep) as a background task")
-    _loop_task = asyncio.create_task(harvester_main.main())
-
-    def _on_done(task: asyncio.Task) -> None:
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is not None:
-            log.error("harvest loop exited with %s — pod restart will resume", type(exc).__name__, exc_info=exc)
-
-    _loop_task.add_done_callback(_on_done)
+    log.info("starting harvest loop (bootstrap-then-sweep) on a dedicated background thread")
+    _loop_thread = threading.Thread(target=_harvest_loop_thread, name="harvest-loop", daemon=True)
+    _loop_thread.start()
 
 
 def _now_ms() -> int:

@@ -85,12 +85,17 @@ spec:
               # for the container scratch only — the lake itself is the PV, not ephemeral.
               memory: "2Gi"
               ephemeral-storage: "512Mi"
-          # The status surface (`/health`) answers immediately — the harvest loop is backgrounded,
-          # so liveness is decoupled from the bootstrap. The startupProbe is the belt-and-suspenders
-          # the long bootstrap warrants: it gates the livenessProbe until the app is serving, with a
-          # generous failureThreshold so even a slow image-pull + uvicorn boot never trips a restart
-          # while the bulk download runs. 30 × 10s = up to 5 min for the app to start serving (the
-          # download/normalize themselves are background, not part of startup).
+          # `/health` answers immediately because the harvest loop runs on a DEDICATED THREAD (src/app.py)
+          # — not uvicorn's event loop — so the bootstrap's CPU-bound Parquet writes never starve the probe
+          # handler. The probes below are still deliberately TOLERANT as defense-in-depth: an early version
+          # ran the loop on the serving event loop, the normalize burst blocked it, and the liveness probe
+          # timed out (5s) → the kubelet killed the pod mid-bootstrap → it re-downloaded the 1.3GB zip and
+          # re-normalized from zero (the sentinel is written only after a FULL pass) → indefinite
+          # crash-loop. The thread fix is the real cure; these widened windows ensure a transient GC pause
+          # or I/O stall can never reproduce that kill. startupProbe (30 × 10s = up to 5 min) gates liveness
+          # until uvicorn is serving; liveness then tolerates ~6 min of sustained unresponsiveness
+          # (12 × 30s) at a 10s timeout before a restart; readiness uses a 5s timeout (the default 1s
+          # flapped under load).
           startupProbe:
             httpGet:
               path: /health
@@ -102,14 +107,15 @@ spec:
               path: /health
               port: 8012
             periodSeconds: 30
-            timeoutSeconds: 5
-            failureThreshold: 6
+            timeoutSeconds: 10
+            failureThreshold: 12
           readinessProbe:
             httpGet:
               path: /health
               port: 8012
             initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 5
       volumes:
         - name: fundamentals-lake
           persistentVolumeClaim:
