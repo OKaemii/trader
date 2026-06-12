@@ -89,7 +89,8 @@ function SourceTag({ label }: { label: string }) {
 // Honest provenance label for the QMJ line-item groups, derived from the per-name `source` the
 // market-data cache stamped (NOT hardcoded — a US name now resolves to the PIT SEC-EDGAR warehouse,
 // not Yahoo). `pit-edgar` → PIT; `yahoo*` → Yahoo; `ai-estimate` (Yahoo analyst-derived QMJ fallback)
-// → "Yahoo · est"; absent → "—". The Growth group is genuinely Yahoo analyst estimates regardless.
+// → "Yahoo · est"; absent → "—". (The growth/analyst section is a placeholder — see
+// GrowthAnalystPlaceholder — and is not tagged by this label.)
 function qmjSourceLabel(source: string | null | undefined): string {
   if (!source) return '—'
   const s = source.toLowerCase()
