@@ -1,18 +1,20 @@
 import { authedFetch } from '@/app/lib/auth-fetch'
 import { trailing12mDividend, sortDividendsDesc } from '@/app/lib/dividends'
+import { GrowthAnalystPlaceholder } from '@/components/GrowthAnalystPlaceholder'
 
 // Fundamentals tab — per-symbol company financials (research-trading-os Task 27, plan §E/§H).
 //
 // DATA SOURCES (all clearly marked in the UI, per §H — EODHD Fundamentals is NOT entitled):
-//   • company_fundamentals (Yahoo, monthly-TTL CURRENT SNAPSHOT) — the QMJ line items + ratios +
-//     market cap, via /admin/api/market-data/fundamentals/:ticker (peek; no provider walk here).
-//     Grouped Valuation / Profitability / Balance Sheet. There is NO deep historical fundamentals
-//     source, so these are a point-in-time snapshot, never a backfillable history.
+//   • company_fundamentals (monthly-TTL CURRENT SNAPSHOT) — the QMJ line items + ratios + market
+//     cap, via /admin/api/market-data/fundamentals/:ticker (peek; no provider walk here). Grouped
+//     Valuation / Profitability / Balance Sheet, each tagged with the per-name provenance (PIT
+//     SEC-EDGAR for covered US names). There is NO deep historical fundamentals source, so these are
+//     a point-in-time snapshot, never a backfillable history.
 //   • Corporate-actions Dividends (EODHD, point-in-time) — trailing-12m dividend-per-share + the
 //     full dividend history, via /admin/api/market-data/corporate-actions?ticker= (Task 14).
-//   • Analyst estimates (Yahoo quoteSummary, additive — MAY TRAIL) — best-effort price target,
-//     recommendation, and forward EPS/revenue growth, folded into the fundamentals/:ticker payload.
-//     Null when Yahoo's session is unavailable; the rest of the tab still renders.
+//   • Growth + analyst estimates — RETIRED Yahoo source (epic pit-fundamentals-lake-rearchitecture,
+//     decision I). Rendered as a "PIT-sourced — coming soon" placeholder until a point-in-time
+//     source is wired; no stale third-party data.
 //
 // PROP CONTRACT: async server component taking exactly `{ symbol }` (see OverviewTab) — the
 // in-universe ticker (e.g. 'AAPL_US_EQ'). page.tsx guarantees a non-empty symbol before mounting.
@@ -30,30 +32,8 @@ interface QmjRatios {
   debtToEquity: number
   currentRatio: number
 }
-interface RecommendationHistogram {
-  strongBuy: number
-  buy: number
-  hold: number
-  sell: number
-  strongSell: number
-}
-interface GrowthEstimate {
-  period: string
-  growth: number | null
-}
-// Mirror of the market-data-service YahooAnalystEstimates shape (display-only, never imported
-// cross-service per the portal AGENTS.md "no service-internal types in the portal" rule).
-interface AnalystEstimates {
-  priceTargetLow: number | null
-  priceTargetMean: number | null
-  priceTargetHigh: number | null
-  numberOfAnalysts: number | null
-  recommendationMean: number | null
-  recommendationKey: string | null
-  recommendation: RecommendationHistogram | null
-  earningsGrowth: GrowthEstimate[]
-  revenueGrowth: GrowthEstimate[]
-}
+// The `analyst` block is still present on the wire (the route returns `analyst: null` from the
+// stubbed provider — decision I), but it is no longer rendered, so the tab does not model its shape.
 interface FundamentalsResponse {
   ticker: string
   raw: FundamentalsRaw | null
@@ -62,7 +42,6 @@ interface FundamentalsResponse {
   marketCapGbp: number | null
   asOf: number | null
   source: string | null
-  analyst: AnalystEstimates | null
 }
 // From /admin/api/market-data/corporate-actions (Task 14 release notes).
 interface StoredDividend {
@@ -154,7 +133,6 @@ export async function FundamentalsTab({ symbol }: { symbol: string }) {
 
   const raw = fund?.raw ?? null
   const ratios = fund?.ratios ?? null
-  const analyst = fund?.analyst ?? null
   const dividends = sortDividendsDesc(actions?.dividends ?? [])
   // `asOf` (the store's sync time) anchors the trailing-12m window; the helper defaults to "now"
   // when it's null, keeping the impure clock-read out of this render path.
@@ -168,10 +146,10 @@ export async function FundamentalsTab({ symbol }: { symbol: string }) {
     <div className="space-y-4">
       <div className="rounded border border-amber-900/40 bg-amber-950/20 p-3 text-xs text-amber-200/80">
         Company financials are a <span className="font-medium">current QMJ snapshot</span> (monthly
-        TTL) — the per-group tag shows the provenance (PIT SEC-EDGAR for covered US names, Yahoo
-        otherwise). EODHD Fundamentals is not entitled, so there is no deep historical fundamentals series.
-        Dividend history is point-in-time from the EODHD Dividends feed. Analyst estimates are
-        best-effort Yahoo and may trail.
+        TTL) — the per-group tag shows the provenance (PIT SEC-EDGAR for covered US names). EODHD
+        Fundamentals is not entitled, so there is no deep historical fundamentals series. Dividend
+        history is point-in-time from the EODHD Dividends feed. Forward growth and analyst estimates
+        are not yet available (the Yahoo source has been retired; a point-in-time source comes later).
         {fund?.asOf ? (
           <span className="ml-1 text-amber-200/60">
             Fundamentals snapshot {new Date(fund.asOf).toLocaleDateString('en-GB')}.
@@ -215,52 +193,7 @@ export async function FundamentalsTab({ symbol }: { symbol: string }) {
         </>
       )}
 
-      <Group title="Growth (forward estimates)" source="Yahoo · est">
-        {analyst && (analyst.earningsGrowth.length > 0 || analyst.revenueGrowth.length > 0) ? (
-          <>
-            {analyst.earningsGrowth.map((g) => (
-              <Stat key={`eps-${g.period}`} label={`EPS growth (${g.period})`} value={pct(g.growth)} />
-            ))}
-            {analyst.revenueGrowth.map((g) => (
-              <Stat key={`rev-${g.period}`} label={`Revenue growth (${g.period})`} value={pct(g.growth)} />
-            ))}
-          </>
-        ) : (
-          <p className="col-span-full text-xs text-gray-600">No forward growth estimates available.</p>
-        )}
-      </Group>
-
-      <Group title="Analyst estimates" source="Yahoo · may trail">
-        {analyst ? (
-          <>
-            <Stat
-              label="Price target (mean)"
-              value={num(analyst.priceTargetMean)}
-              hint={
-                analyst.priceTargetLow != null && analyst.priceTargetHigh != null
-                  ? `low ${num(analyst.priceTargetLow)} · high ${num(analyst.priceTargetHigh)}`
-                  : undefined
-              }
-            />
-            <Stat
-              label="Recommendation"
-              value={analyst.recommendationKey ? analyst.recommendationKey.replace(/_/g, ' ') : DASH}
-              hint={analyst.recommendationMean != null ? `mean ${ratio(analyst.recommendationMean)} (1=buy, 5=sell)` : undefined}
-            />
-            <Stat label="Covering analysts" value={num(analyst.numberOfAnalysts, 0)} />
-            {analyst.recommendation ? (
-              <Stat
-                label="Ratings"
-                value={`${analyst.recommendation.strongBuy + analyst.recommendation.buy} buy · ${analyst.recommendation.hold} hold · ${analyst.recommendation.sell + analyst.recommendation.strongSell} sell`}
-              />
-            ) : null}
-          </>
-        ) : (
-          <p className="col-span-full text-xs text-gray-600">
-            Analyst estimates unavailable (Yahoo quoteSummary did not return data).
-          </p>
-        )}
-      </Group>
+      <GrowthAnalystPlaceholder />
 
       <div className="rounded border border-gray-800 bg-gray-900/40 p-4">
         <h3 className="flex items-center text-xs font-semibold uppercase tracking-wide text-gray-300">
