@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { earningsOverlap } from '../modules/earnings/application/overlap.ts';
-import { extractEarningsInfo } from '../modules/earnings/infrastructure/YahooEarningsProvider.ts';
+import { StubEarningsProvider } from '../modules/earnings/infrastructure/StubEarningsProvider.ts';
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -32,23 +32,24 @@ describe('earningsOverlap', () => {
     });
 });
 
-describe('extractEarningsInfo (Yahoo calendarEvents)', () => {
-    it('converts raw unix seconds to UTC ms for earnings + dividend', () => {
-        const sec = 1781000000;
-        const ce = { earnings: { earningsDate: [{ raw: sec, fmt: '2026-06-09' }] }, dividendDate: { raw: sec + 100, fmt: 'x' } };
-        const info = extractEarningsInfo(ce);
-        expect(info.nextEarningsDate).toBe(sec * 1000);
-        expect(info.dividendDate).toBe((sec + 100) * 1000);
+// The earnings source is stubbed (decision I — Yahoo dropped, no PIT source wired yet). The stub
+// returns no dates, so the overlap-detector degrades to a clean no-op: every ticker comes back
+// within:false (never a false flag, never a false "no earnings soon").
+describe('StubEarningsProvider (no-op placeholder)', () => {
+    const now = Date.UTC(2026, 5, 1);
+
+    it('returns an empty map for any tickers (no dates available)', async () => {
+        const provider = new StubEarningsProvider();
+        expect(await provider.fetch(['AAPL_US_EQ', 'MSFT_US_EQ', 'SHELl_EQ'])).toEqual({});
+        expect(await provider.fetch([])).toEqual({});
     });
 
-    it('returns empty info when calendarEvents is missing or has no dates', () => {
-        expect(extractEarningsInfo(undefined)).toEqual({});
-        expect(extractEarningsInfo({})).toEqual({});
-        expect(extractEarningsInfo({ earnings: {} })).toEqual({});
-    });
-
-    it('accepts a bare-number earningsDate', () => {
-        expect(extractEarningsInfo({ earnings: { earningsDate: [1781000000] } }).nextEarningsDate)
-            .toBe(1781000000 * 1000);
+    it('feeding the stub output into the overlap-detector flags nothing', async () => {
+        const provider = new StubEarningsProvider();
+        const tickers = ['AAPL_US_EQ', 'MSFT_US_EQ'];
+        const byTicker = await provider.fetch(tickers);
+        const out = earningsOverlap(tickers, byTicker, now, 10);
+        expect(out.every((o) => o.within === false)).toBe(true);
+        expect(out.every((o) => o.nextEarningsDate === null && o.daysUntil === null)).toBe(true);
     });
 });

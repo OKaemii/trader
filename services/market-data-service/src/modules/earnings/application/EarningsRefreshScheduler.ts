@@ -1,15 +1,17 @@
 // EarningsRefreshScheduler — keeps earnings_calendar populated off the request path, mirroring the
 // fundamentals refresher. The store's weekly TTL gates real work, so the loop just re-checks
-// staleness on a daily idle, accreting partial progress and backing off past Yahoo's cooldown
-// when a pass makes no progress. market-data-service is replicas:1, so an in-process guard is
-// enough. triggerNow() wakes it (the admin "Refresh" button).
+// staleness on a daily idle, accreting partial progress and backing off on the retry interval when
+// a pass makes no progress. market-data-service is replicas:1, so an in-process guard is enough.
+// triggerNow() wakes it (the admin "Refresh" button). With the current stubbed provider (decision
+// I) no dates are returned, so every pass makes no progress and the loop simply idles on retryMs —
+// harmless until a PIT-backed earnings source is wired.
 
 import type { EarningsStore } from './EarningsStore.ts';
 import { log } from '../../../logger.ts';
 
 export interface EarningsRefreshSchedulerOpts {
     idleMs?: number;       // re-check staleness when coverage is complete (default 24h)
-    retryMs?: number;      // sleep after a no-progress pass; keep > Yahoo's session cooldown (default 20min)
+    retryMs?: number;      // sleep after a no-progress pass (default 20min)
     progressMs?: number;   // sleep after a partial-progress pass (default 1min)
 }
 

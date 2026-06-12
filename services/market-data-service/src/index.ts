@@ -35,8 +35,7 @@ import { runEodhdDailyFeed } from './modules/bars/infrastructure/eodhd-daily-fee
 import { buildFundamentalsCache } from './modules/fundamentals/wiring.ts';
 import { FundamentalsRefreshScheduler } from './modules/fundamentals/application/FundamentalsRefreshScheduler.ts';
 import { createFundamentalsRouter } from './modules/fundamentals/routes.ts';
-import { YahooAnalystEstimates } from './modules/fundamentals/infrastructure/YahooAnalystEstimates.ts';
-import { YahooQuoteSummary } from './modules/bars/infrastructure/providers/yahoo-quote-summary.ts';
+import { StubAnalystEstimates } from './modules/fundamentals/infrastructure/StubAnalystEstimates.ts';
 import { buildEarningsStore } from './modules/earnings/wiring.ts';
 import { EarningsRefreshScheduler } from './modules/earnings/application/EarningsRefreshScheduler.ts';
 import { createEarningsRouter } from './modules/earnings/routes.ts';
@@ -766,15 +765,18 @@ const fundamentalsRefresher = new FundamentalsRefreshScheduler(
     progressMs: env.FUNDAMENTALS_REFRESH_PROGRESS_MS,
   },
 );
-// Best-effort analyst estimates for the per-symbol Research Fundamentals tab (additive/may-trail,
-// §H) — its own quoteSummary session so a session reset here never disturbs the QMJ provider's.
-const analystEstimates = new YahooAnalystEstimates(new YahooQuoteSummary());
+// Analyst estimates for the per-symbol Research Fundamentals tab — stubbed (decision I): the Yahoo
+// source was dropped and no PIT-backed analyst source is wired yet, so this returns null per ticker
+// and the tab renders the "PIT-sourced — coming soon" placeholder. The fetcher seam survives for a
+// later PIT re-wire.
+const analystEstimates = new StubAnalystEstimates();
 app.route('/', createFundamentalsRouter(fundamentalsCache, universeManager, fundamentalsRefresher, analystEstimates));
 app.route('/', createScannerRouter(universeManager, fundamentalsCache));
 
-// Earnings/dividend calendar — earnings_calendar store (Yahoo calendarEvents, weekly refresh) +
-// the upcoming/overlap admin routes backing the portal /calendar page and the dashboard
-// "holding reports within 10 days" red flag. Refresher started in bootstrap() with the universe.
+// Earnings/dividend calendar — earnings_calendar store (stubbed no-op provider per decision I; the
+// Yahoo source was dropped and no PIT source is wired yet) + the upcoming/overlap admin routes
+// backing the portal /calendar page and the dashboard "holding reports within 10 days" red flag.
+// With the stub the store stays empty, so overlap reports no flags. Refresher started in bootstrap().
 const earningsStore = buildEarningsStore(env.EARNINGS_PROVIDER, { requestSpacingMs: env.EARNINGS_REQUEST_SPACING_MS });
 const earningsRefresher = new EarningsRefreshScheduler(
   earningsStore,
