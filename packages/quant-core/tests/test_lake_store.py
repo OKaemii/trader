@@ -233,6 +233,34 @@ def test_as_of_between_prints_excludes_the_restatement(lake: Path) -> None:
     assert rows[0]["value"] == 400.0
 
 
+def test_pit_series_accepts_date_cutoff_as_whole_day(lake: Path) -> None:
+    """A bare `date` cutoff is normalized to the END of that UTC day (not midnight), so it admits a
+    fact knowable at any point that day — and never silently mis-filters against the int64
+    knowledge_ts column. RESTATE_KTS is 2024-08-12 14:30 UTC; an as-of `date(2024, 8, 12)` must see
+    the restated 402 (the whole day is in range), while `date(2024, 8, 11)` must not."""
+    s = Store(lake)
+    same_day = s.pit_series(CIK_ACME, "us-gaap", "Revenues", "USD", date(2024, 8, 12), instant=False)
+    assert [r["value"] for r in same_day] == [402.0]
+    day_before = s.pit_series(CIK_ACME, "us-gaap", "Revenues", "USD", date(2024, 8, 11), instant=False)
+    assert [r["value"] for r in day_before] == [400.0]  # restatement not yet knowable that day
+
+
+def test_pit_series_accepts_datetime_cutoff(lake: Path) -> None:
+    """A timezone-aware `datetime` cutoff is normalized to its exact UTC ms — one minute before the
+    restatement's knowledge instant still returns the first print."""
+    s = Store(lake)
+    just_before = datetime(2024, 8, 12, 14, 29, tzinfo=timezone.utc)
+    rows = s.pit_series(CIK_ACME, "us-gaap", "Revenues", "USD", just_before, instant=False)
+    assert [r["value"] for r in rows] == [400.0]
+
+
+def test_pit_series_rejects_bool_cutoff(lake: Path) -> None:
+    """A bool is an int subclass; reject it so `pit_series(..., True)` can't silently mean epoch 1."""
+    s = Store(lake)
+    with pytest.raises(TypeError):
+        s.pit_series(CIK_ACME, "us-gaap", "Revenues", "USD", True, instant=False)
+
+
 def test_instant_fact_partitions_on_end_only(lake: Path) -> None:
     """An instant (balance-sheet) query partitions on `end` alone (the fact has no `start`) and still
     PIT-filters; the Assets=1500 instant resolves at/after its knowledge instant."""
@@ -274,6 +302,22 @@ def test_resolve_old_symbol_today_falls_back_to_most_recent_era(lake: Path) -> N
     legacy_today = s.resolve("OLDT", "US", date(2026, 6, 12))
     assert legacy_today is not None
     assert legacy_today["cik"] == CIK_ACME
+
+
+def test_resolve_before_first_listing_returns_none(lake: Path) -> None:
+    """A symbol queried at a date BEFORE it was ever listed returns None — the fallback is
+    FORWARD-ONLY. NEWT first listed 2023-06-01; resolving it in 2010 must not leak a CIK backward in
+    time (the look-ahead the unbounded prototype fallback would have introduced)."""
+    s = Store(lake)
+    assert s.resolve("NEWT", "US", date(2010, 1, 1)) is None
+    # OLDT first listed 2020-01-01 — a 2015 as-of predates even the old symbol → None.
+    assert s.resolve("OLDT", "US", date(2015, 1, 1)) is None
+
+
+def test_resolve_at_first_listing_boundary_resolves(lake: Path) -> None:
+    """At exactly the first valid_from the symbol IS knowable (valid_from <= as_of is inclusive)."""
+    s = Store(lake)
+    assert s.resolve("OLDT", "US", date(2020, 1, 1))["cik"] == CIK_ACME
 
 
 def test_resolve_is_case_insensitive(lake: Path) -> None:

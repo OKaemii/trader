@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import json
 import threading
-from datetime import date
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 
 import duckdb
@@ -49,6 +49,31 @@ from quant_core.ticker_identity import Market
 # (LSE/foreign) identity has no EDGAR presence and `resolve` returns None for it — the contract layer
 # (Task 6) turns that into a fail-closed `{}` (no Yahoo fallback, per Thread C).
 _EDGAR_MARKET: Market = "US"
+
+
+def _as_of_ms(as_of: int | date) -> int:
+    """Normalize a knowledge cutoff to the UTC-ms epoch the `knowledge_ts` column stores.
+
+    The hot path passes an `int` (already epoch-ms) — returned unchanged, zero cost. The axis-agnostic
+    `metric_series` types its cutoff as `AsOf = int | date` (so a fixture / the future contract layer
+    may hand a `date`/`datetime`), and `knowledge_ts` is int64-ms — so binding a bare `date` into
+    `knowledge_ts <= ?` would compare a date to a bigint and silently mis-filter every row. Convert
+    instead: a `datetime` → its exact UTC ms; a `date` → the END of that calendar day in UTC
+    (23:59:59.999), so "as of 2024-03-01" admits any fact knowable at any point THAT day (a date is a
+    whole-day cutoff, not midnight). `bool` is rejected (a `bool` is an `int` subclass — guard against
+    `pit_series(..., True)` silently meaning epoch 1). Keeps the store honest regardless of caller axis.
+    """
+    if isinstance(as_of, bool):  # bool is a subclass of int — reject before the int branch
+        raise TypeError(f"as_of must be epoch-ms int or a date, not bool: {as_of!r}")
+    if isinstance(as_of, int):
+        return as_of
+    if isinstance(as_of, datetime):
+        dt = as_of if as_of.tzinfo is not None else as_of.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    if isinstance(as_of, date):
+        eod = datetime.combine(as_of, time(23, 59, 59, 999_000), tzinfo=timezone.utc)
+        return int(eod.timestamp() * 1000)
+    raise TypeError(f"as_of must be epoch-ms int or a date, not {type(as_of).__name__}: {as_of!r}")
 
 
 def _cik_facts_path(lake: Path, cik: int) -> Path:
@@ -88,11 +113,17 @@ class Store:
         across a ticker change.
 
         Only `market == 'US'` resolves to an EDGAR CIK; a non-US listing returns None (no SEC
-        presence). Rename handling mirrors the prototype: prefer the listing whose `[valid_from,
-        valid_to)` window contains `as_of`; failing that (e.g. asking for the OLD symbol *today*,
-        like `FB` now → its window closed at the rename) fall back to that symbol's most recent era.
-        Because the CIK is stable across a rename (FB and META both → CIK 1326801), the old symbol at
-        an old date and the new symbol today both resolve to the same entity.
+        presence). Rename handling: prefer the listing whose `[valid_from, valid_to)` window contains
+        `as_of`; failing that, fall back to the most recent listing that had ALREADY STARTED by
+        `as_of` (e.g. asking for the OLD symbol *today*, like `FB` now → its window closed at the
+        rename, so resolve forward to its successor's CIK). Because the CIK is stable across a rename
+        (FB and META both → CIK 1326801), the old symbol at an old date and the new symbol today both
+        resolve to the same entity.
+
+        The fallback is FORWARD-ONLY (`valid_from <= as_of`): a symbol queried at a date BEFORE it was
+        ever listed returns None, never a CIK. Without that floor the fallback would resolve a symbol
+        backward to a date it did not yet trade under — a look-ahead leak in the identity layer (the
+        prototype omitted it; it is intended only for the resolve-a-retired-symbol-forward case).
 
         A cold lake (no `ticker_history.parquet`) or an unknown symbol → None (degrade, never crash).
         """
@@ -104,24 +135,18 @@ class Store:
         sym = (symbol or "").strip().upper()
         if not sym:
             return None
-        path = str(hist)
-        # As-of read: the listing whose validity window contains `as_of` (valid_to NULL = still live).
+        # One scan, forward-only: among this symbol's listings that had started by `as_of`
+        # (`valid_from <= as_of`), prefer one whose window still CONTAINS `as_of` (`valid_to` open or
+        # in the future) — the boolean sorts those listings first (DESC: True before False) — then the
+        # most recent `valid_from`. So an in-window listing wins; otherwise the latest era already
+        # begun at `as_of` (the FB-today fallback); and a pre-listing `as_of` matches nothing → None.
         rows = self._rows(
             """SELECT cik FROM read_parquet(?)
                WHERE ticker = ? AND valid_from <= ?
-                 AND (valid_to IS NULL OR valid_to > ?)
-               ORDER BY valid_from DESC LIMIT 1""",
-            [path, sym, as_of, as_of],
+               ORDER BY (valid_to IS NULL OR valid_to > ?) DESC, valid_from DESC
+               LIMIT 1""",
+            [str(hist), sym, as_of, as_of],
         )
-        if not rows:
-            # Fallback: asking for an old symbol today (its window closed at the rename) → its most
-            # recent era. Resolves `FB` now to CIK 1326801 (which is also META's), so a legacy symbol
-            # never dead-ends.
-            rows = self._rows(
-                """SELECT cik FROM read_parquet(?) WHERE ticker = ?
-                   ORDER BY valid_from DESC LIMIT 1""",
-                [path, sym],
-            )
         if not rows:
             return None
         cik = rows[0]["cik"]
@@ -162,9 +187,14 @@ class Store:
     # The point-in-time query                                            #
     # ------------------------------------------------------------------ #
     def pit_series(self, cik: int, taxonomy: str, concept: str, unit: str,
-                   as_of_ms: int, instant: bool) -> list[dict]:
+                   as_of_ms: int | date, instant: bool) -> list[dict]:
         """The PIT read for one standardized concept: the latest-known value per fiscal period at the
         `as_of_ms` knowledge cutoff.
+
+        `as_of_ms` is normally an epoch-ms `int`; a `date`/`datetime` is also accepted (the
+        axis-agnostic `metric_series` types its cutoff `int | date`) and normalized to UTC ms by
+        `_as_of_ms` — a date is treated as a whole-day (end-of-day UTC) cutoff — so a bare date never
+        silently mis-filters against the int64 `knowledge_ts` column.
 
         Targets the single `facts/cik=<cik>.parquet` file (no glob) and returns `[]` when it is absent
         (cold lake / unknown CIK). `knowledge_ts <= as_of_ms` admits only rows knowable at the cutoff;
@@ -194,13 +224,13 @@ class Store:
             WHERE rn = 1
             ORDER BY "end"
             """,
-            [str(path), taxonomy, concept, unit, as_of_ms],
+            [str(path), taxonomy, concept, unit, _as_of_ms(as_of_ms)],
         )
 
     def facts(self, cik: int, taxonomy: str, concept: str, unit: str,
-              as_of_ms: int, instant: bool) -> list[dict]:
+              as_of_ms: int | date, instant: bool) -> list[dict]:
         """Raw-concept escape hatch for the `/facts` route: any XBRL concept, PIT-filtered exactly as
         `pit_series` (no standardization / tag-fallback). A thin alias so the read-API has a named,
         intent-revealing entry point distinct from the standardized-metric path; both honour the same
-        per-CIK targeting + `knowledge_ts` cutoff."""
+        per-CIK targeting + `knowledge_ts` cutoff (and the same `int | date` cutoff normalization)."""
         return self.pit_series(cik, taxonomy, concept, unit, as_of_ms, instant)
