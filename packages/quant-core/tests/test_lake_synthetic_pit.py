@@ -165,8 +165,11 @@ def _fact(
 
 def _quarter(cik: int, concept: str, start: str, end: str, value: float, accepted_ts: int,
              filed: str, fp: str) -> dict:
+    # Accession is the FULL concept + period so it is unique across concepts — the store's
+    # `ORDER BY knowledge_ts DESC, accession DESC` tiebreaker is then never asked to disambiguate two
+    # economically-different facts that happen to share a 3-char prefix (Assets vs AssetsCurrent).
     return _fact(cik=cik, concept=concept, value=value, start=start, end=end,
-                 accepted_ts=accepted_ts, filed=filed, accession=f"{concept[:3]}-{fp}",
+                 accepted_ts=accepted_ts, filed=filed, accession=f"{concept}-{fp}",
                  form="10-Q", fp=fp)
 
 
@@ -178,8 +181,9 @@ def _annual(cik: int, concept: str, fy: int, value: float, accepted_ts: int, fil
 
 def _instant(cik: int, concept: str, end: str, value: float, accepted_ts: int, filed: str,
              *, taxonomy: str = "us-gaap", unit: str = "USD") -> dict:
+    # Full concept in the accession (unique per concept) — see `_quarter`.
     return _fact(cik=cik, concept=concept, value=value, start=None, end=end, accepted_ts=accepted_ts,
-                 filed=filed, accession=f"{concept[:3]}-inst", form="10-K", taxonomy=taxonomy, unit=unit)
+                 filed=filed, accession=f"{concept}-inst", form="10-K", taxonomy=taxonomy, unit=unit)
 
 
 def _write_facts(lake: Path, cik: int, rows: list[dict]) -> None:
@@ -386,12 +390,27 @@ def _fy2023_annual_value(rows: list[dict]) -> float | None:
 
 def test_after_hours_filing_not_knowable_same_day(lake: Path) -> None:
     """The 10-K is ACCEPTED 2024-02-15 (Thu) 23:00 UTC = 18:00 ET, AFTER the 16:00 ET close, so it is
-    NOT knowable that calendar day — an as-of on the acceptance day sees no FY2023 annual at all. This
-    is the after-hours look-ahead guard the PIT contract exists for, proved over the real
-    ``derive_knowledge_ts`` (no fact predates 2024-02-15, so the series is empty)."""
+    NOT knowable that calendar day — the FY2023 annual is hidden until the next session's open. This is
+    the after-hours look-ahead guard the PIT contract exists for.
+
+    The assertion is deliberately a DISCRIMINATING cutoff (not a coincidentally-empty series): the
+    three 2023 quarters were filed/knowable in May/Aug/Nov 2023, so just before the 10-K's derived
+    knowledge_ts (Fri 2024-02-16 open) the quarter rows are STILL VISIBLE while the FY-annual row is
+    absent. So the per-row ``knowledge_ts <= as_of`` filter is genuinely doing the work — hiding the
+    after-hours annual specifically, not blanking the whole series."""
     s = Store(lake)
-    same_day = metric_series(s, CIK_ACME, "total_revenue", "a", date(2024, 2, 15))["points"]
-    assert same_day == []  # the 10-K accepted after close is not knowable on its acceptance day
+    # As of one ms before the 10-K becomes knowable (its accept was after Thursday's close):
+    rows = s.pit_series(CIK_ACME, "us-gaap", "Revenues", "USD", KTS_10K - 1, instant=False)
+    # the FY2023 ANNUAL period is hidden...
+    assert _fy2023_annual_value(rows) is None
+    # ...while the three earlier-filed QUARTER periods remain visible (the cutoff discriminates per
+    # row by its own derived availability — it is not an empty-series tautology).
+    visible_periods = {(r["start"], r["end"]) for r in rows}
+    assert visible_periods == {
+        (date(2023, 1, 1), date(2023, 3, 31)),
+        (date(2023, 4, 1), date(2023, 6, 30)),
+        (date(2023, 7, 1), date(2023, 9, 30)),
+    }
 
 
 def test_after_hours_filing_knowable_next_session_open(lake: Path) -> None:
@@ -478,7 +497,16 @@ def test_contract_covered_us_name_yields_canonical_legs(lake: Path) -> None:
     assert li["total_debt"] == 250.0         # LongTermDebt, the select-fallback
     assert li["shares_outstanding"] == 50.0
     assert source == SOURCE_PIT_EDGAR
-    assert obs is not None and kts is not None
+    # observation_ts is the representative (net_income) leg's period_end — FY2023 ends 2023-12-31,
+    # stamped midnight-UTC ms (not merely "not None").
+    assert obs == int(datetime(2023, 12, 31, tzinfo=timezone.utc).timestamp() * 1000)
+    # knowledge_ts is the MAX availability across the chosen legs — and it is the RESTATEMENT's
+    # KTS_10KA (2024-08-12), NOT the first-print 10-K instant (KTS_10K, 2024-02-16): total_revenue
+    # resolves via the TTM whose derived Q4 carries knowledge_ts = max(its inputs), and that input is
+    # the restated 10-K/A. So the restatement's availability propagates all the way through the TTM
+    # leg into the bundle — the conservative, look-ahead-safe "whole bundle knowable" instant.
+    assert kts == KTS_10KA
+    assert kts > KTS_10K
 
 
 def test_contract_missing_leg_is_omitted_not_zero(tmp_path: Path) -> None:
