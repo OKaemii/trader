@@ -43,6 +43,8 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
+from quant_core.ticker_identity import Trading212TickerAdapter
+
 # Canonical snake_case line items — the single shared vocabulary between the ingestion-normalize
 # OUTPUT and the factor/QMJ INPUT. Ordered for readability (income, balance sheet, cash flow,
 # market). Both ends import THIS tuple rather than re-listing keys, so they cannot drift.
@@ -74,14 +76,49 @@ MARKET_US = "US"
 MARKET_UK = "UK"
 MARKET_OTHER = "OTHER"
 
+# The canonical suffix parser now lives in `quant_core.ticker_identity` (the Python twin of the TS
+# `Trading212TickerAdapter`). `market_of` becomes a thin shim over it so the suffix knowledge has
+# exactly one home, while EVERY existing caller keeps its byte-identical `'US'/'UK'/'OTHER'` value.
+# The adapter's `Market` vocabulary is `'US'|'LSE'`; the shim maps `'LSE'→'UK'` (the contract's
+# legacy jurisdiction label).
+_T212_ADAPTER = Trading212TickerAdapter()
 
-def market_of(ticker: str) -> str:
-    """Route a T212 ticker to its jurisdiction by suffix (the PIT source selector)."""
+# The adapter's tradable markets → this module's legacy jurisdiction labels. `'OTHER'` has no
+# adapter equivalent (the adapter rejects non-US/LSE) — it is produced by the shim's fallback.
+_ADAPTER_MARKET_TO_JURISDICTION: dict[str, str] = {
+    "US": MARKET_US,
+    "LSE": MARKET_UK,
+}
+
+
+def _legacy_market_of(ticker: str) -> str:
+    """The original raw-suffix classifier — the byte-identity contract `market_of` must preserve
+    for every caller. Pure `.endswith` on the untrimmed string; no symbol-presence or whitespace
+    handling (so `'_US_EQ'` → `'US'` and a space-padded ticker → `'OTHER'`, exactly as before)."""
     if ticker.endswith("_US_EQ"):
         return MARKET_US
     if ticker.endswith("l_EQ"):
         return MARKET_UK
     return MARKET_OTHER
+
+
+def market_of(ticker: str) -> str:
+    """Route a T212 ticker to its jurisdiction by suffix (the PIT source selector).
+
+    Shim that routes the suffix decision through `Trading212TickerAdapter.from_t212` — the single
+    canonical parser — so the broker-form knowledge has one home, while remaining byte-identical to
+    the legacy raw-suffix classifier for EVERY caller. The adapter is intentionally stricter and
+    normalises (it trims input and rejects malformed/suffix-only/non-tradable forms), so its verdict
+    is used ONLY when it agrees with the legacy classification; on any disagreement — a degenerate
+    `'_US_EQ'` (adapter rejects, legacy → `'US'`) or a space-padded ticker (adapter trims-then-
+    accepts, legacy → `'OTHER'`) — the legacy answer wins, so no caller observes a changed value.
+    """
+    legacy = _legacy_market_of(ticker)
+    try:
+        adapter_market = _ADAPTER_MARKET_TO_JURISDICTION[_T212_ADAPTER.from_t212(ticker).market]
+    except ValueError:
+        return legacy
+    return adapter_market if adapter_market == legacy else legacy
 
 
 @runtime_checkable
