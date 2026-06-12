@@ -46,9 +46,10 @@ _job_runner = None
 
 # ── MCPT job handler (load → run → summarize) ────────────────────────────────────────
 async def _load_validation_history(req: dict) -> dict:
-    """Event loop: prefetch adjusted daily for the universe + benchmark suite from Yahoo (research
-    path), resolve the portal grid override, and (optionally) the point-in-time constituent rows.
-    Returns a fully-picklable ctx for the off-loop validator."""
+    """Event loop: prefetch adjusted daily for the universe + benchmark suite from EODHD `/eod`
+    (the research price path — the same provider the live persisted daily series uses), resolve the
+    portal grid override, and (optionally) the point-in-time constituent rows. Returns a
+    fully-picklable ctx for the off-loop validator."""
     from quant_core.bars.reader import make_bars_reader
     from quant_core.universe import active_union
     from .infrastructure.strategy_config import resolve_search_grid
@@ -63,7 +64,7 @@ async def _load_validation_history(req: dict) -> dict:
     else:
         tickers = [t.strip() for t in (req.get('tickers') or DEFAULT_SP100) if t and t.strip()]
 
-    reader = make_bars_reader('yahoo_daily')
+    reader = make_bars_reader('eodhd_daily')
     await reader.prefetch(list(dict.fromkeys([*tickers, *benchmarks])), start, end)
     prices: dict[str, list] = {}
     for t in tickers:

@@ -277,7 +277,7 @@ class Validator:
 
         if constituents:
             # Point-in-time membership: rank only names in the index at instant t, intersected with
-            # the aligned (full-coverage) panel. Delisted names whose Yahoo history is too partial
+            # the aligned (full-coverage) panel. Delisted names whose EODHD history is too partial
             # already fell out of the panel — the free-data survivorship gap, stamped below.
             universe_spec = {'kind': 'pit', 'constituents': constituents}
             universe_kind = 'point_in_time_sp500'
@@ -287,7 +287,7 @@ class Validator:
         universe_at = _build_universe_at(universe_spec, panel_set)
 
         data_quality = (
-            f"yahoo_daily; universe={universe_kind}; panel {len(panel.tickers)}/{len(prices)} "
+            f"eodhd_daily; universe={universe_kind}; panel {len(panel.tickers)}/{len(prices)} "
             f"names full-coverage; "
             + ("delisted/partial-history names dropped (free-data survivorship gap; full coverage "
                "needs a paid feed)" if constituents else "current-membership ⇒ survivorship bias")
@@ -423,7 +423,7 @@ class Validator:
             strategy_id=strategy_id, objective_name=objective_name, engine='replay_mcpt',
             data_window_ms=[start_ms, end_ms], train_window_ms=[start_ms, train_ms],
             universe_size_at_run=len(panel.tickers),
-            data_source=data_source or 'yahoo_daily',
+            data_source=data_source or 'eodhd_daily',
             rebalance_days=rebalance_days,
             step1_in_sample_fit=asdict(step1), step2_in_sample_mcpt=asdict(step2),
             step3_walk_forward=asdict(step3), step4_walk_forward_mcpt=asdict(step4),
