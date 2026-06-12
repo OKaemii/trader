@@ -1,0 +1,5 @@
+apiVersion: v2
+name: fundamentals-harvester
+description: fundamentals-harvester microservice (PIT Fundamentals Parquet-lake write path + status API)
+type: application
+version: 0.1.0

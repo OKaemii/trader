@@ -1,0 +1,61 @@
+# PIT fundamentals Parquet-lake storage. hostPath-backed PV + PVC for the per-CIK
+# zstd-Parquet fact files the fundamentals-harvester writes and the read engines
+# (fundamentals-api, backtest-engine) read. See
+# agent-docs/plans/pit-fundamentals-lake-rearchitecture.md §Thread B.
+#
+# Single-node k3s assumption (mirrors warehouse-pv.yaml): the harvester Deployment
+# mounts this PVC RW (it is the lake's SINGLE writer — replicas:1), while
+# fundamentals-api + backtest-engine mount it RO. With hostPath the data lives at
+# /srv/fundamentals-lake on the cluster node — when the cluster grows beyond one
+# node, migrate this to a real PV (NFS, longhorn, etc.) or pin the writer + readers
+# to the lake node via nodeSelector / affinity.
+#
+# Persistence is LOAD-BEARING here (unlike the warehouse, which is rebuildable from
+# Timescale): the harvester's crash-safe resume keys on the `bootstrap_complete.json`
+# sentinel + the per-CIK files surviving a restart, and the writer uses tmpfile +
+# `os.replace` (POSIX-atomic) so a reader never sees a torn file across a refresh. An
+# emptyDir would be wiped on every pod restart and force a fresh multi-hour bulk
+# bootstrap each time — hence a real hostPath PV with `Retain`.
+#
+# Capacity: the SEC nightly companyfacts bulk zip is ~1.3 GB; normalized to per-CIK
+# Parquet the full ~15k-entity universe lands at ~2-4 GB, plus the cached bulk zip
+# (kept under <lake>/bulk/ for crash-resume) and headroom for sweeps/restatements.
+# 20 GiB comfortably fits all of that with room to grow.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: fundamentals-lake-pv
+  labels:
+    trader-storage: fundamentals-lake
+spec:
+  capacity:
+    storage: 20Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: /srv/fundamentals-lake
+    # DirectoryOrCreate lets the k3s kubelet create the directory on first mount if
+    # it doesn't exist yet — saves an out-of-band ssh + mkdir on a fresh node.
+    type: DirectoryOrCreate
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: fundamentals-lake-hostpath
+---
+# PVC the fundamentals-harvester (RW writer), fundamentals-api (RO), and
+# backtest-engine (RO) all reference by name. ReadWriteOnce is fine on single-node
+# k3s; every consumer lands on the same node and k3s handles serialised
+# attach/detach. The read-only-ness of the api/backtest mounts is enforced by the
+# `readOnly: true` volumeMount on those Deployments (k8s does not enforce
+# ReadOnlyMany without driver support — RO is the consumer's responsibility).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fundamentals-lake-pvc
+  namespace: {{ .Release.Namespace }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: fundamentals-lake-hostpath
+  volumeName: fundamentals-lake-pv

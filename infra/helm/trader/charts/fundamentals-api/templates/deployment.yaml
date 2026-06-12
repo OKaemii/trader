@@ -65,6 +65,19 @@ spec:
             # for the mint is already injected via the trader-secrets envFrom above.
             - name: MARKET_DATA_SERVICE_URL
               value: "http://market-data-service:3002"
+            # PIT fundamentals LAKE dir — where the lake-backed resolver (epic Task 10) reads per-CIK
+            # Parquet. ADDITIVE/forward-looking: the CURRENT Timescale-backed resolver ignores it, so the
+            # env + the RO mount below are harmless on today's image; they are in place so the Task-10
+            # lake rewrite reads the harvester's lake the moment it deploys (no second infra change).
+            - name: FUNDAMENTALS_LAKE_DIR
+              value: /srv/fundamentals-lake
+          # The PIT fundamentals lake (per-CIK Parquet written by fundamentals-harvester), READ-ONLY —
+          # fundamentals-api never writes the lake; the harvester is its sole writer. Harmless on the
+          # current Timescale-backed image (nothing reads it yet); load-bearing after Task 10.
+          volumeMounts:
+            - name: fundamentals-lake
+              mountPath: /srv/fundamentals-lake
+              readOnly: true
           resources:
             requests:
               cpu: "100m"
@@ -85,3 +98,7 @@ spec:
               port: 8011
             initialDelaySeconds: 10
             periodSeconds: 10
+      volumes:
+        - name: fundamentals-lake
+          persistentVolumeClaim:
+            claimName: fundamentals-lake-pvc

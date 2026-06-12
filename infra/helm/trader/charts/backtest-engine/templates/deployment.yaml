@@ -67,6 +67,13 @@ spec:
               value: {{ .Values.global.env.backtestMinParallel | default "16" | quote }}
             - name: BACKTEST_BLAS_THREADS
               value: {{ .Values.global.env.backtestBlasThreads | default "1" | quote }}
+            # PIT fundamentals LAKE dir — a `fundamentals_source=warehouse` backtest reads per-CIK
+            # Parquet from this path directly (src/main.py `_build_pit_fundamentals` → LakePitFundamentals
+            # over the lake Store), replacing the old fundamentals warehouse-snapshot branch. The code
+            # default already matches this; set here for explicitness alongside the RO mount below. A cold
+            # lake (pre-bootstrap) degrades to {} per name, never an error.
+            - name: FUNDAMENTALS_LAKE_DIR
+              value: /srv/fundamentals-lake
           # Mount the research warehouse PV so the DuckDB reader
           # (src/infrastructure/duckdb_reader.py) can open the Parquet snapshots
           # written daily by the warehouse-snapshot CronJob. Read-only by
@@ -74,6 +81,11 @@ spec:
           volumeMounts:
             - name: warehouse
               mountPath: /srv/warehouse
+              readOnly: true
+            # The PIT fundamentals lake (per-CIK Parquet written by fundamentals-harvester).
+            # Read-only — the backtest engine never writes the lake; the harvester is its sole writer.
+            - name: fundamentals-lake
+              mountPath: /srv/fundamentals-lake
               readOnly: true
           resources:
             requests:
@@ -99,3 +111,6 @@ spec:
         - name: warehouse
           persistentVolumeClaim:
             claimName: warehouse-pvc
+        - name: fundamentals-lake
+          persistentVolumeClaim:
+            claimName: fundamentals-lake-pvc

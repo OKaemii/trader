@@ -139,17 +139,23 @@ global:
     # the operator's deliberate, fully reversible opt-in once the Task-9 backfill has landed rows. The
     # live cycle NEVER breaks if fundamentals-api is down (the seam degrades to {} → Yahoo fallback).
     liveFundamentalsProvider: pit
-    # PIT Fundamentals Warehouse (fundamentals-ingestion write-side). SEC EDGAR mandates a descriptive
-    # User-Agent (with a contact) on every request — the EDGAR clients fail CLOSED without it (every
-    # fetch degrades to empty, so the ingest CronJob/backfill Job writes nothing and the Job exits 2).
-    # This is the ENV-layer default; the operator can override it LIVE from the portal (the
-    # `portal_fundamentals_config` singleton — precedence override > this env > built-in default) without
-    # a redeploy, so a contact change doesn't need a Helm cycle. Non-secret env, not a trader-secrets key.
-    edgarUserAgent: "trader-platform/1.0 (fahadhafiz1998@gmail.com)"
-    # SEC courtesy rate budget for the EDGAR fetches (requests/second, per source IP across BOTH the
-    # submissions and companyfacts clients via one shared limiter). 10/s is SEC's published limit; lower
-    # it to be a gentler citizen, never raise above 10 (earns a 403/IP-block). Used by the ingest run.
+    # SEC EDGAR descriptive User-Agent (with a contact). Shared by BOTH the legacy fundamentals-ingestion
+    # write-side AND the new fundamentals-harvester (the PIT Parquet-lake write path) — both EDGAR clients
+    # FAIL CLOSED without a real "@"-bearing contact (every fetch degrades to empty, so the harvester
+    # bootstrap writes nothing). The real operator contact below clears that guard. ENV-layer default;
+    # the ingestion path also lets the portal override it live (portal_fundamentals_config). Non-secret
+    # env, not a trader-secrets key.
+    edgarUserAgent: "trader-platform fahadhafiz1998@gmail.com"
+    # SEC courtesy rate budget for the EDGAR fetches (requests/second, per source IP across the shared
+    # limiter). 10/s is SEC's published limit; lower it to be a gentler citizen, never raise above 10
+    # (earns a 403/IP-block). Used by both the ingest run AND the harvester's bootstrap + sweeps.
     edgarReqsPerSec: "10"
+    # fundamentals-harvester incremental-sweep cadence (minutes). After the one-time EDGAR bulk bootstrap,
+    # the harvester loop parses the daily form index and refreshes only the CIKs that actually filed every
+    # `sweepMinutes`. 30 keeps the lake same-day-fresh without hammering EDGAR. (The lake PV size is fixed
+    # in templates/fundamentals-lake-pv.yaml — 20Gi for the ~1.3GB zip + 2-4GB parquet + headroom — not a
+    # values knob, since the hostPath PV capacity is a single-node storage decision, not a per-deploy tune.)
+    sweepMinutes: "30"
     # Ingestion CronJob schedule (nightly incremental) — UTC cron. 02:30 UTC lands well after the US
     # close + the warehouse-snapshot (23:30 UTC), so a day's filings have been accepted and the snapshot
     # isn't contended. The one-shot backfill Job is hook-gated separately (see the subchart).
