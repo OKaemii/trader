@@ -65,12 +65,22 @@ class FakeStore:
 
     def add(self, taxonomy: str, concept: str, end: str, value: float,
             filed: str, accession: str, form: str = "10-K",
-            unit: str = "USD", start: str | None = None) -> "FakeStore":
+            unit: str = "USD", start: str | None = None,
+            knowledge_ts: int | None = None) -> "FakeStore":
+        # `knowledge_ts` mirrors the real store's derived availability column (the real pit_series
+        # SELECTs it). Default it deterministically from `filed` (midnight-UTC of the filing date as
+        # UTC ms) so a row always carries one — the carry the derived Q4/TTM now propagates. A test
+        # that needs a specific availability passes it explicitly.
+        kts = knowledge_ts
+        if kts is None:
+            fd = _d(filed)
+            from datetime import datetime, timezone
+            kts = int(datetime(fd.year, fd.month, fd.day, tzinfo=timezone.utc).timestamp() * 1000)
         self.facts.append({
             "taxonomy": taxonomy, "concept": concept, "unit": unit,
             "start": _d(start) if start else None, "end": _d(end),
             "value": float(value), "filed": _d(filed),
-            "accession": accession, "form": form,
+            "accession": accession, "form": form, "knowledge_ts": kts,
         })
         return self
 
@@ -89,7 +99,8 @@ class FakeStore:
             by_period[partition_key(f)] = f  # later iteration (higher filed/accn) overwrites
         rows = [
             {"start": f["start"], "end": f["end"], "value": f["value"],
-             "filed": f["filed"], "accession": f["accession"], "form": f["form"]}
+             "filed": f["filed"], "accession": f["accession"], "form": f["form"],
+             "knowledge_ts": f["knowledge_ts"]}
             for f in by_period.values()
         ]
         return sorted(rows, key=lambda r: r["end"])
@@ -538,3 +549,62 @@ def test_free_cash_flow_omits_period_with_only_one_leg():
     s.add("us-gaap", "NetCashProvidedByUsedInOperatingActivities", "2023-12-31", 1000,
           "2024-02-15", "C1", "10-K", start="2023-01-01")
     assert metric_series(s, 1, "free_cash_flow", "a", AS_OF_NOW)["points"] == []
+
+
+# --------------------------------------------------------------------------------------------------- #
+# knowledge_ts carry on derived points (PIT provenance — a derived value is knowable only once ALL     #
+# its inputs were; the derived row must carry max(inputs.knowledge_ts), mirroring the `filed` carry)   #
+# --------------------------------------------------------------------------------------------------- #
+def _kts(s: str) -> int:
+    from datetime import datetime, timezone
+    d = _d(s)
+    return int(datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp() * 1000)
+
+
+def test_derived_q4_carries_max_input_knowledge_ts():
+    """The synthesized Q4 carries `knowledge_ts = max(inputs.knowledge_ts)` — so it never surfaces in
+    a knowledge-time re-filter before every input (Q1..Q3 + the FY) was knowable. Without this carry
+    the derived row had no knowledge_ts and a consumer maxing over it would under-report availability."""
+    s = FakeStore()
+    # Q1..Q3 knowable through 2023, the FY 10-K knowable 2024-02-15 (the latest input).
+    s.add("us-gaap", "NetIncomeLoss", "2023-03-31", 20, "2023-05-01", "Q1", "10-Q",
+          start="2023-01-01", knowledge_ts=_kts("2023-05-01"))
+    s.add("us-gaap", "NetIncomeLoss", "2023-06-30", 25, "2023-08-01", "Q2", "10-Q",
+          start="2023-04-01", knowledge_ts=_kts("2023-08-01"))
+    s.add("us-gaap", "NetIncomeLoss", "2023-09-30", 30, "2023-11-01", "Q3", "10-Q",
+          start="2023-07-01", knowledge_ts=_kts("2023-11-01"))
+    s.add("us-gaap", "NetIncomeLoss", "2023-12-31", 100, "2024-02-15", "FY", "10-K",
+          start="2023-01-01", knowledge_ts=_kts("2024-02-15"))
+    q = with_derived_q4(*split_periods(merged_series(s, 1, METRICS["net_income"], AS_OF_NOW)))
+    by_end = {r["end"].isoformat(): r for r in q}
+    derived_q4 = by_end["2023-12-31"]
+    assert derived_q4["derived"] is True
+    assert derived_q4["value"] == 100 - (20 + 25 + 30)
+    assert derived_q4["knowledge_ts"] == _kts("2024-02-15")   # the LATEST input's availability
+
+
+def test_ttm_carries_max_input_knowledge_ts():
+    """A TTM sum carries `knowledge_ts = max` over its four quarters — knowable only once the last
+    quarter was public."""
+    s = _quarters_2023(FakeStore(), "NetIncomeLoss", (10, 20, 30))
+    # add a real Q4 (2023) with the LATEST availability so the four-quarter window is complete.
+    s.add("us-gaap", "NetIncomeLoss", "2023-12-31", 40, "2024-02-01", "Q4", "10-Q",
+          start="2023-10-01", knowledge_ts=_kts("2024-02-01"))
+    rows = metric_series(s, 1, "net_income", "ttm", AS_OF_NOW)["points"]
+    ttm_pt = rows[-1]
+    assert ttm_pt["value"] == 10 + 20 + 30 + 40
+    assert ttm_pt["knowledge_ts"] == _kts("2024-02-01")       # the last quarter's availability
+
+
+def test_free_cash_flow_carries_max_leg_knowledge_ts():
+    """A two-leg derived value (FCF = cash_flow_ops - capex) carries the LATER leg's knowledge_ts, not
+    just the left leg's (the `{**p}` inherit would otherwise drop the right leg's availability)."""
+    s = FakeStore()
+    s.add("us-gaap", "NetCashProvidedByUsedInOperatingActivities", "2023-12-31", 1000,
+          "2024-02-15", "C1", "10-K", start="2023-01-01", knowledge_ts=_kts("2024-02-15"))
+    # capex restated LATER (2024-05-01) — the FCF can't be knowable before that.
+    s.add("us-gaap", "PaymentsToAcquirePropertyPlantAndEquipment", "2023-12-31", 250,
+          "2024-05-01", "C2", "10-K/A", start="2023-01-01", knowledge_ts=_kts("2024-05-01"))
+    pts = metric_series(s, 1, "free_cash_flow", "a", AS_OF_NOW)["points"]
+    assert pts[-1]["value"] == 750
+    assert pts[-1]["knowledge_ts"] == _kts("2024-05-01")      # the LATER (capex) leg's availability

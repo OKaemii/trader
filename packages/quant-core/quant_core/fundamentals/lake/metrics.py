@@ -298,12 +298,25 @@ def split_periods(rows: list[dict]) -> tuple[list[dict], list[dict]]:
     return quarters, annual
 
 
+def _max_knowledge_ts(rows: list[dict]) -> int | None:
+    """The latest `knowledge_ts` across a derived row's inputs — the availability carry that mirrors
+    `filed = max(inputs)`. Real (merged_series) rows always carry `knowledge_ts` (the store SELECTs
+    it), so a derived value's availability is the LATEST of its inputs': a derived Q4/TTM is knowable
+    only once EVERY input was knowable. Returns None only if NO input carried one (defensive — a
+    caller handing rows without the field), so a derived row never claims an earlier availability than
+    its inputs (the under-report that would let it surface too early in an as-of/knowledge re-filter)."""
+    kts = [r["knowledge_ts"] for r in rows if r.get("knowledge_ts") is not None]
+    return max(kts) if kts else None
+
+
 def with_derived_q4(quarters: list[dict], annual: list[dict],
                     additive: bool = True) -> list[dict]:
     """US filers don't file a standalone Q4 10-Q; derive Q4 = FY - (Q1+Q2+Q3). The derived row's
-    `filed` is the max of its inputs', so it only ever appears in an as-of view where EVERY input was
-    already public (the PIT-safety carry). Non-additive metrics (EPS, share counts) are NEVER derived
-    this way (`additive=False` short-circuits — you can't subtract per-share figures meaningfully)."""
+    `filed` AND `knowledge_ts` are the max of its inputs', so it only ever appears in an as-of/knowledge
+    view where EVERY input was already public (the PIT-safety carry — without the `knowledge_ts` carry a
+    consumer re-filtering on it would see the derived value as knowable too early). Non-additive metrics
+    (EPS, share counts) are NEVER derived this way (`additive=False` short-circuits — you can't subtract
+    per-share figures meaningfully)."""
     qs = {r["end"]: r for r in quarters}
     for fy in annual:
         if fy["end"] in qs or not additive:
@@ -320,6 +333,7 @@ def with_derived_q4(quarters: list[dict], annual: list[dict],
             "end": fy["end"],
             "value": fy["value"] - sum(q["value"] for q in inside),
             "filed": max([fy["filed"]] + [q["filed"] for q in inside]),
+            "knowledge_ts": _max_knowledge_ts([fy, *inside]),
             "accession": fy["accession"],
             "form": fy["form"],
             "taxonomy": fy["taxonomy"],
@@ -332,7 +346,9 @@ def with_derived_q4(quarters: list[dict], annual: list[dict],
 def ttm(quarters: list[dict]) -> list[dict]:
     """Trailing-twelve-month sums over four CONSECUTIVE quarters (≤120-day end-to-end gaps, so a
     missing quarter doesn't silently stitch a 6-month gap into a "TTM"). Each output carries the
-    latest input `filed` — PIT-safe like the derived Q4."""
+    latest input `filed` AND `knowledge_ts` — PIT-safe like the derived Q4 (a TTM is knowable only once
+    all four quarters were public; the `knowledge_ts` carry keeps a consumer re-filtering on it from
+    seeing the sum too early)."""
     out = []
     for i in range(3, len(quarters)):
         w = quarters[i - 3: i + 1]
@@ -344,6 +360,7 @@ def ttm(quarters: list[dict]) -> list[dict]:
             "end": w[-1]["end"],
             "value": sum(q["value"] for q in w),
             "filed": max(q["filed"] for q in w),
+            "knowledge_ts": _max_knowledge_ts(w),
             "accession": w[-1]["accession"],
             "form": w[-1]["form"],
             "taxonomy": w[-1]["taxonomy"],
@@ -375,6 +392,10 @@ def metric_series(store, cik: int, metric: str, freq: str, as_of: AsOf,
             points.append({**p,
                            "value": p["value"] - q["value"] if op == "-" else p["value"] + q["value"],
                            "filed": max(p["filed"], q["filed"]),
+                           # availability of a two-leg derived value is the LATER of the legs' — mirror
+                           # `filed`, so `{**p}` inheriting only the left leg's knowledge_ts can't make
+                           # the combined value appear knowable before the right leg was public.
+                           "knowledge_ts": _max_knowledge_ts([p, q]),
                            "concept": f"{p['concept']}{op}{q['concept']}",
                            "derived": True})
         return {"unit": a["unit"], "points": points}
