@@ -197,6 +197,65 @@ def test_dst_spring_forward_morning_accept() -> None:
     assert _utc_hhmm(result) == "13:30", "post-spring-forward 09:30 open must be 13:30 UTC (EDT)"
 
 
+# --- pre-2007 DST schedule: the US rule changed in 2007, EDGAR filings reach back to ~1994 ---------
+
+
+def test_pre_2007_spring_uses_april_not_march_dst_rule() -> None:
+    """Pre-2007 US DST started the 1st Sunday of APRIL (not the 2nd Sunday of March). In 1996 the
+    spring-forward was 1996-04-07, so a 1996-04-02 open is still EST (09:30 ET = 14:30 UTC) — NOT the
+    EDT 13:30 UTC the post-2007 rule would wrongly give. A pre-open accept that day resolves to that
+    day's open at the correct EST offset (proving no wrong-offset look-ahead in the disagreement week)."""
+    # Tue 1996-04-02 08:00 ET (EST under the pre-2007 April rule) = 13:00 UTC, before the open.
+    accept = _utc_ms(1996, 4, 2, 13, 0)
+    result = next_session_open_ms(accept)
+    _assert_open_on(result, date(1996, 4, 2))
+    assert _utc_hhmm(result) == "14:30", "pre-2007 early-April open must be EST 14:30 UTC, not EDT 13:30"
+
+
+def test_pre_2007_autumn_uses_october_not_november_dst_rule() -> None:
+    """Pre-2007 US DST ended the LAST Sunday of OCTOBER (not the 1st Sunday of November). In 1996 the
+    fall-back was 1996-10-27, so a 1996-10-30 open is already EST (14:30 UTC), NOT the EDT 13:30 UTC the
+    post-2007 rule would wrongly hold through early November."""
+    # Wed 1996-10-30 08:00 ET (EST under the pre-2007 October rule) = 13:00 UTC, before the open.
+    accept = _utc_ms(1996, 10, 30, 13, 0)
+    result = next_session_open_ms(accept)
+    _assert_open_on(result, date(1996, 10, 30))
+    assert _utc_hhmm(result) == "14:30", "pre-2007 late-October open must be EST 14:30 UTC, not EDT 13:30"
+
+
+def test_pre_2007_summer_is_edt() -> None:
+    """Inside the pre-2007 DST window (April-October) the offset is still EDT — a 1996-07-01 open is
+    13:30 UTC (UTC-4), confirming the year-branch didn't disable DST entirely for old years."""
+    # Mon 1996-07-01 08:00 ET (EDT) = 12:00 UTC.
+    accept = _utc_ms(1996, 7, 1, 12, 0)
+    result = next_session_open_ms(accept)
+    _assert_open_on(result, date(1996, 7, 1))
+    assert _utc_hhmm(result) == "13:30", "mid-summer 1996 open must be EDT 13:30 UTC"
+
+
+def test_pre_2007_bulk_filed_is_look_ahead_safe_in_disagreement_week() -> None:
+    """The unsafe-direction guard: on the bulk `filed` path, a fact filed in the pre-2007 spring
+    DST-disagreement week (late March / early April, where the post-2007 rule would wrongly read EDT)
+    must still resolve to a knowledge day STRICTLY AFTER `filed` and at the correct EST open. A
+    Wednesday 1996-04-03 filed → Thursday 1996-04-04 open at EST 14:30 UTC — never earlier, never the
+    filed day."""
+    result = derive_knowledge_ts(None, date(1996, 4, 3))  # Wed, still EST (spring-forward is 04-07)
+    _assert_open_on(result, date(1996, 4, 4))  # Thu
+    assert _et_of(result).date() > date(1996, 4, 3), "bulk filed must never resolve to the filed day"
+    assert _utc_hhmm(result) == "14:30", "pre-2007 early-April open must be EST 14:30 UTC"
+
+
+def test_post_2007_spring_uses_march_rule() -> None:
+    """The 2007+ branch: from 2007 the spring-forward moved to the 2nd Sunday of March. In 2026 that is
+    2026-03-08, so a 2026-03-10 open is EDT (13:30 UTC) — the post-2007 rule active for modern filings.
+    (Complements the pre-2007 tests so a future edit can't collapse the year-branch in either direction.)"""
+    # Tue 2026-03-10 06:00 ET (EDT) = 10:00 UTC, before the open.
+    accept = _utc_ms(2026, 3, 10, 10, 0)
+    result = next_session_open_ms(accept)
+    _assert_open_on(result, date(2026, 3, 10))
+    assert _utc_hhmm(result) == "13:30", "post-2007 mid-March open must be EDT 13:30 UTC"
+
+
 # --- bulk-bootstrap fallback: derive_knowledge_ts(None, filed) is look-ahead-safe -----------------
 
 
@@ -273,11 +332,16 @@ def test_saturday_new_year_is_not_shifted_to_friday() -> None:
 
 
 def test_juneteenth_absent_before_2022() -> None:
-    """Juneteenth became a market holiday only in 2022; a 2021 backfill must not close June 18/19."""
+    """Juneteenth became a market holiday only in 2022; a 2021 backfill must not close June 18/19. In
+    2022 the 19th is a SUNDAY, so the observed closure is Monday 06-20 ONLY — assert the Sunday is NOT
+    in the set and the Monday IS (a strict shape, not an `or`, so a regression that kept the Sunday or
+    closed BOTH days is caught)."""
     closures_2021 = _nyse_full_closures(2021)
     assert date(2021, 6, 18) not in closures_2021
     assert date(2021, 6, 19) not in closures_2021  # a Saturday anyway, but the rule must not add it
-    assert date(2022, 6, 19) in _nyse_full_closures(2022) or date(2022, 6, 20) in _nyse_full_closures(2022)
+    closures_2022 = _nyse_full_closures(2022)
+    assert date(2022, 6, 19) not in closures_2022  # the Sunday original must NOT be a closure
+    assert date(2022, 6, 20) in closures_2022      # only the observed Monday is
 
 
 # --- schema.py sanity (pyarrow = the [lake] extra; importorskip where absent) ---------------------
@@ -316,9 +380,7 @@ def test_schema_columns_names_types_and_order() -> None:
 def test_schema_knowledge_ts_is_the_read_axis_and_present() -> None:
     """`knowledge_ts` is the PIT read axis (the filter `knowledge_ts <= :as_of`) and must exist as a
     UTC-ms int64. `accepted_ts` is the nullable companion (the bulk path has none); both are int64
-    epoch-ms columns. (pyarrow's `Field.nullable` defaults True for schema-level fields, so the
-    NON-null intent is enforced by the writer/derivation, not the schema flag — asserted via the
-    `derive_knowledge_ts` look-ahead tests above; here we pin the column's presence + type.)"""
+    epoch-ms columns."""
     pytest.importorskip("pyarrow")
     import pyarrow as pa
 
@@ -326,3 +388,23 @@ def test_schema_knowledge_ts_is_the_read_axis_and_present() -> None:
 
     assert SCHEMA.field("knowledge_ts").type == pa.int64()
     assert SCHEMA.field("accepted_ts").type == pa.int64()
+
+
+def test_schema_nullability_is_explicit_and_read_axis_is_non_null() -> None:
+    """Nullability is part of the on-disk contract and declared explicitly (not left to pyarrow's
+    nullable=True default). The PIT read axis `knowledge_ts` MUST be non-null: the read filter
+    `knowledge_ts <= :as_of` silently drops nulls, so a null read-axis value would vanish a row from
+    PIT reads rather than fail — the non-null flag makes a bad writer fail loudly instead. Only the
+    genuinely-optional columns (`start` — instant facts have no period start; `accepted_ts` — the bulk
+    path has no acceptance time; `frame` — absent on many SEC facts) are nullable; every other column,
+    including `knowledge_ts`, is non-null."""
+    pytest.importorskip("pyarrow")
+    from quant_core.fundamentals.lake.schema import SCHEMA
+
+    assert SCHEMA.field("knowledge_ts").nullable is False, "the PIT read axis must be non-null"
+    nullable_by_intent = {"start", "accepted_ts", "frame"}
+    for name in SCHEMA.names:
+        expected = name in nullable_by_intent
+        assert SCHEMA.field(name).nullable is expected, (
+            f"{name}: nullable={SCHEMA.field(name).nullable}, expected {expected}"
+        )
