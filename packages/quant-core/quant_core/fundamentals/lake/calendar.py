@@ -149,7 +149,13 @@ def _nyse_full_closures(year: int) -> frozenset[date]:
         closures.add(_observed_weekend(date(year, 6, 19)))
     # Ad-hoc historical closures in this year (the documented known-gap hook).
     closures |= {d for d in _AD_HOC_CLOSURES if d.year == year}
-    return frozenset(closures)
+    # A closure is a TRADING day NYSE shuts — never a weekend (which is non-trading already). The only
+    # rule that can emit a weekend date is the asymmetric Saturday-New-Year (shift_saturday=False keeps
+    # Jan 1 on the Saturday): NYSE simply has no New Year holiday that year (Fri Dec 31 trades, Sat is
+    # closed regardless), so the unshifted Saturday must NOT pollute the set. Dropping weekends here is
+    # a no-op for every other holiday (all observed onto weekdays) and also guards a stray weekend entry
+    # in `_AD_HOC_CLOSURES`.
+    return frozenset(d for d in closures if d.weekday() < 5)
 
 
 def _is_edt(dt_utc: datetime) -> bool:
