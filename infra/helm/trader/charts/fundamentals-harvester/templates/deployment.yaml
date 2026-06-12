@@ -1,0 +1,116 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fundamentals-harvester
+  namespace: {{ .Release.Namespace }}
+spec:
+  # replicas:1 is LOAD-BEARING — the harvester is the lake's SINGLE writer (per-CIK
+  # Parquet via tmpfile + os.replace). Two writers would race the atomic-replace and the
+  # `harvester_state.json`/sentinel bookkeeping. The lake PVC is ReadWriteOnce, which also
+  # forbids a second concurrent RW mount on the homeserver node.
+  replicas: 1
+  # The bulk bootstrap rewrites the whole lake; never run two pods at once during a
+  # rollout. Recreate tears the old pod down before the new one attaches the RWO lake.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: fundamentals-harvester
+  template:
+    metadata:
+      labels:
+        app: fundamentals-harvester
+    spec:
+      containers:
+        - name: fundamentals-harvester
+          image: {{ .Values.image | default (printf "%strader-fundamentals-harvester:%s" (.Values.global.imageRegistry | default "") (.Values.global.imageTag | default "latest")) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy | default "IfNotPresent" }}
+          ports:
+            - containerPort: 8012
+          envFrom:
+            - secretRef:
+                name: trader-secrets
+          env:
+            # The lake mount path — MUST match the volumeMount below and the path the read
+            # engines (fundamentals-api / backtest-engine) mount RO, so writer and readers
+            # share one on-disk lake. The service reads LAKE_DIR (src/main.py, src/app.py,
+            # src/status.py all default to /data — overridden here).
+            - name: LAKE_DIR
+              value: /srv/fundamentals-lake
+            # Co-host the bootstrap+sweep WRITE LOOP with the status API in this one process:
+            # `uvicorn app:app` starts the loop as a background asyncio task on app startup
+            # ONLY when this flag is set (src/app.py `_start_harvest_loop`). So the single
+            # Deployment both owns the lake RW mount AND serves the portal's status surface,
+            # and /health answers immediately while the multi-hour bulk bootstrap proceeds in
+            # the background. Unset ⇒ status-surface-only (the test default).
+            - name: HARVESTER_RUN_LOOP
+              value: "true"
+            # Incremental-sweep cadence (minutes). After the one-time bootstrap, the loop
+            # parses the EDGAR daily form index and refreshes only the CIKs that actually
+            # filed every SWEEP_MINUTES.
+            - name: SWEEP_MINUTES
+              value: {{ .Values.global.env.sweepMinutes | default "30" | quote }}
+            # SEC EDGAR mandates a descriptive User-Agent (with a contact) on every request;
+            # the EDGAR client (src/edgar.py `_ua_is_valid`) FAILS CLOSED on an empty or
+            # contact-less ("@"-less) UA — a no-op bootstrap that writes nothing. This is the
+            # real operator contact, a non-secret global.env default (not a trader-secrets key).
+            - name: EDGAR_USER_AGENT
+              value: {{ .Values.global.env.edgarUserAgent | default "trader-platform fundamentals-harvester" | quote }}
+            # SEC courtesy rate budget (requests/second across the shared limiter). 10/s is
+            # SEC's published ceiling; the client clamps anything above it. Never raise above 10.
+            - name: EDGAR_REQS_PER_SEC
+              value: {{ .Values.global.env.edgarReqsPerSec | default "10" | quote }}
+            # Per-name staleness windows the /freshness audit keys off (quarterly default 135d;
+            # the annual window has its own 400d default in-code). Env-overridable; mirrors the
+            # ingestion service's knob so the operator tunes one value.
+            - name: FUNDAMENTALS_STALE_AFTER_DAYS
+              value: {{ .Values.global.env.fundamentalsStaleAfterDays | default "135" | quote }}
+          # The lake RW mount — the harvester is the only writer. Path matches LAKE_DIR above.
+          volumeMounts:
+            - name: fundamentals-lake
+              mountPath: /srv/fundamentals-lake
+          resources:
+            requests:
+              # The bulk bootstrap streams the ~1.3 GB companyfacts zip to disk and normalizes
+              # entities one at a time (pyarrow holds a single entity's facts in memory, not the
+              # whole zip), so steady-state memory is modest but the bootstrap burst wants
+              # headroom. No CPU limit — a limit would CFS-throttle the long normalize pass; the
+              # request is a scheduling floor.
+              cpu: "250m"
+              memory: "512Mi"
+              ephemeral-storage: "256Mi"
+            limits:
+              # Generous ceiling so a large entity's companyfacts payload (some filers carry tens
+              # of thousands of facts) never OOM-kills the pod mid-bootstrap. ephemeral-storage is
+              # for the container scratch only — the lake itself is the PV, not ephemeral.
+              memory: "2Gi"
+              ephemeral-storage: "512Mi"
+          # The status surface (`/health`) answers immediately — the harvest loop is backgrounded,
+          # so liveness is decoupled from the bootstrap. The startupProbe is the belt-and-suspenders
+          # the long bootstrap warrants: it gates the livenessProbe until the app is serving, with a
+          # generous failureThreshold so even a slow image-pull + uvicorn boot never trips a restart
+          # while the bulk download runs. 30 × 10s = up to 5 min for the app to start serving (the
+          # download/normalize themselves are background, not part of startup).
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8012
+            periodSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8012
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8012
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: fundamentals-lake
+          persistentVolumeClaim:
+            claimName: fundamentals-lake-pvc
