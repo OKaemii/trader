@@ -1,0 +1,21 @@
+# fundamentals-harvester — the PIT fundamentals LAKE write path (epic Task 8).
+#
+# The on-disk Parquet SCHEMA, the next-session knowledge_ts calendar, and the pyarrow/duckdb
+# scientific pins come from the quant-core package's [lake] extra, installed FIRST from
+# packages/quant-core (see the harvester Dockerfile, a LATER card). quant-core is the single source of
+# truth for those pins — do NOT re-pin pyarrow here. Installing the [lake] extra (pyarrow>=16,<18 +
+# duckdb) gives the harvester both `quant_core.fundamentals.lake.schema.SCHEMA` and
+# `...lake.calendar.derive_knowledge_ts`, the exact modules the DuckDB read engine reads, so writer
+# and reader cannot drift.
+#
+#   pip install './packages/quant-core[lake]'
+#
+# Listed below is only the harvester's own direct upstream dependency that quant-core does not pull:
+
+# SEC EDGAR async HTTP client (companyfacts / submissions / daily form index / bulk-zip download).
+# Same pin as quant-core's [http] extra and the other EDGAR callers, to avoid a split.
+httpx==0.27.2
+
+# Test-only
+pytest==8.3.3
+pytest-asyncio==0.24.0
