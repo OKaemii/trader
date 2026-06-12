@@ -20,6 +20,7 @@ COPY packages/shared-portfolio/package.json   ./packages/shared-portfolio/
 COPY packages/shared-redis/package.json       ./packages/shared-redis/
 COPY packages/shared-types/package.json       ./packages/shared-types/
 COPY packages/telemetry/package.json          ./packages/telemetry/
+COPY packages/ticker-identity/package.json    ./packages/ticker-identity/
 COPY services/auth-service/package.json       ./services/auth-service/
 COPY services/frontend-web/package.json       ./services/frontend-web/
 COPY services/market-data-service/package.json ./services/market-data-service/
