@@ -7,6 +7,7 @@
   "dependencies": {
     "@trader/shared-mongo": "workspace:*",
     "@trader/shared-types": "workspace:*",
+    "@trader/ticker-identity": "workspace:*",
     "mongodb": "^6.5.0"
   },
   "scripts": {

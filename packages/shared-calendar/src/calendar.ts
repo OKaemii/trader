@@ -15,6 +15,8 @@
 // US shifts 1st Sun Nov, UK last Sun Oct) resolve correctly per-date without manual
 // intervention.
 
+import type { TickerIdentity } from '@trader/ticker-identity';
+
 import type { HolidayCache } from './holiday-cache.ts';
 
 export type Market = 'US' | 'LSE';
@@ -144,16 +146,21 @@ export async function shouldPollMarket(cal: ExchangeCalendar, nowMs: number): Pr
 
 // ── Universe partitioning ─────────────────────────────────────────────────────
 //
-// T212 ticker suffixes encode the listing market: `_US_EQ` (NYSE/Nasdaq),
-// `l_EQ` (London, lowercase 'l'). OTHER covers anything else — kept separate so
-// the gate doesn't accidentally poll an unsupported market.
-
-export function partitionByMarket(tickers: readonly string[]): Record<Market | 'OTHER', string[]> {
-  const out: Record<Market | 'OTHER', string[]> = { US: [], LSE: [], OTHER: [] };
-  for (const t of tickers) {
-    if (/_US_EQ$/.test(t))     out.US.push(t);
-    else if (/l_EQ$/.test(t))  out.LSE.push(t);
-    else                       out.OTHER.push(t);
+// Routing is on the canonical identity's `market` field, not the broker string's
+// suffix — `TickerIdentity {symbol, market}` is the platform source of truth, and the
+// `_US_EQ`/`l_EQ` form is known only to `Trading212TickerAdapter` at the broker boundary
+// (Thread A). A caller still holding T212-form strings (the market-data poll loop reads
+// the legacy `instrument_registry`) bridges them through `adapter.fromT212` BEFORE calling
+// this — that conversion, not a suffix regex here, is where a non-US/LSE form (a CFD, a
+// crypto pair) is filtered out (the adapter throws; the caller routes it to its own OTHER
+// bucket). So this function sees only tradable US/LSE identities, and the partition keys
+// are exactly the two `Market` members — no `OTHER` bucket reaches the calendar.
+export function partitionByMarket(
+  identities: readonly TickerIdentity[],
+): Record<Market, TickerIdentity[]> {
+  const out: Record<Market, TickerIdentity[]> = { US: [], LSE: [] };
+  for (const id of identities) {
+    out[id.market].push(id);
   }
   return out;
 }
