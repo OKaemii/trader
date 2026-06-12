@@ -62,6 +62,13 @@ export class Trading212TickerAdapter {
         return `${symbol}${US_SUFFIX}`;
       case 'LSE':
         return `${symbol}${LSE_SUFFIX}`;
+      default:
+        // Symmetric with fromT212's rejection: the produce-side throws on an
+        // unsupported market rather than returning undefined. `market` is typed to
+        // 'US'|'LSE', but Thread A's downstream readers hydrate it from storage
+        // (Mongo fields / Timescale columns) where an `as Market` cast can smuggle
+        // an out-of-type value — fail loudly instead of broker-sending 'undefined'.
+        throw new Error(`[ticker-identity] unsupported market: ${String((id as TickerIdentity).market)}`);
     }
   }
 

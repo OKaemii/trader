@@ -21,6 +21,15 @@ describe('Trading212TickerAdapter.toT212', () => {
     expect(() => adapter.toT212({ symbol: '', market: 'US' })).toThrow();
     expect(() => adapter.toT212({ symbol: '   ', market: 'LSE' })).toThrow();
   });
+
+  it('throws on an out-of-type market instead of returning undefined', () => {
+    // A `market` hydrated from storage and cast `as Market` could smuggle an
+    // unsupported value; the produce-side must reject it (symmetric with fromT212),
+    // never silently emit `undefined`.
+    expect(() =>
+      adapter.toT212({ symbol: 'X', market: 'OTHER' as unknown as 'US' }),
+    ).toThrow();
+  });
 });
 
 describe('Trading212TickerAdapter.fromT212', () => {
