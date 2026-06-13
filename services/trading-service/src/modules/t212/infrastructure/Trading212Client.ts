@@ -1,18 +1,23 @@
-import { type Currency, type Money, money } from '@trader/shared-types';
+import { type Money, money } from '@trader/shared-types';
+import { Trading212TickerAdapter, type TickerIdentity } from '@trader/ticker-identity';
 
 const LIVE_BASE_URL = 'https://live.trading212.com/api/v0';
 const DEMO_BASE_URL = 'https://demo.trading212.com/api/v0';
 
-// T212 quotes positions in the instrument's listing currency. We derive that from the
-// T212 ticker suffix because T212's portfolio response doesn't include currency on each
-// position. `_US_EQ` → USD, `l_EQ` (lowercase l) → GBP. Anything else falls back to GBP
-// since the account base is GBP and broker-side conversion has already happened.
-export function currencyOfTicker(ticker: string): Currency {
-  if (/_US_EQ$/.test(ticker)) return 'USD';
-  return 'GBP';
-}
+// This client IS the Trading212 broker boundary (Thread A, Task 17): it is the only code
+// that turns a bare (symbol, market) identity into the broker's `_US_EQ` / `l_EQ` string on
+// the way out (`toT212` at order placement) and parses a broker response back into a bare
+// identity on the way in (`fromT212` on positions / order history). Currency is derived from
+// the listing `market` via the adapter — T212's portfolio response carries no per-position
+// currency, and the market is its sole determinant (US → USD, LSE → GBP).
+const adapter = new Trading212TickerAdapter();
 
 export interface T212Position {
+  // Bare identity is the source of truth (parsed off the broker ticker via the adapter);
+  // `ticker` is the re-derived broker string, kept for the consumers that still log / key on
+  // it (reconciliation, the pence-kill scaler) until they migrate to (symbol, market).
+  symbol: string;
+  market: TickerIdentity['market'];
   ticker: string;
   quantity: number;
   averagePrice: Money;        // entry price, instrument currency
@@ -63,24 +68,37 @@ export class Trading212Client {
     const res = await fetch(`${this.baseUrl}/equity/portfolio`, { headers: this.headers });
     if (!res.ok) throw new Error(`T212 positions: ${res.status}`);
     const raw = await res.json() as Array<Record<string, unknown>>;
-    return (raw ?? []).map((p) => {
-      const ticker = String(p.ticker ?? '');
-      const ccy = currencyOfTicker(ticker);
+    const out: T212Position[] = [];
+    for (const p of raw ?? []) {
+      const t212Ticker = String(p.ticker ?? '');
+      // Parse the broker ticker back into the bare identity HERE, at the boundary. A position
+      // T212 reports for a non-US/LSE instrument (an exotic CFD) doesn't parse — skip it
+      // fail-soft rather than throwing the whole portfolio read (the sizing/reconciliation
+      // paths then just don't see that name).
+      const id = tryFromT212(t212Ticker);
+      if (!id) continue;
+      const ccy = adapter.currencyOf(id);
       const quantity     = Number(p.quantity ?? 0);
       const avgPriceNum  = Number(p.averagePrice ?? 0);
       const currPriceNum = Number(p.currentPrice ?? 0);
-      return {
-        ticker,
+      out.push({
+        symbol: id.symbol,
+        market: id.market,
+        ticker: adapter.toT212(id),
         quantity,
         averagePrice: money(avgPriceNum, ccy),
         currentPrice: money(currPriceNum, ccy),
         currentValue: money(currPriceNum * quantity, ccy),
-      };
-    });
+      });
+    }
+    return out;
   }
 
-  async placeMarketOrder(ticker: string, quantity: number): Promise<{ orderId: string }> {
-    // T212 rejects market orders with `timeValidity` set ("Invalid payload"); only limit orders carry it.
+  async placeMarketOrder(id: TickerIdentity, quantity: number): Promise<{ orderId: string }> {
+    // The broker string is produced HERE, at the send — toT212 is called nowhere else on the
+    // order-placement path. T212 rejects market orders with `timeValidity` set ("Invalid
+    // payload"); only limit orders carry it.
+    const ticker = adapter.toT212(id);
     const body = JSON.stringify({ ticker, quantity });
     const res  = await fetch(`${this.baseUrl}/equity/orders/market`, {
       method: 'POST', headers: this.headers, body,
@@ -90,7 +108,8 @@ export class Trading212Client {
     return { orderId: String(data.id ?? data.orderId ?? 'unknown') };
   }
 
-  async placeLimitOrder(ticker: string, quantity: number, limitPrice: number): Promise<{ orderId: string }> {
+  async placeLimitOrder(id: TickerIdentity, quantity: number, limitPrice: number): Promise<{ orderId: string }> {
+    const ticker = adapter.toT212(id);
     const body = JSON.stringify({ ticker, quantity, limitPrice, timeValidity: 'DAY' });
     const res  = await fetch(`${this.baseUrl}/equity/orders/limit`, {
       method: 'POST', headers: this.headers, body,
@@ -155,8 +174,23 @@ export class Trading212Client {
     const res  = await fetch(`${base}${path}`, { headers: this.headers });
     if (!res.ok) throw new Error(`T212 history orders: ${res.status}`);
     const data = await res.json() as { items?: T212HistoryItem[]; nextPagePath?: string | null };
-    return { items: data.items ?? [], nextPagePath: data.nextPagePath ?? null };
+    // Parse each item's broker ticker into the bare identity at the boundary, so consumers
+    // read `(symbol, market)` rather than re-deriving it. `ticker` is preserved (terminated
+    // orders are matched to Mongo orders by `t212OrderId`, not by ticker). A non-US/LSE form
+    // leaves symbol/market undefined fail-soft — the consumer falls back to `ticker`.
+    const items = (data.items ?? []).map((item) => {
+      const id = tryFromT212(item.order?.ticker ?? '');
+      return id
+        ? { ...item, order: { ...item.order, symbol: id.symbol, market: id.market } }
+        : item;
+    });
+    return { items, nextPagePath: data.nextPagePath ?? null };
   }
+}
+
+/** Parse a broker ticker fail-soft: `(symbol, market)` or `null` for a non-US/LSE form. */
+function tryFromT212(ticker: string): TickerIdentity | null {
+  try { return adapter.fromT212(ticker); } catch { return null; }
 }
 
 export interface T212Instrument {
@@ -181,6 +215,10 @@ export interface T212HistoryItem {
     status:         string;   // 'FILLED' | 'CANCELLED' | 'REJECTED' | 'EXPIRED' | 'NEW' | ...
     side:           'BUY' | 'SELL';
     ticker:         string;
+    // Bare identity parsed off `ticker` at the boundary (getHistoricalOrders). Absent only
+    // for a non-US/LSE form, where consumers fall back to `ticker`.
+    symbol?:        string;
+    market?:        TickerIdentity['market'];
     quantity:       number;
     filledQuantity: number;
     type:           string;   // 'MARKET' | 'LIMIT' | ...

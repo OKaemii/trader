@@ -6,19 +6,17 @@
 
 import { describe, it, expect } from "vitest";
 import { AccountCache } from '../modules/orders/infrastructure/AccountCache.ts';
+import type { T212Position } from '../modules/t212/infrastructure/Trading212Client.ts';
+import type { PriceLookupForScaler } from '../shared/T212PriceScaler.ts';
 
 class FakeClient {
   cashCalls = 0;
   posCalls  = 0;
   free  = 1000;
   total = 2000;
-  positions: Array<{
-    ticker: string;
-    quantity: number;
-    averagePrice: { amount: number; currency: 'GBP' };
-    currentPrice: { amount: number; currency: 'GBP' };
-    currentValue: { amount: number; currency: 'GBP' };
-  }> = [{
+  positions: T212Position[] = [{
+    symbol: 'AAPL',
+    market: 'US',
     ticker: 'AAPL_US_EQ',
     quantity: 5,
     averagePrice: { amount: 100, currency: 'GBP' },
@@ -105,5 +103,38 @@ describe('AccountCache', () => {
     cache.invalidate();
     await cache.get();
     expect(client.cashCalls).toBe(2);
+  });
+
+  it('pence-kills a pence-quoted LSE position (off its identity) but never a US one', async () => {
+    const client = new FakeClient();
+    // A pence-quoted LSE position (T212 reports 6606p) alongside the US AAPL fixture.
+    client.positions = [
+      ...client.positions,
+      {
+        symbol: 'SGLN', market: 'LSE', ticker: 'SGLNl_EQ', quantity: 2,
+        averagePrice: { amount: 6500, currency: 'GBP' },
+        currentPrice: { amount: 6606, currency: 'GBP' },
+        currentValue: { amount: 13212, currency: 'GBP' },
+      },
+    ];
+    // The lookup is keyed on (symbol, market) and is called with the identity, not a ticker.
+    // A US name short-circuits on the market gate BEFORE the bar is read — only LSE names hit it.
+    const seen: Array<{ symbol: string; market: string }> = [];
+    const priceLookup: PriceLookupForScaler = {
+      lastClose: async (id) => {
+        seen.push({ symbol: id.symbol, market: id.market });
+        return id.symbol === 'SGLN' && id.market === 'LSE' ? 66.06 : null;   // bar in GBP
+      },
+    };
+    const cache = new AccountCache(client, { ttlMs: 60_000, priceLookup });
+    const snap = await cache.get();
+
+    const sgln = snap.positions.find((p) => p.symbol === 'SGLN')!;
+    const aapl = snap.positions.find((p) => p.symbol === 'AAPL')!;
+    expect(sgln.currentPrice.amount).toBeCloseTo(66.06);   // pence → pounds
+    expect(aapl.currentPrice.amount).toBe(110);            // US untouched
+    // Only the LSE name drove the bar read — the US name was gated out by `market !== 'LSE'`
+    // before any lookup. (avg + current price → two reads for the one LSE name.)
+    expect(new Set(seen.map((s) => `${s.symbol}:${s.market}`))).toEqual(new Set(['SGLN:LSE']));
   });
 });

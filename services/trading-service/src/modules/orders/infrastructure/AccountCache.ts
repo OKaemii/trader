@@ -111,8 +111,11 @@ export class AccountCache {
   private async _scalePositions(positions: T212Position[], lookup: PriceLookupForScaler): Promise<T212Position[]> {
     const logger = this.logger ?? undefined;
     return Promise.all(positions.map(async (p): Promise<T212Position> => {
-      const avg  = await scaleT212Quote(p.ticker, p.averagePrice.amount, lookup, logger);
-      const curr = await scaleT212Quote(p.ticker, p.currentPrice.amount, lookup, logger);
+      // The position already carries its bare (symbol, market) identity (parsed at the client
+      // boundary); the pence-kill keys on market, so pass the identity straight through.
+      const id = { symbol: p.symbol, market: p.market };
+      const avg  = await scaleT212Quote(id, p.averagePrice.amount, lookup, logger);
+      const curr = await scaleT212Quote(id, p.currentPrice.amount, lookup, logger);
       if (avg === p.averagePrice.amount && curr === p.currentPrice.amount) return p;
       return {
         ...p,

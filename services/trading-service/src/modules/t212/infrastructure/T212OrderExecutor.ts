@@ -1,3 +1,4 @@
+import type { TickerIdentity } from '@trader/ticker-identity';
 import type { IOrderExecutor, OrderExecutionResult } from '../../orders/domain/IOrderExecutor.ts';
 import { OrderSide, OrderType, OrderStatus } from '../../orders/domain/Order.ts';
 import type { Trading212Client } from './Trading212Client.ts';
@@ -6,7 +7,9 @@ export class T212OrderExecutor implements IOrderExecutor {
   constructor(private readonly client: Trading212Client) {}
 
   async execute(params: {
-    ticker:      string;
+    // The order is described by its bare identity (symbol, market); the client converts to the
+    // broker string via toT212 at the send. The executor never touches the _US_EQ / l_EQ form.
+    id:          TickerIdentity;
     side:        OrderSide;
     orderType:   OrderType;
     quantity:    number;
@@ -21,10 +24,10 @@ export class T212OrderExecutor implements IOrderExecutor {
     const signedQty = params.side === OrderSide.Sell ? -magnitude : magnitude;
 
     if (params.orderType === OrderType.Limit && params.limitPrice) {
-      const result = await this.client.placeLimitOrder(params.ticker, signedQty, params.limitPrice);
+      const result = await this.client.placeLimitOrder(params.id, signedQty, params.limitPrice);
       return { t212OrderId: result.orderId, status: OrderStatus.Submitted };
     } else {
-      const result = await this.client.placeMarketOrder(params.ticker, signedQty);
+      const result = await this.client.placeMarketOrder(params.id, signedQty);
       return { t212OrderId: result.orderId, status: OrderStatus.Submitted };
     }
   }

@@ -1,3 +1,4 @@
+import type { TickerIdentity } from '@trader/ticker-identity';
 import type { OrderType, OrderSide, OrderStatus } from './Order.ts';
 
 export interface OrderExecutionResult {
@@ -9,8 +10,10 @@ export interface OrderExecutionResult {
 }
 
 export interface IOrderExecutor {
+  // The instrument is identified by its bare (symbol, market) — the broker string is produced
+  // only inside the executor's T212 client (Task 17). Upstream holds an identity, not a ticker.
   execute(params: {
-    ticker:      string;
+    id:          TickerIdentity;
     side:        OrderSide;
     orderType:   OrderType;
     quantity:    number;
