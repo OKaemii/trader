@@ -104,9 +104,10 @@ global:
     rollingWindowBars: ""
     # Long-range daily history source for the persisted interval:'daily' series that strategy
     # lookbacks read (12-1 momentum etc.). 'eodhd' (paid, bulk-EOD efficient — pairs with
-    # universeSource=eodhd_scan; the bulk daily feed runs only under this + barFrequency=daily);
-    # 'yahoo' (free, multi-year fallback, decoupled from the metered 5m provider).
-    dailyHistoryProvider: eodhd         # eodhd (paid) | yahoo (free fallback)
+    # universeSource=eodhd_scan; the bulk daily feed runs only under this + barFrequency=daily) is the
+    # ONLY value — the Yahoo daily reader was removed (epic pit-fundamentals-lake-rearchitecture); the
+    # zod enum is ["eodhd"] and rejects anything else (do NOT set 'yahoo' — the pod would crash-loop).
+    dailyHistoryProvider: eodhd         # eodhd (only)
     # One-shot seed depth for the persisted daily series on bootstrap. Set DEEP (provider-permitting,
     # to inception for index names) so the research warehouse isn't truncated at 5y — QA Suite 5
     # wants SPY daily back to inception (1993-01-29 ≈ 33y); 35 covers its full lifecycle with headroom.
