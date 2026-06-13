@@ -1,13 +1,18 @@
 import { describe, it, expect } from 'vitest';
 import { money } from '@trader/shared-types';
+import { Trading212TickerAdapter } from '@trader/ticker-identity';
 import { Reconciliation, type ReconciliationDeps } from '../modules/reconciliation/application/Reconciliation.ts';
 import type { Finding } from '../modules/reconciliation/application/ReconciliationChecks.ts';
 import type { T212Cash, T212Position, T212HistoryItem } from '../modules/t212/infrastructure/Trading212Client.ts';
 
 const WINDOW = { startMs: 0, endMs: 10_000, trigger: 'manual' as const };
+const adapter = new Trading212TickerAdapter();
 
+// A broker position carries the bare (symbol, market) parsed off the ticker at the client
+// boundary (Task 17) alongside the re-derived ticker reconciliation keys on.
 function pos(ticker: string, quantity: number): T212Position {
-  return { ticker, quantity, averagePrice: money(10, 'GBP'), currentPrice: money(11, 'GBP'), currentValue: money(11 * quantity, 'GBP') };
+  const { symbol, market } = adapter.fromT212(ticker);
+  return { symbol, market, ticker, quantity, averagePrice: money(10, 'GBP'), currentPrice: money(11, 'GBP'), currentValue: money(11 * quantity, 'GBP') };
 }
 const CASH: T212Cash = { free: money(500, 'GBP'), total: money(1000, 'GBP') };
 
