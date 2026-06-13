@@ -1,10 +1,10 @@
-// portfolio-service — the Mongo storage-boundary ticker↔identity bridge (Thread A, Task 16a).
+// portfolio-service — the Mongo storage-boundary ticker↔identity bridge (Thread A, Task 16a/17).
 //
 // The `positions` documents are keyed on the BARE identity — `symbol` + `market` — never the
 // concatenated Trading212 `ticker`. trading-service still hands portfolio sync the T212 ticker over
-// the contract (its broker boundary migrates in Task 17), so this module splits that ticker into a
-// TickerIdentity before the `positions` Mongo touch, and re-joins it on read for any consumer that
-// renders a ticker label.
+// the contract (its in-memory position carries the re-derived broker string), so this module splits
+// that ticker into a TickerIdentity before the `positions` Mongo touch, and re-joins it on read for
+// any consumer that renders a ticker label.
 //
 // `Trading212TickerAdapter.fromT212` is the platform's single suffix parser; it throws on a form
 // that is neither a US (`_US_EQ`) nor an LSE (`l_EQ`) equity. Position sync is fail-soft: a T212
@@ -12,6 +12,7 @@
 // rather than aborting the whole sync.
 
 import { Trading212TickerAdapter, type TickerIdentity } from '@trader/ticker-identity';
+import type { Currency } from '@trader/shared-types';
 
 const adapter = new Trading212TickerAdapter();
 
@@ -26,4 +27,9 @@ export function tryIdentityOf(ticker: string): TickerIdentity | null {
 /** Re-derive the T212 ticker from a `(symbol, market)` pair. */
 export function tickerOf(symbol: string, market: string): string {
   return adapter.toT212({ symbol, market: market as TickerIdentity['market'] });
+}
+
+/** Listing currency from an identity (US → USD, LSE → GBP) — the single Money-contract rule. */
+export function currencyOf(id: TickerIdentity): Currency {
+  return adapter.currencyOf(id);
 }

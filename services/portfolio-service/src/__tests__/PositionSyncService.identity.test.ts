@@ -99,4 +99,21 @@ describe('PositionSyncService — (symbol, market) storage shape', () => {
     expect(filters).toEqual(['AAPL:US']);                       // the CFD was skipped
     expect(deletes[0]).toEqual({ $nor: [{ symbol: 'AAPL', market: 'US' }] });
   });
+
+  it('stores the MARKET-derived currency (Task 17 adapter rule), not the contract price tag', async () => {
+    // Money-contract correctness: currency is a pure function of the listing market (US → USD,
+    // LSE → GBP) via the adapter. Even if the contract handed a mis-tagged price, the stored
+    // currency follows the market. Here the broker ticker says US, so the row is USD.
+    const { db, upserts } = fakeDb();
+    const trading = tradingStub([
+      // currentPrice mis-tagged GBP, but AAPL_US_EQ is a US listing → stored currency must be USD.
+      { ticker: 'AAPL_US_EQ', quantity: 2, currentPrice: gbp(150) },
+      { ticker: 'SHELl_EQ',   quantity: 4, currentPrice: gbp(28) },
+    ]);
+    await new PositionSyncService({ db, fx, trading, logger }).run();
+    const byId = new Map(upserts.map((u) => [`${u.filter.symbol}:${u.filter.market}`, u]));
+    expect(byId.get('AAPL:US')!.update.$set.currency).toBe('USD');     // market-derived
+    expect(byId.get('AAPL:US')!.update.$set.currentPrice.currency).toBe('USD');
+    expect(byId.get('SHEL:LSE')!.update.$set.currency).toBe('GBP');
+  });
 });

@@ -3,10 +3,10 @@ import type { Logger } from "@trader/core";
 import type { TradingServiceClient } from "@trader/contracts";
 import type { FxClient } from "@trader/shared-fx";
 import { COLLECTIONS } from "@trader/shared-mongo";
-import { BASE_CURRENCY, type Currency } from "@trader/shared-types";
+import { type Currency } from "@trader/shared-types";
 import { sumPositionsGBP, type PositionDoc } from "@trader/shared-portfolio";
 import { buildPositionUpdate } from "./sync.ts";
-import { tryIdentityOf } from "../../../shared/identity.ts";
+import { tryIdentityOf, currencyOf } from "../../../shared/identity.ts";
 
 export interface PositionSyncDeps {
     db: Db;
@@ -46,13 +46,22 @@ export class PositionSyncService {
                 ? (cashRes?.total.amount ?? cashRes?.free.amount ?? undefined)
                 : undefined;
 
-            // Extract native-currency price + value. Positions are stored in their listing
-            // currency; GBP is derived on read.
-            const sized = posRes.positions.map((p) => {
+            // Resolve each T212 position to its bare (symbol, market) identity and derive currency
+            // from that identity via the adapter (US → USD, LSE → GBP) — the single Money-contract
+            // rule, matching how the price was tagged at the broker boundary. Positions are stored
+            // in their listing currency; GBP is derived on read. Fail-soft: a position whose ticker
+            // isn't a recognised US/LSE equity is dropped here (skipped for both sizing + the held
+            // set) rather than aborting the whole sync.
+            const sized = posRes.positions.flatMap((p) => {
+                const id = p.ticker ? tryIdentityOf(p.ticker) : null;
+                if (!id) {
+                    this.deps.logger.warn({ cycle, ticker: p.ticker }, "position-sync: un-routable ticker — skipping");
+                    return [];
+                }
                 const q = typeof p.quantity === "number" ? p.quantity : 0;
-                const ccy: Currency = (p.currentPrice?.currency ?? BASE_CURRENCY) as Currency;
+                const ccy: Currency = currencyOf(id);
                 const priceNative = p.currentPrice?.amount ?? 0;
-                return { p, q, ccy, priceNative, valueNative: q * priceNative };
+                return [{ p, id, q, ccy, priceNative, valueNative: q * priceNative }];
             });
 
             // GBP NAV for weight denominator. If FX is unavailable past the 24h stale
@@ -78,18 +87,11 @@ export class PositionSyncService {
             }, "position-sync: NAV computed");
 
             // Held identities — the (symbol, market) pairs T212 currently reports. Positions are
-            // stored keyed on this bare identity since Task 16a; the T212 ticker is split at this
-            // sync boundary (trading-service still hands us the concatenated form until Task 17).
-            // Fail-soft: an instrument whose ticker doesn't parse as a US/LSE equity is skipped for
-            // both the upsert and the held-set, never aborting the whole sync.
+            // stored keyed on this bare identity; the broker ticker was split to (symbol, market)
+            // up front (un-routable names already dropped from `sized`).
             const held: Array<{ symbol: string; market: string }> = [];
             let upserted = 0;
-            for (const { p, q, ccy, priceNative, valueNative } of sized) {
-                const id = p.ticker ? tryIdentityOf(p.ticker) : null;
-                if (!id) {
-                    this.deps.logger.warn({ cycle, ticker: p.ticker }, "position-sync: un-routable ticker — skipping");
-                    continue;
-                }
+            for (const { p, id, q, ccy, priceNative, valueNative } of sized) {
                 held.push({ symbol: id.symbol, market: id.market });
                 const valueGBP = navBasisGBP > 0 && valueNative > 0
                     ? await this.deps.fx.toGBP({ amount: valueNative, currency: ccy })
