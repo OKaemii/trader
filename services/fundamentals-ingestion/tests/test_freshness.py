@@ -53,6 +53,16 @@ class _FakeCollection:
         return _FakeCursor(self._rows)
 
 
+def _registry_row(t212: str) -> dict:
+    """instrument_registry stores the bare (symbol, market) identity since Task 16b — split the T212
+    ticker the test seeds (as the live store does) so coverage.load_coverage's symbol/market read +
+    its ticker re-derivation are exercised on the real shape."""
+    from quant_core.ticker_identity import Trading212TickerAdapter
+
+    ident = Trading212TickerAdapter().from_t212(t212)
+    return {"symbol": ident.symbol, "market": ident.market}
+
+
 class _FakeMongo:
     """A motor-db stand-in serving the `instrument_registry {activeTo:null}` universe read that
     `freshness._curated_us_universe` (via `coverage.load_coverage`) issues. Only the registry collection
@@ -61,7 +71,7 @@ class _FakeMongo:
     def __init__(self, registry_tickers: list[str], *, registry_raises: bool = False) -> None:
         self._cols = {
             "instrument_registry": _FakeCollection(
-                [{"ticker": t} for t in registry_tickers], raise_on_find=registry_raises
+                [_registry_row(t) for t in registry_tickers], raise_on_find=registry_raises
             ),
             "index_constituents": _FakeCollection([]),
         }
