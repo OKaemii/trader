@@ -7,12 +7,15 @@ import { getMongoDb, COLLECTIONS } from '@trader/shared-mongo';
 import type { Collection } from 'mongodb';
 import type { FundamentalsProvider, FundamentalsRaw } from '../infrastructure/FundamentalsProvider.ts';
 import { computeRatios, qualityPass, type QmjRatios } from './qmj.ts';
+import { tryIdentityOf, tryIdOf, idOf } from '../../../shared/identity.ts';
 import { log } from '../../../logger.ts';
 
 const MONTH_MS = 30 * 24 * 60 * 60 * 1000;
 
 export interface FundamentalsDoc {
-  _id:          string;        // ticker
+  _id:          string;        // '<symbol>:<market>' (the bare-identity composite key since Task 16b)
+  symbol:       string;        // bare exchange symbol
+  market:       string;        // 'US' | 'LSE'
   asOf:         number;        // when fetched (UTC ms)
   raw:          FundamentalsRaw;
   ratios:       QmjRatios | null;
@@ -99,17 +102,43 @@ export class FundamentalsCache {
     return (await getMongoDb()).collection<FundamentalsDoc>(COLLECTIONS.COMPANY_FUNDAMENTALS);
   }
 
-  /** Read-through: cached docs for `tickers`, refreshing any missing/stale via the provider first. */
+  /**
+   * Map the requested T212 tickers to their (symbol, market) composite `_id`s since Task 16b, keeping
+   * the inverse (`_id` → the requested T212 ticker) so a Mongo read can be re-keyed back to the
+   * caller's ticker. An un-routable ticker (not a US/LSE form) is dropped — the same fail-soft drop a
+   * stale/CFD name always got. Returns the `_id` list to query + the `_id`→ticker map for re-keying.
+   */
+  private idMap(tickers: string[]): { ids: string[]; idToTicker: Map<string, string> } {
+    const idToTicker = new Map<string, string>();
+    for (const t of tickers) {
+      const id = tryIdOf(t);
+      if (id !== null) idToTicker.set(id, t);
+    }
+    return { ids: [...idToTicker.keys()], idToTicker };
+  }
+
+  /** Read-through: cached docs for `tickers`, refreshing any missing/stale via the provider first.
+   *  Keyed on the (symbol, market) composite `_id`; the returned map is re-keyed to the requested
+   *  T212 ticker so the caller's contract is unchanged. */
   async get(tickers: string[]): Promise<Record<string, FundamentalsDoc>> {
     if (tickers.length === 0) return {};
     const coll = await this.coll();
-    const existing = await coll.find({ _id: { $in: tickers } }).toArray();
-    const byTicker = new Map(existing.map((d) => [d._id, d]));
+    const { ids, idToTicker } = this.idMap(tickers);
+    if (ids.length === 0) return {};
+    const existing = await coll.find({ _id: { $in: ids } }).toArray();
+    const byId = new Map(existing.map((d) => [d._id, d]));
     const now = Date.now();
-    const stale = tickers.filter((t) => { const d = byTicker.get(t); return !d || now - d.asOf > this.ttlMs; });
+    const stale = [...idToTicker.entries()]
+      .filter(([id]) => { const d = byId.get(id); return !d || now - d.asOf > this.ttlMs; })
+      .map(([, ticker]) => ticker);
     if (stale.length > 0) await this.refresh(stale);
-    const fresh = await coll.find({ _id: { $in: tickers } }).toArray();
-    return Object.fromEntries(fresh.map((d) => [d._id, d]));
+    const fresh = await coll.find({ _id: { $in: ids } }).toArray();
+    const out: Record<string, FundamentalsDoc> = {};
+    for (const d of fresh) {
+      const ticker = idToTicker.get(d._id);
+      if (ticker !== undefined) out[ticker] = d;
+    }
+    return out;
   }
 
   /**
@@ -121,23 +150,37 @@ export class FundamentalsCache {
   async refreshStale(tickers: string[]): Promise<{ stale: number; refreshed: number }> {
     if (tickers.length === 0) return { stale: 0, refreshed: 0 };
     const coll = await this.coll();
-    const existing = await coll.find({ _id: { $in: tickers } }, { projection: { asOf: 1 } }).toArray();
-    const asOfByTicker = new Map(existing.map((d) => [d._id, d.asOf]));
+    const { ids, idToTicker } = this.idMap(tickers);
+    if (ids.length === 0) return { stale: 0, refreshed: 0 };
+    const existing = await coll.find({ _id: { $in: ids } }, { projection: { asOf: 1 } }).toArray();
+    const asOfById = new Map(existing.map((d) => [d._id, d.asOf]));
     const now = Date.now();
-    const stale = tickers.filter((t) => { const a = asOfByTicker.get(t); return a == null || now - a > this.ttlMs; });
+    const stale = [...idToTicker.entries()]
+      .filter(([id]) => { const a = asOfById.get(id); return a == null || now - a > this.ttlMs; })
+      .map(([, ticker]) => ticker);
     const refreshed = stale.length > 0 ? await this.refresh(stale) : 0;
     return { stale: stale.length, refreshed };
   }
 
-  /** Read-only: cached docs for `tickers` with NO provider refresh (for the Scanner snapshot). */
+  /** Read-only: cached docs for `tickers` with NO provider refresh (for the Scanner snapshot). Keyed
+   *  on the (symbol, market) composite `_id`; the returned map is re-keyed to the requested ticker. */
   async peek(tickers: string[]): Promise<Record<string, FundamentalsDoc>> {
     if (tickers.length === 0) return {};
     const coll = await this.coll();
-    const docs = await coll.find({ _id: { $in: tickers } }).toArray();
-    return Object.fromEntries(docs.map((d) => [d._id, d]));
+    const { ids, idToTicker } = this.idMap(tickers);
+    if (ids.length === 0) return {};
+    const docs = await coll.find({ _id: { $in: ids } }).toArray();
+    const out: Record<string, FundamentalsDoc> = {};
+    for (const d of docs) {
+      const ticker = idToTicker.get(d._id);
+      if (ticker !== undefined) out[ticker] = d;
+    }
+    return out;
   }
 
-  /** Force a provider fetch + upsert for the given tickers. Returns the number written. */
+  /** Force a provider fetch + upsert for the given tickers. Returns the number written. The doc is
+   *  keyed on the (symbol, market) composite `_id` since Task 16b — an un-routable name the provider
+   *  somehow returned is skipped (fail-soft). */
   async refresh(tickers: string[]): Promise<number> {
     if (tickers.length === 0) return 0;
     const coll = await this.coll();
@@ -145,12 +188,15 @@ export class FundamentalsCache {
     const now = Date.now();
     let written = 0;
     for (const [ticker, raw] of Object.entries(fetched)) {
+      const identity = tryIdentityOf(ticker);
+      if (identity === null) continue;   // un-routable form — never store a concatenated/legacy key
       // Persist the provider's per-name source when it exposes one (the `pit` provider stamps
       // `pit-edgar`/`yahoo` per ticker); otherwise the configured mode is already the per-name truth.
       const source = this.provider.sourceOf?.(ticker) ?? this.source;
       await coll.updateOne(
-        { _id: ticker },
+        { _id: idOf(identity) },
         { $set: {
+          symbol: identity.symbol, market: identity.market,
           asOf: now, raw, ratios: computeRatios(raw), qualityPass: qualityPass(raw),
           marketCapGbp: raw.marketCapGbp, source, updatedAt: now,
         } },

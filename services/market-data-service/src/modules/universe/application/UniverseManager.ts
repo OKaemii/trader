@@ -5,8 +5,9 @@
 import { getMongoDb } from '@trader/shared-mongo';
 import { COLLECTIONS } from '@trader/shared-mongo';
 import { getPgPool } from '@trader/shared-pg';
-import { Trading212TickerAdapter } from '@trader/ticker-identity';
+import { Trading212TickerAdapter, type TickerIdentity } from '@trader/ticker-identity';
 import type { Currency } from '@trader/shared-types';
+import { tryIdentityOf, tickerOf } from '../../../shared/identity.ts';
 import { fetchT212Instruments } from '../infrastructure/t212-client.ts';
 import { fetchYahooLiquidity } from '../../bars/infrastructure/providers/yahoo-client.ts';
 import { MongoInstrumentMeta } from '../infrastructure/MongoInstrumentMeta.ts';
@@ -133,6 +134,34 @@ export interface InstrumentMeta {
   t212Tradable: boolean;
   market?:      'US' | 'LSE' | 'OTHER';
   adv?:         number;   // 5-day average dollar volume from Yahoo (curated path only)
+}
+
+/** A forced add/remove entry as stored in portal_universe_overrides since Task 16b — the bare
+ *  (symbol, market) identity, never the concatenated T212 ticker. */
+export interface OverrideEntry { symbol: string; market: string }
+
+/** The portal_universe_overrides singleton document shape (Task 16b: bare-identity adds/removes). */
+export interface OverridesDoc {
+  _id: 'singleton';
+  adds: OverrideEntry[];
+  removes: OverrideEntry[];
+  updatedBy?: string;
+  updatedAt?: Date;
+}
+
+/**
+ * Re-derive the T212 ticker per stored override entry, dropping any whose (symbol, market) can't be
+ * re-joined to a US/LSE form (fail-soft — never throw the refresh). Used at the Mongo read boundary
+ * so the T212-keyed override-application logic stays behaviour-identical (the bare-forced-add UX is
+ * Task 18/21).
+ */
+export function identitiesToTickers(entries: OverrideEntry[] | undefined): string[] {
+  const out: string[] = [];
+  for (const e of entries ?? []) {
+    if (!e || typeof e.symbol !== 'string' || typeof e.market !== 'string') continue;
+    try { out.push(tickerOf(e.symbol, e.market)); } catch { /* un-routable identity — skip */ }
+  }
+  return out;
 }
 
 /**
@@ -423,12 +452,20 @@ export class UniverseManager {
       }));
     } catch (err) {
       log.warn('[universe] T212 instrument fetch failed, using existing registry:', err);
-      // Fall back to whatever is already in the registry
+      // Fall back to whatever is already in the registry. The registry is keyed on (symbol, market)
+      // since Task 16b — re-derive the T212 ticker per row (skipping a row whose identity can't be
+      // re-joined, fail-soft) so the in-memory active set + sector map stay T212-keyed as before.
       const existing = await db.collection(COLLECTIONS.INSTRUMENT_REGISTRY)
         .find({ activeTo: null })
         .toArray();
-      this._activeUniverse = existing.map((d: any) => d.ticker);
-      this._sectorMap      = Object.fromEntries(existing.map((d: any) => [d.ticker, d.sector ?? 'Unknown']));
+      this._activeUniverse = [];
+      this._sectorMap = {};
+      for (const d of existing as Array<{ symbol?: string; market?: string; sector?: string }>) {
+        if (d.symbol == null || d.market == null) continue;
+        const ticker = tickerOf(d.symbol, d.market);
+        this._activeUniverse.push(ticker);
+        this._sectorMap[ticker] = d.sector ?? 'Unknown';
+      }
       return this._activeUniverse;
     }
 
@@ -531,11 +568,17 @@ export class UniverseManager {
     // ── 4b. Portal overrides — applied AFTER eligibility/sector filtering ─────
     // Reason: forced adds/removes are an operator decision and must take precedence over
     // the criteria-driven selection. Removes win over T212 inclusion; adds bypass sector cap.
-    const overridesDoc = await db.collection<{
-      _id: 'singleton';
-      adds: string[];
-      removes: string[];
-    }>(COLLECTIONS.PORTAL_UNIVERSE_OVERRIDES).findOne({ _id: 'singleton' });
+    // portal_universe_overrides stores adds/removes as { symbol, market } objects since Task 16b —
+    // re-derive the T212 ticker per entry (fail-soft drop of an un-routable one) so the in-memory
+    // override application below stays keyed on the T212 ticker exactly as before (the bare-forced-add
+    // UX is Task 18/21). The bare-T212 set used for the addedReason='override_add' stamp is rebuilt
+    // from these reconstructed strings too.
+    const overridesDocRaw = await db.collection<OverridesDoc>(COLLECTIONS.PORTAL_UNIVERSE_OVERRIDES)
+      .findOne({ _id: 'singleton' });
+    const overridesDoc = overridesDocRaw === null ? null : {
+      adds: identitiesToTickers(overridesDocRaw.adds),
+      removes: identitiesToTickers(overridesDocRaw.removes),
+    };
 
     const overrideResult = applyUniverseOverrides(selected, overridesDoc);
     selected = overrideResult.result;
@@ -600,37 +643,54 @@ export class UniverseManager {
       }
     }
 
-    const newTickers = new Set(selected.map((i) => i.ticker));
-
     // ── 5. Diff against current registry — log additions and removals ──────────
+    // The registry is keyed on the bare (symbol, market) identity since Task 16b. Build the split
+    // identity per selected instrument once (skipping any name whose T212 ticker isn't a recognised
+    // US/LSE form — fail-soft, never throw the refresh); the diff/insert/retire below all key on
+    // (symbol, market). The universe-BUILDING above stays T212-internal (Task 18); this is the Mongo
+    // storage boundary alone.
+    const selectedIds = selected
+      .map((i) => ({ inst: i, id: tryIdentityOf(i.ticker) }))
+      .filter((x): x is { inst: InstrumentMeta; id: TickerIdentity } => x.id !== null);
+    const idKey = (id: TickerIdentity) => `${id.symbol}|${id.market}`;
+    const newIdKeys = new Set(selectedIds.map((x) => idKey(x.id)));
+
     const currentDocs = await db.collection(COLLECTIONS.INSTRUMENT_REGISTRY)
       .find({ activeTo: null })
-      .toArray();
-    const currentTickers = new Set(currentDocs.map((d: any) => d.ticker));
+      .toArray() as Array<{ symbol?: string; market?: string }>;
+    const currentIdKeys = new Set(
+      currentDocs
+        .filter((d) => d.symbol != null && d.market != null)
+        .map((d) => `${d.symbol}|${d.market}`),
+    );
 
-    // Additions — split into true new inserts vs reactivations of previously-removed tickers.
-    // insertMany would collide with the unique_ticker index if a doc exists with activeTo set.
-    const added = selected.filter((i) => !currentTickers.has(i.ticker));
+    // Additions — split into true new inserts vs reactivations of previously-removed instruments.
+    // insertMany would collide with the unique (symbol, market) index if a row already exists with
+    // activeTo set, so a previously-retired identity is reactivated (updateMany) instead.
+    const added = selectedIds.filter((x) => !currentIdKeys.has(idKey(x.id)));
     if (added.length > 0) {
-      const addedTickers = added.map((i) => i.ticker);
       const existingDocs = await db.collection(COLLECTIONS.INSTRUMENT_REGISTRY)
-        .find({ ticker: { $in: addedTickers } })
-        .toArray();
-      const existingSet = new Set(existingDocs.map((d: any) => d.ticker));
+        .find({ $or: added.map((x) => ({ symbol: x.id.symbol, market: x.id.market })) })
+        .toArray() as Array<{ symbol?: string; market?: string }>;
+      const existingSet = new Set(
+        existingDocs
+          .filter((d) => d.symbol != null && d.market != null)
+          .map((d) => `${d.symbol}|${d.market}`),
+      );
 
-      const toInsert     = added.filter((i) => !existingSet.has(i.ticker));
-      const toReactivate = added.filter((i) =>  existingSet.has(i.ticker));
+      const toInsert     = added.filter((x) => !existingSet.has(idKey(x.id)));
+      const toReactivate = added.filter((x) =>  existingSet.has(idKey(x.id)));
 
       if (toInsert.length > 0) {
         const overrideAdds = new Set(
           (overridesDoc?.adds ?? []).map((t) => t.toUpperCase().trim()),
         );
         await db.collection(COLLECTIONS.INSTRUMENT_REGISTRY).insertMany(
-          toInsert.map((i) => ({
-            ticker:      i.ticker,
+          toInsert.map(({ inst: i, id }) => ({
+            symbol:      id.symbol,
+            market:      id.market,
             name:        i.name,
             sector:      i.sector,
-            market:      i.market ?? 'OTHER',
             adv:         i.adv ?? 0,
             activeFrom:  now,
             activeTo:    null,
@@ -641,40 +701,42 @@ export class UniverseManager {
       }
       if (toReactivate.length > 0) {
         await db.collection(COLLECTIONS.INSTRUMENT_REGISTRY).updateMany(
-          { ticker: { $in: toReactivate.map((i) => i.ticker) } },
+          { $or: toReactivate.map((x) => ({ symbol: x.id.symbol, market: x.id.market })) },
           { $set: { activeTo: null, addedReason: 'universe_reactivation', updatedAt: now } },
         );
       }
-      log.info(`[universe] added ${added.length} instruments: ${added.map((i) => i.ticker).join(', ')}`);
+      log.info(`[universe] added ${added.length} instruments: ${added.map((x) => x.inst.ticker).join(', ')}`);
     }
 
-    // Refresh ADV + market + sector on every surviving entry so the portal table doesn't show
-    // stale liquidity or a stale sector. Skip when fields are undefined (legacy path) so we don't
-    // blow away a known value with an empty one. The sector backfill matters because the EODHD
-    // screener source (PR #8) only stamped sectors on *newly inserted* rows — rows already active
-    // when the fix landed kept the 'Unknown' placeholder. Only write a *resolved* sector so a
-    // transient screener/Yahoo miss never wipes a previously-good label.
-    const refreshUpdates = selected.filter((i) => i.adv != null || i.market != null);
-    for (const i of refreshUpdates) {
+    // Refresh ADV + sector on every surviving entry so the portal table doesn't show stale
+    // liquidity or a stale sector. (`market` is part of the key now, never re-written.) Skip when
+    // fields are undefined (legacy path) so we don't blow away a known value with an empty one. The
+    // sector backfill matters because the EODHD screener source (PR #8) only stamped sectors on
+    // *newly inserted* rows — rows already active when the fix landed kept the 'Unknown' placeholder.
+    // Only write a *resolved* sector so a transient screener/Yahoo miss never wipes a good label.
+    const refreshUpdates = selectedIds.filter(({ inst: i }) => i.adv != null || i.sector != null);
+    for (const { inst: i, id } of refreshUpdates) {
+      const set: Record<string, unknown> = { updatedAt: now };
+      if (i.adv != null) set.adv = i.adv;
+      if (i.sector && i.sector !== 'Unknown') set.sector = i.sector;
+      if (Object.keys(set).length === 1) continue;   // nothing but updatedAt — skip the write
       await db.collection(COLLECTIONS.INSTRUMENT_REGISTRY).updateOne(
-        { ticker: i.ticker, activeTo: null },
-        { $set: {
-          ...(i.market != null ? { market: i.market } : {}),
-          ...(i.adv != null    ? { adv: i.adv }       : {}),
-          ...(i.sector && i.sector !== 'Unknown' ? { sector: i.sector } : {}),
-          updatedAt: now,
-        }},
+        { symbol: id.symbol, market: id.market, activeTo: null },
+        { $set: set },
       );
     }
 
     // Removals (5-day grace period is tracked externally; we hard-remove here for v1)
-    const removed = currentDocs.filter((d: any) => !newTickers.has(d.ticker));
-    if (removed.length > 0) {
+    const removedDocs = currentDocs.filter(
+      (d) => d.symbol != null && d.market != null && !newIdKeys.has(`${d.symbol}|${d.market}`),
+    );
+    if (removedDocs.length > 0) {
       await db.collection(COLLECTIONS.INSTRUMENT_REGISTRY).updateMany(
-        { ticker: { $in: removed.map((d: any) => d.ticker) }, activeTo: null },
+        { $or: removedDocs.map((d) => ({ symbol: d.symbol, market: d.market })), activeTo: null },
         { $set: { activeTo: now, removedReason: 'universe_refresh', updatedAt: now } },
       );
-      log.info(`[universe] removed ${removed.length} instruments: ${removed.map((d: any) => d.ticker).join(', ')}`);
+      const removedTickers = removedDocs.map((d) => tickerOf(d.symbol as string, d.market as string));
+      log.info(`[universe] removed ${removedDocs.length} instruments: ${removedTickers.join(', ')}`);
     }
 
     this._activeUniverse = selected.map((i) => i.ticker);
@@ -702,7 +764,14 @@ export class UniverseManager {
         activeFrom: { $lte: ts },
         $or: [{ activeTo: null }, { activeTo: { $gte: ts } }],
       })
-      .toArray();
-    return docs.map((d: any) => d.ticker);
+      .toArray() as Array<{ symbol?: string; market?: string }>;
+    // The registry is keyed on (symbol, market) since Task 16b — re-derive the T212 ticker per row
+    // (skip a row whose identity can't be re-joined, fail-soft) so the returned set stays T212-keyed.
+    const out: string[] = [];
+    for (const d of docs) {
+      if (d.symbol == null || d.market == null) continue;
+      out.push(tickerOf(d.symbol, d.market));
+    }
+    return out;
   }
 }

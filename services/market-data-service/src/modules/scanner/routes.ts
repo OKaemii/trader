@@ -12,8 +12,9 @@ import { getRedisClient } from '@trader/shared-redis';
 import { getEodhdClient } from '../bars/infrastructure/providers/eodhd-client.ts';
 import type { UniverseManager } from '../universe/application/UniverseManager.ts';
 import type { FundamentalsCache } from '../fundamentals/application/FundamentalsCache.ts';
+import { tryIdentityOf, tickerOf } from '../../shared/identity.ts';
 
-interface RegistryRow { ticker: string; name?: string; market?: string }
+interface RegistryRow { symbol?: string; market?: string; name?: string }
 
 export function createScannerRouter(universe: UniverseManager, fundamentals: FundamentalsCache): Hono {
   const r = new Hono();
@@ -27,9 +28,18 @@ export function createScannerRouter(universe: UniverseManager, fundamentals: Fun
     const tickers = universe.activeTickers;
     const sectors = universe.sectorMap;
     const db = await getMongoDb();
-    const regs = await db.collection<RegistryRow>(COLLECTIONS.INSTRUMENT_REGISTRY)
-      .find({ ticker: { $in: tickers }, activeTo: null }).toArray();
-    const regByTicker = new Map(regs.map((d) => [d.ticker, d]));
+    // The registry is keyed on (symbol, market) since Task 16b — query by the split identities and
+    // re-key the result map back to the T212 ticker the active set / sectorMap / fundamentals use.
+    const ids = tickers
+      .map((t) => ({ ticker: t, id: tryIdentityOf(t) }))
+      .filter((x): x is { ticker: string; id: NonNullable<typeof x.id> } => x.id !== null);
+    const regs = ids.length === 0 ? [] : await db.collection<RegistryRow>(COLLECTIONS.INSTRUMENT_REGISTRY)
+      .find({ $or: ids.map((x) => ({ symbol: x.id.symbol, market: x.id.market })), activeTo: null }).toArray();
+    const regByTicker = new Map<string, RegistryRow>();
+    for (const d of regs as RegistryRow[]) {
+      if (d.symbol == null || d.market == null) continue;
+      regByTicker.set(tickerOf(d.symbol, d.market), d);
+    }
     const funds = await fundamentals.peek(tickers);   // cached only — no provider calls
 
     const rows = tickers.map((t) => {

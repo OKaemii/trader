@@ -25,6 +25,7 @@ import type {
   ProviderDividend,
   ProviderSplit,
 } from '../infrastructure/CorporateActionsProvider.ts';
+import { tryIdentityOf, tryIdOf, idOf } from '../../../shared/identity.ts';
 
 // A ticker re-checked for new actions no more often than this much wall-clock since its last sync —
 // dividends/splits land at most quarterly, so a daily re-check is generous and keeps the fetch side
@@ -44,7 +45,9 @@ export interface StoredSplit {
 }
 
 export interface CorporateActionsDoc {
-  _id: string;             // ticker
+  _id: string;             // '<symbol>:<market>' (the bare-identity composite key since Task 16b)
+  symbol: string;          // bare exchange symbol
+  market: string;          // 'US' | 'LSE'
   dividends: StoredDividend[];
   splits: StoredSplit[];
   lastDividendDate?: string;
@@ -87,9 +90,13 @@ export class CorporateActionsStore {
     return (await getMongoDb()).collection<CorporateActionsDoc>(COLLECTIONS.CORPORATE_ACTIONS);
   }
 
-  /** The stored doc for `ticker` (no fetch), or null. Backs the admin read + the dividend-yield leg. */
+  /** The stored doc for `ticker` (no fetch), or null. Backs the admin read + the dividend-yield leg.
+   *  The store is keyed on the (symbol, market) composite `_id` since Task 16b — a ticker that isn't
+   *  a recognised US/LSE form has no doc (returns null, fail-soft). */
   async peek(ticker: string): Promise<CorporateActionsDoc | null> {
-    return (await this.coll()).findOne({ _id: ticker });
+    const id = tryIdOf(ticker);
+    if (id === null) return null;
+    return (await this.coll()).findOne({ _id: id });
   }
 
   /** Stored dividends for `ticker` (no fetch) — the point-in-time dividend-yield input. */
@@ -98,11 +105,24 @@ export class CorporateActionsStore {
     return doc?.dividends ?? [];
   }
 
-  /** Stored dividends for many tickers in one query (no fetch) — the per-cycle dividend-yield hot path. */
+  /** Stored dividends for many tickers in one query (no fetch) — the per-cycle dividend-yield hot
+   *  path. Keyed by the (symbol, market) composite `_id`; the result is re-keyed back to the
+   *  requested T212 ticker so the caller's contract is unchanged (an un-routable ticker is skipped). */
   async dividendsForMany(tickers: string[]): Promise<Record<string, StoredDividend[]>> {
     if (tickers.length === 0) return {};
-    const docs = await (await this.coll()).find({ _id: { $in: tickers } }).toArray();
-    return Object.fromEntries(docs.map((d) => [d._id, d.dividends ?? []]));
+    const idToTicker = new Map<string, string>();
+    for (const t of tickers) {
+      const id = tryIdOf(t);
+      if (id !== null) idToTicker.set(id, t);
+    }
+    if (idToTicker.size === 0) return {};
+    const docs = await (await this.coll()).find({ _id: { $in: [...idToTicker.keys()] } }).toArray();
+    const out: Record<string, StoredDividend[]> = {};
+    for (const d of docs) {
+      const ticker = idToTicker.get(d._id);
+      if (ticker !== undefined) out[ticker] = d.dividends ?? [];
+    }
+    return out;
   }
 
   async coverage(): Promise<{ count: number; withDividends: number; withSplits: number }> {
@@ -123,8 +143,13 @@ export class CorporateActionsStore {
    * genuinely-new dates, and advances the cursors.
    */
   async syncOne(ticker: string, now = Date.now()): Promise<{ fetched: boolean; newDividends: number; newSplits: number }> {
+    // The store is keyed on the (symbol, market) composite `_id` since Task 16b. A ticker that isn't
+    // a recognised US/LSE form can't be stored — skip it (fail-soft, no fetch, no write).
+    const identity = tryIdentityOf(ticker);
+    if (identity === null) return { fetched: false, newDividends: 0, newSplits: 0 };
+    const id = idOf(identity);
     const coll = await this.coll();
-    const existing = await coll.findOne({ _id: ticker });
+    const existing = await coll.findOne({ _id: id });
 
     // Gate: a ticker synced recently AND already cursored has nothing worth a credit. A never-synced
     // ticker (no doc, or a doc with no asOf) always fetches its full history once.
@@ -146,6 +171,8 @@ export class CorporateActionsStore {
     const mergedSplits = [...(existing?.splits ?? []), ...newSplits].sort((a, b) => a.date.localeCompare(b.date));
 
     const set: Partial<CorporateActionsDoc> = {
+      symbol: identity.symbol,
+      market: identity.market,
       dividends: mergedDivs,
       splits: mergedSplits,
       source: this.source,
@@ -157,7 +184,7 @@ export class CorporateActionsStore {
     if (lastDividendDate !== undefined) set.lastDividendDate = lastDividendDate;
     if (lastSplitDate !== undefined) set.lastSplitDate = lastSplitDate;
 
-    await coll.updateOne({ _id: ticker }, { $set: set }, { upsert: true });
+    await coll.updateOne({ _id: id }, { $set: set }, { upsert: true });
 
     // A genuinely-new action landed → notify the listener (re-adjust the daily series). Fired only
     // after the cursors are persisted, so a re-adjust always sees the store consistent. Best-effort:
