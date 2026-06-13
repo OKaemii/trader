@@ -104,23 +104,27 @@ def test_stamp_source_only_from_allowed_set():
 
 # ── Doc shape ────────────────────────────────────────────────────────────────────────────────
 def test_build_docs_shape_and_per_ticker_source():
-    """One doc per ticker, the exact T5 doc shape, with per-ticker source resolution (div for the
-    payer, the provider source for the non-payer)."""
+    """One doc per name, keyed on the bare (symbol, market) identity (Task 16b — the concatenated
+    T212 ticker is no longer stored), with per-name source resolution (div for the payer, the provider
+    source for the non-payer)."""
     rows = {"AAPL_US_EQ": _full_row(), "BP_US_EQ": _full_row()}
     docs = build_docs(
         rows, observation_ts=1717718400000,
         fundamentals_source_for=_yahoo_for, div_yield_tickers={"AAPL_US_EQ"},
     )
-    assert {d["ticker"] for d in docs} == {"AAPL_US_EQ", "BP_US_EQ"}
-    by_ticker = {d["ticker"]: d for d in docs}
-    # Shape: top-level ticker/observation_ts + the four-factor `factors` block.
-    aapl = by_ticker["AAPL_US_EQ"]
+    # Stored on (symbol, market) — no `ticker` field on the persisted doc.
+    assert {(d["symbol"], d["market"]) for d in docs} == {("AAPL", "US"), ("BP", "US")}
+    assert all("ticker" not in d for d in docs)
+    by_symbol = {d["symbol"]: d for d in docs}
+    # Shape: top-level symbol/market/observation_ts + the four-factor `factors` block.
+    aapl = by_symbol["AAPL"]
+    assert aapl["market"] == "US"
     assert aapl["observation_ts"] == 1717718400000
     assert set(aapl["factors"].keys()) == {"momentum", "quality", "value", "volatility"}
     assert set(aapl["factors"]["momentum"].keys()) == {"raw", "pct", "source"}
-    # Per-ticker value source: payer → div, non-payer → yahoo-snapshot.
+    # Per-name value source: payer → div, non-payer → yahoo-snapshot.
     assert aapl["factors"]["value"]["source"] == SOURCE_DIV
-    assert by_ticker["BP_US_EQ"]["factors"]["value"]["source"] == SOURCE_YAHOO
+    assert by_symbol["BP"]["factors"]["value"]["source"] == SOURCE_YAHOO
 
 
 # ── Writer + reader (against a tiny in-memory fake motor collection) ────────────────────────────
@@ -244,12 +248,13 @@ class _FakeDb:
 
 @pytest.mark.asyncio
 async def test_ensure_indexes_creates_the_compound_index():
-    """One compound (ticker asc, observation_ts desc) index serves all three reads — a second
-    same-key index would only double write cost, so ensure_indexes creates exactly one."""
+    """One compound (symbol asc, market asc, observation_ts desc) index serves all three reads (the
+    store is keyed on the bare (symbol, market) identity since Task 16b) — a second same-key index
+    would only double write cost, so ensure_indexes creates exactly one."""
     coll = _FakeCollection()
     store = FactorStore(db=_FakeDb(coll))
     await store.ensure_indexes()
-    assert coll.indexes == ["factor_scores_ticker_obs"]
+    assert coll.indexes == ["factor_scores_symbol_market_obs"]
 
 
 @pytest.mark.asyncio
@@ -446,11 +451,12 @@ def test_upgrade_null_cells_ignores_non_genuine_fresh_source():
 
 
 # ── The store candidate query + matched in-place upgrade ─────────────────────────────────────────
-def _row(ticker, ts, *, quality_source, value_source=SOURCE_DIV):
-    """A persisted factor_scores doc with a controllable quality/value source (None = the no-source
-    cell, the re-backfill target)."""
+def _row(symbol, market, ts, *, quality_source, value_source=SOURCE_DIV):
+    """A persisted factor_scores doc keyed on the bare (symbol, market) identity (Task 16b), with a
+    controllable quality/value source (None = the no-source cell, the re-backfill target)."""
     return {
-        "ticker": ticker,
+        "symbol": symbol,
+        "market": market,
         "observation_ts": ts,
         "factors": {
             "momentum":   _cell(1.0, 50.0, SOURCE_EOD),
@@ -464,16 +470,17 @@ def _row(ticker, ts, *, quality_source, value_source=SOURCE_DIV):
 @pytest.mark.asyncio
 async def test_rows_needing_rebackfill_matches_only_null_source_cells():
     """The candidate query returns ONLY rows with a no-source quality or value cell; a fully-sourced
-    row is excluded. Oldest → newest."""
+    row is excluded. Oldest → newest. Each candidate carries a re-derived `ticker` (from its stored
+    symbol/market) so the driver's recompute_fn keeps its ticker contract."""
     coll = _FakeCollection()
     store = FactorStore(db=_FakeDb(coll))
     coll.docs = [
-        _row("AAPL_US_EQ", 3000, quality_source=None),                       # null quality → candidate
-        _row("MSFT_US_EQ", 1000, quality_source=SOURCE_YAHOO, value_source=None),  # null value → candidate
-        _row("BP_US_EQ", 2000, quality_source=SOURCE_YAHOO, value_source=SOURCE_DIV),  # fully sourced → NOT
+        _row("AAPL", "US", 3000, quality_source=None),                       # null quality → candidate
+        _row("MSFT", "US", 1000, quality_source=SOURCE_YAHOO, value_source=None),  # null value → candidate
+        _row("BP", "US", 2000, quality_source=SOURCE_YAHOO, value_source=SOURCE_DIV),  # fully sourced → NOT
     ]
     candidates = await store.rows_needing_rebackfill()
-    tickers = [c["ticker"] for c in candidates]
+    tickers = [c["ticker"] for c in candidates]   # re-derived T212 ticker per candidate
     assert "BP_US_EQ" not in tickers
     assert set(tickers) == {"AAPL_US_EQ", "MSFT_US_EQ"}
     # Oldest → newest by observation_ts (MSFT@1000 before AAPL@3000).
@@ -482,11 +489,11 @@ async def test_rows_needing_rebackfill_matches_only_null_source_cells():
 
 @pytest.mark.asyncio
 async def test_rebackfill_row_writes_matched_block():
-    """rebackfill_row updates the row matched by (ticker, observation_ts) in place, returns True on a
-    real change, False on a no-op."""
+    """rebackfill_row updates the row matched by (symbol, market, observation_ts) in place (the input
+    T212 ticker is split to (symbol, market)), returns True on a real change, False on a no-op."""
     coll = _FakeCollection()
     store = FactorStore(db=_FakeDb(coll))
-    coll.docs = [_row("AAPL_US_EQ", 1000, quality_source=None)]
+    coll.docs = [_row("AAPL", "US", 1000, quality_source=None)]
     new_factors = dict(coll.docs[0]["factors"])
     new_factors["quality"] = _cell(0.9, 95.0, SOURCE_PIT_EDGAR)
     assert await store.rebackfill_row("AAPL_US_EQ", 1000, new_factors) is True
@@ -505,8 +512,8 @@ async def test_rebackfill_factor_sources_upgrades_only_null_rows():
     coll = _FakeCollection()
     store = FactorStore(db=_FakeDb(coll))
     coll.docs = [
-        _row("AAPL_US_EQ", 1000, quality_source=None),                            # null quality
-        _row("BP_US_EQ", 2000, quality_source=SOURCE_YAHOO, value_source=SOURCE_DIV),  # genuine → skipped
+        _row("AAPL", "US", 1000, quality_source=None),                            # null quality
+        _row("BP", "US", 2000, quality_source=SOURCE_YAHOO, value_source=SOURCE_DIV),  # genuine → skipped
     ]
 
     async def recompute(ticker, observation_ts):
@@ -521,11 +528,11 @@ async def test_rebackfill_factor_sources_upgrades_only_null_rows():
     assert summary["scanned"] == 1
     assert summary["rows_upgraded"] == 1
     assert summary["cells_upgraded"] == 1
-    aapl = next(d for d in coll.docs if d["ticker"] == "AAPL_US_EQ")
+    aapl = next(d for d in coll.docs if d["symbol"] == "AAPL")
     assert aapl["factors"]["quality"] == _cell(0.95, 96.0, SOURCE_PIT_EDGAR)   # upgraded
     assert aapl["factors"]["value"]["source"] == SOURCE_DIV                    # genuine div leg untouched
     # BP was fully sourced → never scanned, never changed.
-    bp = next(d for d in coll.docs if d["ticker"] == "BP_US_EQ")
+    bp = next(d for d in coll.docs if d["symbol"] == "BP")
     assert bp["factors"]["quality"]["source"] == SOURCE_YAHOO
 
 
@@ -535,7 +542,7 @@ async def test_rebackfill_is_idempotent():
     source, so they no longer match the candidate query)."""
     coll = _FakeCollection()
     store = FactorStore(db=_FakeDb(coll))
-    coll.docs = [_row("AAPL_US_EQ", 1000, quality_source=None)]
+    coll.docs = [_row("AAPL", "US", 1000, quality_source=None)]
 
     async def recompute(ticker, ts):
         return {"quality": _cell(0.95, 96.0, SOURCE_PIT_EDGAR)}
@@ -552,7 +559,7 @@ async def test_rebackfill_skips_when_pit_still_empty():
     honest gap — nothing upgraded, no fabricated value."""
     coll = _FakeCollection()
     store = FactorStore(db=_FakeDb(coll))
-    coll.docs = [_row("AAPL_US_EQ", 1000, quality_source=None)]
+    coll.docs = [_row("AAPL", "US", 1000, quality_source=None)]
 
     async def recompute_empty(ticker, ts):
         return {}
@@ -569,8 +576,8 @@ async def test_rebackfill_swallows_a_bad_row_and_continues():
     coll = _FakeCollection()
     store = FactorStore(db=_FakeDb(coll))
     coll.docs = [
-        _row("BAD_US_EQ", 1000, quality_source=None),
-        _row("AAPL_US_EQ", 2000, quality_source=None),
+        _row("BAD", "US", 1000, quality_source=None),
+        _row("AAPL", "US", 2000, quality_source=None),
     ]
 
     async def recompute(ticker, ts):
@@ -592,7 +599,7 @@ async def test_rebackfill_accepts_sync_recompute_fn():
     """recompute_fn may be sync (not just async) — the entry point awaits only when it's awaitable."""
     coll = _FakeCollection()
     store = FactorStore(db=_FakeDb(coll))
-    coll.docs = [_row("AAPL_US_EQ", 1000, quality_source=None)]
+    coll.docs = [_row("AAPL", "US", 1000, quality_source=None)]
 
     def recompute_sync(ticker, ts):  # plain sync callable
         return {"quality": _cell(0.95, 96.0, SOURCE_PIT_EDGAR)}

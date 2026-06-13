@@ -59,7 +59,24 @@ async def _load_validation_history(req: dict) -> dict:
 
     constituents = None
     if req.get('survivorship_free'):
-        constituents = await _db['index_constituents'].find({'index': 'sp500'}, {'_id': 0}).to_list(length=None)
+        # index_constituents is keyed on the bare (symbol, market) identity since Task 16b. Keep the
+        # `index` filter (two tags coexist), then re-derive each row's T212 `ticker` from (symbol,
+        # market) so the pure universe_loader + the downstream EODHD bars reader (which accepts the
+        # T212 form) stay behaviour-identical. A row that can't be re-joined is dropped (fail-soft).
+        from quant_core.ticker_identity import TickerIdentity, Trading212TickerAdapter
+
+        _adapter = Trading212TickerAdapter()
+        raw_rows = await _db['index_constituents'].find({'index': 'sp500'}, {'_id': 0}).to_list(length=None)
+        constituents = []
+        for row in raw_rows:
+            sym, mkt = row.get('symbol'), row.get('market')
+            if not isinstance(sym, str) or not isinstance(mkt, str):
+                continue
+            try:
+                ticker = _adapter.to_t212(TickerIdentity(symbol=sym, market=mkt))  # type: ignore[arg-type]
+            except Exception:  # noqa: BLE001 — drop an un-routable stored row, never abort the load
+                continue
+            constituents.append({**row, 'ticker': ticker})
         tickers = active_union(constituents, start, end) or DEFAULT_SP100
     else:
         tickers = [t.strip() for t in (req.get('tickers') or DEFAULT_SP100) if t and t.strip()]

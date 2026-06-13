@@ -230,11 +230,22 @@ class _FakeDb:
         return self._cols[name]
 
 
+# instrument_registry + index_constituents are keyed on the bare (symbol, market) identity since
+# Task 16b — the Mongo rows carry symbol+market (not the concatenated T212 ticker), and load_coverage
+# re-derives the T212 ticker before the pure resolve_coverage strips US `_US_EQ` → bare symbol.
+def _reg_sm(symbol: str, market: str) -> dict:
+    return {"symbol": symbol, "market": market}
+
+
+def _idx_sm(symbol: str, market: str, frm: int, to=None) -> dict:
+    return {"symbol": symbol, "market": market, "effective_from": frm, "effective_to": to}
+
+
 @pytest.mark.asyncio
 async def test_load_coverage_reads_both_collections() -> None:
     db = _FakeDb(
-        registry_rows=[{"ticker": "AAPL_US_EQ"}, {"ticker": "VODl_EQ"}],  # UK dropped
-        index_rows=[_idx("MSFT", 0), _idx("AAPL", 0)],
+        registry_rows=[_reg_sm("AAPL", "US"), _reg_sm("VOD", "LSE")],  # UK dropped (US-only EDGAR)
+        index_rows=[_idx_sm("MSFT", "US", 0), _idx_sm("AAPL", "US", 0)],
     )
     out = await load_coverage(db, window_lo_ms=0, window_hi_ms=10_000 * _DAY, cap=None)
     assert out == ["AAPL", "MSFT"]
@@ -243,13 +254,13 @@ async def test_load_coverage_reads_both_collections() -> None:
 @pytest.mark.asyncio
 async def test_load_coverage_degrades_when_index_read_fails() -> None:
     # A missing/broken index collection still yields the universe (partial coverage beats none).
-    db = _FakeDb(registry_rows=[{"ticker": "AAPL_US_EQ"}], index_rows=[], index_raises=True)
+    db = _FakeDb(registry_rows=[_reg_sm("AAPL", "US")], index_rows=[], index_raises=True)
     out = await load_coverage(db, window_lo_ms=0, cap=None)
     assert out == ["AAPL"]
 
 
 @pytest.mark.asyncio
 async def test_load_coverage_degrades_when_universe_read_fails() -> None:
-    db = _FakeDb(registry_rows=[], index_rows=[_idx("MSFT", 0)], registry_raises=True)
+    db = _FakeDb(registry_rows=[], index_rows=[_idx_sm("MSFT", "US", 0)], registry_raises=True)
     out = await load_coverage(db, window_lo_ms=0, cap=None)
     assert out == ["MSFT"]

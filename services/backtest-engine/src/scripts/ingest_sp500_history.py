@@ -111,11 +111,20 @@ async def ingest(db, url: str = DEFAULT_CSV_URL, index: str = "sp500") -> dict:
         raise SystemExit(f"refusing to ingest: only {len(snapshots)} snapshots parsed from {url}")
     intervals = build_intervals(snapshots, index)
 
+    # index_constituents is keyed on the bare (symbol, market) identity since Task 16b — the
+    # concatenated T212 ticker is no longer stored. The fja05680 CSV carries bare US symbols (e.g.
+    # `AAPL`), so each interval's `ticker` maps 1:1 to {symbol: ticker, market: 'US'} (S&P 500 is all
+    # US-listed); the upsert key + the row drop `ticker` for `symbol`+`market`. Consumers keep
+    # filtering by `index` (two tags `sp500`/`FTSE100` coexist).
     now = datetime.now(timezone.utc)
     for row in intervals:
+        symbol = row["ticker"]
+        doc = {"index": row["index"], "symbol": symbol, "market": "US",
+               "effective_from": row["effective_from"], "effective_to": row["effective_to"]}
         await db["index_constituents"].update_one(
-            {"index": row["index"], "ticker": row["ticker"], "effective_from": row["effective_from"]},
-            {"$set": {**row, "data_source": "fja05680_sp500_csv", "ingested_at": now}},
+            {"index": doc["index"], "symbol": doc["symbol"], "market": doc["market"],
+             "effective_from": doc["effective_from"]},
+            {"$set": {**doc, "data_source": "fja05680_sp500_csv", "ingested_at": now}},
             upsert=True,
         )
     await db["index_constituents_audit"].insert_one(
