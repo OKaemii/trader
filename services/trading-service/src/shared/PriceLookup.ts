@@ -1,6 +1,7 @@
 import type { Db } from 'mongodb';
 import { COLLECTIONS } from '@trader/shared-mongo';
 import { getPgPool } from '@trader/shared-pg';
+import { Trading212TickerAdapter } from '@trader/ticker-identity';
 import type { Money, Currency } from '@trader/shared-types';
 
 // Bi-temporal price lookup for trading-service. Dispatches between Mongo
@@ -9,19 +10,23 @@ import type { Money, Currency } from '@trader/shared-types';
 // OrderDispatcher to size orders in instrument currency.
 //
 // Renamed from MongoPriceLookup as part of agent-docs/plans/three-database-split.md.
+// Storage is keyed on the bare identity (symbol, market) since Thread A (Task 15); the public
+// methods still accept a T212 ticker during the transition and split it at the storage boundary.
 
 function activeBackend(): 'mongo' | 'timescale' {
   return (process.env.BARS_BACKEND ?? 'mongo') === 'timescale' ? 'timescale' : 'mongo';
 }
 
+const tickerAdapter = new Trading212TickerAdapter();
+
 // Currency-tagging fallback when the bar row didn't persist a `currency` field
 // (pre-currency-persistence-fix data). Without this, untagged US bars would be
 // mis-tagged GBP and the dispatcher would size orders by an FX factor —
-// rounded down to 0 shares for almost every US signal. Inferred from the T212
-// ticker suffix: `_US_EQ` → USD, anything else (`l_EQ` LSE / unsuffixed) → GBP.
+// rounded down to 0 shares for almost every US signal. The market is the currency
+// determinant: a US listing → USD, an LSE listing → GBP (via the adapter).
 function inferCurrency(ticker: string, persisted: unknown): Currency {
   if (persisted === 'USD' || persisted === 'GBP') return persisted;
-  return /_US_EQ$/.test(ticker) ? 'USD' : 'GBP';
+  return tickerAdapter.currencyOf(tickerAdapter.fromT212(ticker));
 }
 
 export class PriceLookup {
@@ -41,9 +46,10 @@ export class PriceLookup {
 
   private async _lastCloseMongo(ticker: string, asOf?: number): Promise<number | null> {
     const coll = this.db.collection(COLLECTIONS.OHLCV_BARS);
+    const { symbol, market } = tickerAdapter.fromT212(ticker);
     if (asOf === undefined) {
       const doc = await coll
-        .find({ ticker, is_superseded: false })
+        .find({ symbol, market, is_superseded: false })
         .sort({ observation_ts: -1 })
         .limit(1)
         .next();
@@ -52,7 +58,7 @@ export class PriceLookup {
       return close && close > 0 ? close : null;
     }
     const docs = await coll.aggregate([
-      { $match: { ticker, knowledge_ts: { $lte: asOf } } },
+      { $match: { symbol, market, knowledge_ts: { $lte: asOf } } },
       { $sort: { observation_ts: -1, knowledge_ts: -1 } },
       { $group: { _id: '$observation_ts', close: { $first: '$close' } } },
       { $sort: { _id: -1 } },
@@ -65,16 +71,17 @@ export class PriceLookup {
 
   private async _lastCloseMoneyMongo(ticker: string, asOf?: number): Promise<Money | null> {
     const coll = this.db.collection(COLLECTIONS.OHLCV_BARS);
+    const { symbol, market } = tickerAdapter.fromT212(ticker);
     let doc: Record<string, unknown> | null;
     if (asOf === undefined) {
       doc = await coll
-        .find({ ticker, is_superseded: false })
+        .find({ symbol, market, is_superseded: false })
         .sort({ observation_ts: -1 })
         .limit(1)
         .next();
     } else {
       const docs = await coll.aggregate([
-        { $match: { ticker, knowledge_ts: { $lte: asOf } } },
+        { $match: { symbol, market, knowledge_ts: { $lte: asOf } } },
         { $sort: { observation_ts: -1, knowledge_ts: -1 } },
         { $group: { _id: '$observation_ts', close: { $first: '$close' }, currency: { $first: '$currency' } } },
         { $sort: { _id: -1 } },
@@ -92,12 +99,13 @@ export class PriceLookup {
 
   private async _lastClosePg(ticker: string, asOf?: number): Promise<number | null> {
     const pool = getPgPool();
+    const { symbol, market } = tickerAdapter.fromT212(ticker);
     if (asOf === undefined) {
       const { rows } = await pool.query<{ close: string }>(
         `SELECT close FROM bars
-          WHERE ticker = $1 AND is_superseded = FALSE
+          WHERE symbol = $1 AND market = $2 AND is_superseded = FALSE
           ORDER BY observation_ts DESC LIMIT 1`,
-        [ticker],
+        [symbol, market],
       );
       const close = rows[0]?.close !== undefined ? Number(rows[0].close) : null;
       return close && close > 0 ? close : null;
@@ -106,11 +114,11 @@ export class PriceLookup {
       `SELECT close FROM (
          SELECT DISTINCT ON (observation_ts) observation_ts, close
            FROM bars
-          WHERE ticker = $1 AND knowledge_ts <= $2
+          WHERE symbol = $1 AND market = $2 AND knowledge_ts <= $3
           ORDER BY observation_ts DESC, knowledge_ts DESC
        ) sub
        LIMIT 1`,
-      [ticker, asOf],
+      [symbol, market, asOf],
     );
     const close = rows[0]?.close !== undefined ? Number(rows[0].close) : null;
     return close && close > 0 ? close : null;
@@ -118,13 +126,14 @@ export class PriceLookup {
 
   private async _lastCloseMoneyPg(ticker: string, asOf?: number): Promise<Money | null> {
     const pool = getPgPool();
+    const { symbol, market } = tickerAdapter.fromT212(ticker);
     let row: { close: string; currency: string | null } | undefined;
     if (asOf === undefined) {
       const { rows } = await pool.query<{ close: string; currency: string | null }>(
         `SELECT close, currency FROM bars
-          WHERE ticker = $1 AND is_superseded = FALSE
+          WHERE symbol = $1 AND market = $2 AND is_superseded = FALSE
           ORDER BY observation_ts DESC LIMIT 1`,
-        [ticker],
+        [symbol, market],
       );
       row = rows[0];
     } else {
@@ -132,11 +141,11 @@ export class PriceLookup {
         `SELECT close, currency FROM (
            SELECT DISTINCT ON (observation_ts) observation_ts, close, currency
              FROM bars
-            WHERE ticker = $1 AND knowledge_ts <= $2
+            WHERE symbol = $1 AND market = $2 AND knowledge_ts <= $3
             ORDER BY observation_ts DESC, knowledge_ts DESC
          ) sub
          LIMIT 1`,
-        [ticker, asOf],
+        [symbol, market, asOf],
       );
       row = rows[0];
     }

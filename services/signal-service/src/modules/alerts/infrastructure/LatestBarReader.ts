@@ -1,6 +1,7 @@
 import type { Db } from 'mongodb';
 import { getPgPool } from '@trader/shared-pg';
 import { COLLECTIONS } from '@trader/shared-mongo';
+import { Trading212TickerAdapter } from '@trader/ticker-identity';
 import type { BarHLC } from '../application/detect.ts';
 
 function num(v: unknown): number | null {
@@ -10,6 +11,9 @@ function num(v: unknown): number | null {
 function activeBackend(): 'mongo' | 'timescale' {
     return (process.env.BARS_BACKEND ?? 'mongo') === 'timescale' ? 'timescale' : 'mongo';
 }
+
+// Storage is keyed on the bare identity (symbol, market); split the T212 ticker at the boundary.
+const tickerAdapter = new Trading212TickerAdapter();
 
 // Latest unsuperseded bar for a ticker (high/low/close), used by the AlertWatcher to detect a
 // level cross. Dispatches on BARS_BACKEND exactly like PriceLookup — the live cluster runs
@@ -24,8 +28,9 @@ export class LatestBarReader {
     }
 
     private async latestMongo(ticker: string): Promise<BarHLC | null> {
+        const { symbol, market } = tickerAdapter.fromT212(ticker);
         const doc = await this.db.collection(COLLECTIONS.OHLCV_BARS)
-            .find({ ticker, is_superseded: false })
+            .find({ symbol, market, is_superseded: false })
             .sort({ observation_ts: -1 })
             .limit(1)
             .next();
@@ -36,11 +41,12 @@ export class LatestBarReader {
 
     private async latestPg(ticker: string): Promise<BarHLC | null> {
         // Live path — partial-unique-index fast lane, same as PriceLookup._lastClosePg.
+        const { symbol, market } = tickerAdapter.fromT212(ticker);
         const { rows } = await getPgPool().query<{ high: string; low: string; close: string }>(
             `SELECT high, low, close FROM bars
-              WHERE ticker = $1 AND is_superseded = FALSE
+              WHERE symbol = $1 AND market = $2 AND is_superseded = FALSE
               ORDER BY observation_ts DESC LIMIT 1`,
-            [ticker],
+            [symbol, market],
         );
         const r = rows[0];
         if (!r) return null;

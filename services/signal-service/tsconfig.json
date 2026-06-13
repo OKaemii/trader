@@ -20,6 +20,7 @@
         { "path": "../../packages/shared-pg" },
         { "path": "../../packages/shared-portfolio" },
         { "path": "../../packages/shared-redis" },
-        { "path": "../../packages/shared-types" }
+        { "path": "../../packages/shared-types" },
+        { "path": "../../packages/ticker-identity" }
     ]
 }

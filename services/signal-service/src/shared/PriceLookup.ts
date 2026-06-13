@@ -1,21 +1,25 @@
 import type { Db } from 'mongodb';
 import { COLLECTIONS } from '@trader/shared-mongo';
 import { getPgPool } from '@trader/shared-pg';
+import { Trading212TickerAdapter } from '@trader/ticker-identity';
 import type { IPriceLookup } from '../modules/signals/domain/IPriceLookup.ts';
 
 // Bi-temporal price lookup. Dispatches between Mongo (legacy default) and
 // Timescale (post-cutover) via `BARS_BACKEND`. Live reads (`asOf` omitted)
 // filter `is_superseded:false`/`is_superseded = FALSE` and resolve to the
 // partial-unique-index fast lane on either store. As-of reads aggregate per
-// (ticker, observation_ts) picking the latest revision known at `asOf`.
+// observation_ts picking the latest revision known at `asOf`.
 //
 // Renamed from MongoPriceLookup as part of agent-docs/plans/three-database-split.md.
-// The Mongo-side aggregations are preserved verbatim so this is a zero-risk
-// behavioural change on the default backend.
+// Storage is keyed on the bare identity (symbol, market) since Thread A (Task 15); the public
+// methods still accept a T212 ticker during the transition and split it at the storage boundary via
+// the platform's single suffix parser. The aggregation/SQL shapes are otherwise unchanged.
 
 function activeBackend(): 'mongo' | 'timescale' {
   return (process.env.BARS_BACKEND ?? 'mongo') === 'timescale' ? 'timescale' : 'mongo';
 }
+
+const tickerAdapter = new Trading212TickerAdapter();
 
 export class PriceLookup implements IPriceLookup {
   constructor(private readonly db: Db) {}
@@ -35,9 +39,10 @@ export class PriceLookup implements IPriceLookup {
 
   private async _lastCloseMongo(ticker: string, asOf?: number): Promise<number | null> {
     const coll = this.db.collection(COLLECTIONS.OHLCV_BARS);
+    const { symbol, market } = tickerAdapter.fromT212(ticker);
     if (asOf === undefined) {
       const doc = await coll
-        .find({ ticker, is_superseded: false })
+        .find({ symbol, market, is_superseded: false })
         .sort({ observation_ts: -1 })
         .limit(1)
         .next();
@@ -46,7 +51,7 @@ export class PriceLookup implements IPriceLookup {
       return close && close > 0 ? close : null;
     }
     const docs = await coll.aggregate([
-      { $match: { ticker, knowledge_ts: { $lte: asOf } } },
+      { $match: { symbol, market, knowledge_ts: { $lte: asOf } } },
       { $sort: { observation_ts: -1, knowledge_ts: -1 } },
       { $group: { _id: '$observation_ts', close: { $first: '$close' } } },
       { $sort: { _id: -1 } },
@@ -60,18 +65,23 @@ export class PriceLookup implements IPriceLookup {
   private async _lastCloseManyMongo(tickers: string[], asOf?: number): Promise<Record<string, number | null>> {
     const out: Record<string, number | null> = {};
     const coll = this.db.collection(COLLECTIONS.OHLCV_BARS);
-    const match: Record<string, unknown> = { ticker: { $in: tickers } };
+    // Split each requested ticker to its identity; key results back to the original ticker so the
+    // returned record's keys are unchanged for callers.
+    const ids = tickers.map((t) => ({ ticker: t, ...tickerAdapter.fromT212(t) }));
+    const tickerByIdentity = new Map(ids.map((i) => [`${i.symbol}|${i.market}`, i.ticker]));
+    const match: Record<string, unknown> = { $or: ids.map((i) => ({ symbol: i.symbol, market: i.market })) };
     if (asOf === undefined) match.is_superseded = false;
     else                    match.knowledge_ts  = { $lte: asOf };
 
     const cursor = coll.aggregate([
       { $match: match },
       { $sort: { observation_ts: -1, knowledge_ts: -1 } },
-      { $group: { _id: '$ticker', close: { $first: '$close' } } },
+      { $group: { _id: { symbol: '$symbol', market: '$market' }, close: { $first: '$close' } } },
     ]);
     for await (const row of cursor) {
       const close = typeof row.close === 'number' && row.close > 0 ? row.close : null;
-      out[String(row._id)] = close;
+      const t = tickerByIdentity.get(`${row._id.symbol}|${row._id.market}`);
+      if (t !== undefined) out[t] = close;
     }
     for (const t of tickers) if (!(t in out)) out[t] = null;
     return out;
@@ -81,13 +91,14 @@ export class PriceLookup implements IPriceLookup {
 
   private async _lastClosePg(ticker: string, asOf?: number): Promise<number | null> {
     const pool = getPgPool();
+    const { symbol, market } = tickerAdapter.fromT212(ticker);
     if (asOf === undefined) {
       // Live path — partial-unique-index fast lane.
       const { rows } = await pool.query<{ close: string }>(
         `SELECT close FROM bars
-          WHERE ticker = $1 AND is_superseded = FALSE
+          WHERE symbol = $1 AND market = $2 AND is_superseded = FALSE
           ORDER BY observation_ts DESC LIMIT 1`,
-        [ticker],
+        [symbol, market],
       );
       const close = rows[0]?.close !== undefined ? Number(rows[0].close) : null;
       return close && close > 0 ? close : null;
@@ -98,11 +109,11 @@ export class PriceLookup implements IPriceLookup {
       `SELECT close FROM (
          SELECT DISTINCT ON (observation_ts) observation_ts, close
            FROM bars
-          WHERE ticker = $1 AND knowledge_ts <= $2
+          WHERE symbol = $1 AND market = $2 AND knowledge_ts <= $3
           ORDER BY observation_ts DESC, knowledge_ts DESC
        ) sub
        LIMIT 1`,
-      [ticker, asOf],
+      [symbol, market, asOf],
     );
     const close = rows[0]?.close !== undefined ? Number(rows[0].close) : null;
     return close && close > 0 ? close : null;
@@ -111,40 +122,50 @@ export class PriceLookup implements IPriceLookup {
   private async _lastCloseManyPg(tickers: string[], asOf?: number): Promise<Record<string, number | null>> {
     const pool = getPgPool();
     const out: Record<string, number | null> = {};
+    // Split each ticker; the (symbol, market) membership replaces the single-column ANY(). Results
+    // come back keyed by (symbol, market) and are re-keyed to the caller's original ticker strings.
+    const ids = tickers.map((t) => ({ ticker: t, ...tickerAdapter.fromT212(t) }));
+    const symbols = ids.map((i) => i.symbol);
+    const markets = ids.map((i) => i.market);
+    const tickerByIdentity = new Map(ids.map((i) => [`${i.symbol}|${i.market}`, i.ticker]));
 
     if (asOf === undefined) {
-      // Live path — one query, DISTINCT ON (ticker) picks the latest unsuperseded
-      // observation per ticker.
-      const { rows } = await pool.query<{ ticker: string; close: string }>(
-        `SELECT DISTINCT ON (ticker) ticker, close
+      // Live path — one query, DISTINCT ON (symbol, market) picks the latest unsuperseded
+      // observation per name.
+      const { rows } = await pool.query<{ symbol: string; market: string; close: string }>(
+        `SELECT DISTINCT ON (symbol, market) symbol, market, close
            FROM bars
-          WHERE ticker = ANY($1::text[]) AND is_superseded = FALSE
-          ORDER BY ticker, observation_ts DESC`,
-        [tickers],
+          WHERE (symbol, market) IN (SELECT unnest($1::text[]), unnest($2::text[]))
+            AND is_superseded = FALSE
+          ORDER BY symbol, market, observation_ts DESC`,
+        [symbols, markets],
       );
       for (const row of rows) {
         const close = Number(row.close);
-        out[row.ticker] = close > 0 ? close : null;
+        const t = tickerByIdentity.get(`${row.symbol}|${row.market}`);
+        if (t !== undefined) out[t] = close > 0 ? close : null;
       }
     } else {
-      // As-of path — first DISTINCT ON (ticker, observation_ts) to pick latest
-      // knowledge_ts revision per observation, then DISTINCT ON (ticker) to pick
-      // the latest observation per ticker.
-      const { rows } = await pool.query<{ ticker: string; close: string }>(
-        `SELECT DISTINCT ON (ticker) ticker, close
+      // As-of path — first DISTINCT ON (symbol, market, observation_ts) to pick latest
+      // knowledge_ts revision per observation, then DISTINCT ON (symbol, market) to pick
+      // the latest observation per name.
+      const { rows } = await pool.query<{ symbol: string; market: string; close: string }>(
+        `SELECT DISTINCT ON (symbol, market) symbol, market, close
            FROM (
-             SELECT DISTINCT ON (ticker, observation_ts)
-                    ticker, observation_ts, close
+             SELECT DISTINCT ON (symbol, market, observation_ts)
+                    symbol, market, observation_ts, close
                FROM bars
-              WHERE ticker = ANY($1::text[]) AND knowledge_ts <= $2
-              ORDER BY ticker, observation_ts, knowledge_ts DESC
+              WHERE (symbol, market) IN (SELECT unnest($1::text[]), unnest($2::text[]))
+                AND knowledge_ts <= $3
+              ORDER BY symbol, market, observation_ts, knowledge_ts DESC
            ) sub
-          ORDER BY ticker, observation_ts DESC`,
-        [tickers, asOf],
+          ORDER BY symbol, market, observation_ts DESC`,
+        [symbols, markets, asOf],
       );
       for (const row of rows) {
         const close = Number(row.close);
-        out[row.ticker] = close > 0 ? close : null;
+        const t = tickerByIdentity.get(`${row.symbol}|${row.market}`);
+        if (t !== undefined) out[t] = close > 0 ? close : null;
       }
     }
 
