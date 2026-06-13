@@ -1,79 +1,82 @@
-// Pure merge of the two PIT-fundamentals provenance reads, keyed by T212 ticker, for the Operations
-// per-ticker state table (card 149, plan §J). No React / DOM — unit-tested in the node env.
+// Pure merge of the two PIT-fundamentals provenance reads for the Operations per-ticker state table,
+// keyed by BARE symbol (the platform source of truth since the bare-ticker flag-day). No React / DOM —
+// unit-tested in the node env.
 //
-// The honesty story is per-ticker, from data that already exists (no new store). Two endpoints both
-// key on the T212 ticker (e.g. "AAPL_US_EQ"):
-//   - freshness.names[] (fundamentals-ingestion /freshness): the WAREHOUSE side — covered, the fiscal
-//     period-end observed, the availability (knowledge) instant, our last-stored-at (the ingest
-//     wall-clock), staleness.
-//   - source.by_ticker  (strategy-engine /fundamentals-source): the CONSUME side — which source the
-//     live cycle read (pit-edgar / yahoo-snapshot / null) and built_at = when it read+built this name.
+// The honesty story is per-name, from data that already exists (no new store). Two endpoints:
+//   - freshness.names[] (fundamentals-HARVESTER /freshness): the LAKE / ingest side — covered, the
+//     fiscal period-end observed, the availability (knowledge) instant, the last SEC filing date, the
+//     filing cadence, staleness. Keyed by BARE symbol (`AAPL`) — the harvester has no Mongo and speaks
+//     the bare lake alphabet.
+//   - source.by_ticker (strategy-engine /fundamentals-source): the CONSUME side — which source the live
+//     cycle read (pit-edgar / null) and built_at = when it read+built this name. Keyed by the T212
+//     ticker (`AAPL_US_EQ`) the strategy re-derives from factor_scores.
 //
-// The two sets can diverge: a name can be in the warehouse but not yet read by a cycle (freshness-only),
-// or read by the strategy but absent from the warehouse audit window (source-only). We keep BOTH so the
-// operator sees the gap honestly, rather than dropping either side. The merge is a full outer join.
+// The two key alphabets differ, so the merge maps each T212 source key → its bare symbol and joins on
+// the bare symbol. Either side may be absent (a name harvested but not yet read by a cycle, or read but
+// outside the audit window) — we keep BOTH so the operator sees the gap honestly (a full outer join).
+
+import { fromT212 } from '@/app/lib/ticker-identity'
 
 // ── Upstream shapes (snake_case, ms timestamps) — minimal mirrors of the live payloads. ──────────
+// The harvester /freshness per-name shape (services/fundamentals-harvester/src/freshness.py). Keyed by
+// BARE symbol; carries the CIK + the last filing date + the filing cadence the harvester classifies.
 export interface FreshnessName {
-  symbol: string
-  ticker: string
-  instrument_id: number
+  symbol: string // bare US symbol (e.g. AAPL)
+  cik: number | null
   covered: boolean
   newest_period_end: number | null // fiscal period-end (observation_ts)
   newest_knowledge_ts: number | null // availability (knowledge_ts)
-  last_stored_at: number | null // MAX(revisions_log.logged_at) — our ingest store clock
+  last_filed: number | null // most recent SEC filing date (UTC ms)
+  filing_cadence: string // 'annual' | 'quarterly' — which staleness window applied
   staleness_days: number | null
   stale: boolean
 }
 
 // A curated US name that files NOTHING with the SEC (an unsponsored ADR like TCEHY) — excluded from the
-// EDGAR-eligible denominator (so never counted `missing`) and surfaced as a documented degrade-to-Yahoo
-// exception, mirroring how an LSE/foreign name with no US CIK is already accepted (epic Task A4).
+// EDGAR-eligible denominator (so never counted `missing`) and surfaced as a documented fail-closed
+// exception (the harvester's no_edgar set).
 export interface NoEdgarName {
   symbol: string
   reason: string
 }
 
+// The harvester /freshness aggregate (services/fundamentals-harvester/src/freshness.py). All counts are
+// over the EDGAR-eligible denominator (universe − no_edgar); `names[]` carries only the eligible names.
 export interface FreshnessAudit {
-  // `universe`/`covered`/`missing`/`stale`/`coverage_pct`/`retirable` are over the EDGAR-eligible
-  // denominator (curated universe − the no_edgar set); `names[]` carries only the eligible names.
   universe: number
   covered: number
   missing: number
   stale: number
   coverage_pct: number
   retirable: boolean
-  // The excluded no-EDGAR exception set (epic Task A4). Optional so an older payload (pre-A4) still
-  // parses — absent ⇒ no exceptions surfaced, the panel simply omits the line.
   no_edgar_count?: number
   no_edgar?: NoEdgarName[]
-  last_ingest_run: { state?: string; finished_at_ms?: number | null } | null
   names: FreshnessName[]
 }
 
 export interface SourceEntry {
-  source: string | null // 'pit-edgar' | 'yahoo-snapshot' | null
+  source: string | null // 'pit-edgar' | null (a retired 'yahoo-snapshot' may persist in historical rows)
   built_at: number | null // factor_scores.observation_ts — the strategy read+build instant
 }
 
 export interface FundamentalsSource {
-  provider: string // effective seam mode: 'pit' | 'yahoo'
+  provider: string // effective seam mode: 'pit' (the only live option post Yahoo-removal)
   sources: Record<string, number> // raw source → count (a null source is the literal "null" key)
-  by_ticker: Record<string, SourceEntry>
+  by_ticker: Record<string, SourceEntry> // keyed by T212 ticker
   pit_served: number
   last_cycle_ts: number | null
 }
 
-// ── The merged per-ticker row (one per ticker present on EITHER side). ────────────────────────────
+// ── The merged per-name row (one per BARE symbol present on EITHER side). ──────────────────────────
 export interface MergedRow {
-  ticker: string
-  symbol: string | null // bare symbol from freshness; null when source-only (strategy read it, audit didn't)
-  // warehouse / ingest side (freshness)
+  symbol: string // bare symbol — the row key + the displayed label
+  // lake / ingest side (freshness)
   inFreshness: boolean
   covered: boolean | null
   fiscalPeriodMs: number | null // observation_ts
   availabilityMs: number | null // knowledge_ts
-  lastStoredMs: number | null // ingest store clock
+  lastFiledMs: number | null // most recent SEC filing date
+  filingCadence: string | null // 'annual' | 'quarterly'
   stalenessDays: number | null
   stale: boolean | null
   // consume side (strategy by_ticker)
@@ -83,7 +86,7 @@ export interface MergedRow {
 }
 
 // Normalise the raw `source` string to the provenance bucket the UI tags by.
-// 'pit-edgar*' → PIT (ours); 'yahoo*' → Yahoo (third-party); null / unknown → none.
+// 'pit-edgar*' → PIT (ours); a retired 'yahoo*' stamp in a historical row → Yahoo; null / unknown → none.
 export type ProvenanceKind = 'pit' | 'yahoo' | 'none'
 export function provenanceKind(source: string | null | undefined): ProvenanceKind {
   if (!source) return 'none'
@@ -93,22 +96,29 @@ export function provenanceKind(source: string | null | undefined): ProvenanceKin
   return 'none'
 }
 
-// Full outer join freshness.names ⋈ source.by_ticker on the T212 ticker. Either side may be absent.
+// The bare symbol a source row keys to: parse its T212 ticker, falling back to the raw key (already
+// bare, or unparseable) so a source-only name still lands on a row.
+function symbolOfSourceKey(ticker: string): string {
+  return fromT212(ticker)?.symbol ?? ticker
+}
+
+// Full outer join freshness.names ⋈ source.by_ticker on the BARE symbol. Either side may be absent.
 export function mergeFundamentalsRows(
   freshness: FreshnessAudit | null,
   source: FundamentalsSource | null,
 ): MergedRow[] {
-  const byTicker = new Map<string, MergedRow>()
+  const bySymbol = new Map<string, MergedRow>()
 
   for (const n of freshness?.names ?? []) {
-    byTicker.set(n.ticker, {
-      ticker: n.ticker,
-      symbol: n.symbol,
+    const symbol = n.symbol.toUpperCase()
+    bySymbol.set(symbol, {
+      symbol,
       inFreshness: true,
       covered: n.covered,
       fiscalPeriodMs: n.newest_period_end,
       availabilityMs: n.newest_knowledge_ts,
-      lastStoredMs: n.last_stored_at,
+      lastFiledMs: n.last_filed,
+      filingCadence: n.filing_cadence,
       stalenessDays: n.staleness_days,
       stale: n.stale,
       inSource: false,
@@ -118,20 +128,21 @@ export function mergeFundamentalsRows(
   }
 
   for (const [ticker, entry] of Object.entries(source?.by_ticker ?? {})) {
-    const existing = byTicker.get(ticker)
+    const symbol = symbolOfSourceKey(ticker).toUpperCase()
+    const existing = bySymbol.get(symbol)
     if (existing) {
       existing.inSource = true
       existing.source = entry.source
       existing.lastReadBuiltMs = entry.built_at
     } else {
-      byTicker.set(ticker, {
-        ticker,
-        symbol: null, // source-only: no warehouse audit row to read the bare symbol from
+      bySymbol.set(symbol, {
+        symbol,
         inFreshness: false,
         covered: null,
         fiscalPeriodMs: null,
         availabilityMs: null,
-        lastStoredMs: null,
+        lastFiledMs: null,
+        filingCadence: null,
         stalenessDays: null,
         stale: null,
         inSource: true,
@@ -141,27 +152,27 @@ export function mergeFundamentalsRows(
     }
   }
 
-  return [...byTicker.values()]
+  return [...bySymbol.values()]
 }
 
 // ── Sorting ───────────────────────────────────────────────────────────────────────────────────────
 export type SortKey =
-  | 'ticker'
+  | 'symbol'
   | 'source'
   | 'covered'
   | 'fiscal'
   | 'availability'
-  | 'lastStored'
+  | 'lastFiled'
   | 'lastReadBuilt'
   | 'stale'
 export type SortDir = 'asc' | 'desc'
 
-// Comparator value for a row under a sort key. Nulls always sort last (stable across asc/desc by
-// pushing them to the high end before the direction flip is applied at the call site).
+// Comparator value for a row under a sort key. Nulls always sort last (pushed to the low end before the
+// direction flip is applied at the call site).
 function sortValue(r: MergedRow, key: SortKey): number | string {
   switch (key) {
-    case 'ticker':
-      return r.ticker
+    case 'symbol':
+      return r.symbol
     case 'source':
       return r.source ?? '￿' // unknown source sorts after named ones
     case 'covered':
@@ -170,8 +181,8 @@ function sortValue(r: MergedRow, key: SortKey): number | string {
       return r.fiscalPeriodMs ?? -Infinity
     case 'availability':
       return r.availabilityMs ?? -Infinity
-    case 'lastStored':
-      return r.lastStoredMs ?? -Infinity
+    case 'lastFiled':
+      return r.lastFiledMs ?? -Infinity
     case 'lastReadBuilt':
       return r.lastReadBuiltMs ?? -Infinity
     case 'stale':
@@ -190,31 +201,29 @@ export function sortRows(rows: MergedRow[], key: SortKey, dir: SortDir): MergedR
     } else {
       cmp = av < bv ? -1 : av > bv ? 1 : 0
     }
-    // Tie-break on ticker so the order is deterministic (a flicker-free, reproducible table).
-    if (cmp === 0 && key !== 'ticker') cmp = a.ticker.localeCompare(b.ticker)
+    // Tie-break on symbol so the order is deterministic (a flicker-free, reproducible table).
+    if (cmp === 0 && key !== 'symbol') cmp = a.symbol.localeCompare(b.symbol)
     return cmp * sign
   })
 }
 
 // ── Filtering ─────────────────────────────────────────────────────────────────────────────────────
-export type RowFilter = 'all' | 'stale' | 'missing' | 'pit' | 'yahoo'
+export type RowFilter = 'all' | 'stale' | 'missing' | 'pit'
 
 export function filterRows(rows: MergedRow[], filter: RowFilter, query: string): MergedRow[] {
   const q = query.trim().toLowerCase()
   return rows.filter((r) => {
-    if (q && !r.ticker.toLowerCase().includes(q) && !(r.symbol ?? '').toLowerCase().includes(q)) {
+    if (q && !r.symbol.toLowerCase().includes(q)) {
       return false
     }
     switch (filter) {
       case 'stale':
         return r.stale === true
       case 'missing':
-        // "missing" = curated/read but NOT covered in the warehouse (the self-heal target).
+        // "missing" = curated/read but NOT covered in the lake (the self-heal target).
         return r.covered === false || (r.inSource && !r.inFreshness)
       case 'pit':
         return provenanceKind(r.source) === 'pit'
-      case 'yahoo':
-        return provenanceKind(r.source) === 'yahoo'
       case 'all':
       default:
         return true
@@ -223,24 +232,22 @@ export function filterRows(rows: MergedRow[], filter: RowFilter, query: string):
 }
 
 // ── Summary ─────────────────────────────────────────────────────────────────────────────────────
-// Always-visible operator summary derived from the live source counts + the freshness aggregate.
+// Always-visible operator summary derived from the live source counts + the freshness aggregate. The
+// live provenance is PIT-only post Yahoo-removal (pit-edgar | null); the summary reports pit-served +
+// null-served (no yahoo-snapshot line — the stamp is retired from the live cycle).
 export interface FundamentalsSummary {
   // live strategy source
   provider: string | null
   pitServed: number | null
-  yahooServed: number | null
   nullServed: number | null
   lastCycleMs: number | null
-  // warehouse coverage (over the EDGAR-eligible denominator — see FreshnessAudit)
+  // lake coverage (over the EDGAR-eligible denominator — see FreshnessAudit)
   covered: number | null
   universe: number | null
   stale: number | null
   retirable: boolean | null
-  lastIngestRunMs: number | null
-  lastIngestRunState: string | null
-  // The no-EDGAR exception set (epic Task A4): names excluded from the eligible denominator because they
-  // file nothing with the SEC, so they degrade to Yahoo. Always an array (empty when none / freshness cold)
-  // so the panel can render "N names degrade to Yahoo (no SEC filings): …" without a null guard.
+  // The no-EDGAR exception set: names excluded from the eligible denominator because they file nothing
+  // with the SEC (fail-closed). Always an array (empty when none / freshness cold).
   noEdgar: NoEdgarName[]
 }
 
@@ -249,31 +256,24 @@ export function buildSummary(
   source: FundamentalsSource | null,
 ): FundamentalsSummary {
   const srcCounts = source?.sources ?? {}
-  // Sum every pit-* / yahoo-* bucket so a future per-form source key still rolls up correctly.
+  // Sum every pit-* bucket so a future per-form source key still rolls up correctly.
   let pit = 0
-  let yahoo = 0
   for (const [k, v] of Object.entries(srcCounts)) {
-    const kind = provenanceKind(k)
-    if (kind === 'pit') pit += v
-    else if (kind === 'yahoo') yahoo += v
+    if (provenanceKind(k) === 'pit') pit += v
   }
-  // The literal "null" source bucket (a name the cycle built with no fundamentals source).
+  // The literal "null" source bucket (a name the cycle built with no fundamentals source — non-US
+  // fail-closed, or a US name whose quality factor couldn't be computed that cycle).
   const nullServed = srcCounts['null'] ?? null
 
   return {
     provider: source?.provider ?? null,
     pitServed: source ? pit : null,
-    yahooServed: source ? yahoo : null,
     nullServed,
     lastCycleMs: source?.last_cycle_ts ?? null,
     covered: freshness?.covered ?? null,
     universe: freshness?.universe ?? null,
     stale: freshness?.stale ?? null,
     retirable: freshness?.retirable ?? null,
-    lastIngestRunMs: freshness?.last_ingest_run?.finished_at_ms ?? null,
-    lastIngestRunState: freshness?.last_ingest_run?.state ?? null,
-    // Pass the exception list straight through (empty when absent/cold); the count is derivable from
-    // its length, so we keep the single source of truth here rather than trusting a separate scalar.
     noEdgar: freshness?.no_edgar ?? [],
   }
 }

@@ -2,7 +2,6 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { FundamentalsSourceTag } from '@/components/FundamentalsSourceTag'
-import { QuantOnly } from '@/components/QuantOnly'
 import {
   buildSummary,
   filterRows,
@@ -16,90 +15,84 @@ import {
   type SortKey,
 } from '@/app/lib/fundamentals-merge'
 
-// Operations › PIT Fundamentals panel (card 134, extended by card 149) — the operator surface over
-// the fundamentals-ingestion write-side. Jobs in one client component, SSR-seeded by the tab:
-//   1. MONITOR  — coverage (instruments + facts), ingestion lag, last force-run state, quarantine
-//                 count, and feed-health (effective EDGAR UA + provenance + ingest-enabled).
-//                 Polls /portal-api/admin/fundamentals-ingest/status every 15s like the other
-//                 operator cards (a background CronJob run moves coverage without us triggering it,
-//                 so a static view would lie).
-//   2. SUMMARY + STATE TABLE (card 149) — an always-visible PIT-fundamentals summary (live strategy
-//                 source · PIT coverage C/U · stale N · retirable yes/no · last ingest run) and a full
-//                 per-ticker table merging the freshness audit (warehouse side) with the strategy
-//                 by_ticker map (consume side) so BOTH clocks show per row: when we last STORED a fact
-//                 (ingest) vs when the strategy last READ+BUILT it. Sortable / filterable. Both reads
-//                 poll on the same 15s cadence as status. This data is operational, so NOT mode-gated.
-//   3. FORCE    — "Run ingest now" → POST …/force (single-flight in-cluster run), then polls
-//                 …/runs/{run_id} until done|failed, surfacing the live counts. Confirm-before-run +
-//                 disabled-while-running, matching the panic-control affordances.
-//   4. UA EDITOR — the EDGAR User-Agent the next run sends to SEC, bound to GET/PUT …/config
-//                 (portal_fundamentals_config override > env > default). Shows the effective value +
-//                 where it came from; PUT persists the override; an empty value clears it back.
+// Operations › PIT Fundamentals panel — the operator surface over the fundamentals-HARVESTER (the
+// per-CIK Parquet lake's write path), repointed off the retired Timescale ingestion service by epic
+// pit-fundamentals-lake-rearchitecture (Task 21). The harvester is a pure EDGAR→lake service with NO
+// Mongo and NO Timescale, so the shape is leaner than the old ingestion view:
+//   1. STATUS    — lake state: bootstrap complete?, covered-CIK count, last sweep date, lake byte size,
+//                  the bootstrap sentinel (completed-at, entities, mode), and whether the identity files
+//                  (ticker_history / entities) are present. From /status. Polled every 15s (a background
+//                  sweep moves coverage without us triggering it, so a static view would lie).
+//   2. CONFIG    — the harvester's effective env knobs (sweep cadence, watchlist, EDGAR rps, UA-set
+//                  flag). READ-ONLY — the harvester exposes no config PUT (the UA is a deploy-time env on
+//                  the harvester; the status surface only reports whether it carries a contact). From /config.
+//   3. SUMMARY + STATE TABLE — an always-visible PIT-fundamentals summary (live strategy source · PIT
+//                  coverage C/U · stale · retirable) and a per-NAME table merging the harvester freshness
+//                  audit (lake side) with the strategy by_ticker map (consume side), so BOTH clocks show
+//                  per row: the fiscal period / availability / last filing (lake) vs when the strategy last
+//                  read+built (consume). Sortable / filterable. Keyed by BARE symbol. The freshness read
+//                  is passed the active universe via ?symbols= (the harvester has no Mongo — the universe
+//                  is an input). Operational, NOT mode-gated.
+//   4. FORCE-SWEEP — "Run sweep now" → POST …/force-sweep (single-flight in-cluster sweep). Confirm-
+//                  before-run; the sweep result lands in /status + /runs (no run-id polling — the
+//                  harvester sweep is fire-and-forget, single-flight).
+//   5. RUNS      — recent sweep history (date + CIK count) from /runs.
 //
-// Operational status, the summary, the state table, and the operator controls are NEVER mode-gated
-// (per the portal safety contract); only the quarantine forensics — the by-reason breakdown and the
-// per-name quarantine lookup — sit under <QuantOnly>.
+// The quarantine panel + the per-name quarantine lookup + the UA editor are GONE: the lake design has no
+// quarantine (decision D — a dirty fact is fail-closed-omitted at write time, never quarantined), and the
+// harvester has no config-PUT. Everything here is operational, so nothing is mode-gated.
 
-// ── Mirrors the fundamentals-ingestion /status payload (snake_case, ms timestamps). ─────────────
-interface RunRecord {
-  run_id: string
-  state: string // 'running' | 'done' | 'failed'
-  scope: string // 'subset' | 'all'
-  started_at_ms: number
-  finished_at_ms: number | null
-  requested: number
-  ingested: number
-  skipped: number
-  raw_written: number
-  canonical_inserted: number
-  canonical_revisions: number
-  canonical_skipped: number
-  quarantined: number
-  reason: string | null
-  user_agent_source: string | null
+// ── Mirrors the harvester /status payload (services/fundamentals-harvester/src/status.py). ─────────
+interface BootstrapSentinel {
+  completed_at?: string | null
+  entities?: number | null
+  mode?: string | null
 }
 
-interface IngestStatus {
-  coverage: {
-    instruments: number
-    facts: number
-    oldest_observation_ts: number | null
-    newest_knowledge_ts: number | null
-  }
-  ingestion_lag_ms: number | null
-  last_run: RunRecord | null
-  quarantine: {
-    total: number
-    by_reason: Record<string, number>
-    by_sector: Record<string, number>
-    recent: unknown[]
-  }
-  feed_health: {
-    edgar_user_agent: string
-    edgar_user_agent_source: string // 'override' | 'env' | 'default'
-    edgar_user_agent_usable: boolean
-    coverage_cap: number | null
-    ingest_enabled: boolean
-  }
-  generated_at_ms: number
+interface HarvesterStatus {
+  service: string
+  now_ms: number
+  bootstrap_complete: boolean
+  bootstrap: BootstrapSentinel | null
+  covered_ciks: number
+  last_sweep_date: string | null
+  last_sweep_ciks: number
+  lake_size_bytes: number
+  lake_dir: string
+  has_ticker_history: boolean
+  has_entities: boolean
 }
 
-// Mirrors the /config (GET/PUT) camelCase payload.
-interface IngestConfig {
-  edgarUserAgent: string
-  edgarUserAgentSource: string // 'override' | 'env' | 'default'
-  edgarUserAgentUsable: boolean
-  coverageCap: number | null
-  ingestEnabled: boolean
+// Mirrors the harvester /config payload (read-only).
+interface HarvesterConfig {
+  lake_dir: string
+  sweep_minutes: number
+  watchlist: string[]
+  watchlist_mode: boolean
+  edgar_reqs_per_sec: string
+  edgar_user_agent_set: boolean
+}
+
+// Mirrors the harvester /runs payload.
+interface RunEntry {
+  date: string
+  ciks: number
+}
+interface RunsPayload {
+  runs: RunEntry[]
+  count: number
 }
 
 interface Props {
-  initialStatus: IngestStatus | null
-  initialConfig: IngestConfig | null
-  // card 149: per-name freshness audit (warehouse side) + live strategy source map (consume side),
-  // SSR-seeded by the tab. Either may be null (cold/unreachable upstream) without blanking the panel.
+  initialStatus: HarvesterStatus | null
+  initialConfig: HarvesterConfig | null
   initialFreshness?: FreshnessAudit | null
   initialSource?: FundamentalsSource | null
+  initialRuns?: RunsPayload | null
+  // The active universe (BARE symbols) the freshness audit is run over — the harvester has no Mongo, so
+  // the portal supplies the universe via ?symbols=. Empty ⇒ the harvester defaults to the lake's
+  // currently-listed tickers.
+  universeSymbols?: string[]
 }
 
 function agoMs(ms: number | null): string {
@@ -113,55 +106,54 @@ function agoMs(ms: number | null): string {
   return `${Math.floor(h / 24)}d ago`
 }
 
-function durationMs(ms: number | null): string {
-  if (ms == null) return '—'
-  if (ms < 1000) return `${ms}ms`
-  const s = Math.floor(ms / 1000)
-  if (s < 60) return `${s}s`
-  const m = Math.floor(s / 60)
-  return `${m}m ${s % 60}s`
+function fmtBytes(bytes: number | null): string {
+  if (bytes == null || bytes <= 0) return '—'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let v = bytes
+  let i = 0
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024
+    i += 1
+  }
+  return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)}${units[i]}`
 }
 
-// Lag → fresh/stale badge. A day-old freshest fact means the nightly cron hasn't landed.
-function lagBadge(lagMs: number | null): { label: string; cls: string } {
-  if (lagMs == null) return { label: 'no data', cls: 'text-gray-500' }
-  if (lagMs < 26 * 3_600_000) return { label: 'fresh', cls: 'text-emerald-400' } // < ~26h: nightly cadence ok
-  if (lagMs < 72 * 3_600_000) return { label: 'stale', cls: 'text-amber-300' }
-  return { label: 'very stale', cls: 'text-red-400' }
+// Build the ?symbols= query string for the freshness poll from the active universe (capped defensively
+// so a large universe can't blow the URL length; the harvester defaults to the lake's tickers anyway).
+function symbolsQuery(symbols: string[] | undefined): string {
+  const list = (symbols ?? []).filter(Boolean).slice(0, 600)
+  return list.length ? `?symbols=${encodeURIComponent(list.join(','))}` : ''
 }
-
-const SOURCE_LABEL: Record<string, string> = {
-  override: 'portal override',
-  env: 'cluster env',
-  default: 'built-in default',
-}
-
-const RUN_DONE = (s: string | null | undefined) => s === 'done' || s === 'failed'
 
 export function FundamentalsIngestPanel({
   initialStatus,
   initialConfig,
   initialFreshness = null,
   initialSource = null,
+  initialRuns = null,
+  universeSymbols = [],
 }: Props) {
-  const [status, setStatus] = useState<IngestStatus | null>(initialStatus)
-  const [config, setConfig] = useState<IngestConfig | null>(initialConfig)
+  const [status, setStatus] = useState<HarvesterStatus | null>(initialStatus)
+  const [config] = useState<HarvesterConfig | null>(initialConfig)
+  const [runs, setRuns] = useState<RunsPayload | null>(initialRuns)
 
-  // card 149: the two provenance reads behind the summary + per-ticker state table. Polled alongside
-  // status so a background ingest / strategy cycle is reflected without an operator refresh.
+  // The two provenance reads behind the summary + per-name state table. Polled alongside status so a
+  // background sweep / strategy cycle is reflected without an operator refresh.
   const [freshness, setFreshness] = useState<FreshnessAudit | null>(initialFreshness)
   const [source, setSource] = useState<FundamentalsSource | null>(initialSource)
 
-  // UA editor — seed the input from the EFFECTIVE config; '' (after edit) means "clear the override".
-  const [uaInput, setUaInput] = useState<string>(initialConfig?.edgarUserAgent ?? '')
-  const [savingUa, setSavingUa] = useState(false)
-  const [uaMsg, setUaMsg] = useState<string | null>(null)
+  // Force-sweep tracking — fire-and-forget single-flight (no run-id polling: the harvester sweep result
+  // lands in /status + /runs, which the 15s poll already refreshes).
+  const [sweeping, setSweeping] = useState(false)
+  const [sweepMsg, setSweepMsg] = useState<string | null>(null)
 
-  // Force-ingest run tracking.
-  const [forcing, setForcing] = useState(false) // true while a run is in flight (we triggered or it's polling)
-  const [run, setRun] = useState<RunRecord | null>(initialStatus?.last_run ?? null)
-  const [forceMsg, setForceMsg] = useState<string | null>(null)
-  const runPoll = useRef<ReturnType<typeof setInterval> | null>(null)
+  const freshnessQs = useMemo(() => symbolsQuery(universeSymbols), [universeSymbols])
+  // Keep the latest query string in a ref so the 15s interval (mounted once) always reads the current
+  // universe without re-subscribing the timer on every render. Synced in an effect (never during render).
+  const freshnessQsRef = useRef(freshnessQs)
+  useEffect(() => {
+    freshnessQsRef.current = freshnessQs
+  }, [freshnessQs])
 
   async function refreshStatus(): Promise<void> {
     try {
@@ -170,13 +162,25 @@ export function FundamentalsIngestPanel({
     } catch {
       // transient fetch failures must not blank the operator's view
     }
+    try {
+      const r = await fetch('/portal-api/admin/fundamentals-ingest/runs', { cache: 'no-store' })
+      if (r.ok) {
+        const b = await r.json().catch(() => null)
+        if (b) setRuns(b)
+      }
+    } catch {
+      // transient — keep the last good runs
+    }
   }
 
-  // card 149: refresh the per-ticker provenance reads. Each is independent — a failure on one (or a
-  // null/cold body) leaves the prior value rather than blanking the table, mirroring refreshStatus.
+  // Refresh the per-name provenance reads. Each is independent — a failure on one (or a null/cold body)
+  // leaves the prior value rather than blanking the table, mirroring refreshStatus.
   async function refreshProvenance(): Promise<void> {
     try {
-      const r = await fetch('/portal-api/admin/fundamentals-ingest/freshness', { cache: 'no-store' })
+      const r = await fetch(
+        `/portal-api/admin/fundamentals-ingest/freshness${freshnessQsRef.current}`,
+        { cache: 'no-store' },
+      )
       if (r.ok) {
         const b = await r.json().catch(() => null)
         if (b) setFreshness(b)
@@ -195,8 +199,8 @@ export function FundamentalsIngestPanel({
     }
   }
 
-  // 15s poll — matches the circuit-breaker / auto-approve cadence. Status + the two provenance reads
-  // refresh together so coverage, the summary, and the table never drift apart between ticks.
+  // 15s poll — matches the circuit-breaker / auto-approve cadence. Status + runs + the two provenance
+  // reads refresh together so coverage, the summary, and the table never drift apart between ticks.
   useEffect(() => {
     const id = setInterval(() => {
       void refreshStatus()
@@ -205,285 +209,174 @@ export function FundamentalsIngestPanel({
     return () => clearInterval(id)
   }, [])
 
-  // Stop any in-flight run poller on unmount.
-  useEffect(() => () => { if (runPoll.current) clearInterval(runPoll.current) }, [])
-
-  // card 149: derive the summary + the merged per-ticker rows once per (freshness, source) change.
-  // Must be declared with the other hooks (before any early return) to satisfy rules-of-hooks.
+  // Derive the summary + the merged per-name rows once per (freshness, source) change.
   const summary = useMemo(() => buildSummary(freshness, source), [freshness, source])
   const mergedRows = useMemo(() => mergeFundamentalsRows(freshness, source), [freshness, source])
 
-  // ── UA editor ────────────────────────────────────────────────────────────────────────────────
-  async function saveUa(): Promise<void> {
-    const next = uaInput.trim()
-    const clearing = next === ''
-    const consequence = clearing
-      ? 'Clear the EDGAR User-Agent override and fall back to the cluster env / built-in default?'
-      : `Set the EDGAR User-Agent the next ingest sends to SEC to:\n\n  ${next}\n\nSEC fair-access requires a descriptive UA with a contact. This is applied to the next run (cross-pod).`
-    if (!window.confirm(consequence)) return
-    setSavingUa(true); setUaMsg(null)
-    try {
-      const r = await fetch('/portal-api/admin/fundamentals-ingest/config', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        // explicit null clears the override back to env/default
-        body: JSON.stringify({ edgarUserAgent: clearing ? null : next }),
-      })
-      const b = await r.json().catch(() => ({}))
-      if (!r.ok) throw new Error(b.detail ?? b.error ?? `failed (${r.status})`)
-      const c: IngestConfig = b
-      setConfig(c)
-      setUaInput(c.edgarUserAgent ?? '')
-      await refreshStatus() // feed-health on the monitor reflects the new effective UA + provenance
-      setUaMsg(
-        `Saved — effective UA now from the ${SOURCE_LABEL[c.edgarUserAgentSource] ?? c.edgarUserAgentSource}` +
-          `${c.edgarUserAgentUsable ? '.' : ' (⚠ empty — a run will refuse until a contact is set).'}`,
-      )
-    } catch (e) {
-      setUaMsg(e instanceof Error ? e.message : String(e))
-    } finally {
-      setSavingUa(false)
-    }
-  }
-
-  // ── Force ingest ─────────────────────────────────────────────────────────────────────────────
-  function pollRun(runId: string): void {
-    if (runPoll.current) clearInterval(runPoll.current)
-    runPoll.current = setInterval(async () => {
-      try {
-        const r = await fetch(`/portal-api/admin/fundamentals-ingest/runs/${encodeURIComponent(runId)}`, {
-          cache: 'no-store',
-        })
-        if (!r.ok) return // 404 right after trigger can race the in-process registry — keep polling
-        const rec: RunRecord = await r.json()
-        setRun(rec)
-        if (RUN_DONE(rec.state)) {
-          if (runPoll.current) { clearInterval(runPoll.current); runPoll.current = null }
-          setForcing(false)
-          setForceMsg(
-            rec.state === 'done'
-              ? `Run ${rec.run_id.slice(0, 8)} done — ${rec.canonical_inserted} inserted, ${rec.canonical_revisions} revised, ${rec.quarantined} quarantined.`
-              : `Run ${rec.run_id.slice(0, 8)} failed — ${rec.reason ?? 'unknown reason'}.`,
-          )
-          void refreshStatus()
-        }
-      } catch {
-        // transient — the next tick retries
-      }
-    }, 3_000)
-  }
-
-  async function forceIngest(): Promise<void> {
-    if (forcing) return
+  // ── Force sweep ──────────────────────────────────────────────────────────────────────────────
+  async function forceSweep(): Promise<void> {
+    if (sweeping) return
     if (
       !window.confirm(
-        'Run a PIT-fundamentals ingest now over the full coverage set?\n\n' +
-          'This starts the EDGAR backfill orchestrator in-cluster (single-flight — a concurrent ' +
-          'trigger is a no-op). It can take minutes; progress shows below as it runs.',
+        'Run a fundamentals harvester sweep now?\n\n' +
+          'This refreshes recently-filed CIKs from SEC EDGAR into the lake (single-flight — a concurrent ' +
+          'trigger is a no-op). It runs in the background; coverage + the last-sweep date update below as it lands.',
       )
     )
       return
-    setForcing(true); setForceMsg(null); setRun(null)
+    setSweeping(true)
+    setSweepMsg(null)
     try {
-      const r = await fetch('/portal-api/admin/fundamentals-ingest/force', {
+      const r = await fetch('/portal-api/admin/fundamentals-ingest/force-sweep', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({}), // full coverage set
+        body: JSON.stringify({}),
       })
       const b = await r.json().catch(() => ({}))
       if (!r.ok) throw new Error(b.detail ?? b.error ?? `failed (${r.status})`)
-      const rec: RunRecord | undefined = b.run
-      const runId: string | undefined = b.run_id ?? rec?.run_id
-      if (!runId) throw new Error('no run id returned')
-      setRun(rec ?? null)
-      setForceMsg(b.started === false ? 'A run is already in flight — tracking it.' : `Triggered run ${runId.slice(0, 8)}.`)
-      // a terminal record can come back immediately (e.g. an empty-UA refusal) — don't start polling
-      if (rec && RUN_DONE(rec.state)) {
-        setForcing(false)
-        setForceMsg(
-          rec.state === 'failed'
-            ? `Run refused — ${rec.reason ?? 'unknown reason'}.`
-            : `Run ${runId.slice(0, 8)} done.`,
-        )
-        void refreshStatus()
-      } else {
-        pollRun(runId)
-      }
+      setSweepMsg(
+        b.started === false
+          ? 'A sweep is already in flight — it will land shortly.'
+          : 'Sweep triggered — coverage + last-sweep update below as it completes.',
+      )
+      // Pull fresh status/runs shortly after so the operator sees the sweep land without waiting a full tick.
+      setTimeout(() => void refreshStatus(), 4_000)
     } catch (e) {
-      setForcing(false)
-      setForceMsg(e instanceof Error ? e.message : String(e))
+      setSweepMsg(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSweeping(false)
     }
   }
 
   // ── Render ───────────────────────────────────────────────────────────────────────────────────
   // Only show the wholesale "unavailable" fallback when EVERY read is cold. status/config back the
-  // monitor + controls; freshness/source back the summary + per-ticker table — those come from
-  // independent upstreams, so a status-service blip must not hide the always-visible coverage summary.
+  // monitor; freshness/source back the summary + per-name table — independent upstreams, so a
+  // status-service blip must not hide the always-visible coverage summary.
   if (!status && !config && !freshness && !source) {
     return (
       <div className="rounded border border-amber-900 bg-amber-950 px-4 py-2 text-sm text-amber-300">
-        PIT-fundamentals status unavailable — the ingestion service may be unreachable. The controls
-        below still work once it recovers.
+        PIT-fundamentals harvester status unavailable — the harvester may be unreachable or still
+        bootstrapping. The controls below still work once it recovers.
       </div>
     )
   }
 
-  const lag = lagBadge(status?.ingestion_lag_ms ?? null)
-  const fh = status?.feed_health
-  const uaSource = fh?.edgar_user_agent_source ?? config?.edgarUserAgentSource ?? '—'
-  const uaUsable = fh?.edgar_user_agent_usable ?? config?.edgarUserAgentUsable ?? false
-  const liveRun = run && !RUN_DONE(run.state)
-  const uaDirty = (uaInput.trim()) !== (config?.edgarUserAgent ?? '')
+  const bootstrapDone = status?.bootstrap_complete ?? false
 
   return (
     <div className="space-y-5">
-      {/* ── Monitor: coverage + lag + feed-health ─────────────────────────────────────────────── */}
+      {/* ── Status: lake coverage + sweep + size ───────────────────────────────────────────────── */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <Stat label="Coverage" value={status ? status.coverage.instruments.toLocaleString() : '—'} hint="instruments with facts" />
-        <Stat label="Facts" value={status ? status.coverage.facts.toLocaleString() : '—'} hint="current (non-superseded)" />
         <Stat
-          label="Ingestion lag"
-          value={status ? agoMs(status.coverage.newest_knowledge_ts) : '—'}
-          hint={<span className={lag.cls}>{lag.label}</span>}
+          label="Covered CIKs"
+          value={status ? status.covered_ciks.toLocaleString() : '—'}
+          hint="companies with harvested facts"
         />
         <Stat
-          label="Quarantine"
-          value={status ? status.quarantine.total.toLocaleString() : '—'}
-          hint="QA hold-outs"
-          valueCls={status && status.quarantine.total > 0 ? 'text-amber-300' : undefined}
+          label="Bootstrap"
+          value={status ? (bootstrapDone ? 'complete' : 'in progress') : '—'}
+          hint={
+            status?.bootstrap?.completed_at
+              ? `${status.bootstrap.entities?.toLocaleString() ?? '—'} entities`
+              : 'full companyfacts seed'
+          }
+          valueCls={status ? (bootstrapDone ? 'text-emerald-400' : 'text-amber-300') : undefined}
         />
+        <Stat
+          label="Last sweep"
+          value={status?.last_sweep_date ?? '—'}
+          hint={status ? `${status.last_sweep_ciks.toLocaleString()} CIKs refreshed` : 'newest filings'}
+        />
+        <Stat label="Lake size" value={fmtBytes(status?.lake_size_bytes ?? null)} hint="zstd parquet on disk" />
       </div>
 
-      {/* Feed health — effective UA + provenance + ingest-enabled. Always visible (operational). */}
+      {/* Harvester config — effective env knobs (read-only; the harvester has no config PUT). */}
       <div className="rounded border border-gray-800 bg-gray-900 p-4">
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-400">Feed health</h3>
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-400">Harvester config</h3>
         <dl className="mt-2 grid grid-cols-1 gap-x-6 gap-y-1 text-sm sm:grid-cols-2">
+          <div className="flex justify-between gap-3">
+            <dt className="text-gray-400">Sweep cadence</dt>
+            <dd className="text-gray-200">{config ? `every ${config.sweep_minutes}m` : '—'}</dd>
+          </div>
+          <div className="flex justify-between gap-3">
+            <dt className="text-gray-400">EDGAR rps</dt>
+            <dd className="text-gray-200">{config?.edgar_reqs_per_sec ?? '—'}</dd>
+          </div>
+          <div className="flex justify-between gap-3">
+            <dt className="text-gray-400">EDGAR User-Agent</dt>
+            <dd className={config?.edgar_user_agent_set ? 'text-emerald-400' : 'text-red-400'}>
+              {config ? (config.edgar_user_agent_set ? 'set (contact present)' : 'unset — sweeps refuse') : '—'}
+            </dd>
+          </div>
+          <div className="flex justify-between gap-3">
+            <dt className="text-gray-400">Watchlist mode</dt>
+            <dd className={config?.watchlist_mode ? 'text-amber-300' : 'text-gray-200'}>
+              {config
+                ? config.watchlist_mode
+                  ? `${config.watchlist.length} name${config.watchlist.length === 1 ? '' : 's'}`
+                  : 'full universe'
+                : '—'}
+            </dd>
+          </div>
           <div className="flex justify-between gap-3 sm:col-span-2">
-            <dt className="text-gray-400">Effective EDGAR User-Agent</dt>
-            <dd className="truncate font-mono text-xs text-gray-200" title={fh?.edgar_user_agent}>
-              {fh?.edgar_user_agent || '(unset)'}
+            <dt className="text-gray-400">Identity files</dt>
+            <dd className="text-gray-200">
+              ticker_history{' '}
+              <span className={status?.has_ticker_history ? 'text-emerald-400' : 'text-amber-300'}>
+                {status ? (status.has_ticker_history ? '✓' : '—') : '—'}
+              </span>
+              {' · '}entities{' '}
+              <span className={status?.has_entities ? 'text-emerald-400' : 'text-amber-300'}>
+                {status ? (status.has_entities ? '✓' : '—') : '—'}
+              </span>
             </dd>
-          </div>
-          <div className="flex justify-between gap-3">
-            <dt className="text-gray-400">UA source</dt>
-            <dd className="text-gray-200">{SOURCE_LABEL[uaSource] ?? uaSource}</dd>
-          </div>
-          <div className="flex justify-between gap-3">
-            <dt className="text-gray-400">UA usable</dt>
-            <dd className={uaUsable ? 'text-emerald-400' : 'text-red-400'}>{uaUsable ? 'yes' : 'no — run refuses'}</dd>
-          </div>
-          <div className="flex justify-between gap-3">
-            <dt className="text-gray-400">Ingest enabled</dt>
-            <dd className={fh?.ingest_enabled ? 'text-emerald-400' : 'text-amber-300'}>
-              {fh?.ingest_enabled ? 'yes' : 'no'}
-            </dd>
-          </div>
-          <div className="flex justify-between gap-3">
-            <dt className="text-gray-400">Coverage cap</dt>
-            <dd className="text-gray-200">{fh?.coverage_cap ?? config?.coverageCap ?? '—'}</dd>
           </div>
         </dl>
       </div>
 
-      {/* ── PIT-fundamentals summary + per-ticker state table (card 149) ───────────────────────────
-          Always-visible (operational, not mode-gated): the live-source line, PIT coverage, stale
-          count, the retirable gate, and the full per-ticker table with BOTH provenance clocks. */}
+      {/* ── PIT-fundamentals summary + per-name state table ─────────────────────────────────────────
+          Always-visible (operational): the live-source line, PIT coverage, stale count, the retirable
+          gate, and the full per-name table with the lake + consume provenance clocks. */}
       <FundamentalsSummaryCard summary={summary} />
       <FundamentalsStateTable rows={mergedRows} hasFreshness={!!freshness} hasSource={!!source} />
 
-      {/* Quarantine by-reason — a forensic QA breakdown, not a control: quant-only detail. */}
-      {status && status.quarantine.total > 0 && Object.keys(status.quarantine.by_reason).length > 0 && (
-        <QuantOnly>
-          <div className="rounded border border-gray-800 bg-gray-950 p-4">
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-400">Quarantine by reason</h3>
-            <div className="mt-2 flex flex-wrap gap-x-6 gap-y-1 text-sm">
-              {Object.entries(status.quarantine.by_reason).map(([reason, n]) => (
-                <span key={reason} className="text-gray-300">
-                  {reason}: <span className="text-amber-300">{n}</span>
-                </span>
-              ))}
-            </div>
-          </div>
-        </QuantOnly>
-      )}
-
-      {/* Per-name quarantine lookup — forensic QA only (not a control): quant-only. */}
-      <QuantOnly>
-        <QuarantineLookup />
-      </QuantOnly>
-
-      {/* ── Force ingest ──────────────────────────────────────────────────────────────────────── */}
+      {/* ── Force sweep ───────────────────────────────────────────────────────────────────────── */}
       <div className="rounded border border-gray-800 bg-gray-900 p-4">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <h3 className="font-semibold text-gray-100">Run ingest now</h3>
+            <h3 className="font-semibold text-gray-100">Run sweep now</h3>
             <p className="mt-1 text-xs text-gray-400">
-              Force a full-coverage EDGAR backfill in-cluster (single-flight). Last run:{' '}
-              {status?.last_run || run ? (
-                <RunBadge run={run ?? status?.last_run ?? null} />
-              ) : (
-                <span className="text-gray-500">none this pod lifetime</span>
-              )}
+              Force a harvester sweep in-cluster (single-flight) — refreshes recently-filed CIKs into the
+              lake. The result lands in the coverage + last-sweep above and the run history below.
             </p>
           </div>
           <button
             type="button"
-            onClick={forceIngest}
-            disabled={forcing || !!liveRun}
+            onClick={forceSweep}
+            disabled={sweeping}
             className="shrink-0 rounded bg-emerald-700 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-emerald-600 disabled:opacity-50"
           >
-            {forcing || liveRun ? 'Running…' : 'Run ingest now'}
+            {sweeping ? 'Triggering…' : 'Run sweep now'}
           </button>
         </div>
-
-        {(liveRun || run) && (
-          <div className="mt-3 rounded border border-gray-800 bg-gray-950 px-3 py-2 text-xs">
-            <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
-              <span className="text-gray-400">
-                run <span className="font-mono text-gray-300">{run!.run_id.slice(0, 8)}</span>
-              </span>
-              <RunBadge run={run} />
-              <span className="text-gray-400">scope {run!.scope}</span>
-              <span className="text-gray-400">requested {run!.requested}</span>
-              <span className="text-gray-400">inserted {run!.canonical_inserted}</span>
-              <span className="text-gray-400">revised {run!.canonical_revisions}</span>
-              <span className="text-gray-400">quarantined {run!.quarantined}</span>
-              {run!.finished_at_ms && (
-                <span className="text-gray-500">took {durationMs(run!.finished_at_ms - run!.started_at_ms)}</span>
-              )}
-            </div>
-          </div>
-        )}
-        {forceMsg && <p className="mt-2 text-xs text-amber-300">{forceMsg}</p>}
+        {sweepMsg && <p className="mt-2 text-xs text-amber-300">{sweepMsg}</p>}
       </div>
 
-      {/* ── UA editor ─────────────────────────────────────────────────────────────────────────── */}
-      <div className="rounded border border-gray-800 bg-gray-900 p-4">
-        <h3 className="font-semibold text-gray-100">EDGAR User-Agent</h3>
-        <p className="mt-1 text-xs text-gray-400">
-          The descriptive UA (with a contact) SEC fair-access requires. Effective value is{' '}
-          <span className="text-gray-300">{SOURCE_LABEL[uaSource] ?? uaSource}</span>; saving sets the
-          portal override (empty clears it back to env / default). Applied to the next run cross-pod.
-        </p>
-        <div className="mt-3 flex flex-wrap items-center gap-3">
-          <input
-            type="text"
-            value={uaInput}
-            onChange={(e) => setUaInput(e.target.value)}
-            placeholder="trader-platform/1.0 (you@example.com)"
-            spellCheck={false}
-            className="w-full min-w-0 flex-1 rounded border border-gray-700 bg-gray-950 px-3 py-2 font-mono text-sm text-gray-100 focus:border-emerald-600 focus:outline-none sm:w-auto"
-          />
-          <button
-            type="button"
-            onClick={saveUa}
-            disabled={savingUa || !uaDirty}
-            className="rounded bg-emerald-700 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-emerald-600 disabled:opacity-50"
-          >
-            {savingUa ? 'Saving…' : 'Save'}
-          </button>
-        </div>
-        {uaMsg && <p className="mt-2 text-xs text-amber-300">{uaMsg}</p>}
+      {/* ── Recent sweeps ─────────────────────────────────────────────────────────────────────── */}
+      <div className="rounded border border-gray-800 bg-gray-900 p-4" data-testid="harvester-runs">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-400">Recent sweeps</h3>
+        {runs && runs.runs.length > 0 ? (
+          <ul className="mt-2 space-y-1 text-sm">
+            {runs.runs.map((r) => (
+              <li key={r.date} className="flex justify-between gap-3">
+                <span className="font-mono text-gray-300">{r.date}</span>
+                <span className="text-gray-400">{r.ciks.toLocaleString()} CIKs refreshed</span>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="mt-2 text-sm text-gray-500">No sweeps recorded yet.</p>
+        )}
       </div>
     </div>
   )
@@ -509,36 +402,20 @@ function Stat({
   )
 }
 
-function RunBadge({ run }: { run: RunRecord | null }) {
-  if (!run) return <span className="text-gray-500">—</span>
-  const cls =
-    run.state === 'done'
-      ? 'text-emerald-400'
-      : run.state === 'failed'
-        ? 'text-red-400'
-        : 'text-amber-300'
-  return (
-    <span className={cls}>
-      {run.state}
-      {run.state !== 'running' && run.finished_at_ms ? ` · ${agoMs(run.finished_at_ms)}` : ''}
-    </span>
-  )
-}
-
-// ── card 149 helpers + sub-components ───────────────────────────────────────────────────────────
+// ── Summary + table sub-components ───────────────────────────────────────────────────────────────
 
 // UTC calendar date (yyyy-mm-dd) for a ms timestamp. The bi-temporal model is UTC-anchored, so the
-// table renders dates in UTC to keep period-end / availability / store / build instants comparable.
+// table renders dates in UTC to keep period-end / availability / filing instants comparable.
 function fmtDateUTC(ms: number | null): string {
   if (ms == null) return '—'
   return new Date(ms).toISOString().slice(0, 10)
 }
 
-// Always-visible operator summary: the live strategy source line + the warehouse coverage gate. This
-// is operational state (what's serving the live cycle, whether Yahoo is retirable), so NEVER mode-gated.
+// Always-visible operator summary: the live strategy source line + the lake coverage gate. This is
+// operational state (what's serving the live cycle, whether the universe is fully harvested), so NEVER
+// mode-gated. The live provenance is PIT-only post Yahoo-removal — pit-edgar | null (no yahoo-snapshot).
 function FundamentalsSummaryCard({ summary }: { summary: ReturnType<typeof buildSummary> }) {
-  const providerLabel =
-    summary.provider === 'pit' ? 'PIT (SEC EDGAR)' : summary.provider === 'yahoo' ? 'Yahoo' : '—'
+  const providerLabel = summary.provider === 'pit' ? 'PIT (SEC EDGAR)' : summary.provider ?? '—'
   const coverage =
     summary.covered != null && summary.universe != null
       ? `${summary.covered}/${summary.universe}`
@@ -556,13 +433,11 @@ function FundamentalsSummaryCard({ summary }: { summary: ReturnType<typeof build
             <span className="text-gray-400">
               {' '}
               — <span className="text-emerald-300">pit-edgar {summary.pitServed ?? '—'}</span>
-              {' / '}
-              <span className="text-gray-300">yahoo-snapshot {summary.yahooServed ?? '—'}</span>
               {summary.nullServed ? <span className="text-amber-300"> / null {summary.nullServed}</span> : null}
             </span>
           )}
         </span>
-        <span className="text-gray-300" title="Covered / EDGAR-eligible curated US names (the no-EDGAR exception names below are excluded from this denominator)">
+        <span className="text-gray-300" title="Covered / EDGAR-eligible US names (the no-EDGAR exception names below are excluded from this denominator)">
           PIT coverage: <span className="font-semibold text-gray-100">{coverage}</span>
           <span className="text-gray-500"> eligible</span>
         </span>
@@ -587,21 +462,18 @@ function FundamentalsSummaryCard({ summary }: { summary: ReturnType<typeof build
           </span>
         </span>
         <span className="text-gray-300">
-          last ingest run:{' '}
-          <span className="font-semibold text-gray-100">{agoMs(summary.lastIngestRunMs)}</span>
-          {summary.lastIngestRunState ? (
-            <span className="text-gray-500"> ({summary.lastIngestRunState})</span>
-          ) : null}
+          last cycle:{' '}
+          <span className="font-semibold text-gray-100">{agoMs(summary.lastCycleMs)}</span>
         </span>
       </div>
 
-      {/* No-EDGAR exception list (epic Task A4) — curated US names that file nothing with the SEC (an
-          unsponsored ADR like TCEHY). They are EXCLUDED from the eligible coverage denominator above (so
-          never counted "missing" and never blocking retirable) and listed here as a documented
-          degrade-to-Yahoo exception — the US analogue of the already-accepted LSE/foreign no-CIK names. */}
+      {/* No-EDGAR exception list — curated US names that file NOTHING with the SEC (an unsponsored ADR
+          like TCEHY). They are EXCLUDED from the eligible coverage denominator above (so never counted
+          "missing" and never blocking retirable) and fail-closed (no fundamentals — the value/quality
+          legs are NaN-excluded). Listed here as a documented exception. */}
       {summary.noEdgar.length > 0 && (
         <p className="mt-3 text-xs text-gray-400" data-testid="fundamentals-no-edgar">
-          {summary.noEdgar.length} name{summary.noEdgar.length === 1 ? '' : 's'} degrade to Yahoo (no SEC
+          {summary.noEdgar.length} name{summary.noEdgar.length === 1 ? '' : 's'} fail-closed (no SEC
           filings):{' '}
           {summary.noEdgar.map((n, i) => (
             <span key={n.symbol}>
@@ -622,13 +494,11 @@ const FILTERS: { key: RowFilter; label: string }[] = [
   { key: 'stale', label: 'Stale' },
   { key: 'missing', label: 'Missing' },
   { key: 'pit', label: 'PIT' },
-  { key: 'yahoo', label: 'Yahoo' },
 ]
 
-// Full per-ticker state table merging the freshness audit (warehouse: covered · fiscal period ·
-// availability · last stored · stale) with the strategy by_ticker map (consume: source · last
-// read+built). Both clocks per row — the whole point: "last stored" (ingest) ≠ "last read+built"
-// (strategy). Sortable + filterable. Always-visible (operational), not mode-gated.
+// Full per-name state table merging the harvester freshness audit (lake: covered · fiscal period ·
+// availability · last filed · stale) with the strategy by_ticker map (consume: source · last
+// read+built). Keyed by BARE symbol. Sortable + filterable. Always-visible (operational), not mode-gated.
 function FundamentalsStateTable({
   rows,
   hasFreshness,
@@ -638,7 +508,7 @@ function FundamentalsStateTable({
   hasFreshness: boolean
   hasSource: boolean
 }) {
-  const [sortKey, setSortKey] = useState<SortKey>('ticker')
+  const [sortKey, setSortKey] = useState<SortKey>('symbol')
   const [sortDir, setSortDir] = useState<SortDir>('asc')
   const [filter, setFilter] = useState<RowFilter>('all')
   const [query, setQuery] = useState('')
@@ -653,7 +523,7 @@ function FundamentalsStateTable({
       setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))
     } else {
       setSortKey(key)
-      setSortDir(key === 'ticker' || key === 'source' ? 'asc' : 'desc')
+      setSortDir(key === 'symbol' || key === 'source' ? 'asc' : 'desc')
     }
   }
 
@@ -661,14 +531,14 @@ function FundamentalsStateTable({
     <div className="rounded border border-gray-800 bg-gray-900 p-4" data-testid="fundamentals-state-table">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-400">
-          Per-ticker state
+          Per-name state
         </h3>
         <div className="flex flex-wrap items-center gap-2">
           <input
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="filter ticker…"
+            placeholder="filter symbol…"
             spellCheck={false}
             className="w-36 rounded border border-gray-700 bg-gray-950 px-2 py-1 text-xs text-gray-100 focus:border-emerald-600 focus:outline-none"
           />
@@ -693,25 +563,26 @@ function FundamentalsStateTable({
 
       {!hasFreshness && !hasSource ? (
         <p className="mt-3 text-sm text-amber-300">
-          Per-ticker state unavailable — freshness + source reads are cold or unreachable.
+          Per-name state unavailable — the harvester freshness + strategy source reads are cold or
+          unreachable.
         </p>
       ) : (
         <>
           <p className="mt-1 text-[11px] text-gray-500">
-            Two clocks per row: <span className="text-gray-400">last stored</span> = when our ingest
-            last persisted a fact · <span className="text-gray-400">last read+built</span> = when the
-            live strategy last read it and built this name&apos;s factors.
+            Two clocks per row: <span className="text-gray-400">last filed</span> = the most recent SEC
+            filing the lake holds for the name · <span className="text-gray-400">last read+built</span> =
+            when the live strategy last read it and built this name&apos;s factors.
           </p>
           <div className="mt-2 overflow-x-auto">
             <table className="w-full text-left text-xs">
               <thead>
                 <tr className="border-b border-gray-800 text-gray-500">
-                  <Th label="Ticker" col="ticker" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                  <Th label="Symbol" col="symbol" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                   <Th label="Source" col="source" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                   <Th label="Covered" col="covered" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                   <Th label="Fiscal period (obs)" col="fiscal" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                   <Th label="Availability (know.)" col="availability" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
-                  <Th label="Last stored (ingest)" col="lastStored" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
+                  <Th label="Last filed (SEC)" col="lastFiled" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                   <Th label="Last read+built (strat.)" col="lastReadBuilt" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                   <Th label="Stale?" col="stale" sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />
                 </tr>
@@ -720,13 +591,13 @@ function FundamentalsStateTable({
                 {view.length === 0 ? (
                   <tr>
                     <td colSpan={8} className="py-3 text-center text-gray-500">
-                      No tickers match this filter.
+                      No names match this filter.
                     </td>
                   </tr>
                 ) : (
                   view.map((r) => (
-                    <tr key={r.ticker} className="border-b border-gray-900 last:border-0">
-                      <td className="py-1.5 pr-3 font-mono text-gray-200">{r.ticker}</td>
+                    <tr key={r.symbol} className="border-b border-gray-900 last:border-0">
+                      <td className="py-1.5 pr-3 font-mono text-gray-200">{r.symbol}</td>
                       <td className="py-1.5 pr-3"><FundamentalsSourceTag source={r.source} /></td>
                       <td className="py-1.5 pr-3">
                         {r.covered == null ? (
@@ -743,8 +614,8 @@ function FundamentalsStateTable({
                       <td className="py-1.5 pr-3 text-gray-300" title={r.availabilityMs ? new Date(r.availabilityMs).toISOString() : undefined}>
                         {fmtDateUTC(r.availabilityMs)}
                       </td>
-                      <td className="py-1.5 pr-3 text-gray-300" title={r.lastStoredMs ? new Date(r.lastStoredMs).toISOString() : undefined}>
-                        {agoMs(r.lastStoredMs)}
+                      <td className="py-1.5 pr-3 text-gray-300" title={r.lastFiledMs ? new Date(r.lastFiledMs).toISOString() : undefined}>
+                        {fmtDateUTC(r.lastFiledMs)}
                       </td>
                       <td className="py-1.5 pr-3 text-gray-300" title={r.lastReadBuiltMs ? new Date(r.lastReadBuiltMs).toISOString() : undefined}>
                         {agoMs(r.lastReadBuiltMs)}
@@ -753,7 +624,7 @@ function FundamentalsStateTable({
                         {r.stale == null ? (
                           <span className="text-gray-600">—</span>
                         ) : r.stale ? (
-                          <span className="text-amber-300" title={r.stalenessDays != null ? `${r.stalenessDays}d` : undefined}>
+                          <span className="text-amber-300" title={r.stalenessDays != null ? `${r.stalenessDays}d · ${r.filingCadence ?? ''} cadence` : undefined}>
                             stale
                           </span>
                         ) : (
@@ -767,7 +638,7 @@ function FundamentalsStateTable({
             </table>
           </div>
           <p className="mt-2 text-[11px] text-gray-600">
-            {view.length} of {rows.length} ticker{rows.length === 1 ? '' : 's'}
+            {view.length} of {rows.length} name{rows.length === 1 ? '' : 's'}
           </p>
         </>
       )}
@@ -801,106 +672,5 @@ function Th({
         {active && <span aria-hidden>{sortDir === 'asc' ? '▲' : '▼'}</span>}
       </button>
     </th>
-  )
-}
-
-// Per-name quarantine lookup — forensic QA only (wrapped in <QuantOnly> at the call site). Type a
-// ticker → the …/quarantine?symbol= proxy → AAPL-scoped counts (or an honest empty for an unknown
-// symbol: resolved:false, instrument_id:-1, never the full unfiltered set).
-interface QuarantineResult {
-  resolved?: boolean
-  symbol?: string
-  instrument_id?: number
-  total: number
-  by_reason: Record<string, number>
-  by_sector: Record<string, number>
-  recent: { reason?: string; occurred_at?: string }[]
-}
-
-function QuarantineLookup() {
-  const [symbol, setSymbol] = useState('')
-  const [result, setResult] = useState<QuarantineResult | null>(null)
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-
-  async function lookup(): Promise<void> {
-    const s = symbol.trim().toUpperCase()
-    if (!s) return
-    setLoading(true)
-    setError(null)
-    setResult(null)
-    try {
-      const r = await fetch(
-        `/portal-api/admin/fundamentals-ingest/quarantine?symbol=${encodeURIComponent(s)}`,
-        { cache: 'no-store' },
-      )
-      const b = await r.json().catch(() => null)
-      if (!r.ok || !b) throw new Error(b?.detail ?? b?.error ?? `failed (${r.status})`)
-      setResult(b)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  return (
-    <div className="rounded border border-gray-800 bg-gray-950 p-4" data-testid="quarantine-lookup">
-      <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-400">
-        Per-name quarantine lookup
-      </h3>
-      <p className="mt-1 text-[11px] text-gray-500">
-        Scope the QA hold-out forensics to one ticker. An unknown symbol resolves to an honest empty
-        (not the full set).
-      </p>
-      <div className="mt-3 flex flex-wrap items-center gap-2">
-        <input
-          type="text"
-          value={symbol}
-          onChange={(e) => setSymbol(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') void lookup()
-          }}
-          placeholder="e.g. AAPL"
-          spellCheck={false}
-          className="w-40 rounded border border-gray-700 bg-gray-950 px-2 py-1 font-mono text-sm text-gray-100 focus:border-emerald-600 focus:outline-none"
-        />
-        <button
-          type="button"
-          onClick={lookup}
-          disabled={loading || symbol.trim() === ''}
-          className="rounded bg-emerald-700 px-3 py-1 text-xs font-semibold text-white transition-colors hover:bg-emerald-600 disabled:opacity-50"
-        >
-          {loading ? 'Looking up…' : 'Look up'}
-        </button>
-      </div>
-      {error && <p className="mt-2 text-xs text-red-400">{error}</p>}
-      {result && (
-        <div className="mt-3 text-sm">
-          {result.resolved === false ? (
-            <p className="text-amber-300">
-              {result.symbol} not resolved (instrument_id {result.instrument_id}) — no such US name in
-              the security master. Honest empty.
-            </p>
-          ) : (
-            <>
-              <p className="text-gray-300">
-                {result.symbol ?? 'symbol'}: <span className="font-semibold text-gray-100">{result.total}</span>{' '}
-                quarantined event{result.total === 1 ? '' : 's'}.
-              </p>
-              {Object.keys(result.by_reason).length > 0 && (
-                <div className="mt-1 flex flex-wrap gap-x-6 gap-y-1">
-                  {Object.entries(result.by_reason).map(([reason, n]) => (
-                    <span key={reason} className="text-gray-300">
-                      {reason}: <span className="text-amber-300">{n}</span>
-                    </span>
-                  ))}
-                </div>
-              )}
-            </>
-          )}
-        </div>
-      )}
-    </div>
   )
 }
