@@ -15,6 +15,7 @@
 
 import { setTimeout as sleep } from 'node:timers/promises';
 import type { OHLCVBar, BarInterval, Currency } from '@trader/shared-types';
+import { Trading212TickerAdapter, type TickerIdentity } from '@trader/ticker-identity';
 import { log } from '../../../../logger.ts';
 
 const TWELVEDATA_BASE = 'https://api.twelvedata.com';
@@ -25,12 +26,11 @@ const TWELVEDATA_BASE = 'https://api.twelvedata.com';
 // single US name can sit on NYSE or NASDAQ and the T212 ticker doesn't tell us which.
 const MIC_LSE = 'XLON';
 
-// Legacy-rename overrides. T212's catalog keeps the pre-rebrand symbol; TwelveData only
-// recognises the post-rebrand one. Mirrors yahoo-client's SYMBOL_RENAMES so the curated
-// universe resolves identically across providers (e.g. FB_US_EQ → META).
-const SYMBOL_RENAMES: Record<string, string> = {
-  FB: 'META',
-};
+// The single suffix parser + the market-aware FB→META rename both live in the adapter now — this
+// client no longer carries its own `parseT212Ticker` / `SYMBOL_RENAMES`. The request params are
+// derived from a `TickerIdentity` (the universe build is bare-native); the per-ticker fetch path
+// builds the identity once via the `fromT212` thin wrapper.
+const adapter = new Trading212TickerAdapter();
 
 export interface TwelveDataClientOptions {
   apiKey: string;
@@ -68,33 +68,27 @@ interface TwelveDataSymbol {
   country?: string;
 }
 
-/** Strip ONLY Trading212 synthetic suffixes: d = fractional, l = LSE/CFD. */
-function normalizeBaseSymbol(raw: string): string {
-  return raw.replace(/[dl]$/, '');
+/**
+ * Map a bare `(symbol, market)` identity to the TwelveData request parameters that pin the right
+ * listing: LSE → `mic_code=XLON`, US → `country=United States`. The market-aware rename (FB→META) is
+ * applied so TwelveData (which only knows the post-rebrand symbol) resolves.
+ */
+export function toTwelveDataSymbolFromIdentity(id: TickerIdentity): TwelveDataSymbol {
+  const { symbol, market } = adapter.applyRename(id);
+  return market === 'LSE'
+    ? { symbol, micCode: MIC_LSE }
+    : { symbol, country: 'United States' };
 }
 
-function parseT212Ticker(t212Ticker: string): { symbol: string; exchange: string | null } {
-  const parts = t212Ticker.split('_');
-  const rawSymbol = parts[0] ?? t212Ticker;
-  const symbol = normalizeBaseSymbol(rawSymbol);
-  let exchange: string | null = null;
-  if (parts.length >= 3 && parts[1] !== undefined) {
-    exchange = parts[1];                                   // SYMBOL_EX_EQ (e.g. AAPL_US_EQ)
-  } else if (parts.length === 2 && parts[1] === 'EQ' && /l$/.test(rawSymbol)) {
-    exchange = 'UK';                                       // SYMBOLl_EQ (e.g. HSBAl_EQ)
-  }
-  return { symbol, exchange };
-}
-
-/** Map a T212 ticker to the TwelveData request parameters that pin the right listing. */
+/**
+ * Map a T212 ticker to the TwelveData request parameters. Thin wrapper over the identity-native
+ * mapping for the per-ticker fetch path (which holds a T212 string). Fail-soft on a non-US/LSE string:
+ * returns a bare `{ symbol }` (no mic/country) so TwelveData resolves its default listing — the prior
+ * parser's behaviour for legacy ETF oddballs with no exchange metadata — rather than throwing.
+ */
 export function toTwelveDataSymbol(t212Ticker: string): TwelveDataSymbol {
-  const { symbol, exchange } = parseT212Ticker(t212Ticker);
-  const resolved = SYMBOL_RENAMES[symbol] ?? symbol;
-  if (exchange === 'UK') return { symbol: resolved, micCode: MIC_LSE };
-  if (exchange === 'US') return { symbol: resolved, country: 'United States' };
-  // No exchange metadata (legacy ETF oddballs) — let TwelveData resolve its default
-  // listing. The curated universe is US + LSE only, so this branch is rare.
-  return { symbol: resolved };
+  try { return toTwelveDataSymbolFromIdentity(adapter.fromT212(t212Ticker)); }
+  catch { return { symbol: t212Ticker.trim() }; }
 }
 
 // ── Credit rate-limiter ─────────────────────────────────────────────────────────

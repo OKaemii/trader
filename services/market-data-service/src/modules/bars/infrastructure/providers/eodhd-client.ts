@@ -9,6 +9,7 @@
 // normalisation, the shared call-budget limiter, and request/parse.
 
 import type { OHLCVBar, Currency } from '@trader/shared-types';
+import { Trading212TickerAdapter, type TickerIdentity } from '@trader/ticker-identity';
 import { log } from '../../../../logger.ts';
 import { EodhdCreditLimiter, EodhdDailyLimitError } from './eodhd-credit-limiter.ts';
 
@@ -25,30 +26,37 @@ export const EODHD_COST = {
   technical: 1, dividends: 1, splits: 1, news: 1, exchangeDetails: 1, exchangesList: 1,
 } as const;
 
-// Legacy-rename overrides — mirror twelvedata/yahoo so the curated/scanned universe resolves
-// identically across providers (T212 keeps the pre-rebrand symbol; EODHD wants the new one).
-const SYMBOL_RENAMES: Record<string, string> = { FB: 'META' };
-
 export type EodhdExchange = 'US' | 'LSE';
 
-/** Strip ONLY Trading212 synthetic suffixes: d = fractional, l = LSE/CFD. */
-function normalizeBaseSymbol(raw: string): string { return raw.replace(/[dl]$/, ''); }
+// The single suffix parser + the market-aware FB→META rename both live in the adapter now — this
+// client no longer carries its own `parseT212Ticker` / `SYMBOL_RENAMES`. The EODHD symbol is built
+// from a `TickerIdentity` (the universe build is bare-native); legacy T212-string callers go through
+// the `fromT212` thin wrapper below.
+const adapter = new Trading212TickerAdapter();
 
-export function parseT212Ticker(t212Ticker: string): { symbol: string; exchange: 'US' | 'UK' | null } {
-  const parts = t212Ticker.split('_');
-  const rawSymbol = parts[0] ?? t212Ticker;
-  const symbol = normalizeBaseSymbol(rawSymbol);
-  let exchange: 'US' | 'UK' | null = null;
-  if (parts.length >= 3 && parts[1] === 'US') exchange = 'US';            // SYMBOL_US_EQ
-  else if (parts.length === 2 && parts[1] === 'EQ' && /l$/.test(rawSymbol)) exchange = 'UK';   // SYMBOLl_EQ
-  return { symbol, exchange };
+const EODHD_EXCHANGE_BY_MARKET: Record<TickerIdentity['market'], string> = { US: 'US', LSE: 'LSE' };
+
+/**
+ * Map a bare `(symbol, market)` identity to an EODHD `SYMBOL.EXCHANGE`. US → `.US`, LSE → `.LSE`.
+ * The market-aware rename (FB→META) is applied so the EODHD request uses the canonical symbol.
+ */
+export function toEodhdSymbolFromIdentity(id: TickerIdentity): string {
+  const { symbol, market } = adapter.applyRename(id);
+  return `${symbol}.${EODHD_EXCHANGE_BY_MARKET[market]}`;
 }
 
-/** Map a T212 ticker to an EODHD `SYMBOL.EXCHANGE`. US → `.US`, LSE → `.LSE`. */
+/**
+ * Map a T212 ticker to an EODHD `SYMBOL.EXCHANGE`. Thin wrapper over the identity-native mapping for
+ * the call sites that still hold a T212 string (corporate-actions, news, technical, quotes, the
+ * daily-history backfill). US → `.US`, LSE → `.LSE`. Fail-soft on a non-US/LSE string: defaults to a
+ * `.US` listing (preserving the prior parser's default-US behaviour for legacy/oddball tickers) rather
+ * than throwing into the call site.
+ */
 export function toEodhdSymbol(t212Ticker: string): string {
-  const { symbol, exchange } = parseT212Ticker(t212Ticker);
-  const resolved = SYMBOL_RENAMES[symbol] ?? symbol;
-  return exchange === 'UK' ? `${resolved}.LSE` : `${resolved}.US`;        // default US (curated universe is US+LSE)
+  let id: TickerIdentity;
+  try { id = adapter.fromT212(t212Ticker); }
+  catch { id = { symbol: t212Ticker.trim(), market: 'US' }; }   // default US, as the old suffix parser did
+  return toEodhdSymbolFromIdentity(id);
 }
 
 // EODHD's /eod and /eod-bulk-last-day responses carry no per-bar currency, so it is inferred
