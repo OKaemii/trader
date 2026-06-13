@@ -2,9 +2,9 @@
 
   - ``resolve_provider_mode`` — the single source of truth for the live provider mode, shared by the
     startup wiring (``build_fundamentals_provider``) and the observability endpoint, so the mode the
-    host runs on and the mode the portal reports can never disagree. `pit` only when the configured
-    value is exactly `pit` (case-insensitive/trimmed); anything else — `yahoo`, unset env, a typo —
-    is `yahoo` (fail-safe: never route to the PIT warehouse on an unrecognised value).
+    host runs on and the mode the portal reports can never disagree. After the Yahoo removal there is
+    exactly ONE mode: `pit` (the PIT lake). The resolver always returns `pit` — it is inert to a stale
+    `LIVE_FUNDAMENTALS_PROVIDER=yahoo` left in an un-updated environment.
 
   - ``build_fundamentals_source_response`` — the pure builder behind
     ``GET /admin/api/strategy/fundamentals-source``. Over the ``factor_scores`` store's
@@ -24,7 +24,6 @@ import pytest
 
 from src.infrastructure.fundamentals_as_of import (
     PROVIDER_MODE_PIT,
-    PROVIDER_MODE_YAHOO,
     resolve_provider_mode,
 )
 from src.main import build_fundamentals_source_response
@@ -32,55 +31,23 @@ from src.main import build_fundamentals_source_response
 _ENV = "LIVE_FUNDAMENTALS_PROVIDER"
 
 
-# ── resolve_provider_mode — the shared single source of truth (mode resolution) ──────────────────
-def test_resolve_explicit_pit_arg_wins(monkeypatch):
-    """An explicit `mode='pit'` resolves to `pit` regardless of the env."""
+# ── resolve_provider_mode — the shared single source of truth (now PIT-only) ──────────────────────
+def test_resolve_is_always_pit(monkeypatch):
+    """After the Yahoo removal the seam is PIT-only — the resolver always returns `pit`, regardless of
+    arg or env (the `yahoo` option is gone)."""
     monkeypatch.delenv(_ENV, raising=False)
+    assert resolve_provider_mode() == PROVIDER_MODE_PIT
     assert resolve_provider_mode("pit") == PROVIDER_MODE_PIT
 
 
-def test_resolve_explicit_yahoo_arg_wins(monkeypatch):
-    """An explicit `mode='yahoo'` resolves to `yahoo` even when the env says `pit` (arg wins)."""
-    monkeypatch.setenv(_ENV, "pit")
-    assert resolve_provider_mode("yahoo") == PROVIDER_MODE_YAHOO
-
-
-def test_resolve_is_case_insensitive_and_trimmed(monkeypatch):
-    """`pit` is matched case-insensitively after trimming whitespace (the env-string contract)."""
-    monkeypatch.delenv(_ENV, raising=False)
-    assert resolve_provider_mode("  PIT  ") == PROVIDER_MODE_PIT
-    assert resolve_provider_mode("Pit") == PROVIDER_MODE_PIT
-
-
-def test_resolve_env_pit_when_no_arg(monkeypatch):
-    """No arg ⇒ read LIVE_FUNDAMENTALS_PROVIDER; `pit` (case-insensitive) ⇒ `pit`."""
-    monkeypatch.setenv(_ENV, "PIT")
-    assert resolve_provider_mode() == PROVIDER_MODE_PIT
-
-
-def test_resolve_default_is_yahoo_when_env_unset(monkeypatch):
-    """No arg + no env ⇒ the safe `yahoo` default (pre-backfill the PIT warehouse is empty)."""
-    monkeypatch.delenv(_ENV, raising=False)
-    assert resolve_provider_mode() == PROVIDER_MODE_YAHOO
-
-
-def test_resolve_env_yahoo_is_yahoo(monkeypatch):
+def test_resolve_is_inert_to_stale_yahoo_env(monkeypatch):
+    """A stale `LIVE_FUNDAMENTALS_PROVIDER=yahoo` (or any other value) left in an un-updated environment
+    is INERT — it resolves to `pit`, never erroring on a config that no longer offers `yahoo`."""
     monkeypatch.setenv(_ENV, "yahoo")
-    assert resolve_provider_mode() == PROVIDER_MODE_YAHOO
-
-
-def test_resolve_unknown_value_falls_back_to_yahoo(monkeypatch):
-    """A typo / unrecognised value (arg or env) is `yahoo` — never route to PIT on garbage."""
-    monkeypatch.delenv(_ENV, raising=False)
-    assert resolve_provider_mode("garbage") == PROVIDER_MODE_YAHOO
-    monkeypatch.setenv(_ENV, "pti")  # transposed typo
-    assert resolve_provider_mode() == PROVIDER_MODE_YAHOO
-
-
-def test_resolve_empty_string_env_is_yahoo(monkeypatch):
-    """An empty-string env (falsy) falls through to the `yahoo` default, not an empty mode."""
-    monkeypatch.setenv(_ENV, "")
-    assert resolve_provider_mode() == PROVIDER_MODE_YAHOO
+    assert resolve_provider_mode() == PROVIDER_MODE_PIT
+    assert resolve_provider_mode("yahoo") == PROVIDER_MODE_PIT
+    monkeypatch.setenv(_ENV, "garbage")
+    assert resolve_provider_mode() == PROVIDER_MODE_PIT
 
 
 # ── build_fundamentals_source_response — source counts + by_ticker map over a fake store ──────────
@@ -177,7 +144,7 @@ async def test_response_missing_observation_ts_built_at_is_none():
 async def test_response_missing_factors_block_is_null_source():
     """A row with no ``factors`` block at all (defensive) ⇒ source ``None`` (null bucket), not a crash."""
     store = _FakeFactorStore({"AAPL_US_EQ": {"observation_ts": 1_700_000_000_000}})
-    out = await build_fundamentals_source_response(store, provider_mode=PROVIDER_MODE_YAHOO, last_cycle_ts=None)
+    out = await build_fundamentals_source_response(store, provider_mode=PROVIDER_MODE_PIT, last_cycle_ts=None)
     assert out["sources"] == {"null": 1}
     assert out["by_ticker"]["AAPL_US_EQ"] == {"source": None, "built_at": 1_700_000_000_000}
 
@@ -187,10 +154,10 @@ async def test_response_empty_store_is_empty_maps():
     """An empty/pre-backfill store ⇒ ``sources:{}``, ``by_ticker:{}``, ``pit_served:0`` (degrade,
     never 500) — but ``provider`` + ``last_cycle_ts`` still echo through."""
     out = await build_fundamentals_source_response(
-        _FakeFactorStore({}), provider_mode=PROVIDER_MODE_YAHOO, last_cycle_ts="2026-06-08T12:00:00Z",
+        _FakeFactorStore({}), provider_mode=PROVIDER_MODE_PIT, last_cycle_ts="2026-06-08T12:00:00Z",
     )
     assert out == {
-        "provider": PROVIDER_MODE_YAHOO,
+        "provider": PROVIDER_MODE_PIT,
         "sources": {},
         "by_ticker": {},
         "pit_served": 0,

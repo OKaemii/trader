@@ -22,9 +22,10 @@ export interface FundamentalsDoc {
   qualityPass:  boolean;
   marketCapGbp: number | null;   // null = uncomputable cap (renders `—`, never a fabricated £0)
   // Per-name provenance: the concrete upstream this row came from, as the provider reported it on
-  // the fetch (`provider.sourceOf`) — `pit-edgar` for a PIT-warehouse hit, `yahoo` for the PIT
-  // fall-back (non-US / PIT miss / outage), or the configured mode (`yahoo`/`eodhd`) when the
-  // provider resolves every name from one upstream. Lets the scanner show an honest per-name source.
+  // the fetch (`provider.sourceOf`) — `pit-edgar` for a PIT lake hit, or the configured mode
+  // (`eodhd`) when the provider resolves every name from one upstream. After the Yahoo removal a
+  // non-US name / PIT miss is fail-closed (no doc written), so it never carries a source. Lets the
+  // scanner show an honest per-name source.
   source:       string;
   updatedAt:    number;
 }
@@ -46,20 +47,21 @@ export class FundamentalsCache {
   }
 
   /**
-   * Force a full re-source of `tickers` when the provider MODE changed since the last boot (e.g. an
-   * operator flips `FUNDAMENTALS_PROVIDER` yahoo→pit). The TTL refresher never catches this — a doc
-   * isn't time-stale, and a `yahoo`-sourced US row is a *valid* `pit`-mode fallback — so the surfaces
-   * that read this cache (Research › Fundamentals, the Scanner) would keep serving the OLD provider's
-   * rows for up to the monthly TTL. Persists the mode in `modeStore`; on a change, re-sources the
-   * whole universe through the new provider (US → `pit-edgar`, fallbacks → `yahoo`). The mode key is
-   * written only AFTER the walk, so a crash mid-walk retries on the next boot. Same mode ⇒ no-op.
-   * Call it backgrounded (`void … .catch`) at boot — a full walk runs for minutes.
+   * Force a full re-source of `tickers` when the provider MODE changed since the last boot (the
+   * yahoo→pit flip THIS deploy performs: the prior boot stored `yahoo`, the new code runs `pit`). The
+   * TTL refresher never catches this — a doc isn't time-stale, and a stale `yahoo`-sourced US row from
+   * the old code is not time-stale either — so the surfaces that read this cache (Research ›
+   * Fundamentals, the Scanner) would keep serving the OLD provider's rows for up to the monthly TTL.
+   * Persists the mode in `modeStore`; on a change, re-sources the whole universe through the new
+   * provider (US → `pit-edgar`; non-US fail-closed, so its old `yahoo` row is left to age out by TTL —
+   * the provider returns no doc to overwrite it). The mode key is written only AFTER the walk, so a
+   * crash mid-walk retries on the next boot. Same mode ⇒ no-op. Call it backgrounded (`void … .catch`)
+   * at boot — a full walk runs for minutes.
    *
-   * **US-first, chunked.** A `pit` flip only changes provenance for US (`*_US_EQ`) names (US → the
-   * PIT warehouse, fast + in-cluster); non-US stay on the Yahoo fallback regardless. Re-sourcing US
-   * first, in small chunks, means a throttled/cooling Yahoo upstream on the non-US tail can't hold up
-   * the US writes (the bug: a single batch `refresh(all)` blocked behind the LSE-Yahoo cooldown, so
-   * no US row was written). A chunk that throws is logged and skipped, never failing the whole walk.
+   * **US-first, chunked.** Only US (`*_US_EQ`) names get a fresh doc under `pit` (US → the PIT lake,
+   * fast + in-cluster); a non-US name is fail-closed (the provider returns nothing for it). Re-sourcing
+   * US first, in small chunks, keeps the US writes prompt and isolates any per-chunk failure. A chunk
+   * that throws is logged and skipped, never failing the whole walk.
    */
   async refreshIfModeChanged(
     modeStore: { get(k: string): Promise<string | null>; set(k: string, v: string): Promise<unknown> },

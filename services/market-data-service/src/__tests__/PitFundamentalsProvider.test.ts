@@ -1,36 +1,16 @@
-// PitFundamentalsProvider — US→PIT mapping, non-US→Yahoo, PIT-miss→Yahoo, api-down→Yahoo (degrade,
-// never throw). The fundamentals-api HTTP call and the Yahoo fall-back are both stubbed so the test
-// is hermetic (no live signer, no network, no Mongo).
+// PitFundamentalsProvider — US→PIT mapping, non-US→fail-closed (omitted), PIT-miss→omitted,
+// api-down→omitted (degrade, never throw). After the Yahoo removal (epic Thread C + decision H) there
+// is NO Yahoo fallback: a name with no lake fact is simply absent from the result (the scanner then
+// shows source:null / —). The fundamentals-api HTTP call is stubbed so the test is hermetic (no live
+// signer, no network, no Mongo).
 
 import { describe, it, expect, vi } from 'vitest';
 import {
   PitFundamentalsProvider,
   SOURCE_PIT_EDGAR,
-  SOURCE_YAHOO,
 } from '../modules/fundamentals/infrastructure/PitFundamentalsProvider.ts';
-import type { FundamentalsProvider, FundamentalsRaw } from '../modules/fundamentals/infrastructure/FundamentalsProvider.ts';
 
 const BASE = 'http://fundamentals-api:8011';
-
-// A fixed Yahoo fall-back stub: returns a known FundamentalsRaw for every ticker it's asked about,
-// so we can assert which names were routed to it. `seen` records its input for routing assertions.
-function fakeYahoo(): FundamentalsProvider & { seen: string[][] } {
-  const seen: string[][] = [];
-  return {
-    seen,
-    async fetch(tickers: string[]): Promise<Record<string, FundamentalsRaw>> {
-      seen.push(tickers);
-      const out: Record<string, FundamentalsRaw> = {};
-      for (const t of tickers) {
-        out[t] = {
-          netIncome: 1, totalEquity: 2, totalDebt: 3,
-          currentAssets: 4, currentLiabilities: 5, marketCapGbp: 6,
-        };
-      }
-      return out;
-    },
-  };
-}
 
 // A fundamentals-api `{ fundamentals: { ticker: payload } }` response body builder.
 function pitResponse(fundamentals: Record<string, unknown>) {
@@ -53,9 +33,8 @@ const noMint = async () => 'test-token';
 
 describe('PitFundamentalsProvider', () => {
   it('maps a US PIT hit snake_case → camelCase FundamentalsRaw and stamps pit-edgar', async () => {
-    const yahoo = fakeYahoo();
     const fetcher = vi.fn(async () => pitResponse({ AAPL_US_EQ: AAPL_PIT }));
-    const p = new PitFundamentalsProvider(yahoo, BASE, fetcher as unknown as typeof fetch, noMint);
+    const p = new PitFundamentalsProvider(BASE, fetcher as unknown as typeof fetch, noMint);
 
     const out = await p.fetch(['AAPL_US_EQ']);
 
@@ -64,14 +43,13 @@ describe('PitFundamentalsProvider', () => {
       currentAssets: 200000, currentLiabilities: 150000, marketCapGbp: 2.5e12,
     });
     expect(p.sourceOf('AAPL_US_EQ')).toBe(SOURCE_PIT_EDGAR);
-    expect(yahoo.seen).toEqual([]);                       // a hit never touches Yahoo
   });
 
   it('calls /internal/api/fundamentals-pit with an as-of=now cutoff and an internal JWT bearer', async () => {
     const fetcher = vi.fn(async () => pitResponse({ AAPL_US_EQ: AAPL_PIT }));
     const mint = vi.fn(async (caller: string) => `tok-${caller}`);
     const before = Date.now();
-    const p = new PitFundamentalsProvider(fakeYahoo(), BASE, fetcher as unknown as typeof fetch, mint);
+    const p = new PitFundamentalsProvider(BASE, fetcher as unknown as typeof fetch, mint);
 
     await p.fetch(['AAPL_US_EQ']);
 
@@ -85,87 +63,81 @@ describe('PitFundamentalsProvider', () => {
     expect((init.headers as Record<string, string>).Authorization).toBe('Bearer tok-market-data-service');
   });
 
-  it('routes a non-US (LSE *l_EQ) name straight to Yahoo without a PIT call', async () => {
-    const yahoo = fakeYahoo();
+  it('fail-closes a non-US (LSE *l_EQ) name: no PIT call, absent from the result, no source', async () => {
     const fetcher = vi.fn(async () => pitResponse({}));
-    const p = new PitFundamentalsProvider(yahoo, BASE, fetcher as unknown as typeof fetch, noMint);
+    const p = new PitFundamentalsProvider(BASE, fetcher as unknown as typeof fetch, noMint);
 
     const out = await p.fetch(['HSBAl_EQ']);
 
     expect(fetcher).not.toHaveBeenCalled();               // no US names ⇒ no fundamentals-api round-trip
-    expect(out['HSBAl_EQ']).toBeDefined();
-    expect(p.sourceOf('HSBAl_EQ')).toBe(SOURCE_YAHOO);
-    expect(yahoo.seen).toEqual([['HSBAl_EQ']]);
+    expect(out['HSBAl_EQ']).toBeUndefined();              // fail-closed: omitted (no Yahoo substitute)
+    expect(p.sourceOf('HSBAl_EQ')).toBeUndefined();
   });
 
-  it('falls back to Yahoo for a US PIT miss (resolved name, empty line items, source:null)', async () => {
-    const yahoo = fakeYahoo();
+  it('fail-closes a US PIT miss (resolved name, empty line items, source:null) — omitted, no fallback', async () => {
     // The resolver returns an unresolved/miss name present with source:null and no line items.
     const fetcher = vi.fn(async () => pitResponse({
       AAPL_US_EQ: AAPL_PIT,
       ZZZZ_US_EQ: { source: null, observation_ts: null, knowledge_ts: null },
     }));
-    const p = new PitFundamentalsProvider(yahoo, BASE, fetcher as unknown as typeof fetch, noMint);
+    const p = new PitFundamentalsProvider(BASE, fetcher as unknown as typeof fetch, noMint);
 
     const out = await p.fetch(['AAPL_US_EQ', 'ZZZZ_US_EQ']);
 
+    expect(out['AAPL_US_EQ']).toBeDefined();
     expect(p.sourceOf('AAPL_US_EQ')).toBe(SOURCE_PIT_EDGAR);
-    expect(p.sourceOf('ZZZZ_US_EQ')).toBe(SOURCE_YAHOO);  // miss → Yahoo
-    expect(yahoo.seen).toEqual([['ZZZZ_US_EQ']]);         // only the miss was handed to Yahoo
-    expect(out['ZZZZ_US_EQ']).toBeDefined();
+    expect(out['ZZZZ_US_EQ']).toBeUndefined();            // miss → fail-closed (omitted)
+    expect(p.sourceOf('ZZZZ_US_EQ')).toBeUndefined();
   });
 
-  it('degrades the whole US slice to Yahoo on a non-2xx (e.g. 503 cold warehouse), never throwing', async () => {
-    const yahoo = fakeYahoo();
+  it('fail-closes the whole US slice on a non-2xx (e.g. 503 cold lake), never throwing', async () => {
     const fetcher = vi.fn(async () => ({ ok: false, status: 503, json: async () => ({}) }) as unknown as Response);
-    const p = new PitFundamentalsProvider(yahoo, BASE, fetcher as unknown as typeof fetch, noMint);
+    const p = new PitFundamentalsProvider(BASE, fetcher as unknown as typeof fetch, noMint);
 
     const out = await p.fetch(['AAPL_US_EQ', 'MSFT_US_EQ']);
 
-    expect(out['AAPL_US_EQ']).toBeDefined();
-    expect(out['MSFT_US_EQ']).toBeDefined();
-    expect(p.sourceOf('AAPL_US_EQ')).toBe(SOURCE_YAHOO);
-    expect(p.sourceOf('MSFT_US_EQ')).toBe(SOURCE_YAHOO);
-    expect(yahoo.seen).toEqual([['AAPL_US_EQ', 'MSFT_US_EQ']]);
+    expect(out['AAPL_US_EQ']).toBeUndefined();
+    expect(out['MSFT_US_EQ']).toBeUndefined();
+    expect(p.sourceOf('AAPL_US_EQ')).toBeUndefined();
+    expect(p.sourceOf('MSFT_US_EQ')).toBeUndefined();
   });
 
-  it('degrades to Yahoo when fundamentals-api is unreachable (fetch rejects), never throwing', async () => {
-    const yahoo = fakeYahoo();
+  it('fail-closes when fundamentals-api is unreachable (fetch rejects), never throwing', async () => {
     const fetcher = vi.fn(async () => { throw new Error('ECONNREFUSED'); });
-    const p = new PitFundamentalsProvider(yahoo, BASE, fetcher as unknown as typeof fetch, noMint);
+    const p = new PitFundamentalsProvider(BASE, fetcher as unknown as typeof fetch, noMint);
 
     const out = await p.fetch(['AAPL_US_EQ']);
 
-    expect(out['AAPL_US_EQ']).toBeDefined();
-    expect(p.sourceOf('AAPL_US_EQ')).toBe(SOURCE_YAHOO);
-    expect(yahoo.seen).toEqual([['AAPL_US_EQ']]);
+    expect(out['AAPL_US_EQ']).toBeUndefined();
+    expect(p.sourceOf('AAPL_US_EQ')).toBeUndefined();
   });
 
-  it('handles a mixed batch: US hit → PIT, US miss + LSE → one Yahoo fall-back call', async () => {
-    const yahoo = fakeYahoo();
+  it('handles a mixed batch: US hit → PIT (pit-edgar); US miss + LSE → omitted (one PIT round-trip)', async () => {
     const fetcher = vi.fn(async () => pitResponse({
       AAPL_US_EQ: AAPL_PIT,
       ZZZZ_US_EQ: { source: null },
     }));
-    const p = new PitFundamentalsProvider(yahoo, BASE, fetcher as unknown as typeof fetch, noMint);
+    const p = new PitFundamentalsProvider(BASE, fetcher as unknown as typeof fetch, noMint);
 
     const out = await p.fetch(['AAPL_US_EQ', 'ZZZZ_US_EQ', 'HSBAl_EQ']);
 
-    expect(Object.keys(out).sort()).toEqual(['AAPL_US_EQ', 'HSBAl_EQ', 'ZZZZ_US_EQ']);
+    expect(Object.keys(out)).toEqual(['AAPL_US_EQ']);     // only the US hit survives
     expect(p.sourceOf('AAPL_US_EQ')).toBe(SOURCE_PIT_EDGAR);
-    expect(p.sourceOf('ZZZZ_US_EQ')).toBe(SOURCE_YAHOO);
-    expect(p.sourceOf('HSBAl_EQ')).toBe(SOURCE_YAHOO);
+    expect(p.sourceOf('ZZZZ_US_EQ')).toBeUndefined();     // miss → omitted
+    expect(p.sourceOf('HSBAl_EQ')).toBeUndefined();       // non-US → fail-closed
     expect(fetcher).toHaveBeenCalledTimes(1);             // one PIT round-trip for the US slice
-    // non-US + US-miss folded into a SINGLE Yahoo call (LSE first, then the miss).
-    expect(yahoo.seen).toEqual([['HSBAl_EQ', 'ZZZZ_US_EQ']]);
+    // Only the two US names go into the query; the LSE name is never sent.
+    const [url] = fetcher.mock.calls[0] as [string];
+    expect(url).toContain('tickers=AAPL_US_EQ%2CZZZZ_US_EQ');
+    expect(url).not.toContain('HSBAl_EQ');
   });
 
-  it('treats a missing snake_case QMJ line item as 0 (fail-closed), matching the Yahoo contract', async () => {
+  it('treats a missing snake_case QMJ line item as 0 (fail-closed), matching the screen contract', async () => {
     const fetcher = vi.fn(async () => pitResponse({
       // A bank: no current assets/liabilities. Mapped to 0 ⇒ QMJ fail-closed downstream (no false PASS).
       JPM_US_EQ: { net_income: 50000, total_equity: 250000, total_debt: 900000, market_cap_gbp: 4e11, source: 'pit-edgar' },
     }));
-    const p = new PitFundamentalsProvider(fakeYahoo(), BASE, fetcher as unknown as typeof fetch, noMint);
+    const p = new PitFundamentalsProvider(BASE, fetcher as unknown as typeof fetch, noMint);
 
     const out = await p.fetch(['JPM_US_EQ']);
 
@@ -176,10 +148,10 @@ describe('PitFundamentalsProvider', () => {
   });
 
   it('carries an ABSENT market_cap_gbp as null, NOT 0 (the QMJ inputs still default to 0)', async () => {
-    // C1's as-of read omits `market_cap_gbp` only when the cap is genuinely uncomputable (shares
-    // absent / pre-data as-of). The provider must carry that through as `null` so the scanner /
-    // Research render `—`, never a fabricated £0 (the NVIDIA-£0 bug this card closes). The five QMJ
-    // inputs are unaffected — a missing one stays 0 (fail-closed).
+    // The resolver omits `market_cap_gbp` only when the cap is genuinely uncomputable (shares absent /
+    // pre-data as-of). The provider must carry that through as `null` so the scanner / Research render
+    // `—`, never a fabricated £0 (the NVIDIA-£0 regression). The five QMJ inputs are unaffected — a
+    // missing one stays 0 (fail-closed).
     const fetcher = vi.fn(async () => pitResponse({
       NVDA_US_EQ: {
         net_income: 100000, total_equity: 500000, total_debt: 300000,
@@ -188,7 +160,7 @@ describe('PitFundamentalsProvider', () => {
         source: 'pit-edgar',
       },
     }));
-    const p = new PitFundamentalsProvider(fakeYahoo(), BASE, fetcher as unknown as typeof fetch, noMint);
+    const p = new PitFundamentalsProvider(BASE, fetcher as unknown as typeof fetch, noMint);
 
     const out = await p.fetch(['NVDA_US_EQ']);
 
@@ -207,7 +179,7 @@ describe('PitFundamentalsProvider', () => {
     const fetcher = vi.fn(async () => pitResponse({
       AAPL_US_EQ: { ...AAPL_PIT, market_cap_gbp: null },
     }));
-    const p = new PitFundamentalsProvider(fakeYahoo(), BASE, fetcher as unknown as typeof fetch, noMint);
+    const p = new PitFundamentalsProvider(BASE, fetcher as unknown as typeof fetch, noMint);
 
     const out = await p.fetch(['AAPL_US_EQ']);
 
@@ -218,7 +190,7 @@ describe('PitFundamentalsProvider', () => {
     const fetcher = vi.fn(async () => pitResponse({
       NVDA_US_EQ: { ...AAPL_PIT, market_cap_gbp: 3_712_141_818_000 },
     }));
-    const p = new PitFundamentalsProvider(fakeYahoo(), BASE, fetcher as unknown as typeof fetch, noMint);
+    const p = new PitFundamentalsProvider(BASE, fetcher as unknown as typeof fetch, noMint);
 
     const out = await p.fetch(['NVDA_US_EQ']);
 
@@ -226,12 +198,10 @@ describe('PitFundamentalsProvider', () => {
   });
 
   it('returns {} for an empty ticker list without any call', async () => {
-    const yahoo = fakeYahoo();
     const fetcher = vi.fn(async () => pitResponse({}));
-    const p = new PitFundamentalsProvider(yahoo, BASE, fetcher as unknown as typeof fetch, noMint);
+    const p = new PitFundamentalsProvider(BASE, fetcher as unknown as typeof fetch, noMint);
 
     expect(await p.fetch([])).toEqual({});
     expect(fetcher).not.toHaveBeenCalled();
-    expect(yahoo.seen).toEqual([]);
   });
 });

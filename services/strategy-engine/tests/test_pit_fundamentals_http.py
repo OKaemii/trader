@@ -1,4 +1,4 @@
-"""Tests for PitFundamentalsAsOf — the concrete HTTP client over fundamentals-api (epic Task 14).
+"""Tests for PitFundamentalsAsOf — the concrete HTTP client over fundamentals-api (PIT lake seam).
 
 Mocks the HTTP layer via respx (no network), the same way test_market_data_client.py does. Pins:
   - the seam URL shape: GET {base}/internal/api/fundamentals-pit?tickers=&asOf= (camelCase asOf, the
@@ -6,13 +6,14 @@ Mocks the HTTP layer via respx (no network), the same way test_market_data_clien
   - the internal-JWT auth header (minted as `strategy-engine`, the caller market-data already
     authorizes on the bars/fundamentals routes);
   - the payload→line-item projection (LINE_ITEMS only, finite values, provenance dropped) and the
-    "covered but no fact ≤ asOf → empty line items → absent from the map" contract (so the router
-    falls back to Yahoo for that name in live);
-  - LIVE SAFETY: a transport error, a 503 (cold warehouse), or malformed JSON degrade to {} — NEVER
+    "covered but no fact ≤ asOf → empty line items → absent from the map" contract (a miss → no
+    fundamentals this cycle; FAIL-CLOSED, no Yahoo fallback);
+  - FAIL-CLOSED ROUTING: a non-US name is never sent to the lake — it resolves to {} with NO HTTP;
+  - LIVE SAFETY: a transport error, a 503 (cold lake), or malformed JSON degrade to {} — NEVER
     raised into the cycle (the single most important property for the live trading host);
-  - source_for routes pit-edgar (US) / pit-companies-house (UK).
+  - source_for stamps pit-edgar (the only jurisdiction the lake serves).
 
-The deps-light routing/build tests live in test_fundamentals_as_of.py; this file is the HTTP twin.
+The deps-light build/projection tests live in test_fundamentals_as_of.py; this file is the HTTP twin.
 """
 from __future__ import annotations
 
@@ -24,7 +25,6 @@ import pytest
 import respx
 
 from src.infrastructure.fundamentals_as_of import (
-    SOURCE_PIT_COMPANIES_HOUSE,
     SOURCE_PIT_EDGAR,
     PitFundamentalsAsOf,
 )
@@ -62,7 +62,7 @@ _PIT_PAYLOAD = {
             "knowledge_ts": 1_600_100_000_000,
         },
         # A covered-but-unseeded name: empty line items + null provenance → must be ABSENT from the map
-        # (so RoutingFundamentalsAsOf falls back to Yahoo for it in live).
+        # (a PIT miss → no fundamentals this cycle; FAIL-CLOSED, no fallback).
         "MSFT_US_EQ": {"source": None, "observation_ts": None, "knowledge_ts": None},
     },
     "asOf": 1_600_100_000_000,
@@ -135,8 +135,8 @@ async def test_empty_tickers_makes_no_call():
 
 @pytest.mark.asyncio
 async def test_503_cold_warehouse_degrades_to_empty():
-    """A 503 (cold/unseeded warehouse) degrades to {} — NEVER raised into the cycle (so the router
-    falls back to Yahoo)."""
+    """A 503 (cold/unseeded lake) degrades to {} — NEVER raised into the cycle. With no fallback the
+    US slice simply gets no fundamentals this cycle (legs NaN-excluded downstream)."""
     provider = _provider()
     as_of = 1_600_100_000_000
     with respx.mock() as mock:
@@ -194,8 +194,46 @@ async def test_structurally_malformed_payload_degrades_to_empty():
         assert await provider.fetch_many(["AAPL_US_EQ"], as_of) == {}
 
 
-def test_source_for_routes_by_jurisdiction():
-    """source_for stamps pit-edgar (US) / pit-companies-house (UK)."""
+def test_source_for_is_pit_edgar():
+    """source_for stamps pit-edgar — the only jurisdiction the lake serves (a non-US name fail-closes
+    to {}, so its quality factor is None and the stamp is never attached to it)."""
     provider = _provider()
     assert provider.source_for("AAPL_US_EQ") == SOURCE_PIT_EDGAR
-    assert provider.source_for("HSBAl_EQ") == SOURCE_PIT_COMPANIES_HOUSE
+    assert provider.source_for("HSBAl_EQ") == SOURCE_PIT_EDGAR
+
+
+@pytest.mark.asyncio
+async def test_non_us_fail_closed_makes_no_call():
+    """A non-US (LSE *l_EQ, or anything else) name is FAIL-CLOSED: {} with NO HTTP round-trip (no
+    EDGAR for it, no Yahoo substitute — decision H)."""
+    provider = _provider()
+    as_of = 1_600_100_000_000
+    # assert_all_called=False: registering the route while expecting it NOT to fire is the point.
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.get(f"{BASE_URL}/internal/api/fundamentals-pit").mock(
+            return_value=httpx.Response(200, json={"fundamentals": {}})
+        )
+        out = await provider.fetch_many(["HSBAl_EQ", "SOMECRYPTO"], as_of)
+    assert out == {}
+    assert route.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_mixed_batch_sends_only_us_slice():
+    """A mixed batch sends ONLY the US slice to the lake; the non-US name is fail-closed and never
+    appears in the request or the result."""
+    provider = _provider()
+    as_of = 1_600_100_000_000
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        return httpx.Response(200, json={"fundamentals": {"AAPL_US_EQ": {"net_income": 1.0, "source": "pit-edgar"}}})
+
+    with respx.mock() as mock:
+        mock.get(f"{BASE_URL}/internal/api/fundamentals-pit?tickers=AAPL_US_EQ&asOf={as_of}").mock(side_effect=handler)
+        out = await provider.fetch_many(["AAPL_US_EQ", "HSBAl_EQ"], as_of)
+
+    assert "tickers=AAPL_US_EQ&" in captured["url"]  # only the US name in the query
+    assert "HSBAl_EQ" not in captured["url"]
+    assert set(out.keys()) == {"AAPL_US_EQ"}

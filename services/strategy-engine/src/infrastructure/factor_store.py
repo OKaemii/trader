@@ -154,9 +154,10 @@ def stamp_factor_sources(
     ``{ momentum:{raw,pct}, quality:{raw,pct}, value:{raw,pct}, volatility:{raw,pct} }`` — cells are
     native Python ``float | None`` (JSON-/Mongo-clean, no numpy types leak).
 
-    ``fundamentals_source`` is the FundamentalsAsOf provider's ``source_for(ticker)`` for THIS name
-    (``yahoo-snapshot`` for the live impl; ``pit-edgar`` / ``pit-companies-house`` for the future
-    per-jurisdiction PIT provider).
+    ``fundamentals_source`` is the FundamentalsAsOf provider's ``source_for(ticker)`` for THIS name —
+    ``pit-edgar`` on the live PIT-only seam (a non-US name fail-closes to no fundamentals, so its
+    quality factor is None and this stamp is never attached to it). Historical rows may carry the
+    retired ``yahoo-snapshot`` / ``pit-companies-house`` stamps (read, never freshly written).
 
     Rules (see module docstring):
       - a cell whose ``raw`` is None ⇒ the no-source cell ``{raw:null, pct:null, source:null}``
@@ -242,10 +243,11 @@ def factor_history_points(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 # ── PIT re-backfill (upgrade previously-None fundamentals factors in place) ──────────────────────
 #
-# The forward-only Yahoo seam returns {} for any PAST as_of, so the fundamentals-derived factors
-# (quality, and value's earnings/book leg) were persisted as the honest no-source cell
-# ``{raw:null, pct:null, source:null}`` for historical cycles. Once the PIT warehouse can answer those
-# past as_ofs (the wider epic), a re-backfill recomputes those cycles with PIT fundamentals and upgrades
+# A fundamentals fact the lake has no row for at a PAST as_of yields {} (and the now-removed Yahoo seam
+# did the same for any past as_of), so the fundamentals-derived factors (quality, and value's
+# earnings/book leg) were persisted as the honest no-source cell ``{raw:null, pct:null, source:null}``
+# for those cycles. Once the PIT lake covers those past as_ofs (as the harvester backfills filing
+# depth), a re-backfill recomputes those cycles with PIT fundamentals and upgrades
 # EXACTLY the rows that were genuinely missing — matched by ``(ticker, observation_ts)`` and GUARDED BY
 # ``source``: a cell is upgraded only when its stored ``source`` is None (the no-source cell). A cell
 # that already carries ANY source (``eod`` price factors, a ``div`` value leg, a prior ``yahoo-snapshot``
