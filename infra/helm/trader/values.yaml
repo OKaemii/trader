@@ -69,11 +69,13 @@ global:
     # See agent-docs/plans/three-database-split.md §Cutover.
     barsBackend: timescale              # mongo | timescale
     # Migration-window toggle: when true, market-data-service writes every bar to BOTH Mongo
-    # AND Timescale (best-effort on the PG side — Mongo failures fail the request; PG failures
-    # log to the dual_write_failures collection without affecting the Mongo write). Default
-    # off so production keeps single-writing to Mongo until the operator deliberately enables
-    # the cutover sequence.
-    dualWriteBars: "true"               # "true" enables Timescale dual-write
+    # AND Timescale (best-effort on the PG side). The three-DB cutover to barsBackend=timescale
+    # is COMPLETE and validated live, so the Mongo dual-write is now OFF (runbook step 8 — epic
+    # pit-fundamentals-lake-rearchitecture, Task 24): Timescale is the sole bars store and the
+    # legacy Mongo ohlcv_bars dual-write (the cruft #207 dropped) is no longer written. The
+    # writer reads this flag fresh each call, so it can be flipped back to "true" without a code
+    # change if a Mongo rollback target is ever needed again.
+    dualWriteBars: "false"              # "true" enables Timescale dual-write
     # Default polling cadence for market-data-service live polling. Must be one of the
     # active provider's allowedPollIntervals (Yahoo: 15m / 1h / 24h). The portal renders
     # the dropdown from those values; this default is what new deploys land on before
