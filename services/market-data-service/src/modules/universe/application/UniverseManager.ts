@@ -9,17 +9,15 @@ import { Trading212TickerAdapter, type Market } from '@trader/ticker-identity';
 import type { Currency } from '@trader/shared-types';
 import { tryIdentityOf, tickerOf } from '../../../shared/identity.ts';
 import { fetchT212Instruments } from '../infrastructure/t212-client.ts';
-import { fetchYahooLiquidity } from '../../bars/infrastructure/providers/yahoo-client.ts';
 import { MongoInstrumentMeta } from '../infrastructure/MongoInstrumentMeta.ts';
-import { YahooSectorClient } from '../infrastructure/yahoo-sector-client.ts';
+import { EdgarSicSectorClient } from '../infrastructure/edgar-sic-sector-client.ts';
 import { fetchEodhdCapScan } from '../infrastructure/eodhd-scan.ts';
 import { mapEodhdToT212 } from '../infrastructure/eodhd-symbol-map.ts';
 import { log } from '../../../logger.ts';
 
-// Rows older than this are re-fetched from Yahoo on the next refresh. Sectors are
-// stable for months so a long stale window is fine; the lower bound keeps us
-// covered for the rare GICS reclassification (~quarterly) and lets the operator
-// drop the env to force a re-pull.
+// Rows older than this are re-sourced on the next refresh (the curated/US EDGAR-SIC secondary). Sectors
+// are stable for months so a long stale window is fine; the lower bound keeps us covered for the rare
+// GICS reclassification (~quarterly) and lets the operator drop the env to force a re-pull.
 const SECTOR_STALE_MS_DEFAULT = 30 * 24 * 60 * 60 * 1000;   // 30 days
 
 // FX converter callback; same shape as the one we pass to YahooProvider. Provided by
@@ -98,16 +96,16 @@ async function medianSpreadByTicker(tickers: string[]): Promise<Map<string, numb
   return out;
 }
 
-// Yahoo enrichment is best-effort. Cap each call so a rate-limited (429-walled) or hung
-// upstream can never stall refresh() — and thus can never block the poll loop from
-// starting. (2026-05 incident: refresh() hung on Yahoo's 429 wall during ADV ranking, so
-// market:raw went stale for ~3 days while the poll loop never started.)
-const ADV_RANK_TIMEOUT_MS     = 25_000;
+// Sector enrichment is best-effort. Cap the call so a hung/cold fundamentals-api can never stall
+// refresh() — and thus can never block the poll loop from starting. (The pattern dates to a 2026-05
+// incident where refresh() hung on Yahoo's 429 wall during ADV ranking and market:raw went stale for
+// ~3 days; the Yahoo ADV call + the Yahoo sector client are now gone — Task 19 — but the same hung-
+// upstream guard is kept for the EDGAR-SIC secondary read.)
 const SECTOR_FETCH_TIMEOUT_MS = 25_000;
 
 // Race a promise against a timeout; on timeout OR rejection, resolve to `fallback`. The
-// universe is still built from the T212-resolved candidates, just without this enhancement
-// (unranked ADV / stale sectors), which the poll loop tolerates fine.
+// universe is still built from the resolved candidates, just without this enhancement
+// (stale sectors), which the poll loop tolerates fine.
 async function withTimeout<T>(p: Promise<T>, ms: number, fallback: T, label: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const guard = new Promise<T>((resolve) => {
@@ -141,7 +139,9 @@ export interface InstrumentMeta {
   name:         string;
   sector:       string;       // GICS sector (or 'Unknown' if not supplied)
   t212Tradable: boolean;
-  adv?:         number;       // 5-day average dollar volume from Yahoo (curated path only)
+  adv?:         number;       // legacy ADV field — retained on the type for the registry row + any
+                              // stored value, but no longer POPULATED (the Yahoo ADV rank was dropped
+                              // in Task 19; curated ranking is shortName-stable, eodhd_scan ranks by cap)
 }
 
 const metaAdapter = new Trading212TickerAdapter();
@@ -359,7 +359,7 @@ export function resolveForcedRemove(raw: BareForcedAdd): OverrideEntry | null {
 }
 
 /**
- * Resolve each include-list symbol to the best T212 instrument and rank by Yahoo ADV.
+ * Resolve each include-list symbol to the best T212 instrument, in include-list order.
  *
  * Resolution rules:
  *  - US list → prefer `_US_EQ` suffix (NYSE/NASDAQ primary).
@@ -368,18 +368,21 @@ export function resolveForcedRemove(raw: BareForcedAdd): OverrideEntry | null {
  *    skipped; count logged.
  *
  * Dedup: collapse multiple include-list entries that resolve to the same underlying
- * (same shortName), keeping the higher-ranked candidate. This guards against future
- * dual-listing additions (e.g. SHEL appearing in both lists).
+ * (same shortName), keeping the first. This guards against future dual-listing additions
+ * (e.g. SHEL appearing in both lists).
  *
- * Returns at most this.config.maxSize entries, ranked by 5-day average dollar volume
- * descending, with the sector cap applied (currently a no-op since T212 returns
- * sector='Unknown' for every instrument).
+ * RANKING (Task 19): the Yahoo 5-day-ADV rank was DROPPED — it was ineffective (T212 reports volume=0,
+ * so the ADV the rank read was always 0) and Yahoo is removed platform-wide (Thread C). The curated
+ * order is now the include-list order itself (US list then LSE list, first-listing-per-shortName wins),
+ * which is stable across refreshes — the property the rank was there to provide when the candidate pool
+ * exceeds maxSize. The live universe is `eodhd_scan` (ranked by market cap, not ADV); curated is the
+ * fallback/test path. Returns at most this.config.maxSize entries with the sector cap applied (inert
+ * until sector enrichment lands real labels — 'Unknown' is cap-exempt).
  */
-async function selectCurated(
+function selectCurated(
   rawInstruments: Awaited<ReturnType<typeof fetchT212Instruments>>,
-  fxToGBP: FxToGBP,
   config: UniverseConfig,
-): Promise<InstrumentMeta[]> {
+): InstrumentMeta[] {
   const includeUs  = config.includeUs;
   const includeLse = config.includeLse;
   const maxSize    = config.maxSize;
@@ -417,15 +420,9 @@ async function selectCurated(
   }
   log.info(`[universe] curated candidates: ${candidates.length} (US: ${includeUs.length - unresolvedUS}, LSE: ${includeLse.length - unresolvedLSE})`);
 
-  // Yahoo liquidity rank. ADV values are normalised to GBP (the base currency) so a
-  // USD-denominated $1M ADV and a GBP-denominated £1M ADV are no longer treated as
-  // equal-sized — fxToGBP applies the live rate before ranking.
-  const advMap = await withTimeout(
-    fetchYahooLiquidity(candidates.map((c) => c.ticker), fxToGBP),
-    ADV_RANK_TIMEOUT_MS, {}, 'ADV liquidity ranking',
-  );
-  for (const c of candidates) c.adv = advMap[c.ticker] ?? 0;
-  candidates.sort((a, b) => (b.adv ?? 0) - (a.adv ?? 0));
+  // No ADV rank (Task 19 — the Yahoo ADV call is gone; it read T212's volume=0 so it was always 0).
+  // Candidates stay in include-list order, which is stable across refreshes (the property the rank
+  // provided). Sectors are enriched later in refresh() (the curated/US EDGAR-SIC secondary).
 
   // Sector cap (currently inert until sector enrichment lands, but kept symmetric with
   // the legacy path so an upgrade to real GICS sectors works without touching this code).
@@ -512,10 +509,11 @@ async function selectFromEodhdScan(
 }
 
 export interface UniverseManagerOptions {
-  // Optional injected sector client — defaults to the real Yahoo HTTP client. Tests
-  // pass a stub. When set to `null`, sector enrichment is skipped entirely (useful
-  // for tests that don't care about sectors and don't want the Yahoo call mocked).
-  sectorClient?: YahooSectorClient | null;
+  // Optional injected EDGAR-SIC sector client (the curated/US secondary source). Production wiring
+  // (index.ts) injects the real `EdgarSicSectorClient` over FUNDAMENTALS_API_URL; tests pass a stub or
+  // `null`. DEFAULT (undefined) is `null` — no secondary enrichment unless explicitly wired (the client
+  // needs a base URL, so there is no zero-arg default; the eodhd_scan primary needs no client at all).
+  sectorClient?: EdgarSicSectorClient | null;
   // Stale-window override (ms). Defaults to 30 days.
   sectorStaleMs?: number;
   // Resolves the effective max universe size at refresh time. Lets a portal runtime override
@@ -528,22 +526,23 @@ export class UniverseManager {
   private _activeUniverse: string[] = [];
   private _sectorMap: Record<string, string> = {};
   private readonly config: UniverseConfig;
-  private readonly sectorClient: YahooSectorClient | null;
+  private readonly sectorClient: EdgarSicSectorClient | null;
   private readonly sectorStaleMs: number;
   private readonly maxSizeResolver: (() => number | Promise<number>) | null;
 
-  // Optional FX converter for liquidity ranking. Default (identity) keeps tests and
-  // any caller that doesn't supply FX working — at the cost of incorrect cross-currency
-  // ranking. Production wiring (services/market-data-service/src/index.ts) always
-  // injects the live Yahoo-backed FxClient.
+  // Optional FX converter. Default (identity) keeps tests and any caller that doesn't supply FX
+  // working — at the cost of incorrect cross-currency cap normalisation under eodhd_scan. Production
+  // wiring (services/market-data-service/src/index.ts) injects the live FxClient. (The curated path no
+  // longer uses FX — the Yahoo ADV rank that needed it was dropped in Task 19 — but eodhd_scan does.)
   constructor(
     private readonly fxToGBP: FxToGBP = IDENTITY_FX,
     config: Partial<UniverseConfig> = {},
     options: UniverseManagerOptions = {},
   ) {
     this.config = { ...DEFAULT_CONFIG, ...config };
-    // `undefined` = use the default client; explicit `null` = disable enrichment.
-    this.sectorClient = options.sectorClient === undefined ? new YahooSectorClient() : options.sectorClient;
+    // DEFAULT (undefined) = no secondary enrichment (`null`); production injects the real client. An
+    // explicit `null` also disables it. The EdgarSicSectorClient needs a base URL → no zero-arg default.
+    this.sectorClient = options.sectorClient ?? null;
     this.sectorStaleMs = options.sectorStaleMs ?? SECTOR_STALE_MS_DEFAULT;
     this.maxSizeResolver = options.maxSizeResolver ?? null;
   }
@@ -610,14 +609,13 @@ export class UniverseManager {
       // Feeds the same instrument_registry diff below — no parallel pool.
       selected = await selectFromEodhdScan(rawInstruments, this.fxToGBP, cfg);
     } else if (this.config.includeUs.length > 0 || this.config.includeLse.length > 0) {
-      // ── 2/3/4 (curated): resolve include lists → ADV rank → top N ────────────
+      // ── 2/3/4 (curated): resolve include lists → top N (include-list order) ───
       // Each include-list symbol is matched against T212's `shortName` (the bare symbol,
       // e.g. "AAPL", "SHEL") and the best T212 ticker is picked per the market preference:
       // US list prefers `_US_EQ`, LSE list prefers GBP/GBX `l_EQ`. Unresolved symbols are
-      // dropped — the log line reports how many. Liquidity comes from a one-shot Yahoo call
-      // per candidate; ranking ensures stable selection across refreshes when the candidate
-      // pool exceeds this.config.maxSize.
-      selected = await selectCurated(rawInstruments, this.fxToGBP, cfg);
+      // dropped — the log line reports how many. The Yahoo ADV rank was dropped (Task 19);
+      // selection is include-list order (stable across refreshes), capped at this.config.maxSize.
+      selected = selectCurated(rawInstruments, cfg);
     } else {
       // ── 2. Fetch OHLCV stats for Section 29b eligibility filters ─────────────
       const lookbackDate = new Date(now.getTime() - ADV_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
@@ -720,13 +718,14 @@ export class UniverseManager {
       log.info(`[universe] overrides applied: +${overrideResult.added} -${overrideResult.removed}`);
     }
 
-    // ── 4c. Sector enrichment — Mongo cache (read-through), sourced per universe source ─
+    // ── 4c. Sector enrichment — Mongo cache (read-through), sourced per universe source (Task 19) ─
     // Replaces the placeholder sector with a real label and persists it to the
     // `instrument_metadata` cache (read by the internal /sectors route + the registry diff).
-    // - eodhd_scan: the sector arrives FREE on each selected row from the EODHD screener — NO
-    //   Yahoo. Per-ticker quoteSummary melts at the ~500-name scanned universe (rate-limited),
-    //   so we persist the screener sectors (source 'eodhd') and never call Yahoo here.
-    // - curated/legacy: the low-volume, 30d-cached Yahoo enrichment (sectorClient) still runs.
+    // - PRIMARY (eodhd_scan): the sector arrives FREE on each selected row from the EODHD screener
+    //   (source 'eodhd') — no extra call. Yahoo is gone (Thread C).
+    // - SECONDARY (curated/legacy): the EDGAR-SIC sector label from the PIT lake, via the
+    //   `EdgarSicSectorClient` (source 'edgar'). US-only (non-US has no EDGAR); graceful — a cold/
+    //   partial lake or an unmapped SIC leaves the name 'Unknown' (cap-exempt) and retries next refresh.
     // - Operator overrides (source='manual') always win; failures keep the existing entry.
     const metaRepo = new MongoInstrumentMeta(db);
     const universeTickers = selected.map((i) => i.ticker);
@@ -742,30 +741,30 @@ export class UniverseManager {
             await metaRepo.upsert({ ticker: inst.ticker, sector: inst.sector, source: 'eodhd' });
             persisted++;
           }
-          log.info(`[universe] sector enrichment: ${persisted}/${universeTickers.length} from EODHD screener (no Yahoo)`);
+          log.info(`[universe] sector enrichment: ${persisted}/${universeTickers.length} from EODHD screener (primary)`);
         } else if (this.sectorClient) {
+          // Curated/US secondary: the EDGAR SIC from the lake. needsRefresh skips manual pins + still-
+          // fresh rows; the client itself filters to US names (non-US has no EDGAR) and degrades to {}.
           const needFetch = await metaRepo.needsRefresh(universeTickers, this.sectorStaleMs);
           if (needFetch.length > 0) {
-            log.info(`[universe] sector enrichment: ${needFetch.length}/${universeTickers.length} tickers need Yahoo lookup`);
+            log.info(`[universe] sector enrichment: ${needFetch.length}/${universeTickers.length} tickers need an EDGAR-SIC lookup`);
             const fetched = await withTimeout(
               this.sectorClient.fetchSectors(needFetch),
               SECTOR_FETCH_TIMEOUT_MS, {}, 'sector enrichment',
             );
+            let persisted = 0;
             for (const ticker of needFetch) {
-              const hit = fetched[ticker];
-              if (!hit) continue;   // Yahoo didn't resolve it — leave existing value (or absence)
-              await metaRepo.upsert({
-                ticker,
-                sector:   hit.sector,
-                source:   'yahoo',
-                ...(hit.industry !== undefined ? { industry: hit.industry } : {}),
-              });
+              const sector = fetched[ticker];
+              if (!sector) continue;   // EDGAR didn't sector it — leave existing value (or absence)
+              await metaRepo.upsert({ ticker, sector, source: 'edgar' });
+              persisted++;
             }
+            log.info(`[universe] sector enrichment: ${persisted}/${needFetch.length} from EDGAR SIC (secondary)`);
           }
         }
 
         // Build the in-memory sector map. Precedence: manual override > just-persisted
-        // (eodhd/yahoo) > existing cache > the scan placeholder. Only falls to 'Unknown'
+        // (eodhd/edgar) > existing cache > the scan placeholder. Only falls to 'Unknown'
         // when no source ever resolved the ticker.
         const refreshed = await metaRepo.findMany(universeTickers);
         for (const inst of selected) {

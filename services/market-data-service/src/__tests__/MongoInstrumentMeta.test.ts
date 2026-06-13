@@ -56,7 +56,7 @@ describe('MongoInstrumentMeta', () => {
     const got = await repo.get('AAPL_US_EQ');
     expect(got?.sector).toBe('Technology');
     expect(got?.industry).toBe('Consumer Electronics');
-    expect(got?.source).toBe('yahoo');         // default
+    expect(got?.source).toBe('edgar');         // default (Task 19 — was 'yahoo'; Yahoo source retired)
     expect(got?.fetchedAt).toBeInstanceOf(Date);
   });
 
@@ -106,9 +106,9 @@ describe('MongoInstrumentMeta', () => {
   it('explicit source="manual" persists; second upsert replaces fully', async () => {
     await repo.upsert({ ticker: 'AAPL_US_EQ', sector: 'Tech', source: 'manual' });
     expect((await repo.get('AAPL_US_EQ'))?.source).toBe('manual');
-    // A subsequent Yahoo-sourced upsert overwrites the row — caller is expected to
+    // A subsequent default-sourced upsert overwrites the row — caller is expected to
     // filter manual rows BEFORE invoking upsert (handled in UniverseManager.refresh).
     await repo.upsert({ ticker: 'AAPL_US_EQ', sector: 'Technology' });
-    expect((await repo.get('AAPL_US_EQ'))?.source).toBe('yahoo');
+    expect((await repo.get('AAPL_US_EQ'))?.source).toBe('edgar');
   });
 });

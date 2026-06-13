@@ -83,7 +83,7 @@ export class SectorMomentumRenderer implements StrategyRenderer {
                 severity: 'critical',
                 code: 'SECTOR_DATA_MISSING',
                 message: `${(unknownFraction * 100).toFixed(0)}% of the universe has sector='Unknown' — sector-relative ranking degenerates to plain momentum.`,
-                hint: 'Re-run UniverseManager sector enrichment or check the YahooSectorClient logs for upstream failures.',
+                hint: 'Re-run UniverseManager sector enrichment or check the EODHD screener / EDGAR-SIC (fundamentals-api) sector source for upstream failures.',
                 evidence: { unknownFraction },
             });
         }
