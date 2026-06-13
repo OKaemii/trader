@@ -1,3 +1,4 @@
+-- shared-pg:no-transaction
 -- 0012_bars_symbol_market.sql — bare-ticker identity for the bars/quotes/bar_revisions_log stores.
 --
 -- Thread A of the PIT-fundamentals-lake epic (plan: pit-fundamentals-lake-rearchitecture.md,
@@ -11,23 +12,107 @@
 -- decomposition note 1): per decision G (wipe-and-refetch, no data migration) the operator deploys
 -- it together with the Task 23 store wipe, so there is NO existing data to preserve. We therefore
 -- DROP and recreate the three tables with the new shape rather than fight the compressed-hypertable
--- ALTER constraints below. The data stores are repopulated post-deploy by the universe refresh +
--- poller + harvester.
+-- ALTER constraints (you cannot drop a column that is part of `compress_segmentby` — here `ticker`).
+-- The stores are repopulated post-deploy by the universe refresh + poller + harvester.
 --
--- Why drop-and-recreate instead of ALTER ADD/DROP COLUMN:
---   `bars`/`quotes`/`bar_revisions_log` are COMPRESSED hypertables. TimescaleDB forbids dropping a
---   column that is part of `compress_segmentby` (here `ticker`) while compression is configured, and
---   adding columns to a hypertable with compressed chunks is constrained. A wipe makes the rows
---   disposable, so the clean, deterministic move is to drop each hypertable (which drops its
---   compressed chunks with it) and recreate it new-shape. `DROP TABLE IF EXISTS … CASCADE` +
---   `CREATE TABLE IF NOT EXISTS` keeps the file idempotent and re-runnable against the running DB.
---
--- Idempotency: the whole file is wrapped by the @trader/shared-pg migration runner in one
--- transaction and recorded in `schema_migrations`, so it applies at most once per database; but the
--- statements are individually idempotent too (IF EXISTS / IF NOT EXISTS / create_hypertable
--- if_not_exists / add_compression_policy if_not_exists / DO-guarded role create) so a manual re-run
--- is safe. Applied by the `timescale-init` Helm hook each release.
+-- ⚠ RUNS NON-TRANSACTIONALLY (the `-- shared-pg:no-transaction` directive above). A plain
+-- `DROP TABLE` of a DEEP hypertable takes an AccessExclusiveLock on EVERY chunk at once; the live
+-- `bars` daily series spans ~1000+ 7-day chunks, so dropping it inside ONE transaction overflows the
+-- shared lock table → "out of shared memory" / SQLSTATE 53200 / LockAcquireExtended (the exact
+-- lock-fan the bars OOM work fights — and the reason the first cut of this migration failed the live
+-- timescale-init deploy while passing the fresh-container test). So the file first drops each
+-- hypertable's chunks in BOUNDED 2-year windows — each `drop_chunks` is its own auto-committed
+-- statement (no wrapping BEGIN), so it locks only that window's chunks and releases them before the
+-- next — leaving an (almost) empty hypertable that `DROP TABLE` can then drop cheaply. Because there
+-- is no wrapping transaction, the file is written strictly idempotently (IF EXISTS / IF NOT EXISTS /
+-- if_not_exists / DO-guards) so a re-run after a partial failure completes it; `schema_migrations`
+-- records it only on full success. Applied by the `timescale-init` Helm hook each release.
 
+-- ── 1. Empty the deep hypertables chunk-by-chunk (bounded locks) BEFORE dropping them ────────────
+-- bars: drop chunks in bounded 2y windows. Each DO block is ONE auto-committed
+-- statement (no wrapping txn — see the no-transaction directive), so it locks only that
+-- window's chunks and releases them before the next. The hypertable guard makes it safe
+-- on a fresh DB / after a partial prior run (table absent or not yet a hypertable).
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bars') THEN PERFORM drop_chunks('bars', older_than => 694224000000::bigint, newer_than => 631152000000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bars') THEN PERFORM drop_chunks('bars', older_than => 757382400000::bigint, newer_than => 694224000000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bars') THEN PERFORM drop_chunks('bars', older_than => 820454400000::bigint, newer_than => 757382400000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bars') THEN PERFORM drop_chunks('bars', older_than => 883612800000::bigint, newer_than => 820454400000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bars') THEN PERFORM drop_chunks('bars', older_than => 946684800000::bigint, newer_than => 883612800000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bars') THEN PERFORM drop_chunks('bars', older_than => 1009843200000::bigint, newer_than => 946684800000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bars') THEN PERFORM drop_chunks('bars', older_than => 1072915200000::bigint, newer_than => 1009843200000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bars') THEN PERFORM drop_chunks('bars', older_than => 1136073600000::bigint, newer_than => 1072915200000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bars') THEN PERFORM drop_chunks('bars', older_than => 1199145600000::bigint, newer_than => 1136073600000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bars') THEN PERFORM drop_chunks('bars', older_than => 1262304000000::bigint, newer_than => 1199145600000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bars') THEN PERFORM drop_chunks('bars', older_than => 1325376000000::bigint, newer_than => 1262304000000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bars') THEN PERFORM drop_chunks('bars', older_than => 1388534400000::bigint, newer_than => 1325376000000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bars') THEN PERFORM drop_chunks('bars', older_than => 1451606400000::bigint, newer_than => 1388534400000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bars') THEN PERFORM drop_chunks('bars', older_than => 1514764800000::bigint, newer_than => 1451606400000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bars') THEN PERFORM drop_chunks('bars', older_than => 1577836800000::bigint, newer_than => 1514764800000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bars') THEN PERFORM drop_chunks('bars', older_than => 1640995200000::bigint, newer_than => 1577836800000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bars') THEN PERFORM drop_chunks('bars', older_than => 1704067200000::bigint, newer_than => 1640995200000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bars') THEN PERFORM drop_chunks('bars', older_than => 1767225600000::bigint, newer_than => 1704067200000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bars') THEN PERFORM drop_chunks('bars', older_than => 1830297600000::bigint, newer_than => 1767225600000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bars') THEN PERFORM drop_chunks('bars', older_than => 1893456000000::bigint, newer_than => 1830297600000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bars') THEN PERFORM drop_chunks('bars', older_than => 1956528000000::bigint, newer_than => 1893456000000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bars') THEN PERFORM drop_chunks('bars', older_than => 2019686400000::bigint, newer_than => 1956528000000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bars') THEN PERFORM drop_chunks('bars', older_than => 2082758400000::bigint, newer_than => 2019686400000::bigint); END IF; END $$;
+
+-- quotes: drop chunks in bounded 2y windows. Each DO block is ONE auto-committed
+-- statement (no wrapping txn — see the no-transaction directive), so it locks only that
+-- window's chunks and releases them before the next. The hypertable guard makes it safe
+-- on a fresh DB / after a partial prior run (table absent or not yet a hypertable).
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='quotes') THEN PERFORM drop_chunks('quotes', older_than => 694224000000::bigint, newer_than => 631152000000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='quotes') THEN PERFORM drop_chunks('quotes', older_than => 757382400000::bigint, newer_than => 694224000000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='quotes') THEN PERFORM drop_chunks('quotes', older_than => 820454400000::bigint, newer_than => 757382400000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='quotes') THEN PERFORM drop_chunks('quotes', older_than => 883612800000::bigint, newer_than => 820454400000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='quotes') THEN PERFORM drop_chunks('quotes', older_than => 946684800000::bigint, newer_than => 883612800000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='quotes') THEN PERFORM drop_chunks('quotes', older_than => 1009843200000::bigint, newer_than => 946684800000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='quotes') THEN PERFORM drop_chunks('quotes', older_than => 1072915200000::bigint, newer_than => 1009843200000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='quotes') THEN PERFORM drop_chunks('quotes', older_than => 1136073600000::bigint, newer_than => 1072915200000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='quotes') THEN PERFORM drop_chunks('quotes', older_than => 1199145600000::bigint, newer_than => 1136073600000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='quotes') THEN PERFORM drop_chunks('quotes', older_than => 1262304000000::bigint, newer_than => 1199145600000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='quotes') THEN PERFORM drop_chunks('quotes', older_than => 1325376000000::bigint, newer_than => 1262304000000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='quotes') THEN PERFORM drop_chunks('quotes', older_than => 1388534400000::bigint, newer_than => 1325376000000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='quotes') THEN PERFORM drop_chunks('quotes', older_than => 1451606400000::bigint, newer_than => 1388534400000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='quotes') THEN PERFORM drop_chunks('quotes', older_than => 1514764800000::bigint, newer_than => 1451606400000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='quotes') THEN PERFORM drop_chunks('quotes', older_than => 1577836800000::bigint, newer_than => 1514764800000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='quotes') THEN PERFORM drop_chunks('quotes', older_than => 1640995200000::bigint, newer_than => 1577836800000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='quotes') THEN PERFORM drop_chunks('quotes', older_than => 1704067200000::bigint, newer_than => 1640995200000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='quotes') THEN PERFORM drop_chunks('quotes', older_than => 1767225600000::bigint, newer_than => 1704067200000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='quotes') THEN PERFORM drop_chunks('quotes', older_than => 1830297600000::bigint, newer_than => 1767225600000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='quotes') THEN PERFORM drop_chunks('quotes', older_than => 1893456000000::bigint, newer_than => 1830297600000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='quotes') THEN PERFORM drop_chunks('quotes', older_than => 1956528000000::bigint, newer_than => 1893456000000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='quotes') THEN PERFORM drop_chunks('quotes', older_than => 2019686400000::bigint, newer_than => 1956528000000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='quotes') THEN PERFORM drop_chunks('quotes', older_than => 2082758400000::bigint, newer_than => 2019686400000::bigint); END IF; END $$;
+
+-- bar_revisions_log: drop chunks in bounded 2y windows. Each DO block is ONE auto-committed
+-- statement (no wrapping txn — see the no-transaction directive), so it locks only that
+-- window's chunks and releases them before the next. The hypertable guard makes it safe
+-- on a fresh DB / after a partial prior run (table absent or not yet a hypertable).
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bar_revisions_log') THEN PERFORM drop_chunks('bar_revisions_log', older_than => 694224000000::bigint, newer_than => 631152000000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bar_revisions_log') THEN PERFORM drop_chunks('bar_revisions_log', older_than => 757382400000::bigint, newer_than => 694224000000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bar_revisions_log') THEN PERFORM drop_chunks('bar_revisions_log', older_than => 820454400000::bigint, newer_than => 757382400000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bar_revisions_log') THEN PERFORM drop_chunks('bar_revisions_log', older_than => 883612800000::bigint, newer_than => 820454400000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bar_revisions_log') THEN PERFORM drop_chunks('bar_revisions_log', older_than => 946684800000::bigint, newer_than => 883612800000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bar_revisions_log') THEN PERFORM drop_chunks('bar_revisions_log', older_than => 1009843200000::bigint, newer_than => 946684800000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bar_revisions_log') THEN PERFORM drop_chunks('bar_revisions_log', older_than => 1072915200000::bigint, newer_than => 1009843200000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bar_revisions_log') THEN PERFORM drop_chunks('bar_revisions_log', older_than => 1136073600000::bigint, newer_than => 1072915200000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bar_revisions_log') THEN PERFORM drop_chunks('bar_revisions_log', older_than => 1199145600000::bigint, newer_than => 1136073600000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bar_revisions_log') THEN PERFORM drop_chunks('bar_revisions_log', older_than => 1262304000000::bigint, newer_than => 1199145600000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bar_revisions_log') THEN PERFORM drop_chunks('bar_revisions_log', older_than => 1325376000000::bigint, newer_than => 1262304000000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bar_revisions_log') THEN PERFORM drop_chunks('bar_revisions_log', older_than => 1388534400000::bigint, newer_than => 1325376000000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bar_revisions_log') THEN PERFORM drop_chunks('bar_revisions_log', older_than => 1451606400000::bigint, newer_than => 1388534400000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bar_revisions_log') THEN PERFORM drop_chunks('bar_revisions_log', older_than => 1514764800000::bigint, newer_than => 1451606400000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bar_revisions_log') THEN PERFORM drop_chunks('bar_revisions_log', older_than => 1577836800000::bigint, newer_than => 1514764800000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bar_revisions_log') THEN PERFORM drop_chunks('bar_revisions_log', older_than => 1640995200000::bigint, newer_than => 1577836800000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bar_revisions_log') THEN PERFORM drop_chunks('bar_revisions_log', older_than => 1704067200000::bigint, newer_than => 1640995200000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bar_revisions_log') THEN PERFORM drop_chunks('bar_revisions_log', older_than => 1767225600000::bigint, newer_than => 1704067200000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bar_revisions_log') THEN PERFORM drop_chunks('bar_revisions_log', older_than => 1830297600000::bigint, newer_than => 1767225600000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bar_revisions_log') THEN PERFORM drop_chunks('bar_revisions_log', older_than => 1893456000000::bigint, newer_than => 1830297600000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bar_revisions_log') THEN PERFORM drop_chunks('bar_revisions_log', older_than => 1956528000000::bigint, newer_than => 1893456000000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bar_revisions_log') THEN PERFORM drop_chunks('bar_revisions_log', older_than => 2019686400000::bigint, newer_than => 1956528000000::bigint); END IF; END $$;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM timescaledb_information.hypertables WHERE hypertable_name='bar_revisions_log') THEN PERFORM drop_chunks('bar_revisions_log', older_than => 2082758400000::bigint, newer_than => 2019686400000::bigint); END IF; END $$;
+-- ── 2. Drop & recreate the tables with the (symbol, market) shape ───────────────────────────────
 -- ── bars ────────────────────────────────────────────────────────────────────────────────────────
 DROP TABLE IF EXISTS bars CASCADE;
 
