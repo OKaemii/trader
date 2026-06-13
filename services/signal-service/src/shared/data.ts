@@ -6,7 +6,7 @@ import type { ICache } from '@trader/shared-data/interfaces/ICache';
 import type { ICacheInvalidationBus } from '@trader/shared-data/interfaces/ICacheInvalidationBus';
 import { TradeSignal } from '../modules/signals/domain/TradeSignal.ts';
 import { COLLECTIONS } from '@trader/shared-mongo';
-import { identityOf, tickerOf, tryIdentityOf } from './identity.ts';
+import { identityOf, tickerOf } from './identity.ts';
 import type { Db } from 'mongodb';
 import type { RedisClientType } from 'redis';
 
