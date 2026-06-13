@@ -228,10 +228,10 @@ async def build_fundamentals_source_response(
 
     Provenance comes from the same ``factor_scores`` store the Research surface reads (T9): for each
     ticker, ``factors.quality.source`` is the FundamentalsAsOf provider's ``source_for`` stamp at
-    build time (``pit-edgar`` / ``pit-companies-house`` for a PIT-served name, ``yahoo-snapshot`` for
-    a Yahoo-served/fallback name, or ``null`` when quality couldn't be computed that cycle). That is
-    honest per-name provenance — a Yahoo-fallback name is never mislabelled ``pit-*`` (see
-    ``RoutingFundamentalsAsOf.source_for``).
+    build time (``pit-edgar`` for a PIT-served US name, or ``null`` when quality couldn't be computed
+    that cycle — a non-US name fail-closes to no fundamentals, so its quality factor is ``None`` and
+    carries no source). Post Yahoo-removal the live provenance reduces to ``pit-edgar`` | ``null``;
+    historical rows may still carry the retired ``yahoo-snapshot`` stamp (read, never written).
 
     Two clocks are deliberately distinct across the epic (§J): ``built_at`` here = the row's
     ``observation_ts`` = the cycle's ``as_of_ms`` = when the strategy READ fundamentals and BUILT this
@@ -264,7 +264,9 @@ async def build_fundamentals_source_response(
         "provider":      provider_mode,
         "sources":       sources,
         "by_ticker":     by_ticker,
-        # pit_served = names served from a PIT jurisdiction this cycle (pit-edgar / pit-companies-house).
+        # pit_served = names served from a PIT source (any pit-* stamp). On the live PIT-only seam this
+        # is pit-edgar (US); a legacy pit-companies-house row in stored data still counts. Non-US names
+        # fail-closed to a null source, so they are NOT pit-served.
         "pit_served":    sum(n for k, n in sources.items() if k.startswith("pit-")),
         "last_cycle_ts": last_cycle_ts,
     }
@@ -517,8 +519,9 @@ async def _persist_research_factors(
 
     Fundamentals reach the compute only via HistoryView.fundamentals, filled from two PIT-honest
     legs:
-      - the FundamentalsAsOf seam (Quality + the forward-only earnings/book leg of Value), stamped
-        with the provider's source (yahoo-snapshot today);
+      - the FundamentalsAsOf seam (Quality + the earnings/book leg of Value), PIT-only and stamped
+        with the provider's source (`pit-edgar` for a US name; a non-US name fail-closes to `{}`, so
+        its quality/value legs are None with no source);
       - the cross-service dividend-yield leg (the only backfillable Value component), merged in as
         `dividend_yield` and stamped `div`. Its fetch degrades INDEPENDENTLY: a failure leaves the
         leg None for all names (value source then falls back to the provider source) — it never
@@ -739,14 +742,13 @@ async def _init_engine_singletons() -> None:
     # (so a cycle never breaks on a fundamentals outage). ensure_indexes is idempotent — a failure
     # just leaves the read slower.
     #
-    # build_fundamentals_provider reads LIVE_FUNDAMENTALS_PROVIDER (pit|yahoo, default yahoo): `yahoo`
-    # is the bare forward-only snapshot (pre-Task-14 behaviour, the safe default); `pit` routes US/UK
-    # names to the PIT warehouse (fundamentals-api) with a Yahoo fallback on a miss. Reversible by env —
-    # no code change to flip back. See infrastructure/fundamentals_as_of.py.
+    # The seam is PIT-only (Thread C — Yahoo removed): build_fundamentals_provider returns the
+    # PitFundamentalsAsOf over fundamentals-api (US → the PIT lake, non-US → fail-closed {}). There is
+    # no Yahoo fallback and no `yahoo` mode any more; LIVE_FUNDAMENTALS_PROVIDER is inert (always pit).
+    # See infrastructure/fundamentals_as_of.py.
     _factor_store = FactorStore()
-    _fundamentals_provider = build_fundamentals_provider(_bars_client)
-    print(f"[strategy-engine] fundamentals seam: provider mode="
-          f"{os.getenv('LIVE_FUNDAMENTALS_PROVIDER', 'yahoo')} "
+    _fundamentals_provider = build_fundamentals_provider()
+    print(f"[strategy-engine] fundamentals seam: provider mode={resolve_provider_mode()} "
           f"({type(_fundamentals_provider).__name__})", flush=True)
     try:
         await _factor_store.ensure_indexes()
@@ -909,7 +911,7 @@ async def process_cycle(
         # compute, the cross-service div-yield call, and the Mongo write — is wrapped in one guard
         # that logs and continues, NEVER blocking the decide()/publish below (same contract as the
         # feature store). The div-yield leg degrades independently: a failure leaves it None for all
-        # names (value source falls back to yahoo-snapshot), it never crashes the cycle.
+        # names (value source falls back to the provider's pit-edgar stamp), it never crashes the cycle.
         await _persist_research_factors(active_tickers, history_map, as_of_ms, cycle_n)
 
         output = _strategy.decide(features, _EMPTY_PORTFOLIO) if features is not None else None

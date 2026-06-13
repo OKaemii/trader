@@ -4,12 +4,12 @@ them). One definition here so the writer and the reader cannot drift to differen
 
 WHY this lives in quant-core (not strategy-engine):
 `LINE_ITEMS`, the `FundamentalsAsOf` Protocol, the source stamps and the market router are read by
-BOTH live (strategy-engine) and replay (backtest-engine) and produced by the fundamentals-ingestion
-write-path — they are the contract every side agrees on. quant-core is the single source of truth
-shared by live + replay, so the contract belongs here and each side imports it. Only the concrete
-`YahooFundamentalsAsOf` implementation stays in strategy-engine, because it depends on that service's
-`MarketDataClient`; strategy-engine re-exports the names below from its original
-`infrastructure/fundamentals_as_of.py` so nothing downstream changes import path.
+BOTH live (strategy-engine) and replay (backtest-engine) — they are the contract every side agrees
+on. quant-core is the single source of truth shared by live + replay, so the contract belongs here
+and each side imports it. strategy-engine re-exports the names below from its
+`infrastructure/fundamentals_as_of.py` so nothing downstream changes import path. (After the Yahoo
+removal — epic pit-fundamentals-lake-rearchitecture, Thread C — the live seam is PIT-only: the
+concrete provider is `PitFundamentalsAsOf` over the PIT lake; the old `YahooFundamentalsAsOf` is gone.)
 
 THE LINE-ITEM CONTRACT:
 `LINE_ITEMS` is the snake_case key set the fundamentals factors + the QMJ screen read off
@@ -27,16 +27,20 @@ A field a given source can't supply is simply ABSENT from a name's dict — the 
 missing component rather than reading a fabricated 0 (see `strategy/factors.py`). Membership in
 `LINE_ITEMS` does NOT make a key mandatory; it pins the *spelling* both ends use when the key exists.
 
-MARKET ROUTING — the T212 ticker suffix selects the jurisdiction's PIT source:
-  - `*_US_EQ` → US  (SEC EDGAR)
-  - `*l_EQ`   → UK  (Companies House)
-A jurisdiction we can't route still works today (the Yahoo snapshot is global); the route selects the
-per-jurisdiction PIT warehouse once it exists.
+MARKET ROUTING — the T212 ticker suffix classifies the jurisdiction:
+  - `*_US_EQ` → US  (SEC EDGAR — the only live PIT source)
+  - `*l_EQ`   → UK  (no live fundamentals source — FAIL-CLOSED after the Yahoo removal)
+After Thread C + decision H, only US resolves fundamentals (the PIT EDGAR lake); a non-US name has NO
+live source and its fundamentals legs are NaN-excluded. The `MARKET_UK` label + the
+`pit-companies-house` stamp are kept for the `market_of` shim and for historical `factor_scores` rows,
+not because UK fundamentals are served live.
 
 SOURCE STAMP — every provider names its origin via `source_for(ticker)`; persisted alongside each
 computed factor in `factor_scores` so a later PIT re-backfill knows which previously-`None` rows it
-may upgrade in place (matched by `(ticker, observation_ts)`, guarded by `source`):
-  `yahoo-snapshot` (forward-only live) | `pit-edgar` | `pit-companies-house` (the PIT warehouse).
+may upgrade in place (matched by `(ticker, observation_ts)`, guarded by `source`). The live PIT-only
+seam emits `pit-edgar`; `yahoo-snapshot` and `pit-companies-house` are RETIRED stamps that survive
+only on historical rows (read, never freshly written):
+  `pit-edgar` (live) | `yahoo-snapshot` | `pit-companies-house` (legacy, historical rows only).
 """
 
 from __future__ import annotations
