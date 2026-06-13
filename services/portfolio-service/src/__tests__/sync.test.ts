@@ -1,4 +1,6 @@
-// Regression coverage for the FX/Money cleanup:
+// Regression coverage for the FX/Money cleanup + the Task 16a (symbol, market) re-key:
+//   - the position is keyed on bare symbol + market — the concatenated T212 `ticker` is no longer
+//     in $set, and $unset clears any legacy `ticker` field so pre-Thread-A rows self-heal
 //   - buildPositionUpdate never writes the legacy currentValueGBP field
 //   - $unset always clears currentValueGBP on every write so legacy rows self-heal
 //   - currentPrice + currentValue are Money-shaped in the instrument currency
@@ -14,9 +16,28 @@ import type { Money } from '@trader/shared-types';
 const FIXED_NOW = new Date('2026-05-16T12:00:00Z');
 
 describe('buildPositionUpdate', () => {
+  it('keys the doc on bare symbol + market, not the concatenated T212 ticker', () => {
+    const upd = buildPositionUpdate({
+      symbol: 'AAPL',
+      market: 'US',
+      quantity: 10,
+      currency: 'USD',
+      priceNative: 200,
+      valueNative: 2000,
+      weight: 0.02,
+      now: () => FIXED_NOW,
+    });
+    expect(upd.$set.symbol).toBe('AAPL');
+    expect(upd.$set.market).toBe('US');
+    expect('ticker' in upd.$set).toBe(false);
+    // The legacy concatenated-ticker field is cleared so a pre-Thread-A row self-heals.
+    expect(upd.$unset.ticker).toBe('');
+  });
+
   it('does NOT write currentValueGBP into $set (legacy dual-write field is gone)', () => {
     const upd = buildPositionUpdate({
-      ticker: 'AAPL_US_EQ',
+      symbol: 'AAPL',
+      market: 'US',
       quantity: 10,
       currency: 'USD',
       priceNative: 200,
@@ -29,7 +50,8 @@ describe('buildPositionUpdate', () => {
 
   it('always $unsets currentValueGBP so pre-FX rows self-heal on the next sync', () => {
     const upd = buildPositionUpdate({
-      ticker: 'VOD_l_EQ',
+      symbol: 'VOD',
+      market: 'LSE',
       quantity: 100,
       currency: 'GBP',
       priceNative: 80,
@@ -42,7 +64,8 @@ describe('buildPositionUpdate', () => {
 
   it('writes currentPrice and currentValue as Money in the instrument currency', () => {
     const upd = buildPositionUpdate({
-      ticker: 'AAPL_US_EQ',
+      symbol: 'AAPL',
+      market: 'US',
       quantity: 10,
       currency: 'USD',
       priceNative: 200,

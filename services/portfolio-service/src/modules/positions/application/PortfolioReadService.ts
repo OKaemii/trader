@@ -3,6 +3,7 @@ import type { Logger } from "@trader/core";
 import type { FxClient } from "@trader/shared-fx";
 import { COLLECTIONS } from "@trader/shared-mongo";
 import { sumPositionsGBP, type PositionDoc } from "@trader/shared-portfolio";
+import { tickerOf } from "../../../shared/identity.ts";
 
 export interface PortfolioReadDeps {
     db: Db;
@@ -20,8 +21,16 @@ export interface PnlSummary {
 export class PortfolioReadService {
     constructor(private readonly deps: PortfolioReadDeps) {}
 
-    listPositions(): Promise<unknown[]> {
-        return this.deps.db.collection(COLLECTIONS.POSITIONS).find({}).toArray();
+    async listPositions(): Promise<unknown[]> {
+        const docs = await this.deps.db.collection(COLLECTIONS.POSITIONS).find({}).toArray();
+        // Positions are keyed on (symbol, market) since Task 16a; re-derive a `ticker` onto each doc
+        // so the /api/portfolio/positions response keeps its pre-Thread-A shape for consumers.
+        return docs.map((d) => {
+            if (typeof d.symbol === "string" && typeof d.market === "string") {
+                try { return { ...d, ticker: tickerOf(d.symbol, d.market) }; } catch { /* leave as-is */ }
+            }
+            return d;
+        });
     }
 
     /** Returns null if FX is unavailable past the 24h stale window. Caller maps to 502. */
