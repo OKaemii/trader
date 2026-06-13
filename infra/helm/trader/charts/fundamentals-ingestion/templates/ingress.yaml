@@ -1,0 +1,40 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  # NOTE: this Ingress object is named `fundamentals-ingestion` and lives in the ingestion subchart for
+  # a deliberate reason — it is repointed IN PLACE rather than moved to the harvester chart. nginx's
+  # admission webhook rejects a second Ingress claiming the same (host, path), so creating a NEW
+  # `fundamentals-harvester` Ingress while this one still existed failed the whole `helm upgrade`
+  # ("path /admin/api/fundamentals-ingest is already defined in ingress trader/fundamentals-ingestion").
+  # Keeping the same object name lets Helm UPDATE the backend in place — no create, no collision. The
+  # ingress moves to the harvester chart when the ingestion chart is torn down (epic Task 24 / #208).
+  name: fundamentals-ingestion
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    kubernetes.io/ingress.class: nginx
+spec:
+  rules:
+    - host: trader.local
+      http:
+        paths:
+          # `/admin/api/fundamentals-ingest` — the prefix the portal Operations › PIT Fundamentals panel
+          # fans out to (status / config / freshness / runs / force-sweep). Repointed to the
+          # fundamentals-HARVESTER (the per-CIK Parquet lake's write path + its thin status API,
+          # src/app.py on :8012); it previously pointed at the retired fundamentals-ingestion:8010
+          # (the Timescale write-side), which served the OLD shape (coverage/quarantine/feed_health) and
+          # left the panel's lake-status header empty, /runs + /force-sweep 404-ing, and the EDGAR
+          # contact string leaking. The harvester serves the lake shape (no quarantine — decision D;
+          # runs + force-sweep present; the EDGAR UA reduced to a boolean).
+          #
+          # The old ingestion Deployment/Service/CronJobs stay up for rollback until teardown (Task 24);
+          # they are simply no longer reachable through the ingress. nginx uses longest-prefix matching,
+          # and `/admin/api/fundamentals-ingest`, `/admin/api/fundamentals-pit` (fundamentals-api), and
+          # the bare `/admin/api/fundamentals` (307 → portal) are mutually non-prefixing, so each
+          # resolves to its own backend with no rewrite.
+          - path: /admin/api/fundamentals-ingest
+            pathType: Prefix
+            backend:
+              service:
+                name: fundamentals-harvester
+                port:
+                  number: 8012
