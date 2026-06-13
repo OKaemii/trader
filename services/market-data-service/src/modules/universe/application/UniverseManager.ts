@@ -5,6 +5,7 @@
 import { getMongoDb } from '@trader/shared-mongo';
 import { COLLECTIONS } from '@trader/shared-mongo';
 import { getPgPool } from '@trader/shared-pg';
+import { Trading212TickerAdapter } from '@trader/ticker-identity';
 import type { Currency } from '@trader/shared-types';
 import { fetchT212Instruments } from '../infrastructure/t212-client.ts';
 import { fetchYahooLiquidity } from '../../bars/infrastructure/providers/yahoo-client.ts';
@@ -63,21 +64,33 @@ const SPREAD_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 // quotes only. Tickers with no real quote history → absent from the map → pass-through (the
 // filter is inactive until ≥1 real REGULAR quote exists, e.g. the first 7 days post-deploy, or
 // for synthetic-only LSE small-caps where the high-low proxy would unfairly exclude them).
+const spreadTickerAdapter = new Trading212TickerAdapter();
+
 async function medianSpreadByTicker(tickers: string[]): Promise<Map<string, number>> {
   const out = new Map<string, number>();
   if (tickers.length === 0) return out;
   try {
     const pool = getPgPool();
-    const { rows } = await pool.query<{ ticker: string; median_bps: number }>(
-      `SELECT ticker, percentile_cont(0.5) WITHIN GROUP (ORDER BY spread_bps) AS median_bps
+    // quotes is keyed on the bare identity (symbol, market). Split each ticker, query the (symbol,
+    // market) membership, and re-key the grouped result back to the caller's T212 ticker.
+    const ids = tickers.map((t) => ({ ticker: t, ...spreadTickerAdapter.fromT212(t) }));
+    const symbols = ids.map((i) => i.symbol);
+    const markets = ids.map((i) => i.market);
+    const tickerByIdentity = new Map(ids.map((i) => [`${i.symbol}|${i.market}`, i.ticker]));
+    const { rows } = await pool.query<{ symbol: string; market: string; median_bps: number }>(
+      `SELECT symbol, market, percentile_cont(0.5) WITHIN GROUP (ORDER BY spread_bps) AS median_bps
        FROM quotes
-       WHERE ticker = ANY($1) AND is_superseded = FALSE AND is_synthetic = FALSE
+       WHERE (symbol, market) IN (SELECT unnest($1::text[]), unnest($2::text[]))
+         AND is_superseded = FALSE AND is_synthetic = FALSE
          AND market_state = 'REGULAR' AND spread_bps IS NOT NULL
-         AND observation_ts >= $2
-       GROUP BY ticker`,
-      [tickers, Date.now() - SPREAD_WINDOW_MS],
+         AND observation_ts >= $3
+       GROUP BY symbol, market`,
+      [symbols, markets, Date.now() - SPREAD_WINDOW_MS],
     );
-    for (const r of rows) out.set(r.ticker, Number(r.median_bps));
+    for (const r of rows) {
+      const t = tickerByIdentity.get(`${r.symbol}|${r.market}`);
+      if (t !== undefined) out.set(t, Number(r.median_bps));
+    }
   } catch (err) {
     log.warn('[universe] spread-filter query failed — filter inactive this refresh:', err);
   }

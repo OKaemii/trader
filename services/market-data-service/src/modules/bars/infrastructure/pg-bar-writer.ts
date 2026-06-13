@@ -16,8 +16,14 @@
 
 import { hashBarContent } from '@trader/shared-bars';
 import { getPgPool } from '@trader/shared-pg';
+import { Trading212TickerAdapter } from '@trader/ticker-identity';
 import type { BarInterval, OHLCVBar } from '@trader/shared-types';
 import { log } from '../../../logger.ts';
+
+// Storage is keyed on the bare identity (symbol, market), never the concatenated T212 ticker.
+// Bars flow through this writer carrying OHLCVBar.ticker (the T212 form) during the Thread A
+// transition; split it here at the write boundary. `fromT212` is the platform's single suffix parser.
+const tickerAdapter = new Trading212TickerAdapter();
 
 export interface WriteBarRevisionsStats {
   attempted: number;
@@ -72,26 +78,28 @@ export async function fetchFirstPrintClosesPg(
   if (bars.length === 0) return out;
   const pool = getPgPool();
 
-  // Build a (ticker, observation_ts) tuple list for the lookup. We use
-  // unnest + array params so a 200-key batch goes over the wire as two arrays,
-  // not 400 individual binds.
-  const tickers   = bars.map((b) => b.ticker);
+  // Build a (symbol, market, observation_ts) tuple list for the lookup. We use unnest + array params
+  // so a 200-key batch goes over the wire as three arrays, not 600 individual binds. Keys are
+  // identity-shaped (`symbol|market|observation_ts`) so the caller matches against the same split.
+  const ids       = bars.map((b) => tickerAdapter.fromT212(b.ticker));
+  const symbols   = ids.map((id) => id.symbol);
+  const markets   = ids.map((id) => id.market);
   const obsTsList = bars.map((b) => b.observation_ts);
 
-  const { rows } = await pool.query<{ ticker: string; observation_ts: string; close: string }>(
-    `SELECT DISTINCT ON (ticker, observation_ts)
-       ticker, observation_ts, close
+  const { rows } = await pool.query<{ symbol: string; market: string; observation_ts: string; close: string }>(
+    `SELECT DISTINCT ON (symbol, market, observation_ts)
+       symbol, market, observation_ts, close
      FROM bars
      WHERE interval = $1
-       AND (ticker, observation_ts) IN (
-         SELECT unnest($2::text[]), unnest($3::bigint[])
+       AND (symbol, market, observation_ts) IN (
+         SELECT unnest($2::text[]), unnest($3::text[]), unnest($4::bigint[])
        )
-     ORDER BY ticker, observation_ts, knowledge_ts ASC`,
-    [interval, tickers, obsTsList],
+     ORDER BY symbol, market, observation_ts, knowledge_ts ASC`,
+    [interval, symbols, markets, obsTsList],
   );
 
   for (const row of rows) {
-    out.set(`${row.ticker}|${row.observation_ts}`, Number(row.close));
+    out.set(`${row.symbol}|${row.market}|${row.observation_ts}`, Number(row.close));
   }
   return out;
 }
@@ -154,11 +162,16 @@ async function writeBatchPg(
   if (batch.length === 0) return;
   const pool = getPgPool();
 
-  // Single fetch of the current latest revision per (ticker, observation_ts) — scoped
+  // Storage is keyed on (symbol, market); split each bar's T212 ticker once up-front so the lookup,
+  // the supersede UPDATE, and both INSERTs all use the same identity. (Carried alongside the bar so
+  // we never re-parse.)
+  const items = batch.map(({ bar, hash }) => ({ bar, hash, id: tickerAdapter.fromT212(bar.ticker) }));
+
+  // Single fetch of the current latest revision per (symbol, market, observation_ts) — scoped
   // to this batch only. The batch is sorted by observation_ts, so an explicit
   // `observation_ts BETWEEN min AND max` range narrows the read to that span. The bounds
   // are inlined as integer LITERALS (not bind params) and this is load-bearing: the
-  // `(ticker, observation_ts) IN (SELECT unnest(...))` list is OPAQUE to the planner (it
+  // `(symbol, market, observation_ts) IN (SELECT unnest(...))` list is OPAQUE to the planner (it
   // can't read the array's value range at plan time), so without an explicit time bound
   // the read opens — and locks — every chunk of a deep hypertable before resolving the
   // membership test → "out of shared memory" / SQLSTATE 53200. A *parameterized* range
@@ -169,32 +182,33 @@ async function writeBatchPg(
   // `maxObsTs` are finite-checked JS numbers (filtered upstream) coerced to decimal, so
   // the inline is injection-safe (never user input — our own bar timestamps). Bounded by
   // the partial-unique index bars_latest_unique.
-  const tickers   = batch.map(({ bar }) => bar.ticker);
-  const obsTsList = batch.map(({ bar }) => bar.observation_ts);
+  const symbols   = items.map(({ id }) => id.symbol);
+  const markets   = items.map(({ id }) => id.market);
+  const obsTsList = items.map(({ bar }) => bar.observation_ts);
   // Sorted ascending ⇒ first is min, last is max (a guarded read for noUncheckedIndexedAccess).
   const minLiteral = BigInt(Math.trunc(obsTsList[0]!)).toString();
   const maxLiteral = BigInt(Math.trunc(obsTsList[obsTsList.length - 1]!)).toString();
 
   const { rows: latest } = await pool.query<{
-    ticker: string; observation_ts: string; content_hash: string;
+    symbol: string; market: string; observation_ts: string; content_hash: string;
   }>(
-    `SELECT ticker, observation_ts, content_hash
+    `SELECT symbol, market, observation_ts, content_hash
      FROM bars
      WHERE interval = $1
        AND is_superseded = FALSE
        AND observation_ts >= ${minLiteral}
        AND observation_ts <= ${maxLiteral}
-       AND (ticker, observation_ts) IN (
-         SELECT unnest($2::text[]), unnest($3::bigint[])
+       AND (symbol, market, observation_ts) IN (
+         SELECT unnest($2::text[]), unnest($3::text[]), unnest($4::bigint[])
        )`,
-    [interval, tickers, obsTsList],
+    [interval, symbols, markets, obsTsList],
   );
   const latestByKey = new Map<string, string>(
-    latest.map((row) => [`${row.ticker}|${row.observation_ts}`, row.content_hash]),
+    latest.map((row) => [`${row.symbol}|${row.market}|${row.observation_ts}`, row.content_hash]),
   );
 
-  for (const { bar, hash } of batch) {
-    const key = `${bar.ticker}|${bar.observation_ts}`;
+  for (const { bar, hash, id } of items) {
+    const key = `${id.symbol}|${id.market}|${bar.observation_ts}`;
     const priorHash = latestByKey.get(key);
     if (priorHash === hash) {
       stats.skipped++;
@@ -223,23 +237,24 @@ async function writeBatchPg(
         await client.query(
           `UPDATE bars
               SET is_superseded = TRUE
-            WHERE ticker = $1
-              AND observation_ts = $2
-              AND interval = $3
+            WHERE symbol = $1
+              AND market = $2
+              AND observation_ts = $3
+              AND interval = $4
               AND is_superseded = FALSE`,
-          [bar.ticker, bar.observation_ts, interval],
+          [id.symbol, id.market, bar.observation_ts, interval],
         );
       }
 
       await client.query(
         `INSERT INTO bars
-           (ticker, observation_ts, knowledge_ts, interval,
+           (symbol, market, observation_ts, knowledge_ts, interval,
             open, high, low, close, volume,
             raw_close, adjusted_close, adjustment_factor, currency,
             content_hash, is_superseded)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,FALSE)`,
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,FALSE)`,
         [
-          bar.ticker, bar.observation_ts, now, interval,
+          id.symbol, id.market, bar.observation_ts, now, interval,
           bar.open, bar.high, bar.low, bar.close, bar.volume,
           rawClose, adjustedClose, adjustmentFactor, currency,
           hash,
@@ -248,9 +263,9 @@ async function writeBatchPg(
 
       await client.query(
         `INSERT INTO bar_revisions_log
-           (ticker, observation_ts, interval, knowledge_ts, prior_hash, new_hash)
-         VALUES ($1,$2,$3,$4,$5,$6)`,
-        [bar.ticker, bar.observation_ts, interval, now, priorHash ?? null, hash],
+           (symbol, market, observation_ts, interval, knowledge_ts, prior_hash, new_hash)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [id.symbol, id.market, bar.observation_ts, interval, now, priorHash ?? null, hash],
       );
 
       await client.query('COMMIT');

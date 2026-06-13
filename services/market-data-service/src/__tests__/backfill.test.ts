@@ -50,7 +50,7 @@ class RecordingProvider implements MarketDataProvider {
   readonly maxLookbackMs = 60 * 24 * 60 * 60_000;
   readonly allowedPollIntervals: readonly PollIntervalKey[] = ['1h'];
   readonly calls: Array<{ startTs: number; endTs: number }> = [];
-  constructor(private readonly ticker = 'A') {}
+  constructor(private readonly ticker = 'A_US_EQ') {}
   async fetchLatest() { return []; }
   async fetchRecent() { return []; }
   async fetchHistory(_t: string, startTs: number, endTs: number) {
@@ -99,15 +99,15 @@ const stubRedis = {
 describe('backfillTickers → writeBarRevisions', () => {
   it('reports `upserted` matching writeBarRevisions.inserted on a fresh write', async () => {
     // Empty store ⇒ whole span is a gap ⇒ provider returns its 3 bars.
-    const provider = new StubProvider([bar('A', 1000), bar('A', 2000), bar('A', 3000)]);
-    const results = await backfillTickers(dbWithObserved([]), stubRedis, provider, ['A']);
+    const provider = new StubProvider([bar('A_US_EQ', 1000), bar('A_US_EQ', 2000), bar('A_US_EQ', 3000)]);
+    const results = await backfillTickers(dbWithObserved([]), stubRedis, provider, ['A_US_EQ']);
     expect(results[0].fetched).toBe(3);
     expect(results[0].upserted).toBe(3);
   });
 
   it('reports `upserted` = 0 when the provider yields nothing for the gap', async () => {
     const provider = new StubProvider([]);
-    const results = await backfillTickers(dbWithObserved([]), stubRedis, provider, ['A']);
+    const results = await backfillTickers(dbWithObserved([]), stubRedis, provider, ['A_US_EQ']);
     expect(results[0].fetched).toBe(0);
     expect(results[0].upserted).toBe(0);
   });
@@ -117,7 +117,7 @@ describe('backfillTickers → writeBarRevisions', () => {
     // Override fetchHistory to throw, simulating provider unavailability.
     (failing as { fetchHistory: () => Promise<OHLCVBar[]> }).fetchHistory = async () => { throw new Error('upstream down'); };
 
-    const results = await backfillTickers(dbWithObserved([]), stubRedis, failing, ['A', 'B']);
+    const results = await backfillTickers(dbWithObserved([]), stubRedis, failing, ['A_US_EQ', 'B_US_EQ']);
     expect(results).toHaveLength(2);
     expect(results.every((r) => r.error?.includes('upstream down'))).toBe(true);
     expect(results.every((r) => r.upserted === 0)).toBe(true);
@@ -142,8 +142,8 @@ describe('backfillTickers — gap-aware fetch (§I)', () => {
     const observed: number[] = [];
     for (let ts = flooredStart; ts <= flooredEnd; ts += STEP) observed.push(ts);
 
-    const provider = new RecordingProvider('A');
-    const results = await backfillTickers(dbWithObserved(observed), stubRedis, provider, ['A'], { windowMs });
+    const provider = new RecordingProvider('A_US_EQ');
+    const results = await backfillTickers(dbWithObserved(observed), stubRedis, provider, ['A_US_EQ'], { windowMs });
 
     expect(provider.calls).toHaveLength(0);   // ← the load-bearing assertion: no fetch when covered
     expect(results[0].fetched).toBe(0);
@@ -163,8 +163,8 @@ describe('backfillTickers — gap-aware fetch (§I)', () => {
     const observed: number[] = [];
     for (let ts = flooredStart; ts <= cutoff; ts += STEP) observed.push(ts);
 
-    const provider = new RecordingProvider('A');
-    const results = await backfillTickers(dbWithObserved(observed), stubRedis, provider, ['A'], { windowMs: bigWindow });
+    const provider = new RecordingProvider('A_US_EQ');
+    const results = await backfillTickers(dbWithObserved(observed), stubRedis, provider, ['A_US_EQ'], { windowMs: bigWindow });
 
     expect(provider.calls).toHaveLength(1);
     // Fetch starts at the first uncovered grid point (cutoff+STEP), in the recent tail.
@@ -187,8 +187,8 @@ describe('backfillTickers — gap-aware fetch (§I)', () => {
     for (let ts = flooredStart; ts <= flooredStart + oneDay; ts += STEP_L) observed.push(ts);
     for (let ts = flooredEnd - oneDay; ts <= flooredEnd; ts += STEP_L) observed.push(ts);
 
-    const provider = new RecordingProvider('A');
-    await backfillTickers(dbWithObserved(observed), stubRedis, provider, ['A'], { windowMs: bigWindow });
+    const provider = new RecordingProvider('A_US_EQ');
+    await backfillTickers(dbWithObserved(observed), stubRedis, provider, ['A_US_EQ'], { windowMs: bigWindow });
 
     // Exactly one interior fetch — the missing middle. Its window sits strictly inside the span.
     expect(provider.calls).toHaveLength(1);
@@ -203,8 +203,8 @@ describe('backfillTickers — gap-aware fetch (§I)', () => {
     const observed: number[] = [];
     for (let ts = flooredStart; ts <= flooredEnd; ts += STEP) observed.push(ts);
 
-    const provider = new RecordingProvider('A');
-    const results = await backfillTickers(dbWithObserved(observed), stubRedis, provider, ['A'], { windowMs, forceRefetch: true });
+    const provider = new RecordingProvider('A_US_EQ');
+    const results = await backfillTickers(dbWithObserved(observed), stubRedis, provider, ['A_US_EQ'], { windowMs, forceRefetch: true });
 
     expect(provider.calls).toHaveLength(1);           // one fetch, the whole window
     expect(results[0].fetched).toBeGreaterThan(0);    // bars re-downloaded despite coverage

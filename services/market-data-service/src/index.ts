@@ -997,12 +997,13 @@ async function bootstrap(): Promise<void> {
         // memory). 5m bars are provider-capped at ~60d, so a 90d lower bound prunes
         // chunk-exclusion to a handful of recent chunks (the same bound-the-read fix as getBarAtOrBefore).
         const since = Date.now() - 90 * 24 * 60 * 60 * 1000;
+        const { symbol, market } = tickerAdapter.fromT212(ticker);
         const { rows } = await getPgPool().query<{ high: number; low: number; close: number }>(
           `SELECT high, low, close FROM bars
-           WHERE ticker = $1 AND interval = '5m' AND is_superseded = FALSE
-             AND observation_ts >= $2
+           WHERE symbol = $1 AND market = $2 AND interval = '5m' AND is_superseded = FALSE
+             AND observation_ts >= $3
            ORDER BY observation_ts DESC LIMIT 1`,
-          [ticker, since],
+          [symbol, market, since],
         );
         return rows.length ? { high: Number(rows[0]!.high), low: Number(rows[0]!.low), close: Number(rows[0]!.close) } : null;
       },

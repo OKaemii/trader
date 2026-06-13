@@ -17,6 +17,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { Db } from 'mongodb';
 import type { RedisClientType } from 'redis';
 import type { OHLCVBar } from '@trader/shared-types';
+import { Trading212TickerAdapter } from '@trader/ticker-identity';
 
 // ── In-memory Mongo for the store's per-ticker doc (the only surface it uses) ────────────────────
 interface AnyDoc { _id: string; [k: string]: unknown }
@@ -253,19 +254,21 @@ describe('CorporateActionsWatcher — re-adjust supersedes stale revisions (no s
   // A minimal in-memory ohlcv_bars + audit pair with the surface writeBarRevisions touches, tracking
   // is_superseded so we can read back the "latest" (unsuperseded) series after the re-adjust.
   function makeBarsDb() {
-    interface Row { ticker: string; observation_ts: number; interval: string; close: number; content_hash: string; is_superseded: boolean; knowledge_ts: number }
+    // Storage is keyed on the bare identity (symbol, market) — the writer splits OHLCVBar.ticker at
+    // the boundary, so this stub tracks symbol+market exactly as the real collection now does.
+    interface Row { symbol: string; market: string; observation_ts: number; interval: string; close: number; content_hash: string; is_superseded: boolean; knowledge_ts: number }
     const rows: Row[] = [];
     const audits: Array<Record<string, unknown>> = [];
     const ohlcv = {
-      find: (filter: { $or: Array<{ ticker: string; observation_ts: number; interval: string }>; is_superseded: boolean }) => {
-        const keys = new Set(filter.$or.map((k) => `${k.ticker}|${k.observation_ts}|${k.interval}`));
-        const matched = rows.filter((r) => !r.is_superseded && keys.has(`${r.ticker}|${r.observation_ts}|${r.interval}`));
+      find: (filter: { $or: Array<{ symbol: string; market: string; observation_ts: number; interval: string }>; is_superseded: boolean }) => {
+        const keys = new Set(filter.$or.map((k) => `${k.symbol}|${k.market}|${k.observation_ts}|${k.interval}`));
+        const matched = rows.filter((r) => !r.is_superseded && keys.has(`${r.symbol}|${r.market}|${r.observation_ts}|${r.interval}`));
         return { project: () => ({ toArray: async () => matched }), toArray: async () => matched };
       },
-      updateMany: async (filter: { ticker: string; observation_ts: number; interval: string }, update: { $set: { is_superseded: boolean } }) => {
+      updateMany: async (filter: { symbol: string; market: string; observation_ts: number; interval: string }, update: { $set: { is_superseded: boolean } }) => {
         let n = 0;
         for (const r of rows) {
-          if (r.ticker === filter.ticker && r.observation_ts === filter.observation_ts && r.interval === filter.interval && !r.is_superseded) {
+          if (r.symbol === filter.symbol && r.market === filter.market && r.observation_ts === filter.observation_ts && r.interval === filter.interval && !r.is_superseded) {
             r.is_superseded = update.$set.is_superseded; n++;
           }
         }
@@ -273,7 +276,7 @@ describe('CorporateActionsWatcher — re-adjust supersedes stale revisions (no s
       },
       insertOne: async (doc: Record<string, unknown>) => {
         rows.push({
-          ticker: doc.ticker as string, observation_ts: doc.observation_ts as number, interval: doc.interval as string,
+          symbol: doc.symbol as string, market: doc.market as string, observation_ts: doc.observation_ts as number, interval: doc.interval as string,
           close: doc.close as number, content_hash: doc.content_hash as string,
           is_superseded: doc.is_superseded as boolean, knowledge_ts: doc.knowledge_ts as number,
         });
@@ -282,9 +285,11 @@ describe('CorporateActionsWatcher — re-adjust supersedes stale revisions (no s
     };
     const auditColl = { insertOne: async (d: Record<string, unknown>) => { audits.push(d); return { acknowledged: true, insertedId: 'x' }; } };
     const db = { collection: (n: string) => (n === 'ohlcv_bars' ? ohlcv : auditColl) } as unknown as Db;
-    // Latest (unsuperseded) close series for a ticker, oldest-first.
-    const latestSeries = (ticker: string): number[] =>
-      rows.filter((r) => r.ticker === ticker && !r.is_superseded).sort((a, b) => a.observation_ts - b.observation_ts).map((r) => r.close);
+    // Latest (unsuperseded) close series for a T212 ticker, oldest-first — split to (symbol, market).
+    const latestSeries = (ticker: string): number[] => {
+      const { symbol, market } = new Trading212TickerAdapter().fromT212(ticker);
+      return rows.filter((r) => r.symbol === symbol && r.market === market && !r.is_superseded).sort((a, b) => a.observation_ts - b.observation_ts).map((r) => r.close);
+    };
     return { db, rows, audits, latestSeries };
   }
 
