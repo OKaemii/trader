@@ -58,6 +58,7 @@ from __future__ import annotations
 import logging
 from typing import Callable, Optional
 
+from ..ticker_identity import Trading212TickerAdapter
 from .contract import (
     LINE_ITEMS,
     MARKET_UK,
@@ -68,6 +69,10 @@ from .contract import (
 )
 
 log = logging.getLogger("quant_core.fundamentals.warehouse")
+
+# The single suffix parser — splits a T212 ticker into (symbol, market) for the bars query, which is
+# keyed on the bare identity post-cutover. Stateless, so a module-level instance is fine.
+_TICKER_ADAPTER = Trading212TickerAdapter()
 
 # The line item we OWN the computation of (price × shares × fx) — overrides any warehouse fact.
 _MARKET_CAP_KEY = "market_cap_gbp"
@@ -102,6 +107,10 @@ ORDER BY metric, observation_ts DESC
 
 # As-of adjusted close: latest daily bar at/<= as_of, bi-temporal (a later-revised close is invisible
 # before its knowledge_ts). `close` IS the persisted adjusted_close (the series momentum differences).
+# Keyed on the BARE identity (symbol, market) — the warehouse `bars` snapshot stores symbol+market as
+# two columns, NOT the concatenated T212 `ticker`, after the Thread-A cutover (epic
+# pit-fundamentals-lake-rearchitecture, Task 15). The ticker is split to (symbol, market) by the
+# Trading212TickerAdapter before binding (see `_adjusted_close_as_of`).
 _SELECT_CLOSE_AS_OF = """
 SELECT close
 FROM (
@@ -109,7 +118,8 @@ FROM (
            PARTITION BY observation_ts ORDER BY knowledge_ts DESC
          ) AS rn
   FROM bars
-  WHERE ticker = ?
+  WHERE symbol = ?
+    AND market = ?
     AND interval = 'daily'
     AND observation_ts <= ?
     AND knowledge_ts <= ?
@@ -252,10 +262,19 @@ class WarehousePitFundamentals:
             line_items[_MARKET_CAP_KEY] = cap
 
     def _adjusted_close_as_of(self, ticker: str, as_of_ms: int) -> Optional[float]:
-        """Latest daily adjusted close at/<= as_of from the warehouse `bars` view (bi-temporal)."""
+        """Latest daily adjusted close at/<= as_of from the warehouse `bars` view (bi-temporal).
+
+        The `bars` snapshot is keyed on the bare (symbol, market) post-cutover, so the T212 ticker is
+        split via the adapter before binding. A ticker that isn't a recognised US/LSE equity form (the
+        adapter throws) ⇒ no close ⇒ market cap dropped — never a fabricated value."""
+        try:
+            ident = _TICKER_ADAPTER.from_t212(ticker)
+        except ValueError:
+            # An unroutable ticker has no (symbol, market) — no bars row to read; degrade to no close.
+            return None
         try:
             row = self._con.execute(
-                _SELECT_CLOSE_AS_OF, [ticker, as_of_ms, as_of_ms]
+                _SELECT_CLOSE_AS_OF, [ident.symbol, ident.market, as_of_ms, as_of_ms]
             ).fetchone()
         except Exception as exc:  # noqa: BLE001 — a missing/empty bars view must not break the read
             log.warning("warehouse market-cap close read failed for %s: %r", ticker, exc)

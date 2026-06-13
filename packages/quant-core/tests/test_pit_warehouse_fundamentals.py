@@ -22,6 +22,11 @@ from quant_core.fundamentals.warehouse import (
 )
 from quant_core.fundamentals.contract import FundamentalsAsOf
 from quant_core.strategy.contract import HistoryView
+from quant_core.ticker_identity import Trading212TickerAdapter, TickerIdentity
+
+# The bars query is keyed on (symbol, market) post-cutover; the fake splits its seed rows' T212 ticker
+# through the same adapter the reader uses so the as-of close match honours the new bind shape.
+_BARS_ADAPTER = Trading212TickerAdapter()
 
 
 # --- a faithful fake DuckDB connection -------------------------------------------------------
@@ -95,10 +100,12 @@ class FakeWarehouseConn:
         rows.sort(key=lambda r: (r.metric, -r.observation_ts))
         return [(r.metric, r.observation_ts, r.value) for r in rows]
 
-    def _as_of_close(self, ticker, obs_cutoff, knowledge_cutoff):
+    def _as_of_close(self, symbol, market, obs_cutoff, knowledge_cutoff):
+        # The reader now binds (symbol, market) — split each seed row's T212 ticker the same way to match.
         candidates = [
             b for b in self._bars
-            if b.ticker == ticker and b.observation_ts <= obs_cutoff and b.knowledge_ts <= knowledge_cutoff
+            if _BARS_ADAPTER.from_t212(b.ticker) == TickerIdentity(symbol=symbol, market=market)
+            and b.observation_ts <= obs_cutoff and b.knowledge_ts <= knowledge_cutoff
         ]
         if not candidates:
             return []
