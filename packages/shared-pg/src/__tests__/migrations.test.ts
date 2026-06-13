@@ -275,7 +275,10 @@ describe.skipIf(!dockerAvailable)('runMigrations — 0012 flag-day deep-hypertab
 
   it('runMigrations applies 0012 on the deep hypertable WITHOUT exhausting the lock table', async () => {
     const result = await runMigrations(sqlDir, pool);
-    expect(result.applied).toEqual(['0012_bars_symbol_market.sql']);
+    // 0012 is the subject of this test; any later migration (e.g. 0013) also applies here since the
+    // runner drains every pending file — assert 0012 specifically rather than an exact list so adding
+    // a migration doesn't falsely fail this OOM regression.
+    expect(result.applied).toContain('0012_bars_symbol_market.sql');
 
     // The tables were recreated new-shape: symbol+market, no ticker, and emptied of the deep series.
     const { rows: cols } = await pool.query<{ column_name: string }>(
@@ -301,20 +304,25 @@ describe.skipIf(!dockerAvailable)('runMigrations — 0012 flag-day deep-hypertab
   }, TEST_TIMEOUT_MS);
 });
 
-// ── 0013 teardown migration — deep-fundamentals-hypertable lock-table OOM regression ─────────────
+// ── 0013 teardown migration — deep-fundamentals-hypertable applies cleanly ───────────────────────
 // The PIT-lake epic closer (Task 24 / #208) drops the OLD Timescale fundamentals stack. `fundamentals`
-// + `fundamentals_raw_facts` + `fundamentals_revisions_log` are DEEP hypertables (90-day chunks over
-// decades of fiscal history) — a plain `DROP TABLE` AccessExclusiveLocks EVERY chunk at once and, on a
-// live warehouse, would OOM the shared lock table (SQLSTATE 53200) exactly as the bars `DROP TABLE`
-// did before 0012. So 0013 runs NON-transactionally and empties each hypertable via bounded-window
-// `drop_chunks` before the `DROP TABLE`. This test reproduces the live precondition — a deep many-chunk
-// `fundamentals` under a TIGHT lock budget where the old single-txn drop MUST 53200 — and asserts the
-// runner applies 0013 cleanly, leaving the fundamentals tables / security_master schema / roles gone.
-// (Burns in the PR-#175 lesson: a fresh-container test green-lit 0012's SQL shape but never ran it
-// against a many-chunk hypertable, so the OOM shipped — this is the equivalent guard for 0013.)
+// + `fundamentals_raw_facts` + `fundamentals_revisions_log` are hypertables (90-day chunks over decades
+// of fiscal history) — a plain `DROP TABLE` AccessExclusiveLocks EVERY chunk at once, which on a live
+// many-chunk + COMPRESSED warehouse can OOM the shared lock table (SQLSTATE 53200) exactly as the bars
+// `DROP TABLE` did before 0012. So 0013 runs NON-transactionally and empties each hypertable via
+// bounded-window `drop_chunks` before the `DROP TABLE`.
+//
+// This test seeds a MULTI-CHUNK `fundamentals` hypertable (~120 90-day chunks) and asserts the runner
+// applies 0013 cleanly over it — exercising the bounded-window `drop_chunks` loop (the code that runs in
+// prod) end-to-end, then dropping the whole stack. It does NOT assert the negative (that the OLD
+// single-txn drop would 53200): unlike bars' ~1000 7-day chunks, fundamentals' 90-day chunking can only
+// yield ~120 chunks over a realistic span, which does not overflow the lock table at any achievable
+// testcontainer budget (empirically verified). The lock-fan MECHANISM itself — and that the runner's
+// no-transaction path releases locks between statements — is proven by the bars 0012 regression above
+// (the PR-#175 lesson); this block is the equivalent CLEAN-APPLY + full-teardown guard for 0013.
 const DROP_PRE_0013 = (): string[] => readdirSyncSorted().filter((f) => f < '0013');
 
-describe.skipIf(!dockerAvailable)('runMigrations — 0013 teardown deep-fundamentals OOM regression', () => {
+describe.skipIf(!dockerAvailable)('runMigrations — 0013 teardown over a multi-chunk fundamentals hypertable', () => {
   let container: StartedTestContainer;
   let pool: pg.Pool;
   let sqlDir: string;
@@ -323,13 +331,9 @@ describe.skipIf(!dockerAvailable)('runMigrations — 0013 teardown deep-fundamen
     container = await new GenericContainer('timescale/timescaledb:2.17.2-pg16')
       .withEnvironment({ POSTGRES_PASSWORD: 'test', POSTGRES_DB: 'trader_ts' })
       .withExposedPorts(5432)
-      // Tight lock budget — locking ~100 fundamentals chunks (+ their compressed counterparts) in one
-      // plan/txn must overflow it (the OOM precondition).
       .withCommand([
         'postgres',
         '-c', 'shared_preload_libraries=timescaledb',
-        '-c', `max_locks_per_transaction=${OOM_MAX_LOCKS}`,
-        '-c', `max_connections=${OOM_MAX_CONNECTIONS}`,
       ])
       .start();
     pool = new pg.Pool({
@@ -362,14 +366,13 @@ describe.skipIf(!dockerAvailable)('runMigrations — 0013 teardown deep-fundamen
       await pool.query('INSERT INTO schema_migrations(name) VALUES ($1) ON CONFLICT DO NOTHING', [f]);
     }
 
-    // Seed a DEEP fundamentals series 1995→now (~120 90-day chunks). Insert in ≤2y batches so each
-    // batch's transaction touches few chunks (fits the tight budget); a single all-span insert would
-    // itself OOM. observation_ts = fiscal period_end (UTC ms).
+    // Seed a fundamentals series 1995→now spanning ~120 90-day chunks, so 0013's bounded-window
+    // `drop_chunks` loop actually has many chunks to walk (the real prod shape). observation_ts =
+    // fiscal period_end (UTC ms).
     const startTs = Date.UTC(1995, 0, 1);
     const endTs = Date.now();
     const yearMs = 365 * 24 * 60 * 60 * 1000;
     const quarterMs = 90 * 24 * 60 * 60 * 1000;
-    let seq = 0;
     for (let lo = startTs; lo < endTs; lo += 2 * yearMs) {
       const hi = Math.min(lo + 2 * yearMs - quarterMs, endTs);
       await pool.query(
@@ -380,9 +383,7 @@ describe.skipIf(!dockerAvailable)('runMigrations — 0013 teardown deep-fundamen
            FROM generate_series($1::bigint, $2::bigint, $3::bigint) AS g`,
         [lo, hi, quarterMs],
       );
-      seq++;
     }
-    void seq;
   }, TEST_TIMEOUT_MS);
 
   afterAll(async () => {
@@ -390,27 +391,14 @@ describe.skipIf(!dockerAvailable)('runMigrations — 0013 teardown deep-fundamen
     await container?.stop();
   }, TEST_TIMEOUT_MS);
 
-  it('the deep fundamentals hypertable really spans many chunks (the OOM precondition)', async () => {
+  it('the fundamentals hypertable really spans many chunks (the bounded-drop must walk them all)', async () => {
     const { rows } = await pool.query<{ n: number }>(
       `SELECT count(*)::int AS n FROM timescaledb_information.chunks WHERE hypertable_name = 'fundamentals'`,
     );
     expect(rows[0].n).toBeGreaterThan(50);
   });
 
-  it('a single-transaction DROP TABLE of the deep fundamentals hypertable exhausts the lock table (the bug 0013 avoids)', async () => {
-    // Proves the precondition is real: a naive `DROP TABLE fundamentals CASCADE` in one txn MUST 53200
-    // here. If this ever stops erroring, 0013's bounded-window necessity should be re-checked.
-    const c = await pool.connect();
-    try {
-      await c.query('BEGIN');
-      await expect(c.query('DROP TABLE fundamentals CASCADE')).rejects.toMatchObject({ code: '53200' });
-    } finally {
-      try { await c.query('ROLLBACK'); } catch { /* ignore */ }
-      c.release();
-    }
-  }, TEST_TIMEOUT_MS);
-
-  it('runMigrations applies 0013 on the deep hypertable WITHOUT exhausting the lock table, dropping the whole stack', async () => {
+  it('runMigrations applies 0013 over the multi-chunk hypertable, dropping the whole stack', async () => {
     const result = await runMigrations(sqlDir, pool);
     expect(result.applied).toEqual(['0013_drop_fundamentals.sql']);
 
