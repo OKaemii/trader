@@ -5,6 +5,7 @@
 import { getMongoDb } from '@trader/shared-mongo';
 import { COLLECTIONS } from '@trader/shared-mongo';
 import { getPgPool } from '@trader/shared-pg';
+import { Trading212TickerAdapter } from '@trader/ticker-identity';
 import type { Currency } from '@trader/shared-types';
 import { fetchT212Instruments } from '../infrastructure/t212-client.ts';
 import { fetchYahooLiquidity } from '../../bars/infrastructure/providers/yahoo-client.ts';
@@ -63,21 +64,33 @@ const SPREAD_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 // quotes only. Tickers with no real quote history → absent from the map → pass-through (the
 // filter is inactive until ≥1 real REGULAR quote exists, e.g. the first 7 days post-deploy, or
 // for synthetic-only LSE small-caps where the high-low proxy would unfairly exclude them).
+const spreadTickerAdapter = new Trading212TickerAdapter();
+
 async function medianSpreadByTicker(tickers: string[]): Promise<Map<string, number>> {
   const out = new Map<string, number>();
   if (tickers.length === 0) return out;
   try {
     const pool = getPgPool();
-    const { rows } = await pool.query<{ ticker: string; median_bps: number }>(
-      `SELECT ticker, percentile_cont(0.5) WITHIN GROUP (ORDER BY spread_bps) AS median_bps
+    // quotes is keyed on the bare identity (symbol, market). Split each ticker, query the (symbol,
+    // market) membership, and re-key the grouped result back to the caller's T212 ticker.
+    const ids = tickers.map((t) => ({ ticker: t, ...spreadTickerAdapter.fromT212(t) }));
+    const symbols = ids.map((i) => i.symbol);
+    const markets = ids.map((i) => i.market);
+    const tickerByIdentity = new Map(ids.map((i) => [`${i.symbol}|${i.market}`, i.ticker]));
+    const { rows } = await pool.query<{ symbol: string; market: string; median_bps: number }>(
+      `SELECT symbol, market, percentile_cont(0.5) WITHIN GROUP (ORDER BY spread_bps) AS median_bps
        FROM quotes
-       WHERE ticker = ANY($1) AND is_superseded = FALSE AND is_synthetic = FALSE
+       WHERE (symbol, market) IN (SELECT unnest($1::text[]), unnest($2::text[]))
+         AND is_superseded = FALSE AND is_synthetic = FALSE
          AND market_state = 'REGULAR' AND spread_bps IS NOT NULL
-         AND observation_ts >= $2
-       GROUP BY ticker`,
-      [tickers, Date.now() - SPREAD_WINDOW_MS],
+         AND observation_ts >= $3
+       GROUP BY symbol, market`,
+      [symbols, markets, Date.now() - SPREAD_WINDOW_MS],
     );
-    for (const r of rows) out.set(r.ticker, Number(r.median_bps));
+    for (const r of rows) {
+      const t = tickerByIdentity.get(`${r.symbol}|${r.market}`);
+      if (t !== undefined) out.set(t, Number(r.median_bps));
+    }
   } catch (err) {
     log.warn('[universe] spread-filter query failed — filter inactive this refresh:', err);
   }
@@ -439,14 +452,21 @@ export class UniverseManager {
       const allTickers = instruments.map((i) => i.ticker);
       const lookbackDate = new Date(now.getTime() - ADV_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
 
-      // Aggregate 20-day ADV and latest close per ticker from stored OHLCV bars.
-      // volume=0 from the T212 fill-price approximation means ADV filter is
-      // currently a pass-through; it activates automatically once real volume data flows.
+      // Aggregate 20-day ADV and latest close per name from stored OHLCV bars. Storage is keyed on
+      // the bare identity (symbol, market) and stamps observation_ts (UTC ms), not the legacy
+      // `timestamp` Date — split the T212 tickers, group on the identity over observation_ts, and
+      // re-key back to the T212 ticker for the statsMap below. volume=0 from the T212 fill-price
+      // approximation means the ADV filter is currently a pass-through; it activates once real
+      // volume data flows.
+      const adapter = new Trading212TickerAdapter();
+      const statIds = allTickers.map((t) => ({ ticker: t, ...adapter.fromT212(t) }));
+      const tickerByIdentity = new Map(statIds.map((i) => [`${i.symbol}|${i.market}`, i.ticker]));
+      const lookbackMs = lookbackDate.getTime();
       const ohlcvStats = await db.collection(COLLECTIONS.OHLCV_BARS).aggregate([
-        { $match: { ticker: { $in: allTickers }, timestamp: { $gte: lookbackDate } } },
-        { $sort: { timestamp: 1 } },
+        { $match: { $or: statIds.map((i) => ({ symbol: i.symbol, market: i.market })), observation_ts: { $gte: lookbackMs } } },
+        { $sort: { observation_ts: 1 } },
         { $group: {
-          _id: '$ticker',
+          _id: { symbol: '$symbol', market: '$market' },
           avgVolume:   { $avg: '$volume' },
           latestClose: { $last: '$close' },
         }},
@@ -454,7 +474,10 @@ export class UniverseManager {
 
       const statsMap: Record<string, { avgVolume: number; latestClose: number }> = {};
       for (const s of ohlcvStats) {
-        statsMap[s._id as string] = { avgVolume: s.avgVolume as number ?? 0, latestClose: s.latestClose as number ?? 0 };
+        const id = s._id as { symbol: string; market: string };
+        const ticker = tickerByIdentity.get(`${id.symbol}|${id.market}`);
+        if (ticker === undefined) continue;
+        statsMap[ticker] = { avgVolume: s.avgVolume as number ?? 0, latestClose: s.latestClose as number ?? 0 };
       }
 
       // ── 3. Apply eligibility filters (Section 29b) ───────────────────────────

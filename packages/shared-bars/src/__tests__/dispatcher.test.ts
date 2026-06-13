@@ -60,19 +60,20 @@ describe('BARS_BACKEND dispatcher — default (mongo)', () => {
       }),
     } as unknown as import('mongodb').Db;
 
-    await getBars(redis as unknown as Parameters<typeof getBars>[0], db, 'A', '5m', '30d');
+    await getBars(redis as unknown as Parameters<typeof getBars>[0], db, 'A_US_EQ', '5m', '30d');
 
     expect(findCalls).toHaveLength(1);
-    expect(findCalls[0]).toMatchObject({ ticker: 'A', interval: '5m', is_superseded: false });
+    // Storage is keyed on the bare identity — the T212 ticker is split to (symbol, market).
+    expect(findCalls[0]).toMatchObject({ symbol: 'A', market: 'US', interval: '5m', is_superseded: false });
     const setKeys = redis.calls.filter((c) => c.op === 'setEx').map((c) => c.key);
-    expect(setKeys).toEqual(['bars:v2:A:5m:30d:live']);
+    expect(setKeys).toEqual(['bars:v2:A:US:5m:30d:live']);
   });
 
   it('throws when db is undefined and BARS_BACKEND defaults to mongo', async () => {
     delete process.env.BARS_BACKEND;
     const redis = makeRedis();
     await expect(
-      getBars(redis as unknown as Parameters<typeof getBars>[0], undefined, 'A', '5m', '30d'),
+      getBars(redis as unknown as Parameters<typeof getBars>[0], undefined, 'A_US_EQ', '5m', '30d'),
     ).rejects.toThrow(/db parameter required/);
   });
 });
@@ -80,12 +81,12 @@ describe('BARS_BACKEND dispatcher — default (mongo)', () => {
 describe('invalidateBars — cross-namespace', () => {
   it('clears both Mongo and PG cache keys regardless of active backend', async () => {
     const redis = makeRedis();
-    // Seed both namespaces.
-    redis.store.set('bars:v2:A:5m:30d:live',     '{}');
-    redis.store.set('bars:pg:v1:A:5m:30d:live',  '{}');
-    redis.store.set('bars:v2:A:5m:60d:live',     '{}');
-    redis.store.set('bars:pg:v1:A:5m:60d:live',  '{}');
-    const removed = await invalidateBars(redis as unknown as Parameters<typeof invalidateBars>[0], 'A', '5m');
+    // Seed both namespaces (keyed on the bare identity A:US).
+    redis.store.set('bars:v2:A:US:5m:30d:live',     '{}');
+    redis.store.set('bars:pg:v1:A:US:5m:30d:live',  '{}');
+    redis.store.set('bars:v2:A:US:5m:60d:live',     '{}');
+    redis.store.set('bars:pg:v1:A:US:5m:60d:live',  '{}');
+    const removed = await invalidateBars(redis as unknown as Parameters<typeof invalidateBars>[0], 'A_US_EQ', '5m');
     // 4 cache rows + the meta key (not seeded but DEL'd anyway and counted as 0).
     expect(removed).toBe(4);
     expect(redis.store.size).toBe(0);
@@ -136,15 +137,15 @@ describe.skipIf(!dockerAvailable)('BARS_BACKEND=timescale — real Postgres', ()
     process.env.BARS_BACKEND = 'timescale';
     const pool = getPgPool();
 
-    // Seed one bar directly so getBars has something to return.
+    // Seed one bar directly so getBars has something to return (new symbol+market schema).
     const obsTs = Date.now() - 24 * 60 * 60 * 1000;
     const knowTs = Date.now();
     await pool.query(
-      `INSERT INTO bars (ticker, observation_ts, knowledge_ts, interval,
+      `INSERT INTO bars (symbol, market, observation_ts, knowledge_ts, interval,
                          open, high, low, close, volume,
                          raw_close, content_hash, is_superseded)
-       VALUES ($1, $2, $3, '5m', 100, 101, 99, 100.5, 1000, 100.5, 'h', FALSE)`,
-      ['A', obsTs, knowTs],
+       VALUES ($1, $2, $3, $4, '5m', 100, 101, 99, 100.5, 1000, 100.5, 'h', FALSE)`,
+      ['A', 'US', obsTs, knowTs],
     );
 
     const redis = makeRedis();
@@ -153,7 +154,7 @@ describe.skipIf(!dockerAvailable)('BARS_BACKEND=timescale — real Postgres', ()
     const bars = await getBars(
       redis as unknown as Parameters<typeof getBars>[0],
       undefined,
-      'A',
+      'A_US_EQ',
       '5m',
       '30d',
     );
@@ -161,10 +162,12 @@ describe.skipIf(!dockerAvailable)('BARS_BACKEND=timescale — real Postgres', ()
     expect(bars[0]?.close).toBe(100.5);
     expect(bars[0]?.observation_ts).toBe(obsTs);
     expect(bars[0]?.knowledge_ts).toBe(knowTs);
+    // The returned ticker is re-derived from (symbol, market) → byte-identical to what was passed.
+    expect(bars[0]?.ticker).toBe('A_US_EQ');
 
-    // Cache key under the PG namespace, NOT the Mongo namespace.
+    // Cache key under the PG namespace, NOT the Mongo namespace; keyed on the identity A:US.
     const setKeys = redis.calls.filter((c) => c.op === 'setEx').map((c) => c.key);
-    expect(setKeys).toEqual(['bars:pg:v1:A:5m:30d:live']);
+    expect(setKeys).toEqual(['bars:pg:v1:A:US:5m:30d:live']);
   }, TEST_TIMEOUT_MS);
 
   it('parametric: same call shape returns equivalent data on both backends for a fixed input', async () => {
@@ -175,10 +178,10 @@ describe.skipIf(!dockerAvailable)('BARS_BACKEND=timescale — real Postgres', ()
     const pool = getPgPool();
     const obsTs = Date.now() - 24 * 60 * 60 * 1000;
     await pool.query(
-      `INSERT INTO bars (ticker, observation_ts, knowledge_ts, interval,
+      `INSERT INTO bars (symbol, market, observation_ts, knowledge_ts, interval,
                          open, high, low, close, volume,
                          raw_close, content_hash, is_superseded)
-       VALUES ('B', $1, $2, '5m', 50, 51, 49, 50.5, 500, 50.5, 'h', FALSE)`,
+       VALUES ('B', 'US', $1, $2, '5m', 50, 51, 49, 50.5, 500, 50.5, 'h', FALSE)`,
       [obsTs, Date.now()],
     );
 
@@ -186,14 +189,14 @@ describe.skipIf(!dockerAvailable)('BARS_BACKEND=timescale — real Postgres', ()
     const bars = await getBars(
       redis as unknown as Parameters<typeof getBars>[0],
       undefined,
-      'B',
+      'B_US_EQ',
       '5m',
       '30d',
     );
 
     // Same OHLCVBar shape the Mongo path returns — fields and types match.
     expect(bars[0]).toMatchObject({
-      ticker:         'B',
+      ticker:         'B_US_EQ',
       observation_ts: obsTs,
       timestamp:      obsTs,
       interval:       '5m',

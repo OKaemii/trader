@@ -21,13 +21,14 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // ── Mongo stub ──────────────────────────────────────────────────────────────────────────────────
 // daily-depth on the (default) mongo backend reads via getDailyDepth → a single $group aggregate.
-// Drive that aggregate off a per-ticker daily series: AAPL has two bars (oldest 2006), ZZZZ none.
+// Storage is keyed on the bare identity (symbol, market), so drive the aggregate off a per-identity
+// daily series: AAPL has two bars (oldest 2006), ZZZZ none.
 const obs2006 = Date.UTC(2006, 0, 3);
 const obsRecent = Date.UTC(2026, 4, 14);
-const dailyByTicker: Record<string, Array<{ observation_ts: number }>> = {
-  AAPL_US_EQ: [{ observation_ts: obs2006 }, { observation_ts: obsRecent }],
-  NVDA_US_EQ: [{ observation_ts: Date.UTC(2010, 0, 4) }],
-  ZZZZ_US_EQ: [],
+const dailyByIdentity: Record<string, Array<{ observation_ts: number }>> = {
+  'AAPL|US': [{ observation_ts: obs2006 }, { observation_ts: obsRecent }],
+  'NVDA|US': [{ observation_ts: Date.UTC(2010, 0, 4) }],
+  'ZZZZ|US': [],
 };
 
 vi.mock('@trader/shared-mongo', () => ({
@@ -35,11 +36,11 @@ vi.mock('@trader/shared-mongo', () => ({
   getMongoDb: async () => ({
     collection: () => ({
       // Only the $group depth aggregate is exercised here. Compute {oldest, count} from the
-      // matched ticker's series so the route returns a real shape.
+      // matched (symbol, market) series so the route returns a real shape.
       aggregate: (pipeline: Array<Record<string, unknown>>) => ({
         toArray: async () => {
-          const match = (pipeline[0] as { $match?: { ticker?: string } })?.$match ?? {};
-          const rows = dailyByTicker[match.ticker ?? ''] ?? [];
+          const match = (pipeline[0] as { $match?: { symbol?: string; market?: string } })?.$match ?? {};
+          const rows = dailyByIdentity[`${match.symbol ?? ''}|${match.market ?? ''}`] ?? [];
           if (rows.length === 0) return [];
           const oldest = Math.min(...rows.map((r) => r.observation_ts));
           return [{ _id: null, oldest, count: rows.length }];
@@ -72,9 +73,9 @@ vi.mock('@trader/shared-pg', () => ({
     query: async (sql: string, params: unknown[]) => {
       pgQueries.push({ sql, params });
       // Return rows so the walk accumulates: pretend a single bar lives in the 2006 window for
-      // ticker 'AAPL_US_EQ', everything else empty. params = [ticker, interval, lo, hi].
-      const [ticker, , lo, hi] = params as [string, string, number, number];
-      const inWindow = ticker === 'AAPL_US_EQ' && obs2006 >= (lo as number) && obs2006 < (hi as number);
+      // (symbol 'AAPL', market 'US'), everything else empty. params = [symbol, market, interval, lo, hi].
+      const [symbol, market, , lo, hi] = params as [string, string, string, number, number];
+      const inWindow = symbol === 'AAPL' && market === 'US' && obs2006 >= (lo as number) && obs2006 < (hi as number);
       return { rows: inWindow ? [{ n: '1', oldest: String(obs2006) }] : [{ n: '0', oldest: null }] };
     },
   }),
@@ -201,7 +202,8 @@ describe('GET /admin/api/market-data/daily-depth — OOM-safety (timescale backe
       expect(normalised).toMatch(/observation_ts\s*<\s*\$/);
       // The is_superseded fast-lane filter (live series), and the time bounds are real ms params.
       expect(normalised).toMatch(/is_superseded\s*=\s*FALSE/);
-      const [, , lo, hi] = params as [string, string, number, number];
+      // params = [symbol, market, interval, lo, hi] now (symbol+market lead the bounded query).
+      const [, , , lo, hi] = params as [string, string, string, number, number];
       expect(typeof lo).toBe('number');
       expect(typeof hi).toBe('number');
       expect(lo).toBeLessThan(hi);

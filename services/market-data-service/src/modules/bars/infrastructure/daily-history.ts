@@ -12,6 +12,7 @@ import type { Db } from 'mongodb';
 import type { RedisClientType } from 'redis';
 import { COLLECTIONS } from '@trader/shared-mongo';
 import { invalidateBars } from '@trader/shared-bars';
+import { Trading212TickerAdapter } from '@trader/ticker-identity';
 import type { OHLCVBar } from '@trader/shared-types';
 import { writeBarRevisions } from './persist-bars.ts';
 import { fetchYahooDailyHistory } from './providers/yahoo-client.ts';
@@ -147,12 +148,23 @@ export async function tickersMissingDailyHistory(
 ): Promise<string[]> {
   if (tickers.length === 0) return [];
   const coll = db.collection(COLLECTIONS.OHLCV_BARS);
+  // ohlcv_bars is keyed on (symbol, market); split the T212 tickers, group on the identity, and
+  // re-key the result back to T212 form for the returned "missing" list.
+  const adapter = new Trading212TickerAdapter();
+  const ids = tickers.map((t) => ({ ticker: t, ...adapter.fromT212(t) }));
+  const tickerByIdentity = new Map(ids.map((i) => [`${i.symbol}|${i.market}`, i.ticker]));
   const counts = await coll.aggregate([
-    { $match: { ticker: { $in: tickers }, interval: 'daily', is_superseded: false } },
-    { $group: { _id: '$ticker', count: { $sum: 1 } } },
+    { $match: { $or: ids.map((i) => ({ symbol: i.symbol, market: i.market })), interval: 'daily', is_superseded: false } },
+    { $group: { _id: { symbol: '$symbol', market: '$market' }, count: { $sum: 1 } } },
   ]).toArray();
   const sufficient = new Set(
-    counts.filter((d: Record<string, unknown>) => (d.count as number) >= minBars).map((d: Record<string, unknown>) => d._id as string),
+    counts
+      .filter((d: Record<string, unknown>) => (d.count as number) >= minBars)
+      .map((d: Record<string, unknown>) => {
+        const id = d._id as { symbol: string; market: string };
+        return tickerByIdentity.get(`${id.symbol}|${id.market}`);
+      })
+      .filter((t): t is string => t !== undefined),
   );
   return tickers.filter((t) => !sufficient.has(t));
 }

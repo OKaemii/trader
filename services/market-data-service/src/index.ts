@@ -191,11 +191,12 @@ export async function maybeEmitDailyAtClose(
     try {
       const db = await getMongoDb();
       // Read the latest unsuperseded 5m bars for the UTC day. is_superseded:false
-      // picks one row per (ticker, observation_ts) via the partial-unique index;
-      // observation_ts:$gte bounds the day.
+      // picks one row per (symbol, market, observation_ts) via the partial-unique index;
+      // observation_ts:$gte bounds the day. Storage is keyed on the bare identity, so the
+      // T212 partition tickers are split to (symbol, market) for the membership match.
       const docs = await db.collection(COLLECTIONS.OHLCV_BARS)
         .find({
-          ticker:         { $in: tickers },
+          $or:            tickers.map((t) => { const id = tickerAdapter.fromT212(t); return { symbol: id.symbol, market: id.market }; }),
           interval:       '5m',
           is_superseded:  false,
           observation_ts: { $gte: utcMidnightMs },
@@ -217,8 +218,9 @@ export async function maybeEmitDailyAtClose(
         const obsTs = typeof d.observation_ts === 'number'
           ? d.observation_ts
           : (d.timestamp instanceof Date ? d.timestamp.getTime() : Number(d.timestamp ?? 0));
+        // Docs carry (symbol, market); re-derive the T212 ticker for the aggregate + downstream emit.
         const bar: OHLCVBar = {
-          ticker:         d.ticker as string,
+          ticker:         tickerAdapter.toT212({ symbol: d.symbol as string, market: d.market as 'US' | 'LSE' }),
           observation_ts: obsTs,
           timestamp:      obsTs,
           interval:       '5m',
@@ -997,12 +999,13 @@ async function bootstrap(): Promise<void> {
         // memory). 5m bars are provider-capped at ~60d, so a 90d lower bound prunes
         // chunk-exclusion to a handful of recent chunks (the same bound-the-read fix as getBarAtOrBefore).
         const since = Date.now() - 90 * 24 * 60 * 60 * 1000;
+        const { symbol, market } = tickerAdapter.fromT212(ticker);
         const { rows } = await getPgPool().query<{ high: number; low: number; close: number }>(
           `SELECT high, low, close FROM bars
-           WHERE ticker = $1 AND interval = '5m' AND is_superseded = FALSE
-             AND observation_ts >= $2
+           WHERE symbol = $1 AND market = $2 AND interval = '5m' AND is_superseded = FALSE
+             AND observation_ts >= $3
            ORDER BY observation_ts DESC LIMIT 1`,
-          [ticker, since],
+          [symbol, market, since],
         );
         return rows.length ? { high: Number(rows[0]!.high), low: Number(rows[0]!.low), close: Number(rows[0]!.close) } : null;
       },

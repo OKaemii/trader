@@ -61,8 +61,10 @@ function fakeRedis() {
   };
 }
 
-function doc(ticker: string, ts: number, close: number) {
-  return { ticker, observation_ts: ts, interval: '5m', open: close, high: close, low: close, close, volume: 100 };
+// ohlcv_bars docs are keyed on (symbol, market) now; maybeEmitDailyAtClose re-derives the T212
+// ticker from them. Build docs with the bare identity (the mongo find stub ignores the filter).
+function doc(symbol: string, market: 'US' | 'LSE', ts: number, close: number) {
+  return { symbol, market, observation_ts: ts, interval: '5m', open: close, high: close, low: close, close, volume: 100 };
 }
 
 beforeEach(() => {
@@ -98,8 +100,8 @@ describe('maybeEmitDailyAtClose — gate release on empty (PR #152 regression)',
 
   it('emits and RETAINS the gate once bars are present', async () => {
     h.docs = [
-      doc('AAPL_US_EQ', UTC_MIDNIGHT + 14 * 3_600_000, 100),
-      doc('AAPL_US_EQ', UTC_MIDNIGHT + 14 * 3_600_000 + 60_000, 101),
+      doc('AAPL', 'US', UTC_MIDNIGHT + 14 * 3_600_000, 100),
+      doc('AAPL', 'US', UTC_MIDNIGHT + 14 * 3_600_000 + 60_000, 101),
     ];
     const redis = fakeRedis();
 
@@ -111,7 +113,7 @@ describe('maybeEmitDailyAtClose — gate release on empty (PR #152 regression)',
   });
 
   it('a burned gate from a prior emit blocks a duplicate emit (NX is load-bearing)', async () => {
-    h.docs = [doc('AAPL_US_EQ', UTC_MIDNIGHT + 14 * 3_600_000, 100)];
+    h.docs = [doc('AAPL', 'US', UTC_MIDNIGHT + 14 * 3_600_000, 100)];
     const redis = fakeRedis();
     redis.store.set(US_GATE, '1');                     // already emitted earlier this UTC day
 

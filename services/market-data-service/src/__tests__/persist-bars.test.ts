@@ -54,14 +54,15 @@ function makeCollections(priorByKey: Record<string, { content_hash: string }> = 
   const audits: Array<Record<string, unknown>> = [];
 
   const ohlcv = {
-    find: (filter: { $or: Array<{ ticker: string; observation_ts: number }> }) => {
-      // The writer queries `find({ $or: keys, is_superseded: false })`. Return any
-      // prior rows the test pre-seeded for those keys.
+    find: (filter: { $or: Array<{ symbol: string; market: string; observation_ts: number }> }) => {
+      // The writer queries `find({ $or: keys, is_superseded: false })` where each key is now keyed on
+      // the bare identity (symbol, market). Return any prior rows the test pre-seeded for those keys
+      // (priorByKey is keyed `symbol|market|observation_ts`).
       const matched: Array<Record<string, unknown>> = [];
       for (const k of filter.$or) {
-        const key = `${k.ticker}|${k.observation_ts}`;
+        const key = `${k.symbol}|${k.market}|${k.observation_ts}`;
         const prior = priorByKey[key];
-        if (prior) matched.push({ ticker: k.ticker, observation_ts: k.observation_ts, content_hash: prior.content_hash });
+        if (prior) matched.push({ symbol: k.symbol, market: k.market, observation_ts: k.observation_ts, content_hash: prior.content_hash });
       }
       return {
         project: () => ({ toArray: async () => matched }),
@@ -111,14 +112,15 @@ describe('writeBarRevisions — first insert (no prior row)', () => {
   it('inserts the row with knowledge_ts + is_superseded:false and writes an audit entry with prior_hash:null', async () => {
     const { db, inserts, updates, audits } = makeCollections({});
     const now = 1_700_000_000_000;
-    const b = bar('A', 1_000, 100);
+    const b = bar('A_US_EQ', 1_000, 100);
     const stats = await writeBarRevisions(db, [b], '5m', now);
 
     expect(stats).toEqual({ attempted: 1, inserted: 1, revisions: 0, skipped: 0 });
     expect(inserts).toHaveLength(1);
     expect(updates).toHaveLength(0);                  // no prior row to supersede
     expect(inserts[0]).toMatchObject({
-      ticker: 'A',
+      symbol: 'A',
+      market: 'US',
       observation_ts: 1_000,
       knowledge_ts: now,
       interval: '5m',
@@ -129,7 +131,8 @@ describe('writeBarRevisions — first insert (no prior row)', () => {
 
     expect(audits).toHaveLength(1);
     expect(audits[0]).toMatchObject({
-      ticker: 'A',
+      symbol: 'A',
+      market: 'US',
       observation_ts: 1_000,
       knowledge_ts: now,
       prior_hash: null,                                // first-print marker
@@ -140,9 +143,9 @@ describe('writeBarRevisions — first insert (no prior row)', () => {
 
 describe('writeBarRevisions — idempotent re-poll', () => {
   it('skips bars whose content_hash matches the latest stored revision', async () => {
-    const b = bar('A', 1_000, 100);
+    const b = bar('A_US_EQ', 1_000, 100);
     const hash = hashBarContent(b);
-    const { db, inserts, updates, audits } = makeCollections({ 'A|1000': { content_hash: hash } });
+    const { db, inserts, updates, audits } = makeCollections({ 'A|US|1000': { content_hash: hash } });
 
     const stats = await writeBarRevisions(db, [b], '5m');
 
@@ -156,11 +159,11 @@ describe('writeBarRevisions — idempotent re-poll', () => {
   });
 
   it('skips multiple identical bars in one batch', async () => {
-    const b1 = bar('A', 1_000, 100);
-    const b2 = bar('A', 2_000, 200);
+    const b1 = bar('A_US_EQ', 1_000, 100);
+    const b2 = bar('A_US_EQ', 2_000, 200);
     const { db, inserts } = makeCollections({
-      'A|1000': { content_hash: hashBarContent(b1) },
-      'A|2000': { content_hash: hashBarContent(b2) },
+      'A|US|1000': { content_hash: hashBarContent(b1) },
+      'A|US|2000': { content_hash: hashBarContent(b2) },
     });
 
     const stats = await writeBarRevisions(db, [b1, b2], '5m');
@@ -173,14 +176,14 @@ describe('writeBarRevisions — idempotent re-poll', () => {
 
 describe('writeBarRevisions — revision', () => {
   it('flips is_superseded:true on the prior row, inserts the new row, and audits with prior_hash set', async () => {
-    const original = bar('A', 1_000, 100);
-    const revised  = bar('A', 1_000, 101);            // same observation_ts, different close
+    const original = bar('A_US_EQ', 1_000, 100);
+    const revised  = bar('A_US_EQ', 1_000, 101);      // same observation_ts, different close
     const priorHash = hashBarContent(original);
     const newHash   = hashBarContent(revised);
     expect(priorHash).not.toBe(newHash);              // sanity — the close differs
 
     const { db, inserts, updates, audits } = makeCollections({
-      'A|1000': { content_hash: priorHash },
+      'A|US|1000': { content_hash: priorHash },
     });
     const now = 1_700_000_000_000;
     const stats = await writeBarRevisions(db, [revised], '5m', now);
@@ -190,7 +193,8 @@ describe('writeBarRevisions — revision', () => {
     // 1. Prior row superseded.
     expect(updates).toHaveLength(1);
     expect(updates[0].filter).toMatchObject({
-      ticker: 'A',
+      symbol: 'A',
+      market: 'US',
       observation_ts: 1_000,
       interval: '5m',
       is_superseded: false,
@@ -200,7 +204,8 @@ describe('writeBarRevisions — revision', () => {
     // 2. New revision inserted with the new content + the writer-stamped knowledge_ts.
     expect(inserts).toHaveLength(1);
     expect(inserts[0]).toMatchObject({
-      ticker: 'A',
+      symbol: 'A',
+      market: 'US',
       observation_ts: 1_000,
       knowledge_ts: now,
       is_superseded: false,
@@ -224,15 +229,15 @@ describe('writeBarRevisions — mixed batch', () => {
     //   A@1000: identical to prior → skip
     //   A@2000: no prior → first-print insert
     //   B@1000: prior exists with different hash → revision
-    const skipBar     = bar('A', 1_000, 100);
-    const newBar      = bar('A', 2_000, 200);
-    const reviseBar   = bar('B', 1_000, 50);
+    const skipBar     = bar('A_US_EQ', 1_000, 100);
+    const newBar      = bar('A_US_EQ', 2_000, 200);
+    const reviseBar   = bar('B_US_EQ', 1_000, 50);
     const skipHash    = hashBarContent(skipBar);
-    const oldBHash    = hashBarContent(bar('B', 1_000, 49));   // close=49 — different from 50
+    const oldBHash    = hashBarContent(bar('B_US_EQ', 1_000, 49));   // close=49 — different from 50
 
     const { db, inserts, updates, audits } = makeCollections({
-      'A|1000': { content_hash: skipHash },
-      'B|1000': { content_hash: oldBHash },
+      'A|US|1000': { content_hash: skipHash },
+      'B|US|1000': { content_hash: oldBHash },
     });
 
     const stats = await writeBarRevisions(db, [skipBar, newBar, reviseBar], '5m');
@@ -246,10 +251,10 @@ describe('writeBarRevisions — mixed batch', () => {
     expect(inserts).toHaveLength(2);
     expect(updates).toHaveLength(1);
     expect(audits).toHaveLength(2);
-    // The audit for B|1000 records the prior hash (oldBHash); the audit for A|2000 is null.
-    const audit_B = audits.find((a) => a.ticker === 'B');
+    // The audit for B records the prior hash (oldBHash); the audit for A@2000 is null.
+    const audit_B = audits.find((a) => a.symbol === 'B');
     expect(audit_B?.prior_hash).toBe(oldBHash);
-    const audit_A_new = audits.find((a) => a.ticker === 'A' && a.observation_ts === 2_000);
+    const audit_A_new = audits.find((a) => a.symbol === 'A' && a.observation_ts === 2_000);
     expect(audit_A_new?.prior_hash).toBeNull();
   });
 });
@@ -263,7 +268,7 @@ describe('writeBarRevisions — dual-write to Timescale', () => {
   it('skips the PG writer entirely when DUAL_WRITE_BARS is unset', async () => {
     delete process.env.DUAL_WRITE_BARS;
     const { db } = makeCollections({});
-    await writeBarRevisions(db, [bar('A', 1_000, 100)], '5m');
+    await writeBarRevisions(db, [bar('A_US_EQ', 1_000, 100)], '5m');
     expect(pgWriteMock).not.toHaveBeenCalled();
   });
 
@@ -271,7 +276,7 @@ describe('writeBarRevisions — dual-write to Timescale', () => {
     process.env.DUAL_WRITE_BARS = 'true';
     try {
       const { db, inserts } = makeCollections({});
-      const b = bar('A', 1_000, 100);
+      const b = bar('A_US_EQ', 1_000, 100);
       const now = 1_700_000_000_000;
       await writeBarRevisions(db, [b], '5m', now);
 
@@ -311,13 +316,14 @@ describe('writeBarRevisions — dual-write to Timescale', () => {
       } as unknown as import('mongodb').Db;
 
       // Mongo write must succeed despite PG failure.
-      const stats = await writeBarRevisions(wrappedDb, [bar('A', 1_000, 100)], '5m');
+      const stats = await writeBarRevisions(wrappedDb, [bar('A_US_EQ', 1_000, 100)], '5m');
       expect(stats.inserted).toBe(1);
 
-      // Failure row written.
+      // Failure row written. The dual-write failure log records the in-memory OHLCVBar.ticker
+      // (still the T212 form — the failure log is operator-facing diagnostics, not storage).
       expect(dualInserts).toHaveLength(1);
       expect(dualInserts[0]).toMatchObject({
-        tickers: ['A'],
+        tickers: ['A_US_EQ'],
         observation_ts_range: [1_000, 1_000],
         interval: '5m',
       });
@@ -339,7 +345,7 @@ describe('writeBarRevisions — defensive guards', () => {
 
   it('drops bars with non-finite observation_ts (defensive — should not happen post-typecheck but worth pinning)', async () => {
     const { db, inserts } = makeCollections({});
-    const bad = { ...bar('A', 1_000, 100), observation_ts: Number.NaN };
+    const bad = { ...bar('A_US_EQ', 1_000, 100), observation_ts: Number.NaN };
     const stats = await writeBarRevisions(db, [bad as OHLCVBar], '5m');
     expect(stats.attempted).toBe(1);
     expect(stats.inserted).toBe(0);

@@ -110,24 +110,25 @@ const day = 24 * 60 * 60 * 1000;
 describe('getBars — live path (asOf undefined)', () => {
   it('queries with is_superseded:false and observation_ts $gte sinceTs', async () => {
     const coll = makeCollectionWith([
-      { ticker: 'A', observation_ts: _now - 2 * day, knowledge_ts: _now - 2 * day, interval: '5m', is_superseded: false, open: 1, high: 2, low: 0.5, close: 1.5, volume: 100 },
-      { ticker: 'A', observation_ts: _now - 1 * day, knowledge_ts: _now - 1 * day, interval: '5m', is_superseded: false, open: 2, high: 3, low: 1.5, close: 2.5, volume: 200 },
+      { symbol: 'A', market: 'US', observation_ts: _now - 2 * day, knowledge_ts: _now - 2 * day, interval: '5m', is_superseded: false, open: 1, high: 2, low: 0.5, close: 1.5, volume: 100 },
+      { symbol: 'A', market: 'US', observation_ts: _now - 1 * day, knowledge_ts: _now - 1 * day, interval: '5m', is_superseded: false, open: 2, high: 3, low: 1.5, close: 2.5, volume: 200 },
     ]);
     const redis = makeRedis();
-    const bars = await getBars(redis as any, makeDb(coll), 'A', '5m', '30d');
+    const bars = await getBars(redis as any, makeDb(coll), 'A_US_EQ', '5m', '30d');
     expect(bars).toHaveLength(2);
     expect(coll.findFilters).toHaveLength(1);
-    expect(coll.findFilters[0]).toMatchObject({ ticker: 'A', interval: '5m', is_superseded: false });
+    // The T212 ticker is split to (symbol, market) at the storage boundary.
+    expect(coll.findFilters[0]).toMatchObject({ symbol: 'A', market: 'US', interval: '5m', is_superseded: false });
     expect((coll.findFilters[0].observation_ts as { $gte: number }).$gte).toBeLessThanOrEqual(_now - 30 * day + 1000);
   });
 
   it('uses cache key with "live" bucket', async () => {
     const coll = makeCollectionWith([]);
     const redis = makeRedis();
-    await getBars(redis as any, makeDb(coll), 'A', '5m', '30d');
+    await getBars(redis as any, makeDb(coll), 'A_US_EQ', '5m', '30d');
     const setCalls = redis.calls.filter((c) => c.op === 'setEx');
     expect(setCalls).toHaveLength(1);
-    expect(setCalls[0].key).toBe('bars:v2:A:5m:30d:live');
+    expect(setCalls[0].key).toBe('bars:v2:A:US:5m:30d:live');
   });
 });
 
@@ -139,18 +140,18 @@ describe('getBars — as-of path (asOf set)', () => {
     const k1 = _now - 1 * day + 60_000;        // 1 min after obs
     const k2 = _now - 1 * day + 3 * 60_000;    // 3 min after obs
     const docs = [
-      { ticker: 'A', observation_ts: obsTs, knowledge_ts: k1, interval: '5m', is_superseded: true,  open: 1, high: 1, low: 1, close: 100, volume: 1 },
-      { ticker: 'A', observation_ts: obsTs, knowledge_ts: k2, interval: '5m', is_superseded: false, open: 1, high: 1, low: 1, close: 101, volume: 1 },
+      { symbol: 'A', market: 'US', observation_ts: obsTs, knowledge_ts: k1, interval: '5m', is_superseded: true,  open: 1, high: 1, low: 1, close: 100, volume: 1 },
+      { symbol: 'A', market: 'US', observation_ts: obsTs, knowledge_ts: k2, interval: '5m', is_superseded: false, open: 1, high: 1, low: 1, close: 101, volume: 1 },
     ];
 
     const earlyColl = makeCollectionWith(docs);
-    const earlyBars = await getBars(makeRedis() as any, makeDb(earlyColl), 'A', '5m', '30d', { asOf: k1 + 100 });
+    const earlyBars = await getBars(makeRedis() as any, makeDb(earlyColl), 'A_US_EQ', '5m', '30d', { asOf: k1 + 100 });
     expect(earlyBars).toHaveLength(1);
     expect(earlyBars[0].close).toBe(100);
     expect(earlyColl.aggregatePipelines).toHaveLength(1);
 
     const lateColl = makeCollectionWith(docs);
-    const lateBars = await getBars(makeRedis() as any, makeDb(lateColl), 'A', '5m', '30d', { asOf: k2 + 100 });
+    const lateBars = await getBars(makeRedis() as any, makeDb(lateColl), 'A_US_EQ', '5m', '30d', { asOf: k2 + 100 });
     expect(lateBars).toHaveLength(1);
     expect(lateBars[0].close).toBe(101);
   });
@@ -159,9 +160,9 @@ describe('getBars — as-of path (asOf set)', () => {
     const obsTs = _now - 1 * day;
     const k1 = _now - 1 * day + 60_000;
     const coll = makeCollectionWith([
-      { ticker: 'A', observation_ts: obsTs, knowledge_ts: k1, interval: '5m', is_superseded: false, open: 1, high: 1, low: 1, close: 50, volume: 1 },
+      { symbol: 'A', market: 'US', observation_ts: obsTs, knowledge_ts: k1, interval: '5m', is_superseded: false, open: 1, high: 1, low: 1, close: 50, volume: 1 },
     ]);
-    const bars = await getBars(makeRedis() as any, makeDb(coll), 'A', '5m', '30d', { asOf: k1 - 1 });
+    const bars = await getBars(makeRedis() as any, makeDb(coll), 'A_US_EQ', '5m', '30d', { asOf: k1 - 1 });
     expect(bars).toEqual([]);
   });
 });
@@ -170,39 +171,41 @@ describe('cache key bucketing', () => {
   it('keys live and as-of reads under distinct entries', async () => {
     const coll = makeCollectionWith([]);
     const redis = makeRedis();
-    await getBars(redis as any, makeDb(coll), 'A', '5m', '30d');
-    await getBars(redis as any, makeDb(coll), 'A', '5m', '30d', { asOf: 1_700_000_000_000 });
+    await getBars(redis as any, makeDb(coll), 'A_US_EQ', '5m', '30d');
+    await getBars(redis as any, makeDb(coll), 'A_US_EQ', '5m', '30d', { asOf: 1_700_000_000_000 });
     const setKeys = redis.calls.filter((c) => c.op === 'setEx').map((c) => c.key);
-    expect(setKeys).toContain('bars:v2:A:5m:30d:live');
-    expect(setKeys).toContain('bars:v2:A:5m:30d:28333333');
+    expect(setKeys).toContain('bars:v2:A:US:5m:30d:live');
+    expect(setKeys).toContain('bars:v2:A:US:5m:30d:28333333');
     expect(new Set(setKeys).size).toBe(2);
   });
 
   it('shares a cache key across asOf values inside the same 60s bucket', async () => {
     const coll = makeCollectionWith([
-      { ticker: 'A', observation_ts: 1, knowledge_ts: 1, interval: '5m', is_superseded: false, open: 1, high: 1, low: 1, close: 1, volume: 1 },
+      { symbol: 'A', market: 'US', observation_ts: 1, knowledge_ts: 1, interval: '5m', is_superseded: false, open: 1, high: 1, low: 1, close: 1, volume: 1 },
     ]);
     const redis = makeRedis();
     const base = 1_700_000_000_000;             // wall-clock ms inside an arbitrary minute
-    await getBars(redis as any, makeDb(coll), 'A', '5m', '30d', { asOf: base });
-    await getBars(redis as any, makeDb(coll), 'A', '5m', '30d', { asOf: base + 30_000 });
+    await getBars(redis as any, makeDb(coll), 'A_US_EQ', '5m', '30d', { asOf: base });
+    await getBars(redis as any, makeDb(coll), 'A_US_EQ', '5m', '30d', { asOf: base + 30_000 });
     // First call: Mongo + cache write. Second call: cache hit, no Mongo, no additional setEx.
     const setKeys = redis.calls.filter((c) => c.op === 'setEx').map((c) => c.key);
-    expect(setKeys).toEqual([`bars:v2:A:5m:30d:${Math.floor(base / 60_000)}`]);
+    expect(setKeys).toEqual([`bars:v2:A:US:5m:30d:${Math.floor(base / 60_000)}`]);
     // Second call should not aggregate again because the cache served it.
     expect(coll.aggregatePipelines).toHaveLength(1);
   });
 });
 
 describe('docToBar — schema compatibility', () => {
-  it('reads new bi-temporal shape (observation_ts:number) correctly', async () => {
+  it('reads the bi-temporal shape and re-derives the T212 ticker from (symbol, market)', async () => {
     const obs = _now - 1 * day;
     const know = _now - 1 * day + 60_000;
     const coll = makeCollectionWith([
-      { ticker: 'A', observation_ts: obs, knowledge_ts: know, interval: '5m', is_superseded: false, open: 1, high: 2, low: 0.5, close: 1.5, volume: 100, content_hash: 'abc' },
+      { symbol: 'A', market: 'US', observation_ts: obs, knowledge_ts: know, interval: '5m', is_superseded: false, open: 1, high: 2, low: 0.5, close: 1.5, volume: 100, content_hash: 'abc' },
     ]);
-    const bars = await getBars(makeRedis() as any, makeDb(coll), 'A', '5m', '30d');
+    const bars = await getBars(makeRedis() as any, makeDb(coll), 'A_US_EQ', '5m', '30d');
     expect(bars).toHaveLength(1);
+    // ticker is re-derived from (symbol, market) so OHLCVBar.ticker stays byte-identical.
+    expect(bars[0].ticker).toBe('A_US_EQ');
     expect(bars[0].observation_ts).toBe(obs);
     expect(bars[0].knowledge_ts).toBe(know);
     expect(bars[0].is_superseded).toBe(false);
@@ -211,25 +214,21 @@ describe('docToBar — schema compatibility', () => {
     expect(bars[0].timestamp).toBe(obs);
   });
 
-  it('reads legacy shape (timestamp:Date, no observation_ts) by falling back', async () => {
-    // Migrated row: has both timestamp:Date (legacy) and observation_ts:number (added
-    // by migration script). docToBar reads observation_ts; the timestamp:Date branch
-    // only fires when observation_ts is genuinely absent.
+  it('reads an LSE row and re-derives the lowercase-l T212 form', async () => {
     const obs = _now - 1 * day;
     const coll = makeCollectionWith([
-      { ticker: 'A', timestamp: new Date(obs), observation_ts: obs, is_superseded: false, interval: '5m', open: 1, high: 2, low: 0.5, close: 1.5, volume: 100 },
+      { symbol: 'SHEL', market: 'LSE', observation_ts: obs, knowledge_ts: obs, is_superseded: false, interval: '5m', open: 1, high: 2, low: 0.5, close: 1.5, volume: 100 },
     ]);
-    const bars = await getBars(makeRedis() as any, makeDb(coll), 'A', '5m', '30d');
+    const bars = await getBars(makeRedis() as any, makeDb(coll), 'SHELl_EQ', '5m', '30d');
+    expect(bars[0].ticker).toBe('SHELl_EQ');
     expect(bars[0].observation_ts).toBe(obs);
-    expect(bars[0].timestamp).toBe(obs);
 
     // Sanity: an UNMIGRATED row with no observation_ts at all is invisible to the
-    // bi-temporal live filter — by design. The operator must run the migration
-    // before pre-existing rows become readable.
+    // bi-temporal live filter — by design. The stores are wiped + refetched at cutover.
     const unmigrated = makeCollectionWith([
-      { ticker: 'A', timestamp: new Date(obs), is_superseded: false, interval: '5m', open: 1, high: 2, low: 0.5, close: 1.5, volume: 100 },
+      { symbol: 'SHEL', market: 'LSE', is_superseded: false, interval: '5m', open: 1, high: 2, low: 0.5, close: 1.5, volume: 100 },
     ]);
-    const noObsBars = await getBars(makeRedis() as any, makeDb(unmigrated), 'A', '5m', '30d');
+    const noObsBars = await getBars(makeRedis() as any, makeDb(unmigrated), 'SHELl_EQ', '5m', '30d');
     expect(noObsBars).toEqual([]);
   });
 });

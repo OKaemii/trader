@@ -14,24 +14,25 @@
 process.env.JWT_SECRET = 'test-jwt-secret-min-16-chars';
 import { describe, it, expect, vi } from 'vitest';
 
-// The mocked daily series: AAPL has bars, ZZZZ has none (→ null close, the fail-closed path).
+// The mocked daily series, keyed on the bare identity `symbol|market` (storage is keyed on those two
+// columns now). AAPL has bars, ZZZZ has none (→ null close, the fail-closed path).
 const dayStart = Date.UTC(2026, 4, 14, 0, 0, 0);
-const dailyByTicker: Record<string, Array<Record<string, unknown>>> = {
-  AAPL_US_EQ: [
-    { ticker: 'AAPL_US_EQ', observation_ts: dayStart - 86_400_000, knowledge_ts: dayStart - 86_400_000, interval: 'daily', is_superseded: false, open: 1, high: 1, low: 1, close: 150, volume: 1 },
-    { ticker: 'AAPL_US_EQ', observation_ts: dayStart,              knowledge_ts: dayStart,              interval: 'daily', is_superseded: false, open: 1, high: 1, low: 1, close: 175, volume: 1 },
+const dailyByIdentity: Record<string, Array<Record<string, unknown>>> = {
+  'AAPL|US': [
+    { symbol: 'AAPL', market: 'US', observation_ts: dayStart - 86_400_000, knowledge_ts: dayStart - 86_400_000, interval: 'daily', is_superseded: false, open: 1, high: 1, low: 1, close: 150, volume: 1 },
+    { symbol: 'AAPL', market: 'US', observation_ts: dayStart,              knowledge_ts: dayStart,              interval: 'daily', is_superseded: false, open: 1, high: 1, low: 1, close: 175, volume: 1 },
   ],
-  ZZZZ_US_EQ: [],
+  'ZZZZ|US': [],
 };
 
-// Minimal find().sort().limit().toArray() over the per-ticker daily series — enough for
+// Minimal find().sort().limit().toArray() over the per-identity daily series — enough for
 // getBarAtOrBefore's live mongo path. Picks the newest by the sort spec, slices to the limit.
 vi.mock('@trader/shared-mongo', () => ({
   COLLECTIONS: { OHLCV_BARS: 'ohlcv_bars' },
   getMongoDb: async () => ({
     collection: () => ({
-      find: (q: { ticker: string; interval?: string }) => {
-        const rows = (q.interval === 'daily' ? dailyByTicker[q.ticker] ?? [] : []).slice();
+      find: (q: { symbol: string; market: string; interval?: string }) => {
+        const rows = (q.interval === 'daily' ? dailyByIdentity[`${q.symbol}|${q.market}`] ?? [] : []).slice();
         let limitN: number | null = null;
         const cursor: { sort: (s: Record<string, number>) => typeof cursor; limit: (n: number) => typeof cursor; toArray: () => Promise<Array<Record<string, unknown>>> } = {
           sort: (s: Record<string, number>) => {

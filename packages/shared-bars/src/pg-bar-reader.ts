@@ -31,6 +31,7 @@ import type { OHLCVBar, BarInterval } from '@trader/shared-types';
 import { getPgPool } from '@trader/shared-pg';
 
 import type { GetBarsOpts, RangeKey } from './index.ts';
+import { identityOf, tickerOf, identityKey } from './identity.ts';
 
 const RANGE_DAYS: Record<RangeKey, number> = {
   '30d': 30,
@@ -57,7 +58,8 @@ function asOfBucket(asOf: number | undefined): string {
 }
 
 export function pgCacheKey(ticker: string, interval: BarInterval, range: RangeKey, asOf?: number): string {
-  return `bars:pg:v1:${ticker}:${interval}:${range}:${asOfBucket(asOf)}`;
+  const id = identityOf(ticker);
+  return `bars:pg:v1:${identityKey(id.symbol, id.market)}:${interval}:${range}:${asOfBucket(asOf)}`;
 }
 
 /**
@@ -95,23 +97,25 @@ export async function getBarsFromPg(
 
   const sinceTs = Date.now() - RANGE_DAYS[range] * 24 * 60 * 60 * 1000;
   const pool = getPgPool();
+  const { symbol, market } = identityOf(ticker);
 
   let bars: OHLCVBar[];
   if (asOf === undefined) {
     // Live path — partial-unique index fast lane. `is_superseded = FALSE` picks
-    // exactly one row per (ticker, observation_ts, interval).
+    // exactly one row per (symbol, market, observation_ts, interval).
     const { rows } = await pool.query(
-      `SELECT ticker, observation_ts, knowledge_ts, interval,
+      `SELECT symbol, market, observation_ts, knowledge_ts, interval,
               open, high, low, close, volume,
               raw_close, adjusted_close, adjustment_factor,
               currency, content_hash, is_superseded
          FROM bars
-        WHERE ticker = $1
-          AND interval = $2
+        WHERE symbol = $1
+          AND market = $2
+          AND interval = $3
           AND is_superseded = FALSE
-          AND observation_ts >= $3
+          AND observation_ts >= $4
         ORDER BY observation_ts ASC`,
-      [ticker, interval, sinceTs],
+      [symbol, market, interval, sinceTs],
     );
     bars = rows.map(rowToBar);
   } else {
@@ -120,17 +124,18 @@ export async function getBarsFromPg(
     // `$sort+$group({$first})`. The bars_knowledge_lookup index covers the range.
     const { rows } = await pool.query(
       `SELECT DISTINCT ON (observation_ts)
-              ticker, observation_ts, knowledge_ts, interval,
+              symbol, market, observation_ts, knowledge_ts, interval,
               open, high, low, close, volume,
               raw_close, adjusted_close, adjustment_factor,
               currency, content_hash, is_superseded
          FROM bars
-        WHERE ticker = $1
-          AND interval = $2
-          AND observation_ts >= $3
-          AND knowledge_ts <= $4
+        WHERE symbol = $1
+          AND market = $2
+          AND interval = $3
+          AND observation_ts >= $4
+          AND knowledge_ts <= $5
         ORDER BY observation_ts ASC, knowledge_ts DESC`,
-      [ticker, interval, sinceTs, asOf],
+      [symbol, market, interval, sinceTs, asOf],
     );
     bars = rows.map(rowToBar);
   }
@@ -190,7 +195,8 @@ const DEPTH_FLOOR_MS = Date.UTC(1990, 0, 1);
  * read for the same (ticker, interval, asOf) are different shapes.
  */
 export function pgAtCacheKey(ticker: string, interval: BarInterval, asOf?: number): string {
-  return `bars:pg:v1:${ticker}:${interval}:at:${asOfBucket(asOf)}`;
+  const id = identityOf(ticker);
+  return `bars:pg:v1:${identityKey(id.symbol, id.market)}:${interval}:at:${asOfBucket(asOf)}`;
 }
 
 // One bounded query: the latest bar in `(anchor - windowMs, anchor]`. Live (`isLive`) filters the
@@ -208,32 +214,39 @@ async function queryBarInWindow(
   isLive: boolean,
 ): Promise<OHLCVBar | null> {
   const lowerBound = anchor - windowMs;
+  const { symbol, market } = identityOf(ticker);
+  // $1=symbol $2=market $3=interval $4=anchor (upper bound) $5=lowerBound. The window bounds
+  // ($4 upper / $5 lower on observation_ts) are the load-bearing OOM fix — chunk-exclusion prunes
+  // on BOTH bounds — and are unchanged here; only the name filter moved from `ticker` to the two
+  // identity columns (now backed by the re-keyed bars_asof_lookup index).
   const sql = isLive
-    ? `SELECT ticker, observation_ts, knowledge_ts, interval,
+    ? `SELECT symbol, market, observation_ts, knowledge_ts, interval,
               open, high, low, close, volume,
               raw_close, adjusted_close, adjustment_factor,
               currency, content_hash, is_superseded
          FROM bars
-        WHERE ticker = $1
-          AND interval = $2
+        WHERE symbol = $1
+          AND market = $2
+          AND interval = $3
           AND is_superseded = FALSE
-          AND observation_ts <= $3
-          AND observation_ts > $4
+          AND observation_ts <= $4
+          AND observation_ts > $5
         ORDER BY observation_ts DESC
         LIMIT 1`
-    : `SELECT ticker, observation_ts, knowledge_ts, interval,
+    : `SELECT symbol, market, observation_ts, knowledge_ts, interval,
               open, high, low, close, volume,
               raw_close, adjusted_close, adjustment_factor,
               currency, content_hash, is_superseded
          FROM bars
-        WHERE ticker = $1
-          AND interval = $2
-          AND observation_ts <= $3
-          AND observation_ts > $4
-          AND knowledge_ts <= $3
+        WHERE symbol = $1
+          AND market = $2
+          AND interval = $3
+          AND observation_ts <= $4
+          AND observation_ts > $5
+          AND knowledge_ts <= $4
         ORDER BY observation_ts DESC, knowledge_ts DESC
         LIMIT 1`;
-  const { rows } = await pool.query(sql, [ticker, interval, anchor, lowerBound]);
+  const { rows } = await pool.query(sql, [symbol, market, interval, anchor, lowerBound]);
   return rows[0] ? rowToBar(rows[0]) : null;
 }
 
@@ -309,6 +322,7 @@ export async function getDailyDepthPg(
 ): Promise<{ oldest: number | null; count: number }> {
   const pool = getPgPool();
   const nowMs = Date.now();
+  const { symbol, market } = identityOf(ticker);
   let oldest: number | null = null;
   let count = 0;
   // Walk forward in bounded windows. Each query is bounded on BOTH sides of the time dimension, so
@@ -318,12 +332,13 @@ export async function getDailyDepthPg(
     const { rows } = await pool.query<{ n: string; oldest: string | null }>(
       `SELECT count(*)::bigint AS n, min(observation_ts) AS oldest
          FROM bars
-        WHERE ticker = $1
-          AND interval = $2
+        WHERE symbol = $1
+          AND market = $2
+          AND interval = $3
           AND is_superseded = FALSE
-          AND observation_ts >= $3
-          AND observation_ts < $4`,
-      [ticker, interval, lo, hi],
+          AND observation_ts >= $4
+          AND observation_ts < $5`,
+      [symbol, market, interval, lo, hi],
     );
     const n = Number(rows[0]?.n ?? 0);
     if (n > 0) {
@@ -356,9 +371,12 @@ export async function getLastClosePg(
 function rowToBar(row: Record<string, unknown>): OHLCVBar {
   const observationMs = Number(row.observation_ts);
   const knowledgeMs   = row.knowledge_ts !== undefined ? Number(row.knowledge_ts) : undefined;
+  // Storage is keyed on (symbol, market); re-derive the T212 ticker so OHLCVBar.ticker is identical
+  // to what callers pass in (the OHLCVBar contract is unchanged by this card).
+  const ticker = tickerOf(String(row.symbol ?? ''), String(row.market ?? ''));
 
   const bar: OHLCVBar = {
-    ticker:         String(row.ticker ?? ''),
+    ticker,
     observation_ts: observationMs,
     // Legacy alias preserved for any consumer still reading `timestamp` —
     // matches the Mongo reader's docToBar so the two backends are read-side

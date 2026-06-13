@@ -28,6 +28,9 @@ import {
 const dockerAvailable = await isDockerAvailable();
 const TEST_TIMEOUT_MS = 120_000;
 
+// Fixtures pass a T212-form ticker (the writer splits it to (symbol, market) at the storage
+// boundary). Storage assertions below query the bare `symbol`/`market` columns; the helper keeps the
+// bare letter as the symbol (e.g. 'A_US_EQ' -> symbol 'A', market 'US').
 function bar(ticker: string, obs: number, close: number, overrides: Partial<OHLCVBar> = {}): OHLCVBar {
   return {
     ticker,
@@ -89,18 +92,19 @@ describe.skipIf(!dockerAvailable)('writeBarRevisionsPg', () => {
   describe('first insert (no prior row)', () => {
     it('inserts the row with knowledge_ts + is_superseded=false and writes an audit entry with prior_hash=null', async () => {
       const now = 1_700_000_000_000;
-      const b = bar('A', 1_000, 100);
+      const b = bar('A_US_EQ', 1_000, 100);
 
       const stats = await writeBarRevisionsPg([b], '5m', now);
       expect(stats).toEqual({ attempted: 1, inserted: 1, revisions: 0, skipped: 0 });
 
       const pool = getPgPool();
       const { rows: barsRows } = await pool.query(
-        'SELECT ticker, observation_ts, knowledge_ts, interval, close, content_hash, is_superseded FROM bars',
+        'SELECT symbol, market, observation_ts, knowledge_ts, interval, close, content_hash, is_superseded FROM bars',
       );
       expect(barsRows).toHaveLength(1);
       expect(barsRows[0]).toMatchObject({
-        ticker: 'A',
+        symbol: 'A',
+        market: 'US',
         observation_ts: '1000',
         knowledge_ts: String(now),
         interval: '5m',
@@ -110,11 +114,12 @@ describe.skipIf(!dockerAvailable)('writeBarRevisionsPg', () => {
       expect(barsRows[0].content_hash).toBe(hashBarContent(b));
 
       const { rows: auditRows } = await pool.query(
-        'SELECT ticker, observation_ts, prior_hash, new_hash FROM bar_revisions_log',
+        'SELECT symbol, market, observation_ts, prior_hash, new_hash FROM bar_revisions_log',
       );
       expect(auditRows).toHaveLength(1);
       expect(auditRows[0]).toMatchObject({
-        ticker: 'A',
+        symbol: 'A',
+        market: 'US',
         observation_ts: '1000',
         prior_hash: null,
         new_hash: hashBarContent(b),
@@ -124,7 +129,7 @@ describe.skipIf(!dockerAvailable)('writeBarRevisionsPg', () => {
 
   describe('idempotent re-poll', () => {
     it('skips bars whose content_hash matches the latest stored revision', async () => {
-      const b = bar('A', 1_000, 100);
+      const b = bar('A_US_EQ', 1_000, 100);
       await writeBarRevisionsPg([b], '5m', 1_700_000_000_000);
 
       const stats = await writeBarRevisionsPg([b], '5m', 1_700_000_001_000);
@@ -139,8 +144,8 @@ describe.skipIf(!dockerAvailable)('writeBarRevisionsPg', () => {
     });
 
     it('skips multiple identical bars in one batch', async () => {
-      const b1 = bar('A', 1_000, 100);
-      const b2 = bar('A', 2_000, 200);
+      const b1 = bar('A_US_EQ', 1_000, 100);
+      const b2 = bar('A_US_EQ', 2_000, 200);
       await writeBarRevisionsPg([b1, b2], '5m');
 
       const stats = await writeBarRevisionsPg([b1, b2], '5m');
@@ -151,8 +156,8 @@ describe.skipIf(!dockerAvailable)('writeBarRevisionsPg', () => {
 
   describe('revision', () => {
     it('flips is_superseded=true on the prior row, inserts the new row, audits with prior_hash set', async () => {
-      const original = bar('A', 1_000, 100);
-      const revised  = bar('A', 1_000, 101);
+      const original = bar('A_US_EQ', 1_000, 100);
+      const revised  = bar('A_US_EQ', 1_000, 101);
       const priorHash = hashBarContent(original);
       const newHash   = hashBarContent(revised);
       expect(priorHash).not.toBe(newHash);
@@ -167,7 +172,7 @@ describe.skipIf(!dockerAvailable)('writeBarRevisionsPg', () => {
       const { rows: barsRows } = await pool.query(
         `SELECT knowledge_ts, close, content_hash, is_superseded
            FROM bars
-          WHERE ticker='A' AND observation_ts=1000 AND interval='5m'
+          WHERE symbol='A' AND market='US' AND observation_ts=1000 AND interval='5m'
           ORDER BY knowledge_ts ASC`,
       );
       expect(barsRows).toHaveLength(2);
@@ -176,16 +181,16 @@ describe.skipIf(!dockerAvailable)('writeBarRevisionsPg', () => {
       expect(barsRows[1]).toMatchObject({ knowledge_ts: String(t1), is_superseded: false, content_hash: newHash   });
       expect(Number(barsRows[1].close)).toBe(101);
 
-      // Partial-unique index must permit this — one is_superseded=false row per (ticker, observation_ts, interval).
+      // Partial-unique index must permit this — one is_superseded=false row per (symbol, market, observation_ts, interval).
       const { rows: latest } = await pool.query(
-        `SELECT count(*)::int AS n FROM bars WHERE is_superseded = FALSE AND ticker='A' AND observation_ts=1000`,
+        `SELECT count(*)::int AS n FROM bars WHERE is_superseded = FALSE AND symbol='A' AND market='US' AND observation_ts=1000`,
       );
       expect(latest[0]?.n).toBe(1);
 
       // Audit log: latest entry diffs the two hashes.
       const { rows: auditRows } = await pool.query(
         `SELECT prior_hash, new_hash FROM bar_revisions_log
-          WHERE ticker='A' AND observation_ts=1000
+          WHERE symbol='A' AND market='US' AND observation_ts=1000
           ORDER BY knowledge_ts ASC`,
       );
       expect(auditRows).toHaveLength(2);
@@ -196,10 +201,10 @@ describe.skipIf(!dockerAvailable)('writeBarRevisionsPg', () => {
 
   describe('mixed batch', () => {
     it('correctly accounts skips, first-prints, and revisions in stats', async () => {
-      const skipBar    = bar('A', 1_000, 100);
-      const newBar     = bar('A', 2_000, 200);
-      const oldB       = bar('B', 1_000, 49);
-      const reviseBar  = bar('B', 1_000, 50);
+      const skipBar    = bar('A_US_EQ', 1_000, 100);
+      const newBar     = bar('A_US_EQ', 2_000, 200);
+      const oldB       = bar('B_US_EQ', 1_000, 49);
+      const reviseBar  = bar('B_US_EQ', 1_000, 50);
 
       // Seed: skipBar already present at A|1000; oldB already present at B|1000.
       await writeBarRevisionsPg([skipBar, oldB], '5m');
@@ -218,7 +223,7 @@ describe.skipIf(!dockerAvailable)('writeBarRevisionsPg', () => {
       // Two latest rows for B's observation: the supersede transition + reviseBar.
       const { rows: bLatest } = await pool.query(
         `SELECT count(*)::int AS n FROM bars
-          WHERE ticker='B' AND observation_ts=1000 AND is_superseded=FALSE`,
+          WHERE symbol='B' AND market='US' AND observation_ts=1000 AND is_superseded=FALSE`,
       );
       expect(bLatest[0]?.n).toBe(1);
     });
@@ -231,7 +236,7 @@ describe.skipIf(!dockerAvailable)('writeBarRevisionsPg', () => {
     });
 
     it('drops bars with non-finite observation_ts', async () => {
-      const bad = { ...bar('A', 1_000, 100), observation_ts: Number.NaN };
+      const bad = { ...bar('A_US_EQ', 1_000, 100), observation_ts: Number.NaN };
       const stats = await writeBarRevisionsPg([bad as OHLCVBar], '5m');
       // Same shape as the Mongo writer: counted as attempted, then filtered out so
       // inserted/skipped stay zero.
@@ -246,20 +251,20 @@ describe.skipIf(!dockerAvailable)('writeBarRevisionsPg', () => {
   });
 
   describe('fetchFirstPrintClosesPg', () => {
-    it('returns the smallest-knowledge_ts close per (ticker, observation_ts) — distinguishing first-prints from revisions', async () => {
-      const original = bar('A', 1_000, 100);
-      const revised  = bar('A', 1_000, 101);
+    it('returns the smallest-knowledge_ts close per (symbol, market, observation_ts) — distinguishing first-prints from revisions', async () => {
+      const original = bar('A_US_EQ', 1_000, 100);
+      const revised  = bar('A_US_EQ', 1_000, 101);
       await writeBarRevisionsPg([original], '5m', 1_700_000_000_000);
       await writeBarRevisionsPg([revised],  '5m', 1_700_000_001_000);
 
       const map = await fetchFirstPrintClosesPg([revised], '5m');
-      // First-print close was 100 (original), not 101 (the revision).
-      expect(map.get('A|1000')).toBe(100);
+      // First-print close was 100 (original), not 101 (the revision). Keyed by symbol|market|obs.
+      expect(map.get('A|US|1000')).toBe(100);
     });
 
     it('omits keys with no prior row (first-prints — caller treats absence as the marker)', async () => {
-      const map = await fetchFirstPrintClosesPg([bar('A', 1_000, 100)], '5m');
-      expect(map.has('A|1000')).toBe(false);
+      const map = await fetchFirstPrintClosesPg([bar('A_US_EQ', 1_000, 100)], '5m');
+      expect(map.has('A|US|1000')).toBe(false);
     });
   });
 });
@@ -344,7 +349,7 @@ describe.skipIf(!dockerAvailable)('writeBarRevisionsPg — bulk-write lock-table
 
   it('the NEW batched write lands the whole 2006→now series without exhausting the lock table', async () => {
     process.env.BARS_BACKEND = 'timescale';
-    const series = deepDailySeries('NEW');
+    const series = deepDailySeries('NEW_US_EQ');
     // The series must be deep enough to span > the lock budget in chunks (~1000), so a
     // single unbounded lookup over it would OOM.
     expect(series.length).toBeGreaterThan(WRITE_BATCH_SIZE * 4);
@@ -365,7 +370,7 @@ describe.skipIf(!dockerAvailable)('writeBarRevisionsPg — bulk-write lock-table
 
     // All rows landed and reach 2006 — the deep series is now in the timescale read store,
     // not just Mongo. getDailyDepthPg is itself bounded (it walked the deep table without OOM).
-    const depth = await getDailyDepthPg('NEW', 'daily');
+    const depth = await getDailyDepthPg('NEW_US_EQ', 'daily');
     expect(depth.count).toBe(series.length);
     expect(depth.oldest).toBe(START_2006);
   }, TEST_TIMEOUT_MS);
@@ -376,7 +381,7 @@ describe.skipIf(!dockerAvailable)('writeBarRevisionsPg — bulk-write lock-table
     // bounded lookup on EVERY batch (it reads each batch's existing rows to compare hashes) —
     // the exact path the OOM lived on — and skip all bars. This is the re-backfill the
     // capstone runs once this fix deploys.
-    const series = deepDailySeries('REPEAT');
+    const series = deepDailySeries('REPEAT_US_EQ');
     await writeBarRevisionsPg(series, 'daily');
     const stats = await writeBarRevisionsPg(series, 'daily');
     expect(stats.skipped).toBe(series.length);
@@ -387,11 +392,13 @@ describe.skipIf(!dockerAvailable)('writeBarRevisionsPg — bulk-write lock-table
     process.env.BARS_BACKEND = 'timescale';
     // Populate the deep series via the (fixed) batched writer so the hypertable holds the
     // ~1000 chunks the OOM needs.
-    const series = deepDailySeries('OLD');
+    const series = deepDailySeries('OLD_US_EQ');
     await writeBarRevisionsPg(series, 'daily');
 
     const pool = getPgPool();
-    const tickers   = series.map((b) => b.ticker);
+    // The deep series is one symbol on one market; the unbounded lookup straddles 2006→now.
+    const symbols   = series.map(() => 'OLD');
+    const markets   = series.map(() => 'US');
     const obsTsList = series.map((b) => b.observation_ts);
     // The exact unbounded lookup writeBarRevisionsPg ran before this fix when handed the
     // whole series in one shot: an IN-list of keys straddling 2006→now with NO time bound.
@@ -400,14 +407,14 @@ describe.skipIf(!dockerAvailable)('writeBarRevisionsPg — bulk-write lock-table
     // the OOM ship.
     await expect(
       pool.query(
-        `SELECT ticker, observation_ts, content_hash
+        `SELECT symbol, market, observation_ts, content_hash
            FROM bars
           WHERE interval = $1
             AND is_superseded = FALSE
-            AND (ticker, observation_ts) IN (
-              SELECT unnest($2::text[]), unnest($3::bigint[])
+            AND (symbol, market, observation_ts) IN (
+              SELECT unnest($2::text[]), unnest($3::text[]), unnest($4::bigint[])
             )`,
-        ['daily', tickers, obsTsList],
+        ['daily', symbols, markets, obsTsList],
       ),
     ).rejects.toMatchObject({ code: '53200' }); // 53200 = out_of_memory (shared lock table)
   }, TEST_TIMEOUT_MS);
@@ -449,12 +456,12 @@ describe.skipIf(!dockerAvailable)('writeBarRevisionsPg — deep-series bi-tempor
     // Deep first-print series, then revise ONE deep-history bar (close 10 → 11). The supersede
     // must stay atomic within its batch's per-bar transaction even though the bar sits deep in
     // a multi-chunk series, and the prior first-print is flipped (not overwritten).
-    const series = deepDailySeries('REV', 10);
+    const series = deepDailySeries('REV_US_EQ', 10);
     const seedStats = await writeBarRevisionsPg(series, 'daily', 1_700_000_000_000);
     expect(seedStats.inserted).toBe(series.length);
 
     const reviseTs = START_2006 + 50 * DAY_MS; // a 2006 observation, deep in the series
-    const revised = bar('REV', reviseTs, 11, { interval: 'daily', timestamp: reviseTs });
+    const revised = bar('REV_US_EQ', reviseTs, 11, { interval: 'daily', timestamp: reviseTs });
     const stats = await writeBarRevisionsPg([revised], 'daily', 1_700_000_001_000);
     expect(stats.inserted).toBe(1);
     expect(stats.revisions).toBe(1);
@@ -463,7 +470,7 @@ describe.skipIf(!dockerAvailable)('writeBarRevisionsPg — deep-series bi-tempor
     // Exactly one live row at that observation, and it's the revision (close 11).
     const { rows: live } = await pool.query(
       `SELECT close, is_superseded FROM bars
-        WHERE ticker='REV' AND observation_ts=$1 AND interval='daily' AND is_superseded=FALSE`,
+        WHERE symbol='REV' AND market='US' AND observation_ts=$1 AND interval='daily' AND is_superseded=FALSE`,
       [reviseTs],
     );
     expect(live).toHaveLength(1);
@@ -471,7 +478,7 @@ describe.skipIf(!dockerAvailable)('writeBarRevisionsPg — deep-series bi-tempor
     // The prior first-print row is flipped superseded (still present — bi-temporal, never overwritten).
     const { rows: all } = await pool.query(
       `SELECT close, is_superseded FROM bars
-        WHERE ticker='REV' AND observation_ts=$1 AND interval='daily' ORDER BY knowledge_ts ASC`,
+        WHERE symbol='REV' AND market='US' AND observation_ts=$1 AND interval='daily' ORDER BY knowledge_ts ASC`,
       [reviseTs],
     );
     expect(all).toHaveLength(2);
@@ -480,7 +487,7 @@ describe.skipIf(!dockerAvailable)('writeBarRevisionsPg — deep-series bi-tempor
     expect(all[1]).toMatchObject({ is_superseded: false });
     expect(Number(all[1].close)).toBe(11);
     // Depth still reaches 2006 and the live count is unchanged (one live row per observation).
-    const depth = await getDailyDepthPg('REV', 'daily');
+    const depth = await getDailyDepthPg('REV_US_EQ', 'daily');
     expect(depth.oldest).toBe(START_2006);
     expect(depth.count).toBe(series.length);
   }, TEST_TIMEOUT_MS);

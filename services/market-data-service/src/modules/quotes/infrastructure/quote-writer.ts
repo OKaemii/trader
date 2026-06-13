@@ -1,9 +1,13 @@
 import { createHash } from 'node:crypto';
 import { getPgPool } from '@trader/shared-pg';
+import { Trading212TickerAdapter } from '@trader/ticker-identity';
 
-// Bi-temporal quote row (matches 0006_quotes.sql). One row per (ticker, observation_ts);
-// supersede-then-insert on revision, content-hash no-op on identical re-poll — same discipline
-// as the bar writer.
+// Storage is keyed on the bare identity (symbol, market). QuoteRow still carries the T212 ticker
+// during the Thread A transition; split it at the write boundary via the single suffix parser.
+const tickerAdapter = new Trading212TickerAdapter();
+
+// Bi-temporal quote row. One row per (symbol, market, observation_ts); supersede-then-insert on
+// revision, content-hash no-op on identical re-poll — same discipline as the bar writer.
 export interface QuoteRow {
   ticker: string;
   observation_ts: number;
@@ -38,13 +42,14 @@ export class QuoteWriter {
   private async writeOne(row: QuoteRow): Promise<boolean> {
     const pool = getPgPool();
     const hash = contentHash(row);
+    const { symbol, market } = tickerAdapter.fromT212(row.ticker);
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
       const { rows: existing } = await client.query<{ content_hash: string }>(
         `SELECT content_hash FROM quotes
-         WHERE ticker=$1 AND observation_ts=$2 AND is_superseded=FALSE LIMIT 1`,
-        [row.ticker, row.observation_ts],
+         WHERE symbol=$1 AND market=$2 AND observation_ts=$3 AND is_superseded=FALSE LIMIT 1`,
+        [symbol, market, row.observation_ts],
       );
       if (existing.length && existing[0]!.content_hash === hash) {
         await client.query('ROLLBACK');   // identical re-poll → no-op
@@ -53,17 +58,17 @@ export class QuoteWriter {
       if (existing.length) {
         await client.query(
           `UPDATE quotes SET is_superseded=TRUE
-           WHERE ticker=$1 AND observation_ts=$2 AND is_superseded=FALSE`,
-          [row.ticker, row.observation_ts],
+           WHERE symbol=$1 AND market=$2 AND observation_ts=$3 AND is_superseded=FALSE`,
+          [symbol, market, row.observation_ts],
         );
       }
       await client.query(
         `INSERT INTO quotes
-           (ticker, observation_ts, knowledge_ts, bid, ask, mid, spread, spread_bps,
+           (symbol, market, observation_ts, knowledge_ts, bid, ask, mid, spread, spread_bps,
             bid_size, ask_size, market_state, source, is_synthetic, is_superseded, content_hash)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,FALSE,$14)`,
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,FALSE,$15)`,
         [
-          row.ticker, row.observation_ts, row.knowledge_ts, row.bid, row.ask, row.mid,
+          symbol, market, row.observation_ts, row.knowledge_ts, row.bid, row.ask, row.mid,
           row.spread, row.spread_bps, row.bid_size, row.ask_size, row.market_state,
           row.source, row.is_synthetic, hash,
         ],

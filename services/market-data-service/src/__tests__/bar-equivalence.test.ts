@@ -168,7 +168,7 @@ describe.skipIf(!dockerAvailable)('bar-equivalence (Mongo vs Timescale)', () => 
 
   it('first-print: both backends return the same bar', async () => {
     const mongoDb = await getMongoDb('trader');
-    const b = bar('A', OBS_A_1, 100);
+    const b = bar('A_US_EQ', OBS_A_1, 100);
     const now = Date.now();
 
     await writeBarRevisions(mongoDb, [b], '5m', now);
@@ -176,8 +176,8 @@ describe.skipIf(!dockerAvailable)('bar-equivalence (Mongo vs Timescale)', () => 
 
     const redisMongo = makeRedis();
     const redisPg = makeRedis();
-    const mongoBars = await getBars(redisMongo as never, mongoDb, 'A', '5m', '180d');
-    const pgBars    = await getBarsFromPg(redisPg as never, 'A', '5m', '180d');
+    const mongoBars = await getBars(redisMongo as never, mongoDb, 'A_US_EQ', '5m', '180d');
+    const pgBars    = await getBarsFromPg(redisPg as never, 'A_US_EQ', '5m', '180d');
 
     expect(mongoBars).toHaveLength(1);
     expect(pgBars).toHaveLength(1);
@@ -187,15 +187,15 @@ describe.skipIf(!dockerAvailable)('bar-equivalence (Mongo vs Timescale)', () => 
   it('multi-bar batch: arrays equal across backends', async () => {
     const mongoDb = await getMongoDb('trader');
     const bars: OHLCVBar[] = [
-      bar('A', OBS_A_1, 100),
-      bar('A', OBS_A_2, 200),
-      bar('B', OBS_B_1, 50),
-      bar('B', OBS_B_2, 60),
+      bar('A_US_EQ', OBS_A_1, 100),
+      bar('A_US_EQ', OBS_A_2, 200),
+      bar('B_US_EQ', OBS_B_1, 50),
+      bar('B_US_EQ', OBS_B_2, 60),
     ];
     await writeBarRevisions(mongoDb, bars, '5m');
     await writeBarRevisionsPg(bars, '5m');
 
-    for (const ticker of ['A', 'B'] as const) {
+    for (const ticker of ['A_US_EQ', 'B_US_EQ'] as const) {
       const mongoBars = await getBars(makeRedis() as never, mongoDb, ticker, '5m', '180d');
       const pgBars    = await getBarsFromPg(makeRedis() as never, ticker, '5m', '180d');
       // Both non-empty AND equal — guards against the empty-equals-empty false positive.
@@ -206,8 +206,8 @@ describe.skipIf(!dockerAvailable)('bar-equivalence (Mongo vs Timescale)', () => 
 
   it('revision: live read returns the latest revision on both sides', async () => {
     const mongoDb = await getMongoDb('trader');
-    const original = bar('A', OBS_A_1, 100);
-    const revised  = bar('A', OBS_A_1, 101);
+    const original = bar('A_US_EQ', OBS_A_1, 100);
+    const revised  = bar('A_US_EQ', OBS_A_1, 101);
     const t0 = Date.now();
     const t1 = t0 + 1_000;
 
@@ -217,8 +217,8 @@ describe.skipIf(!dockerAvailable)('bar-equivalence (Mongo vs Timescale)', () => 
     await writeBarRevisions(mongoDb, [revised],   '5m', t1);
     await writeBarRevisionsPg([revised],          '5m', t1);
 
-    const mongoBars = await getBars(makeRedis() as never, mongoDb, 'A', '5m', '180d');
-    const pgBars    = await getBarsFromPg(makeRedis() as never, 'A', '5m', '180d');
+    const mongoBars = await getBars(makeRedis() as never, mongoDb, 'A_US_EQ', '5m', '180d');
+    const pgBars    = await getBarsFromPg(makeRedis() as never, 'A_US_EQ', '5m', '180d');
 
     expect(mongoBars).toHaveLength(1);
     expect(pgBars).toHaveLength(1);
@@ -227,9 +227,9 @@ describe.skipIf(!dockerAvailable)('bar-equivalence (Mongo vs Timescale)', () => 
     expect(normalise(mongoBars[0]!)).toEqual(normalise(pgBars[0]!));
 
     // Sanity — the prior revision is still in both stores, just superseded.
-    const mongoCount = await mongoDb.collection('ohlcv_bars').countDocuments({ ticker: 'A' });
+    const mongoCount = await mongoDb.collection('ohlcv_bars').countDocuments({ symbol: 'A', market: 'US' });
     const { rows } = await getPgPool().query<{ n: number }>(
-      "SELECT count(*)::int AS n FROM bars WHERE ticker = 'A'",
+      "SELECT count(*)::int AS n FROM bars WHERE symbol = 'A' AND market = 'US'",
     );
     expect(mongoCount).toBe(2);
     expect(rows[0]?.n).toBe(2);
@@ -237,8 +237,8 @@ describe.skipIf(!dockerAvailable)('bar-equivalence (Mongo vs Timescale)', () => 
 
   it('as-of read: same revision picked on both sides given the same asOf', async () => {
     const mongoDb = await getMongoDb('trader');
-    const original = bar('A', OBS_A_1, 100);
-    const revised  = bar('A', OBS_A_1, 101);
+    const original = bar('A_US_EQ', OBS_A_1, 100);
+    const revised  = bar('A_US_EQ', OBS_A_1, 101);
     const t0 = Date.now();
     const t1 = t0 + 1_000;
 
@@ -249,8 +249,8 @@ describe.skipIf(!dockerAvailable)('bar-equivalence (Mongo vs Timescale)', () => 
 
     // asOf in the middle of the two writes: both backends should pick the t0 revision.
     const asOfMid = t0 + 500;
-    const mongoMidBars = await getBars(makeRedis() as never, mongoDb, 'A', '5m', '180d', { asOf: asOfMid });
-    const pgMidBars    = await getBarsFromPg(makeRedis() as never, 'A', '5m', '180d', { asOf: asOfMid });
+    const mongoMidBars = await getBars(makeRedis() as never, mongoDb, 'A_US_EQ', '5m', '180d', { asOf: asOfMid });
+    const pgMidBars    = await getBarsFromPg(makeRedis() as never, 'A_US_EQ', '5m', '180d', { asOf: asOfMid });
     expect(mongoMidBars).toHaveLength(1);
     expect(pgMidBars).toHaveLength(1);
     expect(mongoMidBars[0]?.close).toBe(100);
@@ -259,8 +259,8 @@ describe.skipIf(!dockerAvailable)('bar-equivalence (Mongo vs Timescale)', () => 
 
     // asOf after t1: both should pick the revised.
     const asOfAfter = t1 + 500;
-    const mongoAfterBars = await getBars(makeRedis() as never, mongoDb, 'A', '5m', '180d', { asOf: asOfAfter });
-    const pgAfterBars    = await getBarsFromPg(makeRedis() as never, 'A', '5m', '180d', { asOf: asOfAfter });
+    const mongoAfterBars = await getBars(makeRedis() as never, mongoDb, 'A_US_EQ', '5m', '180d', { asOf: asOfAfter });
+    const pgAfterBars    = await getBarsFromPg(makeRedis() as never, 'A_US_EQ', '5m', '180d', { asOf: asOfAfter });
     expect(mongoAfterBars[0]?.close).toBe(101);
     expect(pgAfterBars[0]?.close).toBe(101);
   }, TEST_TIMEOUT_MS);
@@ -275,13 +275,13 @@ describe.skipIf(!dockerAvailable)('bar-equivalence (Mongo vs Timescale)', () => 
     const fiveMinMs  = 5 * 60 * 1000;
     const bars: OHLCVBar[] = [];
     for (let i = 0; i < 4; i++) {
-      bars.push(bar('A', dayStartMs + i * fiveMinMs, 100 + i));
+      bars.push(bar('A_US_EQ', dayStartMs + i * fiveMinMs, 100 + i));
     }
     await writeBarRevisions(mongoDb, bars, '5m');
     await writeBarRevisionsPg(bars, '5m');
 
-    const mongoBars = await getBars(makeRedis() as never, mongoDb, 'A', '5m', '180d');
-    const pgBars    = await getBarsFromPg(makeRedis() as never, 'A', '5m', '180d');
+    const mongoBars = await getBars(makeRedis() as never, mongoDb, 'A_US_EQ', '5m', '180d');
+    const pgBars    = await getBarsFromPg(makeRedis() as never, 'A_US_EQ', '5m', '180d');
     const mongoDaily = aggregateBars(mongoBars, 'daily');
     const pgDaily    = aggregateBars(pgBars, 'daily');
 

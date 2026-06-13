@@ -21,10 +21,15 @@ import type { RedisClientType } from 'redis';
 import { COLLECTIONS } from '@trader/shared-mongo';
 import { invalidateBars, computeMissingRanges } from '@trader/shared-bars';
 import type { MissingRange } from '@trader/shared-bars';
+import { Trading212TickerAdapter } from '@trader/ticker-identity';
 import type { BarInterval } from '@trader/shared-types';
 import type { MarketDataProvider } from './providers/market-data-provider.ts';
 import { writeBarRevisions } from './persist-bars.ts';
 import { log } from '../../../logger.ts';
+
+// ohlcv_bars is keyed on the bare identity (symbol, market); the coverage/heal reads here split the
+// T212 ticker at the storage boundary via the platform's single suffix parser.
+const tickerAdapter = new Trading212TickerAdapter();
 
 const FIVE_MIN_MS = 5 * 60_000;
 // Bridge a weeknight overnight close (~17.5h, e.g. Mon 16:00 → Tue 09:30) between two covered
@@ -117,10 +122,11 @@ export async function planGapWindows(
   const neededStart = Math.floor(startMs / stepMs) * stepMs;
   const neededEnd   = Math.floor(endMs   / stepMs) * stepMs;
 
+  const { symbol, market } = tickerAdapter.fromT212(ticker);
   const docs = await db
     .collection(COLLECTIONS.OHLCV_BARS)
     .find(
-      { ticker, interval, is_superseded: false, observation_ts: { $gte: neededStart, $lte: endMs } },
+      { symbol, market, interval, is_superseded: false, observation_ts: { $gte: neededStart, $lte: endMs } },
       { projection: { _id: 0, observation_ts: 1 } },
     )
     .toArray();
@@ -250,15 +256,27 @@ export async function tickersMissingHistory(
 ): Promise<string[]> {
   if (tickers.length === 0) return [];
   const collection = db.collection(COLLECTIONS.OHLCV_BARS);
-  // Count only the latest unsuperseded revision per (ticker, observation_ts). A ticker
+  // Split each T212 ticker to its (symbol, market) identity (storage key); re-key the grouped
+  // result back to the caller's ticker so the returned "missing" list stays in T212 form.
+  const ids = tickers.map((t) => ({ ticker: t, ...tickerAdapter.fromT212(t) }));
+  const tickerByIdentity = new Map(ids.map((i) => [`${i.symbol}|${i.market}`, i.ticker]));
+  // Count only the latest unsuperseded revision per (symbol, market, observation_ts). A name
   // with N first-prints and M revisions has N unsuperseded rows, not N+M — without
   // is_superseded:false the count would inflate after every revision and a brand-new
   // ticker that revised every bar would falsely appear "well-covered".
   const counts = await collection.aggregate([
-    { $match: { ticker: { $in: tickers }, interval: '5m', is_superseded: false } },
-    { $group: { _id: '$ticker', count: { $sum: 1 } } },
+    { $match: { $or: ids.map((i) => ({ symbol: i.symbol, market: i.market })), interval: '5m', is_superseded: false } },
+    { $group: { _id: { symbol: '$symbol', market: '$market' }, count: { $sum: 1 } } },
   ]).toArray();
-  const sufficient = new Set(counts.filter((d: Record<string, unknown>) => (d.count as number) >= minBars).map((d: Record<string, unknown>) => d._id as string));
+  const sufficient = new Set(
+    counts
+      .filter((d: Record<string, unknown>) => (d.count as number) >= minBars)
+      .map((d: Record<string, unknown>) => {
+        const id = d._id as { symbol: string; market: string };
+        return tickerByIdentity.get(`${id.symbol}|${id.market}`);
+      })
+      .filter((t): t is string => t !== undefined),
+  );
   return tickers.filter((t) => !sufficient.has(t));
 }
 
@@ -302,21 +320,26 @@ export async function healMissingHistory(
     return now - latestMs > stale;
   };
 
-  // Single aggregation: latest unsuperseded observation_ts per ticker for the 5m series.
-  // Tickers not present in the result have no history at all (handled by bootstrap, not
-  // heal — heal trusts that bootstrap ran). is_superseded:false keeps the gap check
-  // honest: a revision of a stale bar shouldn't appear as fresh coverage.
+  // Single aggregation: latest unsuperseded observation_ts per (symbol, market) for the 5m series.
+  // Names not present in the result have no history at all (handled by bootstrap, not heal — heal
+  // trusts that bootstrap ran). is_superseded:false keeps the gap check honest: a revision of a
+  // stale bar shouldn't appear as fresh coverage. Split the T212 tickers to identities and re-key
+  // the grouped result back to T212 (backfillTickers below takes T212 tickers).
+  const ids = tickers.map((t) => ({ ticker: t, ...tickerAdapter.fromT212(t) }));
+  const tickerByIdentity = new Map(ids.map((i) => [`${i.symbol}|${i.market}`, i.ticker]));
   const agg = await collection.aggregate([
-    { $match: { ticker: { $in: tickers }, interval: '5m', is_superseded: false } },
-    { $group: { _id: '$ticker', latest: { $max: '$observation_ts' } } },
-  ]).toArray() as Array<{ _id: string; latest: number | Date }>;
+    { $match: { $or: ids.map((i) => ({ symbol: i.symbol, market: i.market })), interval: '5m', is_superseded: false } },
+    { $group: { _id: { symbol: '$symbol', market: '$market' }, latest: { $max: '$observation_ts' } } },
+  ]).toArray() as Array<{ _id: { symbol: string; market: string }; latest: number | Date }>;
 
   const gapped: Array<{ ticker: string; latestMs: number }> = [];
   for (const row of agg) {
+    const ticker = tickerByIdentity.get(`${row._id.symbol}|${row._id.market}`);
+    if (ticker === undefined) continue;
     // observation_ts is a number; legacy rows pre-migration carried Date. Tolerate both
     // until the migration has run on every existing deployment.
     const latestMs = row.latest instanceof Date ? row.latest.getTime() : Number(row.latest);
-    if (isGapped(latestMs)) gapped.push({ ticker: row._id, latestMs });
+    if (isGapped(latestMs)) gapped.push({ ticker, latestMs });
   }
   if (gapped.length === 0) return { healed: 0, barsAdded: 0, unrecoverable: 0 };
 

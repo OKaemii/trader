@@ -29,6 +29,7 @@ import type { OHLCVBar, BarInterval } from '@trader/shared-types';
 import { COLLECTIONS } from '@trader/shared-mongo';
 import { getPgPool } from '@trader/shared-pg';
 import { getBarsFromPg, getBarAtOrBeforePg, getDailyDepthPg, pgCacheKey, pgAtCacheKey } from './pg-bar-reader.ts';
+import { identityOf, tickerOf, identityKey } from './identity.ts';
 
 export { hashBarContent } from './content-hash.ts';
 export { getBarsFromPg, getBarAtOrBeforePg, getDailyDepthPg, getLastClosePg, pgCacheKey, pgAtCacheKey } from './pg-bar-reader.ts';
@@ -165,12 +166,16 @@ function asOfBucket(asOf: number | undefined): string {
   return String(Math.floor(asOf / 60_000));
 }
 
+// Cache keys carry the bare identity (`${symbol}:${market}`) — not the T212 ticker — so two markets
+// listing the same symbol never share an entry. The ticker is split via the adapter at the boundary.
 function cacheKey(ticker: string, interval: BarInterval, range: RangeKey, asOf?: number): string {
-  return `bars:v2:${ticker}:${interval}:${range}:${asOfBucket(asOf)}`;
+  const id = identityOf(ticker);
+  return `bars:v2:${identityKey(id.symbol, id.market)}:${interval}:${range}:${asOfBucket(asOf)}`;
 }
 
 function atCacheKey(ticker: string, interval: BarInterval, asOf?: number): string {
-  return `bars:v2:${ticker}:${interval}:at:${asOfBucket(asOf)}`;
+  const id = identityOf(ticker);
+  return `bars:v2:${identityKey(id.symbol, id.market)}:${interval}:at:${asOfBucket(asOf)}`;
 }
 
 // at-or-before window bounds (ms). The single-bar read is bounded BELOW at the anchor (`asOf`, or
@@ -184,7 +189,8 @@ const AT_PRIMARY_WINDOW_MS = 400 * AT_DAY_MS;
 const AT_WIDE_WINDOW_MS = 5 * 365 * AT_DAY_MS;
 
 function metaKey(ticker: string, interval: BarInterval): string {
-  return `bars:v2:meta:${ticker}:${interval}`;
+  const id = identityOf(ticker);
+  return `bars:v2:meta:${identityKey(id.symbol, id.market)}:${interval}`;
 }
 
 export interface GetBarsOpts {
@@ -261,23 +267,25 @@ async function getBarsFromMongo(
 
   const sinceTs = Date.now() - RANGE_DAYS[range] * 24 * 60 * 60 * 1000;
   const coll = db.collection(COLLECTIONS.OHLCV_BARS);
+  const { symbol, market } = identityOf(ticker);
 
   let bars: OHLCVBar[];
   if (asOf === undefined) {
     // Live path — partial-index fast lane. is_superseded:false picks exactly one row
-    // per (ticker, observation_ts, interval). observation_ts:{$gte} bounds the range.
+    // per (symbol, market, observation_ts, interval). observation_ts:{$gte} bounds the range.
     const docs = await coll
-      .find({ ticker, interval, is_superseded: false, observation_ts: { $gte: sinceTs } })
+      .find({ symbol, market, interval, is_superseded: false, observation_ts: { $gte: sinceTs } })
       .sort({ observation_ts: 1 })
       .toArray();
     bars = docs.map(docToBar);
   } else {
     // As-of path — one bar per observation_ts, picking the latest revision known at asOf.
-    // The compound (ticker, observation_ts, interval, knowledge_ts) index covers the
+    // The compound (symbol, market, observation_ts, interval, knowledge_ts) index covers the
     // match; $sort+$group selects per-observation-ts.
     const docs = await coll.aggregate([
       { $match: {
-          ticker,
+          symbol,
+          market,
           interval,
           observation_ts: { $gte: sinceTs },
           knowledge_ts:   { $lte: asOf },
@@ -353,6 +361,7 @@ async function getBarAtOrBeforeFromMongo(
   const coll = db.collection(COLLECTIONS.OHLCV_BARS);
   const isLive = asOf === undefined;
   const anchor = isLive ? Date.now() : asOf;
+  const { symbol, market } = identityOf(ticker);
 
   // One bounded read in `(anchor - windowMs, anchor]`. Live filters the unsuperseded fast lane;
   // as-of additionally filters `knowledge_ts <= anchor`. `sort(observation_ts DESC, knowledge_ts
@@ -361,7 +370,8 @@ async function getBarAtOrBeforeFromMongo(
   const queryWindow = async (windowMs: number): Promise<OHLCVBar | null> => {
     const lowerBound = anchor - windowMs;
     const filter: Record<string, unknown> = {
-      ticker,
+      symbol,
+      market,
       interval,
       observation_ts: { $lte: anchor, $gt: lowerBound },
     };
@@ -420,8 +430,9 @@ export async function getDailyDepth(
     throw new Error('[shared-bars] getDailyDepth: db parameter required when BARS_BACKEND=mongo (the default)');
   }
   const coll = db.collection(COLLECTIONS.OHLCV_BARS);
+  const { symbol, market } = identityOf(ticker);
   const agg = await coll.aggregate([
-    { $match: { ticker, interval, is_superseded: false } },
+    { $match: { symbol, market, interval, is_superseded: false } },
     { $group: { _id: null, oldest: { $min: '$observation_ts' }, count: { $sum: 1 } } },
   ]).toArray();
   const row = agg[0] as { oldest?: unknown; count?: number } | undefined;
@@ -475,11 +486,12 @@ export async function getMidQuote(
   const freshness = opts.freshnessMs ?? 15 * 60_000;
   const asOf = opts.asOf ?? Date.now();
   const pool = getPgPool();
+  const { symbol, market } = identityOf(ticker);
   const { rows } = await pool.query<{ mid: number; source: string; spread_bps: number | null; observation_ts: string }>(
     `SELECT mid, source, spread_bps, observation_ts FROM quotes
-     WHERE ticker = $1 AND is_superseded = FALSE AND observation_ts <= $2
+     WHERE symbol = $1 AND market = $2 AND is_superseded = FALSE AND observation_ts <= $3
      ORDER BY observation_ts DESC LIMIT 1`,
-    [ticker, asOf],
+    [symbol, market, asOf],
   );
   if (rows.length === 0) return null;
   const r = rows[0]!;
@@ -564,9 +576,16 @@ function docToBar(doc: Record<string, unknown>): OHLCVBar {
     observationMs = legacy instanceof Date ? legacy.getTime() : typeof legacy === 'number' ? legacy : 0;
   }
   const knowledgeMs = typeof doc.knowledge_ts === 'number' ? doc.knowledge_ts : undefined;
+  // New Mongo docs carry (symbol, market); re-derive the T212 ticker so OHLCVBar.ticker is
+  // byte-identical for downstream consumers. `tickerOf` (adapter.toT212) throws on an unrecognised
+  // market, so only call it for a recognised market value — a corrupt/partial doc (market '' or
+  // unexpected) falls through to the legacy `ticker` field rather than crashing the whole read.
+  const ticker = typeof doc.symbol === 'string' && (doc.market === 'US' || doc.market === 'LSE')
+    ? tickerOf(doc.symbol, doc.market)
+    : String(doc.ticker ?? '');
 
   const bar: OHLCVBar = {
-    ticker:         String(doc.ticker ?? ''),
+    ticker,
     observation_ts: observationMs,
     // Carry the legacy alias for any consumer that hasn't migrated yet. Removed when
     // the deprecation window closes.

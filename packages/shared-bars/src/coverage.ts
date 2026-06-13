@@ -19,6 +19,7 @@ import type { BarInterval } from '@trader/shared-types';
 import { COLLECTIONS } from '@trader/shared-mongo';
 import type { RangeKey } from './index.ts';
 import { RANGE_DAYS } from './index.ts';
+import { identityOf } from './identity.ts';
 
 /**
  * A grid-inclusive uncovered span. Both bounds are aligned `observation_ts` values (ms)
@@ -138,11 +139,12 @@ export async function coverageOf(
 ): Promise<{ observed: number[]; neededStart: number; neededEnd: number }> {
   const neededStart = now - RANGE_DAYS[range] * 24 * 60 * 60 * 1000;
   const neededEnd = now;
+  const { symbol, market } = identityOf(ticker);
 
   const docs = await db
     .collection(COLLECTIONS.OHLCV_BARS)
     .find(
-      { ticker, interval, is_superseded: false, observation_ts: { $gte: neededStart } },
+      { symbol, market, interval, is_superseded: false, observation_ts: { $gte: neededStart } },
       { projection: { _id: 0, observation_ts: 1 } },
     )
     .sort({ observation_ts: 1 })
