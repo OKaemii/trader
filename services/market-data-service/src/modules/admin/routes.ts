@@ -10,9 +10,13 @@ import { getMongoDb, COLLECTIONS } from '@trader/shared-mongo';
 import { getRedisClient, xAdd } from '@trader/shared-redis';
 import { getLiveConfig, invalidateLiveConfig, _envDefaultsForTest } from '../../shared/live-config.ts';
 import { getRuntimeEnv } from '../../runtime-env.ts';
-import { type UniverseManager, type OverridesDoc, identitiesToTickers } from '../universe/application/UniverseManager.ts';
+import {
+  type UniverseManager, type OverridesDoc, type OverrideEntry, type BareForcedAdd,
+  identitiesToTickers, indexT212ByMarket, resolveForcedAdd, resolveForcedRemove,
+} from '../universe/application/UniverseManager.ts';
 import { MongoInstrumentMeta } from '../universe/infrastructure/MongoInstrumentMeta.ts';
-import { tryIdentityOf, tickerOf, tickersToIdentities } from '../../shared/identity.ts';
+import { fetchT212Instruments } from '../universe/infrastructure/t212-client.ts';
+import { tryIdentityOf, tickerOf } from '../../shared/identity.ts';
 import type { MarketDataProvider } from '../bars/infrastructure/providers/market-data-provider.ts';
 import { aggregateBars, getBars, getBarAtOrBefore, getDailyDepth, invalidateBars, type RangeKey } from '@trader/shared-bars';
 import { Trading212TickerAdapter } from '@trader/ticker-identity';
@@ -179,24 +183,43 @@ export function createAdminRouter(
     zValidator('json', MarketDataContracts.UniverseOverridesRequestSchema),
     async (c) => {
       const body = c.req.valid('json');
-      // Preserve case so T212 suffixes (e.g. `l_EQ` for London) survive. Earlier code upper-cased
-      // every entry, which silently broke any non-_US_EQ ticker passing through portal overrides.
-      const norm = (arr: string[] | undefined): string[] =>
-        (arr ?? []).map((t) => t.trim()).filter(Boolean);
-      const adds = norm(body.adds);
-      const removes = norm(body.removes);
-      // Storage shape since Task 16b: split each T212 string to its bare { symbol, market } at the
-      // Mongo boundary (drop an un-routable one, fail-soft). The wire/response stays T212 strings
-      // until the bare-forced-add UX lands (Task 18/21). The reconstructed T212 strings are echoed
-      // back so the response matches what was persisted-then-re-derived.
-      const addEntries = tickersToIdentities(adds);
-      const removeEntries = tickersToIdentities(removes);
+      // Forced-adds accept the BARE form since Task 18 — a bare symbol (`'GOOGL'`), a
+      // `{ symbol, market? }` object (market defaults to US), or a legacy T212 string for back-compat.
+      // A bare add is resolved against the live T212 catalog with the US-preferred cross-listing rule
+      // (reusing the universe-build resolution), so the stored identity is the tradable listing — an
+      // unresolvable symbol is dropped (never persisted as a phantom). Removes don't gate on the
+      // catalog (a delisted name can still be removed). Both persist as { symbol, market } (Task 16b).
+      let catalogLoaded = true;
+      let index = indexT212ByMarket([]);
+      try {
+        index = indexT212ByMarket(await fetchT212Instruments());
+      } catch (err) {
+        // Catalog fetch failed (T212 throttle/hang) — fall back to a bare-resolve that can't verify
+        // tradability (an explicit/defaulted market identity is still derivable for a forced add).
+        catalogLoaded = false;
+        logger.warn({ err }, '[universe] forced-add resolution: T212 catalog unavailable, resolving without tradability check');
+      }
+      // With the catalog loaded, gate each add on a real listing (resolveForcedAdd); without it, still
+      // honour the operator's forced add by deriving the identity (resolveForcedRemove = no catalog gate).
+      const resolveAdd = (raw: BareForcedAdd): OverrideEntry | null =>
+        catalogLoaded ? resolveForcedAdd(raw, index) : resolveForcedRemove(raw);
+      const dedup = (entries: OverrideEntry[]): OverrideEntry[] => {
+        const seen = new Set<string>();
+        return entries.filter((e) => { const k = `${e.symbol}|${e.market}`; if (seen.has(k)) return false; seen.add(k); return true; });
+      };
+      const addEntries = dedup(
+        (body.adds ?? []).map(resolveAdd).filter((e): e is OverrideEntry => e !== null),
+      );
+      const removeEntries = dedup(
+        (body.removes ?? []).map(resolveForcedRemove).filter((e): e is OverrideEntry => e !== null),
+      );
       const db = await getMongoDb();
       await db.collection(COLLECTIONS.PORTAL_UNIVERSE_OVERRIDES).updateOne(
         { _id: 'singleton' as any },
         { $set: { adds: addEntries, removes: removeEntries, updatedBy: body.userId ?? 'unknown', updatedAt: new Date() } },
         { upsert: true },
       );
+      // Echo back T212 strings (the byte-unchanged portal contract until Task 21 flips it to bare).
       return c.json({
         ok: true,
         adds: identitiesToTickers(addEntries),

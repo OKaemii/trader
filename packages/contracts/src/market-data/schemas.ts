@@ -6,9 +6,20 @@ export type BarInterval = z.infer<typeof BarIntervalSchema>;
 export const RangeKeySchema = z.enum(["30d", "60d", "90d", "180d", "1y", "2y", "5y", "max"]);
 export type RangeKey = z.infer<typeof RangeKeySchema>;
 
+// A forced add/remove entry: a bare exchange symbol (`"GOOGL"`), a `{ symbol, market? }` object
+// (market defaults to US, resolved against the T212 catalog with the US-preferred cross-listing rule),
+// or — for backward compatibility with the pre-bare portal — a legacy T212 ticker (`"GOOGL_US_EQ"`).
+// The backend (Task 18) resolves any of these to the stored `{ symbol, market }`; the portal switches
+// to the bare object form in Task 21.
+export const ForcedUniverseEntrySchema = z.union([
+    z.string(),
+    z.object({ symbol: z.string(), market: z.string().optional() }),
+]);
+export type ForcedUniverseEntry = z.infer<typeof ForcedUniverseEntrySchema>;
+
 export const UniverseOverridesRequestSchema = z.object({
-    adds: z.array(z.string()).optional(),
-    removes: z.array(z.string()).optional(),
+    adds: z.array(ForcedUniverseEntrySchema).optional(),
+    removes: z.array(ForcedUniverseEntrySchema).optional(),
     userId: z.string().optional(),
 });
 export type UniverseOverridesRequest = z.infer<typeof UniverseOverridesRequestSchema>;
