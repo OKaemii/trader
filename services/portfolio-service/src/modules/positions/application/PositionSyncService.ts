@@ -6,6 +6,7 @@ import { COLLECTIONS } from "@trader/shared-mongo";
 import { BASE_CURRENCY, type Currency } from "@trader/shared-types";
 import { sumPositionsGBP, type PositionDoc } from "@trader/shared-portfolio";
 import { buildPositionUpdate } from "./sync.ts";
+import { tryIdentityOf } from "../../../shared/identity.ts";
 
 export interface PositionSyncDeps {
     db: Db;
@@ -76,13 +77,27 @@ export class PositionSyncService {
                 navBasisSource: cashGBP && cashGBP > 0 ? "cashGBP" : "positionsGBP",
             }, "position-sync: NAV computed");
 
+            // Held identities — the (symbol, market) pairs T212 currently reports. Positions are
+            // stored keyed on this bare identity since Task 16a; the T212 ticker is split at this
+            // sync boundary (trading-service still hands us the concatenated form until Task 17).
+            // Fail-soft: an instrument whose ticker doesn't parse as a US/LSE equity is skipped for
+            // both the upsert and the held-set, never aborting the whole sync.
+            const held: Array<{ symbol: string; market: string }> = [];
+            let upserted = 0;
             for (const { p, q, ccy, priceNative, valueNative } of sized) {
+                const id = p.ticker ? tryIdentityOf(p.ticker) : null;
+                if (!id) {
+                    this.deps.logger.warn({ cycle, ticker: p.ticker }, "position-sync: un-routable ticker — skipping");
+                    continue;
+                }
+                held.push({ symbol: id.symbol, market: id.market });
                 const valueGBP = navBasisGBP > 0 && valueNative > 0
                     ? await this.deps.fx.toGBP({ amount: valueNative, currency: ccy })
                     : 0;
                 const weight = navBasisGBP > 0 ? valueGBP / navBasisGBP : 0;
                 const update = buildPositionUpdate({
-                    ticker:      p.ticker,
+                    symbol:      id.symbol,
+                    market:      id.market,
                     quantity:    q,
                     currency:    ccy,
                     priceNative,
@@ -91,24 +106,26 @@ export class PositionSyncService {
                     avgPriceNative: p.averagePrice?.amount,
                 });
                 await this.deps.db.collection(COLLECTIONS.POSITIONS).updateOne(
-                    { ticker: p.ticker },
+                    { symbol: id.symbol, market: id.market },
                     update,
                     { upsert: true },
                 );
+                upserted++;
             }
 
-            // Drop positions that T212 no longer reports (sold to zero) so currentWeights
-            // doesn't keep returning stale exposure that blocks new BUYs on the same ticker.
-            const heldTickers = posRes.positions
-                .map((p) => p.ticker)
-                .filter((t): t is string => typeof t === "string");
-            const deleteRes = await this.deps.db.collection(COLLECTIONS.POSITIONS).deleteMany({ ticker: { $nin: heldTickers } });
+            // Drop positions that T212 no longer reports (sold to zero) so currentWeights doesn't
+            // keep returning stale exposure that blocks new BUYs on the same name. Keep only the
+            // held (symbol, market) identities: $nor of the per-identity equality matches deletes
+            // everything not in the held set (an empty held set deletes all, as the old $nin:[] did).
+            const keepMatches = held.map((h) => ({ symbol: h.symbol, market: h.market }));
+            const deleteFilter = keepMatches.length > 0 ? { $nor: keepMatches } : {};
+            const deleteRes = await this.deps.db.collection(COLLECTIONS.POSITIONS).deleteMany(deleteFilter);
             this.deps.logger.info({
                 cycle,
-                upserted: sized.length,
+                upserted,
                 deleted:  deleteRes.deletedCount,
                 durationMs: Date.now() - cycleStart,
-                heldSample: heldTickers.slice(0, 10),
+                heldSample: held.slice(0, 10).map((h) => `${h.symbol}:${h.market}`),
             }, "position-sync: cycle done");
         } catch (err) {
             const cause = (err as { cause?: { code?: string } })?.cause;

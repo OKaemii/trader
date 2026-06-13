@@ -118,14 +118,15 @@ export const COLLECTIONS = {
   // Append-only per-cycle snapshot of the optimiser's held set. After the long-only optimiser
   // produces the final weights each cycle, signal-service writes one doc per ranked name. Powers
   // the Strategy Impact (GET /admin/api/signals/strategy-impact?ticker=) and Factor Evolution
-  // selected/holding context. Doc:
-  //   { strategy_id, observation_ts, ticker,
+  // selected/holding context. Keyed on the bare (symbol, market) identity since Task 16a (the
+  // concatenated T212 ticker is no longer stored). Doc:
+  //   { strategy_id, observation_ts, symbol, market,
   //     rank,              // from sorting composite_scores
   //     selected,         // true = in the held set
   //     weight,           // final long-only weight (0 when not selected)
-  //     holding_age_days } // days since the oldest open BUY for this ticker
-  // Indexes (created by the writer task, NOT here): (strategy_id, observation_ts) and
-  // (strategy_id, ticker, observation_ts) for per-name inclusion history.
+  //     holding_age_days } // days since the oldest open BUY for this name
+  // Indexes (created by the writer, NOT here): (strategy_id, observation_ts) and
+  // (strategy_id, symbol, market, observation_ts) for per-name inclusion history.
   HELD_SET_SNAPSHOTS:        'held_set_snapshots',
   // Per-entity research notebook entry. signal-service's `research` module serves
   // GET/PUT /admin/api/research/notes/:ticker. Body is operator-authored markdown; the `@`-links in

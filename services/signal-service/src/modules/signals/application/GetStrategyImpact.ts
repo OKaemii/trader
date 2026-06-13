@@ -7,16 +7,21 @@ import {
   type StrategyImpactSnapshot,
   type StrategyImpactSignal,
 } from './StrategyImpact.ts';
+import { tryIdentityOf } from '../../../shared/identity.ts';
 
 // Reads the two own-service collections the strategy-impact metrics derive from and feeds the pure
 // buildStrategyImpact aggregation. signal-service owns both held_set_snapshots (T11) and signals,
 // so there's no cross-service /internal hop here — no 403 trap for authenticated QA.
+//
+// Both collections are keyed on the bare (symbol, market) identity since Task 16a; the requested
+// T212 ticker is split before the Mongo touch, and `ticker` is re-derived onto the pure-layer rows
+// so buildStrategyImpact is unchanged (it keys per-name on `ticker`, which here is just the
+// requested name echoed back).
 
 // held_set_snapshots projection — only the fields buildStrategyImpact reads.
 interface SnapshotDoc {
   strategy_id?:      string;
   observation_ts?:   number;
-  ticker?:           string;
   rank?:             number;
   selected?:         boolean;
   holding_age_days?: number;
@@ -25,7 +30,6 @@ interface SnapshotDoc {
 // signals projection — the contribution calc needs action + entry/exit + strategy.
 interface SignalDoc {
   strategy_id?: string;
-  ticker?:      string;
   action?:      string;
   lifecycle?:   number;
   entryPrice?:  number;
@@ -37,15 +41,20 @@ export class GetStrategyImpactUseCase {
 
   async execute(ticker: string): Promise<StrategyImpactRow[]> {
     if (!ticker) return [];
+    // An un-routable ticker has no (symbol, market) — it can hold no snapshots/signals, so the
+    // impact is empty (matching the pre-Thread-A behaviour of a ticker that simply never appears).
+    const id = tryIdentityOf(ticker);
+    if (!id) return [];
+    const { symbol, market } = id;
 
     const snapshotsColl = this.db.collection<SnapshotDoc>(COLLECTIONS.HELD_SET_SNAPSHOTS);
     const signalsColl   = this.db.collection<SignalDoc>(COLLECTIONS.SIGNALS);
 
     const [snapDocs, sigDocs] = await Promise.all([
-      // Every snapshot for the ticker — served by the (strategy_id, ticker, observation_ts)
-      // index from T11. Bounded by cycles×strategies; a hard limit guards a pathological history.
+      // Every snapshot for the name — served by the (strategy_id, symbol, market, observation_ts)
+      // index from Task 16a. Bounded by cycles×strategies; a hard limit guards a pathological history.
       snapshotsColl
-        .find({ ticker }, { projection: { _id: 0 } })
+        .find({ symbol, market }, { projection: { _id: 0 } })
         .sort({ observation_ts: 1 })
         .limit(20_000)
         .toArray(),
@@ -54,8 +63,8 @@ export class GetStrategyImpactUseCase {
       // pure layer.
       signalsColl
         .find(
-          { ticker, lifecycle: { $in: [SignalLifecycle.Executed, SignalLifecycle.Closed] } },
-          { projection: { _id: 0, strategy_id: 1, ticker: 1, action: 1, lifecycle: 1, entryPrice: 1, exitPrice: 1 } },
+          { symbol, market, lifecycle: { $in: [SignalLifecycle.Executed, SignalLifecycle.Closed] } },
+          { projection: { _id: 0, strategy_id: 1, action: 1, lifecycle: 1, entryPrice: 1, exitPrice: 1 } },
         )
         .toArray(),
     ]);
@@ -63,7 +72,7 @@ export class GetStrategyImpactUseCase {
     const snapshots: StrategyImpactSnapshot[] = snapDocs.map((d) => ({
       strategy_id:      d.strategy_id ?? '',
       observation_ts:   d.observation_ts ?? 0,
-      ticker:           d.ticker ?? ticker,
+      ticker,
       rank:             d.rank ?? 0,
       selected:         d.selected ?? false,
       holding_age_days: d.holding_age_days ?? 0,
@@ -71,7 +80,7 @@ export class GetStrategyImpactUseCase {
 
     const signals: StrategyImpactSignal[] = sigDocs.map((d) => ({
       strategy_id: d.strategy_id ?? '',
-      ticker:      d.ticker ?? ticker,
+      ticker,
       action:      d.action ?? '',
       lifecycle:   (d.lifecycle ?? SignalLifecycle.Pending) as SignalLifecycle,
       entryPrice:  d.entryPrice,

@@ -10,7 +10,14 @@ import type { Money } from "@trader/shared-types";
 import type { RedisClientType } from "redis";
 
 import { loadSignalEnv } from "./env.ts";
+import { tickerOf } from "./shared/identity.ts";
 import { wireDependencies } from "./wiring.ts";
+
+// (symbol, market) → the T212 ticker, falling back to the bare symbol if the market is
+// unrecognised (a corrupt row still renders a label rather than dropping out).
+const safeTickerOf = (symbol: string, market: string): string => {
+    try { return tickerOf(symbol, market); } catch { return symbol; }
+};
 import { createRouter } from "./modules/signals/routes/public.ts";
 import { createInternalRouter } from "./modules/signals/routes/internal.ts";
 import { createPieRouter } from "./modules/pie/routes/pie-routes.ts";
@@ -66,15 +73,24 @@ async function main(): Promise<void> {
     const positionsColl = deps.db.collection(COLLECTIONS.POSITIONS);
     const listPositions = async (): Promise<Position[]> => {
         const docs = await positionsColl.find({}).toArray();
+        // Positions are keyed on (symbol, market) since Task 16a; re-derive the T212 ticker so the
+        // downstream trade-plan / enriched-positions / alert path (which keys on `pos.ticker`) is
+        // unchanged. A row missing a routable identity is skipped (same as the old empty-ticker filter).
         return docs
-            .filter((d) => typeof d.ticker === "string" && d.ticker)
-            .map((d): Position => ({
-                ticker:   d.ticker as string,
-                quantity: typeof d.quantity === "number" ? d.quantity : 0,
-                ...(d.currentPrice  ? { currentPrice:  d.currentPrice  as Money } : {}),
-                ...(d.currentValue  ? { currentValue:  d.currentValue  as Money } : {}),
-                ...(d.averagePrice  ? { averagePrice:  d.averagePrice  as Money } : {}),
-            }));
+            .map((d): Position | null => {
+                const ticker = typeof d.symbol === "string" && typeof d.market === "string"
+                    ? safeTickerOf(d.symbol, d.market)
+                    : (typeof d.ticker === "string" ? d.ticker : "");
+                if (!ticker) return null;
+                return {
+                    ticker,
+                    quantity: typeof d.quantity === "number" ? d.quantity : 0,
+                    ...(d.currentPrice  ? { currentPrice:  d.currentPrice  as Money } : {}),
+                    ...(d.currentValue  ? { currentValue:  d.currentValue  as Money } : {}),
+                    ...(d.averagePrice  ? { averagePrice:  d.averagePrice  as Money } : {}),
+                };
+            })
+            .filter((p): p is Position => p !== null);
     };
     app.route("/", createTradePlanRouter({
         tradePlanRepo:  deps.tradePlanRepo,

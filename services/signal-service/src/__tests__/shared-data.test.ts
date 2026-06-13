@@ -30,6 +30,37 @@ function makeSignal(overrides: Partial<ConstructorParameters<typeof TradeSignal>
   });
 }
 
+describe('toSignalDoc / fromSignalDoc — (symbol, market) storage shape (Task 16a)', () => {
+  it('stores the bare symbol + market and NOT the concatenated T212 ticker (US)', () => {
+    const doc = toSignalDoc(makeSignal({ ticker: 'AAPL_US_EQ' }));
+    expect(doc.symbol).toBe('AAPL');
+    expect(doc.market).toBe('US');
+    expect('ticker' in doc).toBe(false);
+  });
+
+  it('stores the bare symbol + market for an LSE name (SHEL -> SHELl_EQ)', () => {
+    const doc = toSignalDoc(makeSignal({ ticker: 'SHELl_EQ' }));
+    expect(doc.symbol).toBe('SHEL');
+    expect(doc.market).toBe('LSE');
+    expect('ticker' in doc).toBe(false);
+  });
+
+  it('re-derives the T212 ticker from (symbol, market) on read (round-trip both markets)', () => {
+    for (const t of ['AAPL_US_EQ', 'SHELl_EQ', 'MSFT_US_EQ', 'VODl_EQ']) {
+      const restored = fromSignalDoc(toSignalDoc(makeSignal({ ticker: t })));
+      expect(restored.ticker).toBe(t);
+    }
+  });
+
+  it('falls back to a legacy bare `ticker` field when a partially-migrated doc lacks symbol/market', () => {
+    // A doc written before the migration still carries a flat `ticker` and no identity columns.
+    const legacy = { _id: 'sig-legacy', ticker: 'TSLA_US_EQ', strategy_id: 'x', action: 'BUY',
+      confidence: 0.5, targetWeight: 0.01, rationale: '{}', lifecycle: SignalLifecycle.Pending, attempts: 0 };
+    const restored = fromSignalDoc(legacy);
+    expect(restored.ticker).toBe('TSLA_US_EQ');
+  });
+});
+
 describe('toSignalDoc / fromSignalDoc', () => {
   it('round-trips features_snapshot through the Mongo serialiser', () => {
     const ctx = makeAnalysisContext('AAPL_US_EQ', 0.42);
