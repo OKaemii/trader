@@ -4,6 +4,17 @@ import { OrderSide, OrderStatus } from '../../orders/domain/Order.ts';
 import type { OrderView, PositionView } from '../application/ReconciliationChecks.ts';
 import type { SystemReader } from '../application/Reconciliation.ts';
 import type { FillsHistoryStore } from './FillsHistoryStore.ts';
+import { tickerOf } from '../../../shared/identity.ts';
+
+// (symbol, market) → the T212 display ticker, falling back to the bare symbol / legacy field if the
+// market is unrecognised. positions + orders store the bare identity since Task 16a; the
+// reconciliation views render a ticker label (the actual T212 match is by orderId, not by ticker).
+function tickerFromDoc(d: Record<string, unknown>): string {
+  if (typeof d.symbol === 'string' && typeof d.market === 'string') {
+    try { return tickerOf(d.symbol, d.market); } catch { /* fall through */ }
+  }
+  return typeof d.ticker === 'string' ? d.ticker : (typeof d.symbol === 'string' ? d.symbol : '');
+}
 
 // Reads system state (Mongo) as the minimal view types the pure checks consume. Fill ids come
 // from the Timescale ledger (FillsHistoryStore). Kept thin: no business logic, just adaptation.
@@ -13,7 +24,7 @@ export class MongoSystemReader implements SystemReader {
   async positions(): Promise<PositionView[]> {
     const docs = await this.db.collection(COLLECTIONS.POSITIONS).find({}).toArray();
     return docs.map((d) => ({
-      ticker: String(d.ticker),
+      ticker: tickerFromDoc(d),
       quantity: typeof d.quantity === 'number' ? d.quantity : 0,
     }));
   }
@@ -25,7 +36,7 @@ export class MongoSystemReader implements SystemReader {
       .toArray();
     return docs.map((d) => ({
       orderId: String(d.t212OrderId),                  // match T212 history order.id
-      ticker: String(d.ticker),
+      ticker: tickerFromDoc(d),
       side: d.side === OrderSide.Buy ? 'BUY' : 'SELL',
       status: 'submitted',                             // already filtered to Submitted
       signalId: d.signalId ? String(d.signalId) : null,
