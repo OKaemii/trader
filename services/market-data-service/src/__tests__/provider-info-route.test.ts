@@ -3,7 +3,7 @@
 // is what the FE depends on:
 //   { name, maxLookbackMs, allowedPollIntervals: [{key,ms,label,tier}, ...] }
 //
-// We use the real YahooProvider so any drift between the interface declaration and
+// We use the real TwelveDataProvider so any drift between the interface declaration and
 // the implementation (forgetting to declare allowedPollIntervals, mismatched key
 // names) shows up immediately.
 
@@ -64,7 +64,7 @@ vi.mock('@trader/shared-redis', () => ({
 const { Hono } = await import('hono');
 const { signAccessToken } = await import('@trader/shared-auth');
 const { createAdminRouter } = await import('../modules/admin/routes.ts');
-const { YahooProvider } = await import('../modules/bars/infrastructure/providers/yahoo-provider.ts');
+const { TwelveDataProvider } = await import('../modules/bars/infrastructure/providers/twelvedata-provider.ts');
 
 function buildApp() {
   const app = new Hono();
@@ -72,7 +72,8 @@ function buildApp() {
   // the provider-info route doesn't touch the universe manager at all.
   const stubUM: any = { activeTickers: [], refresh: async () => [] };
   const noopLog = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {}, trace: () => {}, fatal: () => {}, child: () => noopLog, level: 'info' } as never;
-  app.route('/', createAdminRouter(stubUM, new YahooProvider(), noopLog));
+  const provider = new TwelveDataProvider({ apiKey: '', creditsPerMinute: 8, dailyCreditLimit: 800 });
+  app.route('/', createAdminRouter(stubUM, provider, noopLog));
   return app;
 }
 
@@ -95,11 +96,11 @@ describe('GET /admin/api/market-data/provider-info', () => {
     });
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.name).toBe('yahoo');
+    expect(body.name).toBe('twelvedata');
     expect(body.maxLookbackMs).toBe(60 * 24 * 60 * 60_000);
-    // Yahoo's allow-list: 15m / 1h / 24h. Order matters for the dropdown.
+    // TwelveData's allow-list: 24h only (the free-tier credit budget can't poll faster).
     const keys = body.allowedPollIntervals.map((o: any) => o.key);
-    expect(keys).toEqual(['15m', '1h', '24h']);
+    expect(keys).toEqual(['24h']);
     // Every option should have a tier (used for chip colour on the portal).
     for (const opt of body.allowedPollIntervals) {
       expect(opt).toHaveProperty('ms');
@@ -116,7 +117,7 @@ describe('PUT /admin/api/market-data/config (allowlist enforcement)', () => {
     const res = await app.request('/admin/api/market-data/config', {
       method: 'PUT',
       headers: { Authorization: await gatewayToken(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pollIntervalMs: 60 * 60_000 }),  // 1h, in Yahoo's list
+      body: JSON.stringify({ pollIntervalMs: 24 * 60 * 60_000 }),  // 24h, in TwelveData's list
     });
     expect(res.status).toBe(200);
     // Should have written to the mocked Mongo (real assertion that the route reached

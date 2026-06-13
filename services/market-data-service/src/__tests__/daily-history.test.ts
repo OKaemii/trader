@@ -4,7 +4,8 @@
 // hash-gated) is unchanged and mocked here — the concern is purely which dates get fetched.
 
 process.env.INTERNAL_SECRET = 'test-internal-secret';
-// Default provider is Yahoo; pin it so the dispatch is deterministic regardless of env.
+// The daily-history source is EODHD-only now (the Yahoo path was removed); the dispatch is
+// deterministic regardless of env, but clear the knob so nothing else interferes.
 delete process.env.DAILY_HISTORY_PROVIDER;
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -22,13 +23,13 @@ vi.mock('../modules/bars/infrastructure/persist-bars.ts', () => ({
   ensureBiTemporalIndexes: vi.fn(async () => {}),
 }));
 
-// Record each (startMs, endMs) the Yahoo daily provider is asked for, and synthesise one
-// daily bar per UTC-midnight grid point inside [startMs, endMs). EODHD provider is stubbed to
-// throw so a wrong dispatch is loud.
-const yahooCalls: Array<{ startMs: number; endMs: number }> = [];
-vi.mock('../modules/bars/infrastructure/providers/yahoo-client.ts', () => ({
-  fetchYahooDailyHistory: vi.fn(async (ticker: string, startMs: number, endMs: number) => {
-    yahooCalls.push({ startMs, endMs });
+// Record each (startMs, endMs) the EODHD daily provider (the only daily-history upstream) is asked
+// for, and synthesise one daily bar per UTC-midnight grid point inside [startMs, endMs). The concern
+// is gap-aware fetch PLANNING — which dates get fetched — independent of the provider behind it.
+const eodhdCalls: Array<{ startMs: number; endMs: number }> = [];
+vi.mock('../modules/bars/infrastructure/providers/eodhd-client.ts', () => ({
+  fetchEodhdDailyHistory: vi.fn(async (ticker: string, startMs: number, endMs: number) => {
+    eodhdCalls.push({ startMs, endMs });
     const bars: OHLCVBar[] = [];
     const first = Math.ceil(startMs / DAY_MS) * DAY_MS;
     for (let ts = first; ts < endMs; ts += DAY_MS) {
@@ -36,9 +37,6 @@ vi.mock('../modules/bars/infrastructure/providers/yahoo-client.ts', () => ({
     }
     return bars;
   }),
-}));
-vi.mock('../modules/bars/infrastructure/providers/eodhd-client.ts', () => ({
-  fetchEodhdDailyHistory: vi.fn(async () => { throw new Error('eodhd path should not be hit in this test'); }),
 }));
 
 import { backfillDailyHistory } from '../modules/bars/infrastructure/daily-history.ts';
@@ -66,7 +64,7 @@ function weekdaySeries(flooredStart: number, flooredEnd: number): number[] {
 }
 
 describe('backfillDailyHistory — gap-aware fetch (§I)', () => {
-  beforeEach(() => { yahooCalls.length = 0; });
+  beforeEach(() => { eodhdCalls.length = 0; });
 
   it('FULL weekday coverage → ZERO upstream calls (weekends bridged, not re-fetched)', async () => {
     const years = 1;
@@ -77,14 +75,14 @@ describe('backfillDailyHistory — gap-aware fetch (§I)', () => {
 
     const results = await backfillDailyHistory(dbWithObserved(observed), stubRedis, ['AAPL_US_EQ'], { years });
 
-    expect(yahooCalls).toHaveLength(0);   // ← load-bearing: covered weekday series ⇒ no fetch
+    expect(eodhdCalls).toHaveLength(0);   // ← load-bearing: covered weekday series ⇒ no fetch
     expect(results[0].fetched).toBe(0);
     expect(results[0].upserted).toBe(0);
   });
 
   it('empty store → fetches the whole span', async () => {
     const results = await backfillDailyHistory(dbWithObserved([]), stubRedis, ['AAPL_US_EQ'], { years: 1 });
-    expect(yahooCalls.length).toBeGreaterThanOrEqual(1);
+    expect(eodhdCalls.length).toBeGreaterThanOrEqual(1);
     expect(results[0].fetched).toBeGreaterThan(0);
   });
 
@@ -99,11 +97,11 @@ describe('backfillDailyHistory — gap-aware fetch (§I)', () => {
 
     const results = await backfillDailyHistory(dbWithObserved(observed), stubRedis, ['AAPL_US_EQ'], { years });
 
-    expect(yahooCalls).toHaveLength(1);
+    expect(eodhdCalls).toHaveLength(1);
     // The fetch must start in the recent tail, not back at flooredStart — i.e. near `cutoff`,
     // not at the start of the year-long window. (Allow a few days slack for a weekend boundary.)
-    expect(yahooCalls[0].startMs).toBeGreaterThanOrEqual(cutoff - 4 * DAY_MS);
-    expect(yahooCalls[0].startMs).toBeGreaterThan(flooredStart + 300 * DAY_MS);
+    expect(eodhdCalls[0].startMs).toBeGreaterThanOrEqual(cutoff - 4 * DAY_MS);
+    expect(eodhdCalls[0].startMs).toBeGreaterThan(flooredStart + 300 * DAY_MS);
     expect(results[0].fetched).toBeGreaterThan(0);
   });
 
@@ -116,7 +114,7 @@ describe('backfillDailyHistory — gap-aware fetch (§I)', () => {
 
     const results = await backfillDailyHistory(dbWithObserved(observed), stubRedis, ['AAPL_US_EQ'], { years, forceRefetch: true });
 
-    expect(yahooCalls).toHaveLength(1);            // whole-span single fetch
+    expect(eodhdCalls).toHaveLength(1);            // whole-span single fetch
     expect(results[0].fetched).toBeGreaterThan(0); // bars re-downloaded despite coverage
   });
 });

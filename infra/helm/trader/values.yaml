@@ -69,11 +69,13 @@ global:
     # See agent-docs/plans/three-database-split.md §Cutover.
     barsBackend: timescale              # mongo | timescale
     # Migration-window toggle: when true, market-data-service writes every bar to BOTH Mongo
-    # AND Timescale (best-effort on the PG side — Mongo failures fail the request; PG failures
-    # log to the dual_write_failures collection without affecting the Mongo write). Default
-    # off so production keeps single-writing to Mongo until the operator deliberately enables
-    # the cutover sequence.
-    dualWriteBars: "true"               # "true" enables Timescale dual-write
+    # AND Timescale (best-effort on the PG side). The three-DB cutover to barsBackend=timescale
+    # is COMPLETE and validated live, so the Mongo dual-write is now OFF (runbook step 8 — epic
+    # pit-fundamentals-lake-rearchitecture, Task 24): Timescale is the sole bars store and the
+    # legacy Mongo ohlcv_bars dual-write (the cruft #207 dropped) is no longer written. The
+    # writer reads this flag fresh each call, so it can be flipped back to "true" without a code
+    # change if a Mongo rollback target is ever needed again.
+    dualWriteBars: "false"              # "true" enables Timescale dual-write
     # Default polling cadence for market-data-service live polling. Must be one of the
     # active provider's allowedPollIntervals (Yahoo: 15m / 1h / 24h). The portal renders
     # the dropdown from those values; this default is what new deploys land on before
@@ -102,9 +104,10 @@ global:
     rollingWindowBars: ""
     # Long-range daily history source for the persisted interval:'daily' series that strategy
     # lookbacks read (12-1 momentum etc.). 'eodhd' (paid, bulk-EOD efficient — pairs with
-    # universeSource=eodhd_scan; the bulk daily feed runs only under this + barFrequency=daily);
-    # 'yahoo' (free, multi-year fallback, decoupled from the metered 5m provider).
-    dailyHistoryProvider: eodhd         # eodhd (paid) | yahoo (free fallback)
+    # universeSource=eodhd_scan; the bulk daily feed runs only under this + barFrequency=daily) is the
+    # ONLY value — the Yahoo daily reader was removed (epic pit-fundamentals-lake-rearchitecture); the
+    # zod enum is ["eodhd"] and rejects anything else (do NOT set 'yahoo' — the pod would crash-loop).
+    dailyHistoryProvider: eodhd         # eodhd (only)
     # One-shot seed depth for the persisted daily series on bootstrap. Set DEEP (provider-permitting,
     # to inception for index names) so the research warehouse isn't truncated at 5y — QA Suite 5
     # wants SPY daily back to inception (1993-01-29 ≈ 33y); 35 covers its full lifecycle with headroom.
@@ -155,38 +158,17 @@ global:
     # in templates/fundamentals-lake-pv.yaml — 20Gi for the ~1.3GB zip + 2-4GB parquet + headroom — not a
     # values knob, since the hostPath PV capacity is a single-node storage decision, not a per-deploy tune.)
     sweepMinutes: "30"
-    # Ingestion CronJob schedule (nightly incremental) — UTC cron. 02:30 UTC lands well after the US
-    # close + the warehouse-snapshot (23:30 UTC), so a day's filings have been accepted and the snapshot
-    # isn't contended. The one-shot backfill Job is hook-gated separately (see the subchart).
-    fundamentalsIngestCron: "30 2 * * *"
-    # Self-heal CronJob schedule (`python -m src.ingest --heal`) — UTC cron. A SECOND, more frequent pass
-    # alongside the nightly full walk: it ingests ONLY the missing/stale curated-US subset (via the
-    # freshness audit), so a newly-curated or stale name converges intra-day rather than waiting for the
-    # next nightly tick. Idempotent + Forbid, so an overlap with the nightly job is harmless.
-    fundamentalsHealCron: "0 */6 * * *"
-    # Self-heal staleness window (days). A covered name whose freshest fiscal period_end is older than
-    # this is treated as stale and re-ingested by the heal run. Default 135 ≈ a reporting quarter (~90d)
-    # plus a ~45d filing-grace buffer; a non-positive value is ignored (the window can never be silently
-    # disabled — that would make every name look fresh and heal nothing).
+    # Per-name staleness window (days) the harvester's /freshness audit keys off (quarterly default
+    # 135d ≈ a reporting quarter + a filing-grace buffer; the annual window has its own 400d default
+    # in-code). A covered name whose freshest fiscal period_end is older than this reads as stale.
     fundamentalsStaleAfterDays: "135"
-    # Coverage set the ingest run walks: universe_plus_index (active T212 universe ∪ point-in-time US
-    # S&P members — the default) | universe_only | index_only. A small default cap keeps a first
-    # backfill bounded (FUNDAMENTALS_COVERAGE_CAP env, default 64; 0 ⇒ uncapped — the operator's opt-in
-    # to the full set once the per-name cost is understood). The full ~15k-CIK market is out of scope.
-    fundamentalsCoverage: "universe_plus_index"
-    # Raised 64 → 200 (epic pit-coverage-broaden Task 11): bounds the per-service ingest envelope while
-    # guaranteeing the full active US universe (≤60 active + the curated US list) PLUS a healthy S&P-PIT
-    # index union. The curated universe is NEVER truncated (Task 1 — the cap bounds only the index-history
-    # remainder); the 6-hourly self-heal CronJob keeps it fresh. 0 ⇒ uncapped (an unbounded nightly walk).
-    fundamentalsCoverageCap: "200"
-    # One-shot backfill Job gate. "false" (default) ⇒ the backfill-job.yaml renders NOTHING, so a
-    # routine `helm upgrade` never kicks off a heavy from-scratch backfill. Flip to "true" (and redeploy)
-    # to run a one-off `python -m src.ingest --full --tickers <fundamentalsBackfillTickers>` — the Job
-    # name is image-tag-suffixed so each enabled deploy creates a fresh Job. Set back to "false" after.
-    fundamentalsBackfill: "false"
-    # Tickers for the one-shot backfill Job (bare US symbols). Default AAPL,MSFT is the demo that lands
-    # `fundamentals` rows; set "" to backfill the full configured coverage set (universe ∪ index).
-    fundamentalsBackfillTickers: "AAPL,MSFT"
+    # NOTE: the old fundamentals-INGESTION knobs (fundamentalsIngestCron / fundamentalsHealCron /
+    # fundamentalsCoverage / fundamentalsCoverageCap / fundamentalsBackfill / fundamentalsBackfillTickers)
+    # were REMOVED with the Timescale fundamentals stack (epic pit-fundamentals-lake-rearchitecture,
+    # Task 24). The PIT fundamentals system is now the Parquet lake only: the harvester self-bootstraps
+    # from SEC's bulk zip then sweeps every `sweepMinutes` (above) — there is no nightly/heal CronJob, no
+    # coverage cap, and no one-shot backfill Job. Coverage is the full companyfacts universe by
+    # construction; the freshness audit is served by the harvester's status API.
     # Earnings/dividend calendar source. yahoo (free calendarEvents) | eodhd (dormant — falls back to yahoo).
     earningsProvider: yahoo
     # Sector-rotation reference ETFs (comma-separated T212 tickers). Empty → built-in 11 SPDRs + SPY.

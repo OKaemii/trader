@@ -83,10 +83,10 @@ export function createScannerRouter(universe: UniverseManager, fundamentals: Fun
       feed:         { date: today, usPulledToday: usPull === '1', lsePulledToday: lsePull === '1' },
       config: {
         universeSource:       process.env.UNIVERSE_SOURCE ?? 'curated',
-        dailyHistoryProvider: process.env.DAILY_HISTORY_PROVIDER ?? 'yahoo',
-        // EFFECTIVE provider the wired cache runs (the live FUNDAMENTALS_PROVIDER) — `yahoo` today,
-        // `pit` once the capstone flips it. Read from the cache, not a re-parse of process.env, so
-        // the panel can't drift from the provider actually serving the snapshot's per-name sources.
+        dailyHistoryProvider: process.env.DAILY_HISTORY_PROVIDER ?? 'eodhd',
+        // EFFECTIVE provider the wired cache runs (the live FUNDAMENTALS_PROVIDER) — `pit` (the PIT
+        // lake) by default. Read from the cache, not a re-parse of process.env, so the panel can't
+        // drift from the provider actually serving the snapshot's per-name sources.
         fundamentalsProvider: fundamentals.effectiveSource,
         minMarketCapGbp:      Number(process.env.MIN_MARKET_CAP_GBP ?? 5_000_000_000),
       },

@@ -32,15 +32,14 @@ class BarsReader(Protocol):
 
 
 def make_bars_reader(source: str, **kwargs) -> BarsReader:
-    """source ∈ {'live','warehouse','eodhd_daily','yahoo_daily'}. Concrete readers are
+    """source ∈ {'live','warehouse','eodhd_daily','in_memory'}. Concrete readers are
     lazy-imported so adding a source never forces this module to depend on a concretion.
 
     'eodhd_daily' is the offline-research price path: EODHD `/eod` dividend-adjusted multi-year
     daily — the same provider the live persisted daily series uses — fully decoupled from the live
-    (metered) TwelveData budget. It supersedes 'yahoo_daily' as the validator default (Thread C —
-    no Yahoo dependency). 'yahoo_daily' is retained only until its Phase-6 teardown (no caller
-    defaults to it). A 'twelvedata_daily' branch can be slotted in here later (e.g. on a paid plan)
-    without touching any consumer."""
+    (metered) TwelveData budget. It is the validator default (the 'yahoo_daily' reader was removed —
+    epic pit-fundamentals-lake-rearchitecture, Thread C — no Yahoo dependency). A 'twelvedata_daily'
+    branch can be slotted in here later (e.g. on a paid plan) without touching any consumer."""
     if source == 'live':
         from .live_reader import LiveBarsReader
         return LiveBarsReader(**kwargs)
@@ -50,13 +49,10 @@ def make_bars_reader(source: str, **kwargs) -> BarsReader:
     if source == 'eodhd_daily':
         from .eodhd_daily_reader import EodhdDailyBarsReader
         return EodhdDailyBarsReader(**kwargs)
-    if source == 'yahoo_daily':
-        from .yahoo_daily_reader import YahooDailyBarsReader
-        return YahooDailyBarsReader(**kwargs)
     if source == 'in_memory':
         from .in_memory_reader import InMemoryBarsReader
         return InMemoryBarsReader(**kwargs)
     raise ValueError(
         f"unknown bars source: {source!r} "
-        f"(known: 'live', 'warehouse', 'eodhd_daily', 'yahoo_daily', 'in_memory')"
+        f"(known: 'live', 'warehouse', 'eodhd_daily', 'in_memory')"
     )

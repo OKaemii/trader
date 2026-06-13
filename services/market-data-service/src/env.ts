@@ -43,10 +43,10 @@ const EnvSchema = z.object({
     SIGNAL_ORDER_TYPE: z.string().default("Limit"),
 
     // ── Market-data provider ──────────────────────────────────────────────────
-    // Active upstream for OHLCV bars + liquidity. Defaults to TwelveData; `yahoo` keeps
-    // the legacy free Yahoo Finance path as a fallback (no API key needed). FX rates and
-    // sector classification stay on Yahoo regardless — separate, free, low-volume calls.
-    MARKET_DATA_PROVIDER: z.enum(["twelvedata", "yahoo"]).default("twelvedata"),
+    // Active upstream for OHLCV bars + liquidity. TwelveData only — the dormant Yahoo OHLCV
+    // provider was removed (epic pit-fundamentals-lake-rearchitecture, Thread C). FX is
+    // TwelveData; sector classification is EODHD screener + EDGAR SIC.
+    MARKET_DATA_PROVIDER: z.enum(["twelvedata"]).default("twelvedata"),
     // TwelveData free Basic plan: 8 credits/min, 800/day, 1 credit per symbol. The key is
     // injected from trader-secrets (TWELVEDATA_API_KEY); bump the credit knobs to match a
     // paid plan. Optional so the service still boots (provider returns no bars) without it.
@@ -65,8 +65,9 @@ const EnvSchema = z.object({
     // market-cap screener (>= MIN_MARKET_CAP_GBP, US+LSE). One active universe either way.
     UNIVERSE_SOURCE:    z.enum(["curated", "eodhd_scan"]).default("curated"),
     MIN_MARKET_CAP_GBP: z.coerce.number().nonnegative().default(5_000_000_000),
-    // Long-range daily history source (decoupled from the metered intraday provider).
-    DAILY_HISTORY_PROVIDER: z.enum(["yahoo", "eodhd"]).default("yahoo"),
+    // Long-range daily history source (decoupled from the metered intraday provider). EODHD `/eod`
+    // only — the Yahoo daily reader was removed (epic pit-fundamentals-lake-rearchitecture, Thread C).
+    DAILY_HISTORY_PROVIDER: z.enum(["eodhd"]).default("eodhd"),
     // Fundamentals (QMJ) source. 'pit' (default) — the PIT SEC-EDGAR lake via fundamentals-api for
     // US (*_US_EQ) names; non-US names FAIL-CLOSED (no fundamentals — no Yahoo substitute, decision
     // H). 'eodhd' is a dormant paid add-on. The 'yahoo' option was removed with the Yahoo fundamentals

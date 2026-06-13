@@ -61,8 +61,8 @@ spec:
             - name: EDGAR_REQS_PER_SEC
               value: {{ .Values.global.env.edgarReqsPerSec | default "10" | quote }}
             # Per-name staleness windows the /freshness audit keys off (quarterly default 135d;
-            # the annual window has its own 400d default in-code). Env-overridable; mirrors the
-            # ingestion service's knob so the operator tunes one value.
+            # the annual window has its own 400d default in-code). Env-overridable via the
+            # global.env.fundamentalsStaleAfterDays knob.
             - name: FUNDAMENTALS_STALE_AFTER_DAYS
               value: {{ .Values.global.env.fundamentalsStaleAfterDays | default "135" | quote }}
           # The lake RW mount — the harvester is the only writer. Path matches LAKE_DIR above.

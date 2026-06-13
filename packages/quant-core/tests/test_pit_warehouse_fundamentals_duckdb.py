@@ -19,6 +19,10 @@ import pytest
 duckdb = pytest.importorskip("duckdb")
 
 from quant_core.fundamentals.warehouse import WarehousePitFundamentals  # noqa: E402
+from quant_core.ticker_identity import Trading212TickerAdapter  # noqa: E402
+
+# Splits the seed rows' T212 ticker → (symbol, market) at insert, matching the bare-keyed bars snapshot.
+_BARS_ADAPTER = Trading212TickerAdapter()
 
 
 # Same fixture timestamps as the fake-connection suite, so the two prove the same scenarios.
@@ -44,10 +48,14 @@ def _con(fact_rows=None, bar_rows=None):
         )
         """
     )
+    # The warehouse `bars` snapshot is keyed on the BARE identity (symbol, market) post-cutover
+    # (0012_bars_symbol_market.sql / epic Task 15), NOT the concatenated T212 `ticker`. The seed rows
+    # below still carry a `ticker` for readability; we split it to (symbol, market) at insert via the
+    # same adapter the reader uses, so the table shape matches the real snapshot the reader queries.
     con.execute(
         """
         CREATE TABLE bars (
-          ticker VARCHAR, interval VARCHAR, observation_ts BIGINT, knowledge_ts BIGINT,
+          symbol VARCHAR, market VARCHAR, interval VARCHAR, observation_ts BIGINT, knowledge_ts BIGINT,
           close DOUBLE, is_superseded BOOLEAN
         )
         """
@@ -59,10 +67,11 @@ def _con(fact_rows=None, bar_rows=None):
              r.get("dim_signature", ""), r["value"], r.get("is_superseded", False)],
         )
     for b in bar_rows or []:
+        ident = _BARS_ADAPTER.from_t212(b["ticker"])
         con.execute(
-            "INSERT INTO bars VALUES (?, ?, ?, ?, ?, ?)",
-            [b["ticker"], b.get("interval", "daily"), b["observation_ts"], b["knowledge_ts"],
-             b["close"], b.get("is_superseded", False)],
+            "INSERT INTO bars VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [ident.symbol, ident.market, b.get("interval", "daily"), b["observation_ts"],
+             b["knowledge_ts"], b["close"], b.get("is_superseded", False)],
         )
     return con
 

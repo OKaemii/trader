@@ -121,7 +121,8 @@ def _build_pit_fundamentals(req: dict):
     BARS WIRING. quant-core's lake package has no warehouse connection, so the price leg is injected:
     a closure over the `WarehouseReader` bars view running the SAME at-or-before-as-of close query the
     warehouse reader used (`interval='daily'`, latest knowledge_ts ≤ as_of). The bars view keys on the
-    T212 ticker, so the closure is handed the original ticker string (the provider passes it through).
+    BARE identity `(symbol, market)` post-cutover (0012), so the closure is handed the T212 ticker and
+    splits it via the `Trading212TickerAdapter` before binding (matching `_SELECT_CLOSE_AS_OF`).
 
     INJECTION GAP (carried forward, NOT fixed here — plan §7 / the Task-13 follow-up):
       • fx_to_gbp: GBP-identity default (LSE/GBP-native names compute fully; USD market caps need a
@@ -133,18 +134,29 @@ def _build_pit_fundamentals(req: dict):
     from quant_core.fundamentals.lake.replay import LakePitFundamentals
     from quant_core.fundamentals.lake.store import Store
     from quant_core.fundamentals.warehouse import _SELECT_CLOSE_AS_OF
+    from quant_core.ticker_identity import Trading212TickerAdapter
     from .infrastructure.duckdb_reader import WarehouseReader
 
     store = Store(FUNDAMENTALS_LAKE_DIR)   # cold lake (pre-bootstrap) degrades to {} per name
     reader = WarehouseReader()             # DEFAULT_WAREHOUSE_DIR; bars view (fundamentals snapshot dropped)
+    ticker_adapter = Trading212TickerAdapter()   # splits the T212 ticker → (symbol, market) for the bars bind
 
     def _bars_close_as_of(ticker: str, as_of_ms: int):
         """Latest daily adjusted close at/<= as_of from the warehouse `bars` view (bi-temporal) — the
         market-cap price leg. Mirrors `WarehousePitFundamentals._adjusted_close_as_of`: the same
-        at-or-before-as-of `LIMIT 1` query, degrading to None on a missing/empty bars view so a cold
-        warehouse never breaks the read (the market cap is simply dropped for that name)."""
+        at-or-before-as-of `LIMIT 1` query, keyed on the bare `(symbol, market)` (the bars view dropped
+        the concatenated `ticker` column at the 0012 cutover), degrading to None on a missing/empty bars
+        view OR an unroutable ticker so a cold warehouse never breaks the read (the market cap is simply
+        dropped for that name)."""
         try:
-            row = reader._con.execute(_SELECT_CLOSE_AS_OF, [ticker, as_of_ms, as_of_ms]).fetchone()
+            ident = ticker_adapter.from_t212(ticker)
+        except ValueError:
+            # An unroutable ticker has no (symbol, market) — no bars row to read; drop the market cap.
+            return None
+        try:
+            row = reader._con.execute(
+                _SELECT_CLOSE_AS_OF, [ident.symbol, ident.market, as_of_ms, as_of_ms]
+            ).fetchone()
         except Exception:  # noqa: BLE001 — a missing/empty bars view must not break the replay read
             return None
         if not row or row[0] is None:

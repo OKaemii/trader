@@ -98,7 +98,7 @@ vi.mock('../modules/bars/infrastructure/daily-history.ts', () => ({
 const { Hono } = await import('hono');
 const { signAccessToken } = await import('@trader/shared-auth');
 const { createAdminRouter, curatedUsTickers } = await import('../modules/admin/routes.ts');
-const { YahooProvider } = await import('../modules/bars/infrastructure/providers/yahoo-provider.ts');
+const { TwelveDataProvider } = await import('../modules/bars/infrastructure/providers/twelvedata-provider.ts');
 
 // A mixed active universe: 2 curated-US names + 1 LSE name. curatedUsTickers must keep only the US.
 const ACTIVE = ['AAPL_US_EQ', 'NVDA_US_EQ', 'VODl_EQ'];
@@ -107,7 +107,8 @@ function buildApp(activeTickers: string[] = ACTIVE) {
   const app = new Hono();
   const stubUM: any = { activeTickers, sectorMap: {}, refresh: async () => activeTickers };
   const noopLog = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {}, trace: () => {}, fatal: () => {}, child: () => noopLog, level: 'info' } as never;
-  app.route('/', createAdminRouter(stubUM, new YahooProvider(), noopLog));
+  const provider = new TwelveDataProvider({ apiKey: '', creditsPerMinute: 8, dailyCreditLimit: 800 });
+  app.route('/', createAdminRouter(stubUM, provider, noopLog));
   return app;
 }
 

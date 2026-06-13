@@ -62,7 +62,10 @@ spec:
             - name: MARKET_DATA_PROVIDER
               value: {{ .Values.global.env.marketDataProvider | default "twelvedata" | quote }}
             - name: DAILY_HISTORY_PROVIDER
-              value: {{ .Values.global.env.dailyHistoryProvider | default "yahoo" | quote }}
+              # Default MUST match the (tightened) DAILY_HISTORY_PROVIDER zod enum, now ["eodhd"] only —
+              # the Yahoo daily reader was removed, so a "yahoo" fallback here would crash-loop the pod
+              # (env.ts loadEnv exits on an invalid enum) whenever the value is unset/nulled.
+              value: {{ .Values.global.env.dailyHistoryProvider | default "eodhd" | quote }}
             - name: DAILY_BACKFILL_YEARS
               value: {{ .Values.global.env.dailyBackfillYears | default "5" | quote }}
             # EODHD single universe source + fundamentals. EODHD_API_KEY arrives via the
