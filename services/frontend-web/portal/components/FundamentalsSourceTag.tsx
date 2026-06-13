@@ -1,17 +1,19 @@
 import { provenanceKind } from '@/app/lib/fundamentals-merge'
 
-// Reusable per-ticker fundamentals provenance badge (plan §J). One honest label for "where did this
-// name's fundamentals come from": PIT = OUR point-in-time SEC-EDGAR warehouse (source 'pit-edgar');
-// Yahoo = a THIRD-PARTY snapshot (source 'yahoo-snapshot'); none = no source row yet (rendered '—').
+// Reusable per-name fundamentals provenance badge. One honest label for "where did this name's
+// fundamentals come from": PIT = OUR point-in-time SEC-EDGAR lake (source 'pit-edgar'); none = no
+// fundamentals source this cycle (rendered '—' — a non-US name fail-closes to no fundamentals, or a
+// US name whose quality factor couldn't be computed).
+//
+// Post Yahoo-removal (epic pit-fundamentals-lake-rearchitecture, Thread C) the LIVE vocabulary reduces
+// to 'pit-edgar' | null — the 'yahoo-snapshot' stamp is retired from the live cycle. The 'Yahoo' badge
+// is kept ONLY as a defensive label for a HISTORICAL stored row that still carries the retired stamp
+// (read, never freshly written); a live surface should only ever show PIT or —.
 //
 // The bucketing is NOT re-implemented here — it reuses fundamentals-merge.ts's provenanceKind so the
-// badge, the Operations summary, and the filter all agree on what counts as PIT vs Yahoo. Fed a raw
-// `source` string per ticker (the strategy fundamentals-source by_ticker map's value, or the scanner
-// snapshot row's per-name source — both carry the same 'pit-edgar' | 'yahoo*' | null vocabulary). The
-// raw source surfaces on hover (title) so the operator can see the exact upstream behind the bucket.
-//
-// Extracted from the inline tag in FundamentalsIngestPanel (card 149) so it can also tag the scanner
-// rows + later positions/signals from the same map, with identical labels everywhere.
+// badge, the Operations summary, and the filter all agree. Fed a raw `source` string per name (the
+// strategy fundamentals-source by_ticker map's value, or the scanner snapshot row's per-name source).
+// The raw source surfaces on hover (title) so the operator can see the exact upstream behind the bucket.
 
 interface Props {
   source: string | null | undefined

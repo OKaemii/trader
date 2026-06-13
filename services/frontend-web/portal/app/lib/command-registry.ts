@@ -120,7 +120,7 @@ export const COMMANDS: Command[] = [
   { id: 'ws.operations.reconciliation', label: 'Operations · Reconciliation', group: GO_TO, href: '/operations?tab=reconciliation', keywords: ['recon', 'drift', 'mismatch'] },
   { id: 'ws.operations.tca', label: 'Operations · TCA', group: GO_TO, href: '/operations?tab=tca', keywords: ['transaction cost', 'slippage'] },
   { id: 'ws.operations.market-data', label: 'Operations · Market Data', group: GO_TO, href: '/operations?tab=market-data', keywords: ['bars', 'poll', 'sessions', 'holidays', 'calendar', 'eodhd'] },
-  { id: 'ws.operations.fundamentals', label: 'Operations · PIT Fundamentals', group: GO_TO, href: '/operations?tab=fundamentals', keywords: ['fundamentals', 'edgar', 'sec', 'ingest', 'backfill', 'user-agent', 'pit', 'coverage', 'quarantine'] },
+  { id: 'ws.operations.fundamentals', label: 'Operations · PIT Fundamentals', group: GO_TO, href: '/operations?tab=fundamentals', keywords: ['fundamentals', 'edgar', 'sec', 'harvester', 'sweep', 'lake', 'pit', 'coverage'] },
 
   // ── Global actions (no href — handled by id at the call site) ─────────────
   { id: 'act.toggle-mode', label: 'Toggle Beginner / Quant mode', group: ACTIONS, keywords: ['beginner', 'quant', 'complexity', 'simple', 'advanced'] },
