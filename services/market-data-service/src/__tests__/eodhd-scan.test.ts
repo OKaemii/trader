@@ -23,36 +23,39 @@ const T212: T212Instrument[] = [
 ];
 
 describe('mapEodhdToT212', () => {
-  it('maps US/LSE candidates to tradeable T212 tickers and drops untradeable / unknown', () => {
+  // Native to the bare identity since Task 18: mapped rows carry `(symbol, market)`, not a T212 string.
+  const idOf = (m: { symbol: string; market: string }) => `${m.symbol}|${m.market}`;
+
+  it('maps US/LSE candidates to tradeable (symbol, market) identities and drops untradeable / unknown', () => {
     const { mapped, dropped } = mapEodhdToT212([
       { code: 'AAPL', name: 'Apple',  exchange: 'US',  marketCapGbp: 3e12, sector: 'Technology' },
       { code: 'HSBA', name: 'HSBC',   exchange: 'LSE', marketCapGbp: 1e11 },
       { code: 'NOPE', name: 'Ghost',  exchange: 'US',  marketCapGbp: 9e9 },   // not on T212
       { code: 'BRK',  name: 'Berk',   exchange: 'XETRA', marketCapGbp: 9e11 }, // unknown exchange
     ], T212);
-    expect(mapped.map((m) => m.ticker)).toEqual(['AAPL_US_EQ', 'HSBAl_EQ']);
+    expect(mapped.map(idOf)).toEqual(['AAPL|US', 'HSBA|LSE']);
     expect(mapped[0]!.eodhdSymbol).toBe('AAPL.US');
     expect(mapped[0]!.sector).toBe('Technology');   // sector threaded from the screener candidate
     expect(mapped[1]!.eodhdSymbol).toBe('HSBA.LSE');
     expect(dropped).toBe(2);
   });
 
-  // T212 renamed FB→META in 2021 (operator-confirmed); META_US_EQ is the correct, orderable
-  // ticker. The EODHD `META` candidate must resolve to META_US_EQ — never the dead FB_US_EQ —
-  // regardless of which shortName the broker's instrument feed currently echoes.
-  it('resolves the EODHD rename (META) to the canonical META_US_EQ when T212 carries META', () => {
+  // T212 renamed FB→META in 2021 (operator-confirmed); META is the canonical, orderable symbol. The
+  // EODHD `META` candidate must resolve to the {META, US} identity — never the dead {FB, US} — whatever
+  // shortName the broker's instrument feed currently echoes.
+  it('resolves the EODHD rename (META) to the canonical {META, US} when T212 carries META', () => {
     const t212 = [{ ticker: 'META_US_EQ', name: 'Meta Platforms', shortName: 'META', currencyCode: 'USD' }];
     const { mapped } = mapEodhdToT212([{ code: 'META', name: 'Meta', exchange: 'US', marketCapGbp: 1e12 }], t212);
-    expect(mapped.map((m) => m.ticker)).toEqual(['META_US_EQ']);
+    expect(mapped.map(idOf)).toEqual(['META|US']);
   });
 
-  it('still resolves META to META_US_EQ when the broker metadata lags (echoes legacy FB shortName)', () => {
+  it('still resolves META to {META, US} when the broker metadata lags (echoes legacy FB shortName)', () => {
     // The broker's instrument feed may trail the rename and still list the row under shortName FB.
-    // We locate it via the legacy shortName for its name, but EMIT the canonical orderable ticker.
+    // We locate it via the legacy shortName for its name, but EMIT the canonical identity.
     const t212 = [{ ticker: 'FB_US_EQ', name: 'Meta Platforms', shortName: 'FB', currencyCode: 'USD' }];
     const { mapped } = mapEodhdToT212([{ code: 'META', name: 'Meta', exchange: 'US', marketCapGbp: 1e12 }], t212);
-    expect(mapped.map((m) => m.ticker)).toEqual(['META_US_EQ']);
-    expect(mapped.map((m) => m.ticker)).not.toContain('FB_US_EQ');
+    expect(mapped.map(idOf)).toEqual(['META|US']);
+    expect(mapped.map((m) => m.symbol)).not.toContain('FB');
     expect(mapped[0]!.name).toBe('Meta');   // EODHD candidate name preferred; instrument name is the fallback
   });
 });

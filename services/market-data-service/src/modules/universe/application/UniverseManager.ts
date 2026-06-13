@@ -5,7 +5,7 @@
 import { getMongoDb } from '@trader/shared-mongo';
 import { COLLECTIONS } from '@trader/shared-mongo';
 import { getPgPool } from '@trader/shared-pg';
-import { Trading212TickerAdapter, type TickerIdentity } from '@trader/ticker-identity';
+import { Trading212TickerAdapter, type Market } from '@trader/ticker-identity';
 import type { Currency } from '@trader/shared-types';
 import { tryIdentityOf, tickerOf } from '../../../shared/identity.ts';
 import { fetchT212Instruments } from '../infrastructure/t212-client.ts';
@@ -127,13 +127,42 @@ async function withTimeout<T>(p: Promise<T>, ms: number, fallback: T, label: str
   }
 }
 
+/**
+ * A universe member, built natively on the bare `(symbol, market)` identity since Task 18. `symbol`
+ * + `market` are the source of truth (written straight to instrument_registry); `ticker` is the
+ * derived Trading212 string kept on the object for the in-memory active set, the provider routing,
+ * and the override-application logic — the broker form lives only at this derived boundary, never in
+ * storage.
+ */
 export interface InstrumentMeta {
-  ticker:       string;
+  symbol:       string;       // bare exchange symbol (canonical, post-rename)
+  market:       Market;       // 'US' | 'LSE' — the listing market
+  ticker:       string;       // derived T212 ticker (adapter.toT212(symbol, market))
   name:         string;
-  sector:       string;   // GICS sector (or 'Unknown' if T212 doesn't supply it)
+  sector:       string;       // GICS sector (or 'Unknown' if not supplied)
   t212Tradable: boolean;
-  market?:      'US' | 'LSE' | 'OTHER';
-  adv?:         number;   // 5-day average dollar volume from Yahoo (curated path only)
+  adv?:         number;       // 5-day average dollar volume from Yahoo (curated path only)
+}
+
+const metaAdapter = new Trading212TickerAdapter();
+
+/**
+ * Build an InstrumentMeta from the bare identity, deriving the T212 `ticker` once. The single
+ * construction seam so every selector + the override path produce the same `(symbol, market, ticker)`
+ * triple — there is no place that hand-rolls the T212 string.
+ */
+function metaOf(fields: {
+  symbol: string; market: Market; name: string; sector: string; t212Tradable: boolean; adv?: number;
+}): InstrumentMeta {
+  return {
+    symbol:       fields.symbol,
+    market:       fields.market,
+    ticker:       metaAdapter.toT212({ symbol: fields.symbol, market: fields.market }),
+    name:         fields.name,
+    sector:       fields.sector,
+    t212Tradable: fields.t212Tradable,
+    ...(fields.adv !== undefined ? { adv: fields.adv } : {}),
+  };
 }
 
 /** A forced add/remove entry as stored in portal_universe_overrides since Task 16b — the bare
@@ -164,43 +193,169 @@ export function identitiesToTickers(entries: OverrideEntry[] | undefined): strin
   return out;
 }
 
+/** The identity-key form (`symbol|market`) used to dedup/match overrides against the selection. */
+function idKeyOf(symbol: string, market: string): string { return `${symbol}|${market}`; }
+
 /**
- * Apply portal-driven adds/removes on top of the eligibility-filtered selection.
- * Removes win over T212 inclusion; adds bypass the sector cap and are marked
- * t212Tradable=false so downstream code can detect operator-forced entries.
- * Exported for unit testing.
+ * Normalise stored override entries to the canonical `(UPPER symbol, US/LSE market)` form, dropping an
+ * empty-symbol or non-US/LSE entry. The SINGLE predicate for every override read site (the refresh
+ * override-load + applyUniverseOverrides), so a stale/hand-edited doc with a lower-case or whitespace
+ * symbol still matches the upper-cased selected set, and there is one place to change if the accepted
+ * markets ever widen. Exported for unit testing.
+ */
+export function normaliseOverrideEntries(entries: OverrideEntry[] | undefined): OverrideEntry[] {
+  return (entries ?? []).flatMap((e) => {
+    if (!e || typeof e.symbol !== 'string') return [];
+    const symbol = e.symbol.trim().toUpperCase();
+    if (symbol === '' || (e.market !== 'US' && e.market !== 'LSE')) return [];
+    return [{ symbol, market: e.market }];
+  });
+}
+
+/**
+ * Apply portal-driven adds/removes on top of the eligibility-filtered selection. Native to the bare
+ * `(symbol, market)` identity since Task 18: adds/removes are `OverrideEntry`s (already resolved to a
+ * tradable identity by the caller's bare-forced-add resolution), matched on `(symbol, market)` — so
+ * the cross-listing ambiguity that a single T212 string couldn't express is gone.
+ *
+ * Removes win over inclusion; adds bypass the sector cap and are marked `t212Tradable=false` so
+ * downstream code can detect operator-forced entries. Exported for unit testing.
  */
 export function applyUniverseOverrides(
   selected: InstrumentMeta[],
-  overrides: { adds?: string[]; removes?: string[] } | null,
+  overrides: { adds?: OverrideEntry[]; removes?: OverrideEntry[] } | null,
 ): { result: InstrumentMeta[]; added: number; removed: number } {
   if (!overrides) return { result: selected, added: 0, removed: 0 };
 
-  // Case-sensitive matching. T212 tickers carry meaningful case in the exchange suffix
-  // (`SGLNl_EQ` is a London listing; `SGLNL_EQ` would be wrong). Earlier code upper-cased
-  // both sides, which silently mangled overrides like `SGLNl_EQ` into `SGLNL_EQ` and then
-  // failed to match against the T212 catalog.
-  const removeSet = new Set((overrides.removes ?? []).map((t) => t.trim()).filter(Boolean));
+  const removeSet = new Set(normaliseOverrideEntries(overrides.removes).map((e) => idKeyOf(e.symbol, e.market)));
   const before = selected.length;
-  let result = selected.filter((i) => !removeSet.has(i.ticker));
+  const result = selected.filter((i) => !removeSet.has(idKeyOf(i.symbol, i.market)));
   const removed = before - result.length;
 
-  const presentTickers = new Set(result.map((i) => i.ticker));
+  const present = new Set(result.map((i) => idKeyOf(i.symbol, i.market)));
   let added = 0;
-  for (const rawTicker of overrides.adds ?? []) {
-    const ticker = rawTicker.trim();
-    if (!ticker || presentTickers.has(ticker)) continue;
-    // Infer market from T212 suffix so the portal renders the right badge and so the
-    // value persists onto instrument_registry. Without this, override-added entries fall
-    // through to 'OTHER' in the upsert and the universe overview shows "—" for the region.
-    const market: 'US' | 'LSE' | 'OTHER' =
-      /_US_EQ$/.test(ticker) ? 'US' :
-      /l_EQ$/.test(ticker)   ? 'LSE' : 'OTHER';
-    result.push({ ticker, name: ticker, sector: 'Unknown', t212Tradable: false, market });
-    presentTickers.add(ticker);
+  for (const e of normaliseOverrideEntries(overrides.adds)) {
+    const key = idKeyOf(e.symbol, e.market);
+    if (present.has(key)) continue;
+    // A forced add bypasses the sector cap, carries 'Unknown' sector (enriched later if a source
+    // resolves it), and is flagged non-tradable-by-criteria so downstream can detect operator forces.
+    // `market` is part of the stored identity now, so the registry upsert renders the right region.
+    result.push(metaOf({ symbol: e.symbol, market: e.market as Market, name: e.symbol, sector: 'Unknown', t212Tradable: false }));
+    present.add(key);
     added++;
   }
   return { result, added, removed };
+}
+
+/** A T212 instrument indexed by bare shortName within each market — the shared resolution structure
+ *  for the curated include lists AND the bare-forced-add resolver. US requires the `_US_EQ` form; LSE
+ *  requires `l_EQ` with a GBP/GBX currency (London primary). First listing per (shortName, market) wins. */
+export type T212MarketIndex = Record<Market, Record<string, { ticker: string; name: string }>>;
+
+export function indexT212ByMarket(rawInstruments: Awaited<ReturnType<typeof fetchT212Instruments>>): T212MarketIndex {
+  const byMarket: T212MarketIndex = { US: {}, LSE: {} };
+  for (const inst of rawInstruments) {
+    const sn = inst.shortName?.toUpperCase();
+    if (!sn) continue;
+    const isUS  = /_US_EQ$/.test(inst.ticker);
+    const isLSE = /l_EQ$/.test(inst.ticker) && (inst.currencyCode === 'GBP' || inst.currencyCode === 'GBX');
+    if (isUS && !byMarket.US[sn]) byMarket.US[sn] = { ticker: inst.ticker, name: inst.name };
+    if (isLSE && !byMarket.LSE[sn]) byMarket.LSE[sn] = { ticker: inst.ticker, name: inst.name };
+  }
+  return byMarket;
+}
+
+/** A bare forced-add as it arrives on the wire: either a bare symbol string (`'GOOGL'`) or an explicit
+ *  `{ symbol, market }`. The portal UI is Task 21; this is the backend's accepted input shape. `market`
+ *  allows `undefined` to match the zod-inferred contract type under `exactOptionalPropertyTypes`. */
+export type BareForcedAdd = string | { symbol: string; market?: string | undefined };
+
+// The legacy symbols the adapter rename knows about (the LHS of the rename table) — kept narrow
+// (FB→META today). A bare-add resolver probes these against the broker catalog so a name still echoed
+// under its pre-rebrand shortName resolves regardless of which symbol the operator typed.
+const LEGACY_RENAME_SOURCES = ['FB'] as const;
+
+/** Legacy shortName aliases whose market-aware rename equals `canonical` (so the catalog can be probed
+ *  under the pre-rebrand symbol when the broker metadata lags). */
+function legacyAliasesFor(canonical: string, market: Market): string[] {
+  return LEGACY_RENAME_SOURCES.filter(
+    (legacy) => legacy !== canonical && metaAdapter.applyRename({ symbol: legacy, market }).symbol === canonical,
+  );
+}
+
+/** A normalised forced-entry candidate: an upper-cased symbol + an optional explicit market. The single
+ *  parse point for the three accepted shapes (bare string, legacy T212 string, `{symbol, market?}`), so
+ *  case-handling + the legacy-T212 parse is identical for adds AND removes. Returns `null` on an empty
+ *  symbol or an explicit-but-unsupported market. */
+function normaliseForcedEntry(raw: BareForcedAdd): { symbol: string; market?: Market } | null {
+  if (typeof raw === 'string') {
+    const s = raw.trim();
+    if (s === '') return null;
+    // A legacy T212 string carries an explicit listing — parse it. The suffix match is case-sensitive
+    // (`_US_EQ` upper, `l_EQ` lower-`l`), so try the canonical-case string first (handles `SGLNl_EQ`,
+    // `AAPL_US_EQ`), then an upper-cased retry to catch a lower-cased US form (`aapl_us_eq` →
+    // `AAPL_US_EQ`). Anything that still doesn't parse is treated as a bare symbol.
+    for (const candidate of s === s.toUpperCase() ? [s] : [s, s.toUpperCase()]) {
+      try { const id = metaAdapter.fromT212(candidate); return { symbol: id.symbol, market: id.market }; }
+      catch { /* try the next candidate, else fall through to bare */ }
+    }
+    return { symbol: s.toUpperCase() };               // a bare symbol — market unspecified
+  }
+  const symbol = (raw.symbol ?? '').trim().toUpperCase();
+  if (symbol === '') return null;
+  const m = (raw.market ?? '').trim().toUpperCase();
+  if (m === '') return { symbol };                  // market unspecified → caller's default
+  if (m !== 'US' && m !== 'LSE') return null;        // an explicit non-US/LSE market is unsupported
+  return { symbol, market: m as Market };
+}
+
+/**
+ * Resolve a forced-add to a tradable `(symbol, market)` identity against the T212 catalog, reusing the
+ * curated include-list resolution (shortName match per market) + the US-preferred cross-listing rule:
+ *  - Accepts a bare symbol (`'GOOGL'`), a legacy T212 string (`'GOOGL_US_EQ'`/`'SHELl_EQ'`, the pre-bare
+ *    portal form until Task 21), or a `{ symbol, market? }` object — all normalised the same way.
+ *  - An explicit `market` (legacy-string listing OR object field) is honoured (the symbol must exist on
+ *    that market in the catalog). A bare symbol (no market) defaults to **US** and, when cross-listed,
+ *    prefers the US listing — falling back to LSE only when the symbol is LSE-only.
+ *  - The market-aware rename (FB→META) is applied uniformly, so `FB`, `FB_US_EQ`, and `META` all resolve
+ *    to the canonical `META` (the catalog is probed under the legacy shortName when the broker lags).
+ *  - A symbol the catalog doesn't carry on the requested/any market → `null` (dropped, never a phantom).
+ * Exported + pure (takes a pre-built index) for unit testing.
+ */
+export function resolveForcedAdd(raw: BareForcedAdd, index: T212MarketIndex): OverrideEntry | null {
+  const norm = normaliseForcedEntry(raw);
+  if (norm === null) return null;
+  // Candidate markets in preference order. Explicit market → that one only. Bare → US then LSE
+  // (US-preferred cross-listing), so a dual-listed name lands on its US listing as elsewhere.
+  const markets: Market[] = norm.market ? [norm.market] : ['US', 'LSE'];
+
+  for (const market of markets) {
+    // Canonicalise per market (FB→META on US) before the catalog lookup. The catalog is probed under
+    // BOTH the canonical symbol and any legacy alias that renames to it (FB for META) so a broker
+    // catalog still echoing the pre-rebrand shortName resolves whether the operator typed the new
+    // symbol (META) or the old one (FB) — the emitted identity is always canonical.
+    const canonical = metaAdapter.applyRename({ symbol: norm.symbol, market }).symbol;
+    const lookups = new Set<string>([canonical, norm.symbol, ...legacyAliasesFor(canonical, market)]);
+    for (const sym of lookups) {
+      if (index[market][sym]) return { symbol: canonical, market };
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve a forced-REMOVE to a `(symbol, market)` identity WITHOUT a catalog gate — a removed name may
+ * be delisted/untradeable, so it need not exist in the live catalog (removes match the active set by
+ * identity). Accepts the same three shapes as {@link resolveForcedAdd}; the market-aware rename
+ * (FB→META) is applied so a remove keys the canonical identity. A bare symbol defaults to US (a
+ * cross-listed bare remove should name its market explicitly — the active-set portal UI does, Task 21).
+ * Returns `null` only for an empty symbol / an explicit unsupported market.
+ */
+export function resolveForcedRemove(raw: BareForcedAdd): OverrideEntry | null {
+  const norm = normaliseForcedEntry(raw);
+  if (norm === null) return null;
+  const market: Market = norm.market ?? 'US';
+  return { symbol: metaAdapter.applyRename({ symbol: norm.symbol, market }).symbol, market };
 }
 
 /**
@@ -228,25 +383,11 @@ async function selectCurated(
   const includeUs  = config.includeUs;
   const includeLse = config.includeLse;
   const maxSize    = config.maxSize;
-  // Build a shortName-indexed lookup, choosing the best T212 ticker per (symbol, market).
-  // T212 lists multiple cross-listings per symbol (e.g. VFEM has VFEMl_EQ, VFEMs_EQ, VFEMa_EQ);
-  // we score per-market and keep the top scorer.
-  const byMarket: Record<'US' | 'LSE', Record<string, typeof rawInstruments[number]>> = {
-    US:  {},
-    LSE: {},
-  };
-
-  for (const inst of rawInstruments) {
-    const sn = inst.shortName?.toUpperCase();
-    if (!sn) continue;
-
-    const isUS  = /_US_EQ$/.test(inst.ticker);
-    const isLSE = /l_EQ$/.test(inst.ticker) &&
-                  (inst.currencyCode === 'GBP' || inst.currencyCode === 'GBX');
-
-    if (isUS && !byMarket.US[sn]) byMarket.US[sn] = inst;
-    if (isLSE && !byMarket.LSE[sn]) byMarket.LSE[sn] = inst;
-  }
+  // Shared shortName index (US prefers `_US_EQ`, LSE prefers GBP/GBX `l_EQ`, first per market wins).
+  // T212 lists multiple cross-listings per symbol (e.g. VFEM has VFEMl_EQ, VFEMs_EQ, VFEMa_EQ); the
+  // index keeps the canonical equity listing per market. The build is bare-native — `metaOf` derives
+  // the T212 ticker from `(symbol, market)`, so no listing string is hand-rolled here.
+  const byMarket = indexT212ByMarket(rawInstruments);
 
   const candidates: InstrumentMeta[] = [];
   const seenShortNames = new Set<string>();
@@ -258,13 +399,7 @@ async function selectCurated(
     if (!m) { unresolvedUS++; continue; }
     if (seenShortNames.has(sym)) continue;
     seenShortNames.add(sym);
-    candidates.push({
-      ticker:       m.ticker,
-      name:         m.name,
-      sector:       m.sector ?? 'Unknown',
-      t212Tradable: true,
-      market:       'US',
-    });
+    candidates.push(metaOf({ symbol: sym, market: 'US', name: m.name, sector: 'Unknown', t212Tradable: true }));
   }
   for (const sym of includeLse) {
     const m = byMarket.LSE[sym];
@@ -274,13 +409,7 @@ async function selectCurated(
       continue;
     }
     seenShortNames.add(sym);
-    candidates.push({
-      ticker:       m.ticker,
-      name:         m.name,
-      sector:       m.sector ?? 'Unknown',
-      t212Tradable: true,
-      market:       'LSE',
-    });
+    candidates.push(metaOf({ symbol: sym, market: 'LSE', name: m.name, sector: 'Unknown', t212Tradable: true }));
   }
 
   if (unresolvedUS || unresolvedLSE) {
@@ -344,10 +473,10 @@ export function balanceByMarket<T extends { market: 'US' | 'LSE'; marketCapGbp: 
 
 /**
  * EODHD-scan universe source. Scans every US+LSE name >= minCapGbp via the EODHD screener,
- * maps to tradeable T212 tickers, dedupes by ticker, and selects a market-balanced top set
- * (100 US / 100 LSE at maxSize=200, via balanceByMarket — market cap is a sound liquidity proxy
- * at the >=£5B floor, avoiding N per-name ADV calls). Sector enrichment, portal overrides, and the
- * registry diff happen in refresh() exactly as for the curated source — this only swaps the
+ * maps to tradeable `(symbol, market)` identities, dedupes by identity, and selects a market-balanced
+ * top set (100 US / 100 LSE at maxSize=200, via balanceByMarket — market cap is a sound liquidity
+ * proxy at the >=£5B floor, avoiding N per-name ADV calls). Sector enrichment, portal overrides, and
+ * the registry diff happen in refresh() exactly as for the curated source — this only swaps the
  * candidate source. ONE active universe, no parallel pool.
  */
 async function selectFromEodhdScan(
@@ -358,25 +487,27 @@ async function selectFromEodhdScan(
   const candidates = await fetchEodhdCapScan({ minCapGbp: config.minCapGbp, exchanges: ['US', 'LSE'], fxToGBP });
   const { mapped, dropped } = mapEodhdToT212(candidates, rawInstruments);
 
-  // Dedup by T212 ticker (a cross-listing could resolve twice); keep the larger cap.
-  const byTicker = new Map<string, (typeof mapped)[number]>();
+  // Dedup by the bare `(symbol, market)` identity (a cross-listing could resolve twice); keep the
+  // larger cap. `(symbol, market)` disambiguates a cross-listed name that a single string couldn't.
+  const byId = new Map<string, (typeof mapped)[number]>();
   for (const m of mapped) {
-    const prev = byTicker.get(m.ticker);
-    if (!prev || m.marketCapGbp > prev.marketCapGbp) byTicker.set(m.ticker, m);
+    const key = idKeyOf(m.symbol, m.market);
+    const prev = byId.get(key);
+    if (!prev || m.marketCapGbp > prev.marketCapGbp) byId.set(key, m);
   }
-  const balanced = balanceByMarket([...byTicker.values()], config.maxSize);
+  const balanced = balanceByMarket([...byId.values()], config.maxSize);
   const usCount  = balanced.filter((m) => m.market === 'US').length;
   const lseCount = balanced.length - usCount;
 
   log.info(`[universe] eodhd_scan: ${candidates.length} >= £${(config.minCapGbp / 1e9).toFixed(1)}B, ${mapped.length} tradeable (${dropped} dropped), ${balanced.length} selected (${usCount} US / ${lseCount} LSE, cap ${config.maxSize})`);
-  return balanced.map((m) => ({
-    ticker:       m.ticker,
+  return balanced.map((m) => metaOf({
+    symbol:       m.symbol,
+    market:       m.market,
     name:         m.name,
     // Sector comes straight from the EODHD screener row (no Yahoo). refresh() step 4c
     // persists it to the meta cache; 'Unknown' only when the screener omitted it.
     sector:       m.sector && m.sector.trim() ? m.sector : 'Unknown',
     t212Tradable: true,
-    market:       m.market,
   }));
 }
 
@@ -444,12 +575,15 @@ export class UniverseManager {
     let rawInstruments: Awaited<ReturnType<typeof fetchT212Instruments>> = [];
     try {
       rawInstruments = await fetchT212Instruments();
-      instruments = rawInstruments.map((i) => ({
-        ticker:       i.ticker,
-        name:         i.name,
-        sector:       i.sector ?? 'Unknown',
-        t212Tradable: true,
-      }));
+      // Build natively on the bare identity (Task 18): split each T212 instrument to `(symbol, market)`
+      // and drop any that isn't a US/LSE equity (OTHER/CFD/ETF oddballs — fail-soft, never enters the
+      // universe). Only the no-include-list legacy path consumes `instruments`; the curated + eodhd_scan
+      // sources build their own `(symbol, market)` candidates from the catalog.
+      instruments = rawInstruments.flatMap((i) => {
+        const id = tryIdentityOf(i.ticker);
+        if (id === null) return [];
+        return [metaOf({ symbol: id.symbol, market: id.market, name: i.name, sector: i.sector ?? 'Unknown', t212Tradable: true })];
+      });
     } catch (err) {
       log.warn('[universe] T212 instrument fetch failed, using existing registry:', err);
       // Fall back to whatever is already in the registry. The registry is keyed on (symbol, market)
@@ -486,21 +620,18 @@ export class UniverseManager {
       selected = await selectCurated(rawInstruments, this.fxToGBP, cfg);
     } else {
       // ── 2. Fetch OHLCV stats for Section 29b eligibility filters ─────────────
-      const allTickers = instruments.map((i) => i.ticker);
       const lookbackDate = new Date(now.getTime() - ADV_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
 
       // Aggregate 20-day ADV and latest close per name from stored OHLCV bars. Storage is keyed on
       // the bare identity (symbol, market) and stamps observation_ts (UTC ms), not the legacy
-      // `timestamp` Date — split the T212 tickers, group on the identity over observation_ts, and
-      // re-key back to the T212 ticker for the statsMap below. volume=0 from the T212 fill-price
-      // approximation means the ADV filter is currently a pass-through; it activates once real
+      // `timestamp` Date. `instruments` already carries the native identity (Task 18), so group on
+      // (symbol, market) directly and re-key to the derived T212 ticker for the statsMap. volume=0
+      // from the T212 fill-price approximation means the ADV filter is a pass-through until real
       // volume data flows.
-      const adapter = new Trading212TickerAdapter();
-      const statIds = allTickers.map((t) => ({ ticker: t, ...adapter.fromT212(t) }));
-      const tickerByIdentity = new Map(statIds.map((i) => [`${i.symbol}|${i.market}`, i.ticker]));
+      const tickerByIdentity = new Map(instruments.map((i) => [idKeyOf(i.symbol, i.market), i.ticker]));
       const lookbackMs = lookbackDate.getTime();
       const ohlcvStats = await db.collection(COLLECTIONS.OHLCV_BARS).aggregate([
-        { $match: { $or: statIds.map((i) => ({ symbol: i.symbol, market: i.market })), observation_ts: { $gte: lookbackMs } } },
+        { $match: { $or: instruments.map((i) => ({ symbol: i.symbol, market: i.market })), observation_ts: { $gte: lookbackMs } } },
         { $sort: { observation_ts: 1 } },
         { $group: {
           _id: { symbol: '$symbol', market: '$market' },
@@ -512,7 +643,7 @@ export class UniverseManager {
       const statsMap: Record<string, { avgVolume: number; latestClose: number }> = {};
       for (const s of ohlcvStats) {
         const id = s._id as { symbol: string; market: string };
-        const ticker = tickerByIdentity.get(`${id.symbol}|${id.market}`);
+        const ticker = tickerByIdentity.get(idKeyOf(id.symbol, id.market));
         if (ticker === undefined) continue;
         statsMap[ticker] = { avgVolume: s.avgVolume as number ?? 0, latestClose: s.latestClose as number ?? 0 };
       }
@@ -566,18 +697,21 @@ export class UniverseManager {
     }
 
     // ── 4b. Portal overrides — applied AFTER eligibility/sector filtering ─────
-    // Reason: forced adds/removes are an operator decision and must take precedence over
-    // the criteria-driven selection. Removes win over T212 inclusion; adds bypass sector cap.
-    // portal_universe_overrides stores adds/removes as { symbol, market } objects since Task 16b —
-    // re-derive the T212 ticker per entry (fail-soft drop of an un-routable one) so the in-memory
-    // override application below stays keyed on the T212 ticker exactly as before (the bare-forced-add
-    // UX is Task 18/21). The bare-T212 set used for the addedReason='override_add' stamp is rebuilt
-    // from these reconstructed strings too.
+    // Reason: forced adds/removes are an operator decision and must take precedence over the
+    // criteria-driven selection. Removes win over inclusion; adds bypass the sector cap. Since Task 18
+    // the whole override path is native to the bare `(symbol, market)` identity: portal_universe_overrides
+    // already stores adds/removes as { symbol, market } (Task 16b; the bare-forced-add resolution
+    // happens at the admin PUT boundary), so they flow straight into applyUniverseOverrides with no
+    // T212 round-trip. The override-add identity set drives the addedReason='override_add' stamp below.
     const overridesDocRaw = await db.collection<OverridesDoc>(COLLECTIONS.PORTAL_UNIVERSE_OVERRIDES)
       .findOne({ _id: 'singleton' });
+    // Normalise the stored entries to the canonical (UPPER symbol, US/LSE market) form ONCE, so the
+    // override_add stamp keys below match the identities applyUniverseOverrides actually adds (it
+    // normalises internally too — keeping both sides on the same projection avoids a stale-case miss).
+    const overrideAddEntries = normaliseOverrideEntries(overridesDocRaw?.adds);
     const overridesDoc = overridesDocRaw === null ? null : {
-      adds: identitiesToTickers(overridesDocRaw.adds),
-      removes: identitiesToTickers(overridesDocRaw.removes),
+      adds: overrideAddEntries,
+      removes: normaliseOverrideEntries(overridesDocRaw.removes),
     };
 
     const overrideResult = applyUniverseOverrides(selected, overridesDoc);
@@ -644,16 +778,11 @@ export class UniverseManager {
     }
 
     // ── 5. Diff against current registry — log additions and removals ──────────
-    // The registry is keyed on the bare (symbol, market) identity since Task 16b. Build the split
-    // identity per selected instrument once (skipping any name whose T212 ticker isn't a recognised
-    // US/LSE form — fail-soft, never throw the refresh); the diff/insert/retire below all key on
-    // (symbol, market). The universe-BUILDING above stays T212-internal (Task 18); this is the Mongo
-    // storage boundary alone.
-    const selectedIds = selected
-      .map((i) => ({ inst: i, id: tryIdentityOf(i.ticker) }))
-      .filter((x): x is { inst: InstrumentMeta; id: TickerIdentity } => x.id !== null);
-    const idKey = (id: TickerIdentity) => `${id.symbol}|${id.market}`;
-    const newIdKeys = new Set(selectedIds.map((x) => idKey(x.id)));
+    // The registry is keyed on the bare (symbol, market) identity. Since Task 18 the universe is BUILT
+    // natively on `(symbol, market)`, so `selected` IS the identity source here — no re-derivation from
+    // a T212 string. The diff/insert/retire below all key on (symbol, market) straight off the meta.
+    const idKey = (i: { symbol: string; market: string }) => idKeyOf(i.symbol, i.market);
+    const newIdKeys = new Set(selected.map(idKey));
 
     const currentDocs = await db.collection(COLLECTIONS.INSTRUMENT_REGISTRY)
       .find({ activeTo: null })
@@ -667,10 +796,10 @@ export class UniverseManager {
     // Additions — split into true new inserts vs reactivations of previously-removed instruments.
     // insertMany would collide with the unique (symbol, market) index if a row already exists with
     // activeTo set, so a previously-retired identity is reactivated (updateMany) instead.
-    const added = selectedIds.filter((x) => !currentIdKeys.has(idKey(x.id)));
+    const added = selected.filter((i) => !currentIdKeys.has(idKey(i)));
     if (added.length > 0) {
       const existingDocs = await db.collection(COLLECTIONS.INSTRUMENT_REGISTRY)
-        .find({ $or: added.map((x) => ({ symbol: x.id.symbol, market: x.id.market })) })
+        .find({ $or: added.map((i) => ({ symbol: i.symbol, market: i.market })) })
         .toArray() as Array<{ symbol?: string; market?: string }>;
       const existingSet = new Set(
         existingDocs
@@ -678,34 +807,33 @@ export class UniverseManager {
           .map((d) => `${d.symbol}|${d.market}`),
       );
 
-      const toInsert     = added.filter((x) => !existingSet.has(idKey(x.id)));
-      const toReactivate = added.filter((x) =>  existingSet.has(idKey(x.id)));
+      const toInsert     = added.filter((i) => !existingSet.has(idKey(i)));
+      const toReactivate = added.filter((i) =>  existingSet.has(idKey(i)));
 
       if (toInsert.length > 0) {
-        const overrideAdds = new Set(
-          (overridesDoc?.adds ?? []).map((t) => t.toUpperCase().trim()),
-        );
+        // override_add stamp: the operator-forced identities, keyed on (symbol, market).
+        const overrideAddKeys = new Set(overrideAddEntries.map((e) => idKeyOf(e.symbol, e.market)));
         await db.collection(COLLECTIONS.INSTRUMENT_REGISTRY).insertMany(
-          toInsert.map(({ inst: i, id }) => ({
-            symbol:      id.symbol,
-            market:      id.market,
+          toInsert.map((i) => ({
+            symbol:      i.symbol,
+            market:      i.market,
             name:        i.name,
             sector:      i.sector,
             adv:         i.adv ?? 0,
             activeFrom:  now,
             activeTo:    null,
-            addedReason: overrideAdds.has(i.ticker.toUpperCase()) ? 'override_add' : 'universe_refresh',
+            addedReason: overrideAddKeys.has(idKey(i)) ? 'override_add' : 'universe_refresh',
             updatedAt:   now,
           })),
         );
       }
       if (toReactivate.length > 0) {
         await db.collection(COLLECTIONS.INSTRUMENT_REGISTRY).updateMany(
-          { $or: toReactivate.map((x) => ({ symbol: x.id.symbol, market: x.id.market })) },
+          { $or: toReactivate.map((i) => ({ symbol: i.symbol, market: i.market })) },
           { $set: { activeTo: null, addedReason: 'universe_reactivation', updatedAt: now } },
         );
       }
-      log.info(`[universe] added ${added.length} instruments: ${added.map((x) => x.inst.ticker).join(', ')}`);
+      log.info(`[universe] added ${added.length} instruments: ${added.map((i) => i.ticker).join(', ')}`);
     }
 
     // Refresh ADV + sector on every surviving entry so the portal table doesn't show stale
@@ -714,14 +842,14 @@ export class UniverseManager {
     // sector backfill matters because the EODHD screener source (PR #8) only stamped sectors on
     // *newly inserted* rows — rows already active when the fix landed kept the 'Unknown' placeholder.
     // Only write a *resolved* sector so a transient screener/Yahoo miss never wipes a good label.
-    const refreshUpdates = selectedIds.filter(({ inst: i }) => i.adv != null || i.sector != null);
-    for (const { inst: i, id } of refreshUpdates) {
+    const refreshUpdates = selected.filter((i) => i.adv != null || i.sector != null);
+    for (const i of refreshUpdates) {
       const set: Record<string, unknown> = { updatedAt: now };
       if (i.adv != null) set.adv = i.adv;
       if (i.sector && i.sector !== 'Unknown') set.sector = i.sector;
       if (Object.keys(set).length === 1) continue;   // nothing but updatedAt — skip the write
       await db.collection(COLLECTIONS.INSTRUMENT_REGISTRY).updateOne(
-        { symbol: id.symbol, market: id.market, activeTo: null },
+        { symbol: i.symbol, market: i.market, activeTo: null },
         { $set: set },
       );
     }
