@@ -6,6 +6,13 @@ export const COLLECTIONS = {
   STRATEGY_HEALTH_LOG:   'strategy_health_log',
   MODEL_VERSIONS:        'model_versions',
   FEATURE_IMPORTANCE:    'feature_importance_log',
+  // The active-universe membership journal, owned by market-data-service's UniverseManager: one
+  // soft-delete row per instrument with `activeFrom`/`activeTo` (null = active) for point-in-time
+  // universe reconstruction. Keyed on the bare (symbol, market) identity since Task 16b — each doc
+  // carries `symbol`+`market` as two separate fields; the concatenated T212 `ticker` is no longer
+  // stored (the registry diff add/retire/reactivate + every read re-derive the T212 ticker via the
+  // ticker-identity adapter at the Mongo boundary). Doc: { symbol, market, name, sector, adv,
+  // activeFrom, activeTo, addedReason, removedReason?, updatedAt }. Unique index on (symbol, market).
   INSTRUMENT_REGISTRY:   'instrument_registry',
   // Walk-forward ValidationReports persisted by backtest-engine's run_backtest (Phase 4).
   // Each doc carries engine ('replay' real | 'synthetic' placeholder), the gate metrics
@@ -19,11 +26,15 @@ export const COLLECTIONS = {
   // re-queues jobs left 'running' by a crashed process (replicas: 1). Endpoints under
   // POST/GET /admin/api/validator/*.
   VALIDATION_JOBS:       'validation_jobs',
-  // Point-in-time index membership (Phase 6) — one row per {index, ticker, effective_from}
-  // interval (effective_to=null = still a member). Ingested from the fja05680/sp500 community
-  // CSV by src/scripts/ingest_sp500_history.py. quant-core's universe_loader resolves the active
-  // set as-of any historical instant so the validator can run a survivorship-bias-reduced
-  // universe (membership is correct; delisted-name *prices* are best-effort from Yahoo).
+  // Point-in-time index membership (Phase 6) — one row per {index, symbol, market, effective_from}
+  // interval (effective_to=null = still a member). Two index tags coexist (`index:'sp500'` US +
+  // `index:'FTSE100'` LSE), ingested by src/scripts/ingest_{sp500,ftse}_history.py — so EVERY
+  // consumer MUST filter by `index`. Keyed on the bare (symbol, market) identity since Task 16b —
+  // each doc carries `symbol`+`market` as two separate fields; the concatenated T212 `ticker` is no
+  // longer stored (the Mongo read-sites re-derive the T212 ticker via the adapter before handing rows
+  // to quant-core's pure universe_loader, which resolves the active set as-of any historical instant).
+  // Membership is correct; delisted-name *prices* are best-effort. Upsert key (index, symbol, market,
+  // effective_from). Doc: { index, symbol, market, effective_from, effective_to, data_source, ingested_at }.
   INDEX_CONSTITUENTS:    'index_constituents',
   USERS:                 'users',
   POSITIONS:             'positions',
@@ -34,10 +45,15 @@ export const COLLECTIONS = {
   // days-held from the opening BUY signal, R-multiple, stop distance) and the AlertWatcher,
   // which auto-derives stop/target price alert rules from each plan.
   TRADE_PLANS:           'trade_plans',
-  // Per-ticker next earnings + dividend dates (UTC ms) for the swing-portal earnings calendar
-  // and the "position reports within 10 days" flag. { _id: ticker, nextEarningsDate?, dividendDate?,
-  // source, asOf, updatedAt }. Written by market-data-service's EarningsStore (Yahoo calendarEvents,
-  // weekly refresh); unknown coverage is omitted (never a fabricated date).
+  // Per-instrument next earnings + dividend dates (UTC ms) for the swing-portal earnings calendar
+  // and the "position reports within 10 days" flag. Keyed on the bare (symbol, market) identity since
+  // Task 16b — `_id` is the composite `${symbol}:${market}` string (the single-string key rule for an
+  // _id, mirroring the Redis-key convention) and `symbol`+`market` are also carried as separate fields;
+  // the concatenated T212 `ticker` is no longer stored. Doc: { _id: '<symbol>:<market>', symbol,
+  // market, nextEarningsDate?, dividendDate?, source, asOf, updatedAt }.
+  // VESTIGIAL post-Yahoo-removal (Thread C / Task 20): EarningsStore's provider is the StubEarningsProvider,
+  // which returns {} for every name, so the store stays empty (no doc is ever written) until a PIT-backed
+  // earnings source is wired by a later epic. The shape is migrated for that future writer's sake.
   EARNINGS_CALENDAR:     'earnings_calendar',
   // Price alert rules (manual + auto-derived from trade-plan stop/target). The AlertWatcher reads
   // enabled rules each cycle and fires on a bar-range cross. { _id: id, ticker, kind, direction,
@@ -52,6 +68,15 @@ export const COLLECTIONS = {
   PUSH_TOKENS:           'push_tokens',
   RISK_REJECTIONS:       'risk_rejections',
   RISK_STATE:            'risk_state',
+  // Operator-driven forced add/remove for the curated universe — a singleton { _id:'singleton', ... }.
+  // Keyed on the bare (symbol, market) identity since Task 16b: `adds` / `removes` are arrays of
+  // { symbol, market } objects (was bare/T212 strings), so the storage carries GOOGL not GOOGL_US_EQ.
+  // Written/read by market-data-service (PUT/GET /admin/api/market-data/universe/overrides + applied in
+  // UniverseManager.refresh). The bare-forced-add UX (the portal posting {symbol,market} directly) is
+  // Task 18/21; until then the admin handler still accepts T212 strings on the wire and splits them to
+  // { symbol, market } at the Mongo boundary, re-deriving the T212 string on read so the in-memory
+  // override-application stays behaviour-identical. Doc: { _id:'singleton',
+  // adds:[{symbol,market}], removes:[{symbol,market}], updatedBy, updatedAt }.
   PORTAL_UNIVERSE_OVERRIDES: 'portal_universe_overrides',
   PORTAL_MARKET_CONFIG:      'portal_market_config',
   // Per-strategy tunable overrides set from the portal: { _id: strategy_id, liveParams,
@@ -59,10 +84,14 @@ export const COLLECTIONS = {
   PORTAL_STRATEGY_CONFIG:    'portal_strategy_config',
   MARKET_CALENDAR:           'market_calendar',
   COMPANY_PROFILES:          'company_profiles',
-  // Per-ticker fundamentals (raw balance-sheet + income line items + market cap in GBP) for the
-  // QMJ quality screen. Written by market-data-service's FundamentalsCache (Yahoo quoteSummary,
-  // monthly refresh); read by the high-velocity strategy host + the Scanner/Feeds page. Doc:
-  // { _id: ticker, asOf, raw, ratios, qualityPass, source, updatedAt }.
+  // Per-instrument fundamentals (raw balance-sheet + income line items + market cap in GBP) for the
+  // QMJ quality screen. Written by market-data-service's FundamentalsCache (Yahoo/PIT provider,
+  // monthly refresh); read by the high-velocity strategy host + the Scanner/Feeds page. Keyed on the
+  // bare (symbol, market) identity since Task 16b — `_id` is the composite `${symbol}:${market}` string
+  // and `symbol`+`market` are carried as separate fields; the concatenated T212 `ticker` is no longer
+  // stored. Doc: { _id: '<symbol>:<market>', symbol, market, asOf, raw, ratios, qualityPass,
+  // marketCapGbp, source, updatedAt }. Still actively written under FUNDAMENTALS_PROVIDER=yahoo|pit
+  // (the Yahoo QMJ snapshot / PIT-warehouse read-through) — NOT vestigial.
   COMPANY_FUNDAMENTALS:      'company_fundamentals',
   // Reusable holdings "pie" — one active doc per strategy (keyed by pieId uuid): target
   // weights + rebalance history. Written by signal-service's PieManager on each rebalance;
@@ -95,16 +124,20 @@ export const COLLECTIONS = {
   // persisted best-effort after compute_features (a store failure logs, never blocks emission).
   // Written by strategy-engine's FactorStore (factor_store.py); read by the strategy-engine scores
   // / factor-history endpoints (GET /admin/api/strategy/{scores,factor-history}) and, for the
-  // signal "Why?" panel, as-of the signal's knowledge time. Doc:
-  //   { ticker, observation_ts,            // cycle as_of_ms (knowledge time of these closes)
+  // signal "Why?" panel, as-of the signal's knowledge time. Keyed on the bare (symbol, market)
+  // identity since Task 16b — each doc carries `symbol`+`market` as two separate fields; the
+  // concatenated T212 `ticker` is no longer stored (the reader endpoints take a T212 ticker, split it
+  // to (symbol, market) for the query, and re-derive `ticker` on the way out so the portal contract is
+  // unchanged). Doc:
+  //   { symbol, market, observation_ts,    // cycle as_of_ms (knowledge time of these closes)
   //     factors: {
   //       momentum:   { raw, pct, source }, // pct = cross-sectional percentile (0..100)
   //       volatility: { raw, pct, source },
   //       value:      { raw, pct, source },
   //       quality:    { raw, pct, source } } }
   // Each factor stamps a `source` so a later point-in-time fundamentals warehouse can re-backfill
-  // and upgrade previously-`null` rows in place, matched by (ticker, observation_ts), guarded by
-  // the per-factor `source` (plan §H). `source` is one of:
+  // and upgrade previously-`null` rows in place, matched by (symbol, market, observation_ts), guarded
+  // by the per-factor `source` (plan §H). `source` is one of:
   //   'eod'                  — from our own EODHD-fed persisted daily series (price factors)
   //   'div'                  — from the EODHD Dividends feed (value's dividend-yield component)
   //   'yahoo-snapshot'       — forward-only Yahoo quoteSummary snapshot (quality; value earnings/book)
@@ -112,8 +145,7 @@ export const COLLECTIONS = {
   //   'pit-companies-house'  — future UK point-in-time Companies House warehouse (out of scope)
   //   null                   — no source available (e.g. historical Quality pre-PIT-warehouse:
   //                            { raw: null, pct: null, source: null } — never a fabricated value)
-  // Indexes (created by the writer task, NOT here): (ticker, observation_ts) and a partial
-  // "latest per ticker" lookup.
+  // Indexes (created by the writer task, NOT here): (symbol, market, observation_ts).
   FACTOR_SCORES:             'factor_scores',
   // Append-only per-cycle snapshot of the optimiser's held set. After the long-only optimiser
   // produces the final weights each cycle, signal-service writes one doc per ranked name. Powers
@@ -139,12 +171,15 @@ export const COLLECTIONS = {
   // Indexes (created by the writer task, NOT here): a backlink lookup over `links.ref`
   // ("notes referencing entity X").
   RESEARCH_NOTES:            'research_notes',
-  // Per-ticker corporate-actions store (cash dividends + stock splits) sourced from the EODHD
+  // Per-instrument corporate-actions store (cash dividends + stock splits) sourced from the EODHD
   // Dividends/Splits feeds. Written by market-data-service's CorporateActionsStore via an
   // INCREMENTAL sync — each pass fetches only the events newer than the last stored ex-date /
   // split-effective date, so a re-sync with no new actions makes ZERO upstream EODHD calls
-  // (plan §I). One doc per ticker:
-  //   { _id: ticker,
+  // (plan §I). Keyed on the bare (symbol, market) identity since Task 16b — `_id` is the composite
+  // `${symbol}:${market}` string and `symbol`+`market` are carried as separate fields; the
+  // concatenated T212 `ticker` is no longer stored (the public methods take a T212 ticker and bridge
+  // to the (symbol, market) `_id` at the Mongo boundary). One doc per instrument:
+  //   { _id: '<symbol>:<market>', symbol, market,
   //     dividends: [ { date,            // 'YYYY-MM-DD' ex-dividend date (point-in-time key)
   //                    valuePerShare,   // gross dividend per share, BASE units (pence killed at
   //                                     // the boundary — LSE pence ÷100 → GBP, like prices)
