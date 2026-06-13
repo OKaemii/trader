@@ -235,3 +235,74 @@ def test_factors_endpoint_no_universe_is_empty(monkeypatch, lake: Path) -> None:
     res = client.get("/admin/api/fundamentals-pit/factors")
     assert res.status_code == 200
     assert res.json()["factors"] == {}
+
+
+# ── /sectors — the secondary EDGAR-SIC sector source for the universe (Task 19) ─────
+def _patch_store(monkeypatch, lake: Path) -> None:
+    """Point the /sectors handler's singleton `get_store()` at the synthetic lake (the route reads the
+    store directly, not via `_build_resolver`)."""
+    monkeypatch.setattr("src.store.get_store", lambda: Store(lake))
+
+
+def test_sectors_resolves_us_sic_to_gics_label(monkeypatch, lake: Path) -> None:
+    # The fixture entity is SIC 7372 (prepackaged software) → 'Technology'. The covered US name
+    # resolves to its EDGAR-SIC sector label, keyed on the request ticker.
+    _patch_store(monkeypatch, lake)
+    res = client.get("/internal/api/fundamentals-pit/sectors?symbols=AAPL_US_EQ")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["sectors"]["AAPL_US_EQ"] == "Technology"
+    assert body["count"] == 1
+
+
+def test_sectors_accepts_bare_symbol(monkeypatch, lake: Path) -> None:
+    _patch_store(monkeypatch, lake)
+    res = client.get("/internal/api/fundamentals-pit/sectors?symbols=AAPL")
+    assert res.status_code == 200
+    assert res.json()["sectors"]["AAPL"] == "Technology"
+
+
+def test_sectors_omits_non_us(monkeypatch, lake: Path) -> None:
+    # A non-US (LSE) name has no EDGAR presence → omitted (not in the map, no error).
+    _patch_store(monkeypatch, lake)
+    res = client.get("/internal/api/fundamentals-pit/sectors?symbols=SHELl_EQ")
+    assert res.status_code == 200
+    assert res.json()["sectors"] == {}
+
+
+def test_sectors_omits_uncovered_us_name(monkeypatch, lake: Path) -> None:
+    # A US name absent from the lake (cold/partial) → omitted, never guessed. Graceful-fallback contract.
+    _patch_store(monkeypatch, lake)
+    res = client.get("/internal/api/fundamentals-pit/sectors?symbols=ZZZZ_US_EQ")
+    assert res.status_code == 200
+    assert res.json()["sectors"] == {}
+
+
+def test_sectors_omits_unmapped_sic(monkeypatch, tmp_path: Path) -> None:
+    # A covered US name whose SIC maps to no sector band → omitted (the caller leaves it 'Unknown').
+    root = tmp_path / "lake2"
+    root.mkdir()
+    write_facts(root, 200, full_name_facts(200))
+    write_ticker_history(root, [ticker_row(200, "WEIRD")])
+    write_entities(root, [entity_row(200, "WEIRD", sic="9995", sic_desc="Non-classifiable")])
+    monkeypatch.setattr("src.store.get_store", lambda: Store(root))
+    res = client.get("/internal/api/fundamentals-pit/sectors?symbols=WEIRD")
+    assert res.status_code == 200
+    assert res.json()["sectors"] == {}
+
+
+def test_sectors_cold_lake_omits_all(monkeypatch, tmp_path: Path) -> None:
+    # A cold lake (no entities.parquet / ticker_history at all) → every name omitted, 200 not 500.
+    cold = tmp_path / "cold-sectors"
+    cold.mkdir()
+    monkeypatch.setattr("src.store.get_store", lambda: Store(cold))
+    res = client.get("/internal/api/fundamentals-pit/sectors?symbols=AAPL,MSFT")
+    assert res.status_code == 200
+    assert res.json()["sectors"] == {}
+
+
+def test_sectors_no_symbols_is_empty(monkeypatch, lake: Path) -> None:
+    _patch_store(monkeypatch, lake)
+    res = client.get("/internal/api/fundamentals-pit/sectors")
+    assert res.status_code == 200
+    assert res.json()["sectors"] == {}

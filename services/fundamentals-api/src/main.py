@@ -306,3 +306,68 @@ async def admin_coverage() -> JSONResponse:
             status_code=503,
             content={"detail": f"coverage unavailable: {type(exc).__name__}: {exc}"},
         )
+
+
+def _resolve_sectors(symbols: list[str]) -> dict[str, str]:
+    """Map each US symbol to its GICS-style sector label off the lake's EDGAR SIC (`entities.parquet`),
+    for the SECONDARY universe sector source (Task 19). Per symbol: request ticker → identity → (US
+    only) `Store.resolve` → CIK → `Store.profile(cik).sic` → `sector_for_sic`. A name is included ONLY
+    when a sector genuinely resolved — a non-US identity, a cold/partial lake (no CIK, no entity row),
+    or an unmapped/absent SIC all OMIT the symbol (the caller treats absence as "no EDGAR sector"). This
+    is the graceful-fallback contract: the lake `entities.parquet` fills in over harvester sweeps, so a
+    not-yet-covered name must degrade to omission, never to a guessed sector or a crash.
+
+    Keyed on the ORIGINAL request symbol (bare or T212) so the TS caller can re-key to its own ticker.
+    Synchronous (DuckDB) — the route awaits it off the event loop is unnecessary at this volume; the
+    resolve is a single per-CIK metadata read, not a fact scan."""
+    from datetime import datetime, timezone
+
+    from src.resolver import identity_of
+    from src.store import get_store
+
+    from quant_core.fundamentals.lake.sic_sector import sector_for_sic
+
+    store = get_store()
+    today = datetime.now(timezone.utc).date()  # the resolve as-of (current membership; sector is "now")
+    out: dict[str, str] = {}
+    for symbol in symbols:
+        ident = identity_of(symbol)
+        if ident is None or ident.market != "US":
+            continue  # non-US / malformed → no EDGAR sector (fail-soft, omitted)
+        ent = store.resolve(ident.symbol, ident.market, today)
+        if ent is None:
+            continue  # cold/partial lake or unknown CIK — omit, never guess
+        profile = store.profile(ent["cik"])
+        sector = sector_for_sic(profile.get("sic") if profile is not None else None)
+        if sector is not None:
+            out[symbol] = sector
+    return out
+
+
+@app.get("/internal/api/fundamentals-pit/sectors")
+async def internal_sectors(
+    symbols: Optional[str] = Query(
+        default=None,
+        description="Comma-separated symbols — legacy T212 (AAPL_US_EQ) OR bare (AAPL). Non-US names "
+        "are silently omitted (no EDGAR presence).",
+    ),
+) -> JSONResponse:
+    """SECONDARY sector source for the active universe (Task 19) — the EDGAR-SIC sector label per US
+    name, off the lake's `entities.parquet`. market-data-service's `EdgarSicSectorClient` calls this
+    in-cluster for curated/US tickers the EODHD screener (the PRIMARY source) didn't sector. Returns
+    `{ "sectors": { symbol: "<GICS label>" } }` for ONLY the names a sector resolved — a non-US name, a
+    cold/partial lake, or an unmapped SIC is absent from the map (the caller leaves those 'Unknown').
+
+    GRACEFUL, never required: a cold-lake / filesystem error degrades to a 503 (the caller fail-soft
+    treats any non-200 as "no EDGAR sectors this refresh"), and `entities.parquet` may legitimately be
+    absent/partial while the harvester bootstraps — a not-yet-covered name simply isn't in the map. Not
+    in-app auth-gated (mirrors the sibling `/internal/api/fundamentals-pit` seam routes — the ingress +
+    in-cluster network are the boundary)."""
+    try:
+        sectors = _resolve_sectors(_parse_tickers(symbols))
+        return JSONResponse(content={"sectors": sectors, "count": len(sectors)})
+    except Exception as exc:  # noqa: BLE001 — a cold-lake/filesystem error degrades to 503, never a bare 500
+        return JSONResponse(
+            status_code=503,
+            content={"detail": f"sectors unavailable: {type(exc).__name__}: {exc}"},
+        )
