@@ -1,7 +1,7 @@
 import type { Db } from 'mongodb';
 import { COLLECTIONS } from '@trader/shared-mongo';
 import { getPgPool } from '@trader/shared-pg';
-import { Trading212TickerAdapter } from '@trader/ticker-identity';
+import { Trading212TickerAdapter, type TickerIdentity } from '@trader/ticker-identity';
 import type { Money, Currency } from '@trader/shared-types';
 
 // Bi-temporal price lookup for trading-service. Dispatches between Mongo
@@ -10,8 +10,9 @@ import type { Money, Currency } from '@trader/shared-types';
 // OrderDispatcher to size orders in instrument currency.
 //
 // Renamed from MongoPriceLookup as part of agent-docs/plans/three-database-split.md.
-// Storage is keyed on the bare identity (symbol, market) since Thread A (Task 15); the public
-// methods still accept a T212 ticker during the transition and split it at the storage boundary.
+// Storage is keyed on the bare identity (symbol, market) since Thread A (Task 15); since
+// Task 17 the PUBLIC methods take a TickerIdentity directly — there is no T212 ticker on the
+// read path, so no toT212/fromT212 here. The broker string is produced only at the T212 client.
 
 function activeBackend(): 'mongo' | 'timescale' {
   return (process.env.BARS_BACKEND ?? 'mongo') === 'timescale' ? 'timescale' : 'mongo';
@@ -24,29 +25,29 @@ const tickerAdapter = new Trading212TickerAdapter();
 // mis-tagged GBP and the dispatcher would size orders by an FX factor —
 // rounded down to 0 shares for almost every US signal. The market is the currency
 // determinant: a US listing → USD, an LSE listing → GBP (via the adapter).
-function inferCurrency(ticker: string, persisted: unknown): Currency {
+function inferCurrency(id: TickerIdentity, persisted: unknown): Currency {
   if (persisted === 'USD' || persisted === 'GBP') return persisted;
-  return tickerAdapter.currencyOf(tickerAdapter.fromT212(ticker));
+  return tickerAdapter.currencyOf(id);
 }
 
 export class PriceLookup {
   constructor(private readonly db: Db) {}
 
-  async lastClose(ticker: string, asOf?: number): Promise<number | null> {
-    if (activeBackend() === 'timescale') return this._lastClosePg(ticker, asOf);
-    return this._lastCloseMongo(ticker, asOf);
+  async lastClose(id: TickerIdentity, asOf?: number): Promise<number | null> {
+    if (activeBackend() === 'timescale') return this._lastClosePg(id, asOf);
+    return this._lastCloseMongo(id, asOf);
   }
 
-  async lastCloseMoney(ticker: string, asOf?: number): Promise<Money | null> {
-    if (activeBackend() === 'timescale') return this._lastCloseMoneyPg(ticker, asOf);
-    return this._lastCloseMoneyMongo(ticker, asOf);
+  async lastCloseMoney(id: TickerIdentity, asOf?: number): Promise<Money | null> {
+    if (activeBackend() === 'timescale') return this._lastCloseMoneyPg(id, asOf);
+    return this._lastCloseMoneyMongo(id, asOf);
   }
 
   // ── Mongo path ──────────────────────────────────────────────────────────────
 
-  private async _lastCloseMongo(ticker: string, asOf?: number): Promise<number | null> {
+  private async _lastCloseMongo(id: TickerIdentity, asOf?: number): Promise<number | null> {
     const coll = this.db.collection(COLLECTIONS.OHLCV_BARS);
-    const { symbol, market } = tickerAdapter.fromT212(ticker);
+    const { symbol, market } = id;
     if (asOf === undefined) {
       const doc = await coll
         .find({ symbol, market, is_superseded: false })
@@ -69,9 +70,9 @@ export class PriceLookup {
     return close && close > 0 ? close : null;
   }
 
-  private async _lastCloseMoneyMongo(ticker: string, asOf?: number): Promise<Money | null> {
+  private async _lastCloseMoneyMongo(id: TickerIdentity, asOf?: number): Promise<Money | null> {
     const coll = this.db.collection(COLLECTIONS.OHLCV_BARS);
-    const { symbol, market } = tickerAdapter.fromT212(ticker);
+    const { symbol, market } = id;
     let doc: Record<string, unknown> | null;
     if (asOf === undefined) {
       doc = await coll
@@ -92,14 +93,14 @@ export class PriceLookup {
     if (!doc) return null;
     const close = typeof doc.close === 'number' ? doc.close : null;
     if (!close || close <= 0) return null;
-    return { amount: close, currency: inferCurrency(ticker, doc.currency) };
+    return { amount: close, currency: inferCurrency(id, doc.currency) };
   }
 
   // ── Timescale path ──────────────────────────────────────────────────────────
 
-  private async _lastClosePg(ticker: string, asOf?: number): Promise<number | null> {
+  private async _lastClosePg(id: TickerIdentity, asOf?: number): Promise<number | null> {
     const pool = getPgPool();
-    const { symbol, market } = tickerAdapter.fromT212(ticker);
+    const { symbol, market } = id;
     if (asOf === undefined) {
       const { rows } = await pool.query<{ close: string }>(
         `SELECT close FROM bars
@@ -124,9 +125,9 @@ export class PriceLookup {
     return close && close > 0 ? close : null;
   }
 
-  private async _lastCloseMoneyPg(ticker: string, asOf?: number): Promise<Money | null> {
+  private async _lastCloseMoneyPg(id: TickerIdentity, asOf?: number): Promise<Money | null> {
     const pool = getPgPool();
-    const { symbol, market } = tickerAdapter.fromT212(ticker);
+    const { symbol, market } = id;
     let row: { close: string; currency: string | null } | undefined;
     if (asOf === undefined) {
       const { rows } = await pool.query<{ close: string; currency: string | null }>(
@@ -152,6 +153,6 @@ export class PriceLookup {
     if (!row) return null;
     const close = Number(row.close);
     if (!close || close <= 0) return null;
-    return { amount: close, currency: inferCurrency(ticker, row.currency) };
+    return { amount: close, currency: inferCurrency(id, row.currency) };
   }
 }

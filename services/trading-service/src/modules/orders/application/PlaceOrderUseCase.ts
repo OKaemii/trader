@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Logger } from '@trader/core';
 import type { SignalServiceClient } from '@trader/contracts';
 import type { Money } from '@trader/shared-types';
+import { identityOf } from '../../../shared/identity.ts';
 import {
     type Order,
     OrderSide,
@@ -138,8 +139,12 @@ export class PlaceOrderUseCase {
 
         const brokerStart = Date.now();
         try {
+            // Convert to the bare identity at the executor boundary — the single fromT212 on the
+            // order-send path. The Order entity still carries the broker `ticker` (it migrates to
+            // (symbol, market) in a later card); the executor + its T212 client work in identity
+            // and call toT212 at the actual send.
             const result = await this.executor.execute({
-                ticker:     order.ticker,
+                id:         identityOf(order.ticker),
                 side:       order.side,
                 orderType:  order.orderType,
                 quantity:   order.quantity,

@@ -24,13 +24,15 @@ export class FlattenAllUseCase {
       catch (err) { errors.push(`cancel ${o.id}: ${err instanceof Error ? err.message : String(err)}`); }
     }
 
-    // 2. Market-sell every open position (signed negative quantity = SELL).
-    let positions: Array<{ ticker: string; quantity: number }> = [];
+    // 2. Market-sell every open position (signed negative quantity = SELL). The position already
+    // carries its bare (symbol, market) — pass that straight to the client, which re-derives the
+    // broker string at the send. No ticker re-parse here.
+    let positions: Awaited<ReturnType<Trading212Client['getPositions']>> = [];
     try { positions = await this.client.getPositions(); }
     catch (err) { errors.push(`positions: ${err instanceof Error ? err.message : String(err)}`); }
     for (const p of positions) {
       if (p.quantity > 0) {
-        try { await this.client.placeMarketOrder(p.ticker, -p.quantity); soldPositions++; }
+        try { await this.client.placeMarketOrder({ symbol: p.symbol, market: p.market }, -p.quantity); soldPositions++; }
         catch (err) { errors.push(`sell ${p.ticker}: ${err instanceof Error ? err.message : String(err)}`); }
       }
     }

@@ -1,9 +1,13 @@
 import type { Logger } from '@trader/core';
 import type { SignalServiceClient, OpenBuy } from '@trader/contracts';
+import { Trading212TickerAdapter } from '@trader/ticker-identity';
 import { type Order, OrderSide, OrderStatus } from '../../orders/domain/Order.ts';
 import type { IOrderRepository } from '../../orders/domain/IOrderRepository.ts';
-import { type Trading212Client, type T212HistoryItem, currencyOfTicker } from '../../t212/infrastructure/Trading212Client.ts';
+import { type Trading212Client, type T212HistoryItem } from '../../t212/infrastructure/Trading212Client.ts';
 import { scaleT212Quote, type PriceLookupForScaler } from '../../../shared/T212PriceScaler.ts';
+import { tryIdentityOf } from '../../../shared/identity.ts';
+
+const adapter = new Trading212TickerAdapter();
 
 const MAX_HISTORY_PAGES = 5;    // 5 × 50 = 250 most-recent terminal orders — well beyond a 30s tick window
 const HISTORY_PAGE_SIZE = 50;
@@ -168,8 +172,13 @@ export class FillsPoller {
         if (status === 'FILLED' && item.fill) {
             const filledAt = Date.parse(item.fill.filledAt);
             const rawFillPrice = item.fill.price;
-            const fillPrice = this.priceLookup
-                ? await scaleT212Quote(order.ticker, rawFillPrice, this.priceLookup, this.logger)
+            // The Mongo order carries the broker `ticker` (re-derived from its stored (symbol,
+            // market)). Split it once here, fail-soft, so the pence-kill keys on market and the
+            // ledger currency comes from the adapter — no suffix sniffing. An un-routable form
+            // (shouldn't happen for a real fill) skips the scale + tags GBP (the account base).
+            const id = tryIdentityOf(order.ticker);
+            const fillPrice = this.priceLookup && id
+                ? await scaleT212Quote(id, rawFillPrice, this.priceLookup, this.logger)
                 : rawFillPrice;
             const filledQuantity = item.fill.quantity;
             await this.orderRepo.save({ ...order, status: OrderStatus.Filled, filledAt, fillPrice, filledQuantity });
@@ -185,7 +194,7 @@ export class FillsPoller {
                         side:      order.side === OrderSide.Buy ? 'BUY' : 'SELL',
                         quantity:  filledQuantity,
                         fillPrice,
-                        currency:  currencyOfTicker(order.ticker),
+                        currency:  id ? adapter.currencyOf(id) : 'GBP',
                         filledAt,
                         arrivalAt: Date.parse(item.order.createdAt) || null,
                     });

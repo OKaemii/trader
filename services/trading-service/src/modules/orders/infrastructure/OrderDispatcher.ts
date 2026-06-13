@@ -10,6 +10,7 @@ import type { AccountCache } from './AccountCache.ts';
 import { MongoOrderRepository } from './MongoOrderRepository.ts';
 import { getMidQuote } from '@trader/shared-bars';
 import { PriceLookup } from '../../../shared/PriceLookup.ts';
+import { tryIdentityOf } from '../../../shared/identity.ts';
 import { T212OrderExecutor } from '../../t212/infrastructure/T212OrderExecutor.ts';
 import { PlaceOrderUseCase } from '../application/PlaceOrderUseCase.ts';
 import { getSignalOrderType } from './live-config.ts';
@@ -237,7 +238,13 @@ export class OrderDispatcher {
 
         const db = await this.deps.getDb();
         const priceLookup = new PriceLookup(db);
-        const currentPrice = await priceLookup.lastCloseMoney(signal.ticker);
+        // The claimed signal carries the broker `ticker` over the contract (signal-service keeps
+        // the T212 string until the contract migration). Split it to the bare identity at this
+        // boundary; PriceLookup now reads on (symbol, market). Fail-soft: an un-routable name
+        // yields no price, and the signal fails CashInsufficient on a zero size — the existing
+        // degradation, never a thrown cycle.
+        const signalId = tryIdentityOf(signal.ticker);
+        const currentPrice = signalId ? await priceLookup.lastCloseMoney(signalId) : null;
 
         if (!currentPrice) {
             this.deps.logger.warn({ signalId: signal.id, ticker: signal.ticker },
