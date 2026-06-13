@@ -183,13 +183,14 @@ describe('POST /internal/bars (batch)', () => {
 describe('admin + internal-bars on the same app (mounting regression)', () => {
   it('strategy-engine token is accepted on /internal/bars when both routers are mounted', async () => {
     const { createAdminRouter } = await import('../modules/admin/routes.ts');
-    const { YahooProvider } = await import('../modules/bars/infrastructure/providers/yahoo-provider.ts');
+    const { TwelveDataProvider } = await import('../modules/bars/infrastructure/providers/twelvedata-provider.ts');
     const stubUM: any = { activeTickers: [], sectorMap: {}, refresh: async () => [] };
 
     const app = new Hono();
     // Admin first, then internal — same order as production wiring (index.ts).
     const noopLog = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {}, trace: () => {}, fatal: () => {}, child: () => noopLog, level: 'info' } as never;
-    app.route('/', createAdminRouter(stubUM, new YahooProvider(), noopLog));
+    const provider = new TwelveDataProvider({ apiKey: '', creditsPerMinute: 8, dailyCreditLimit: 800 });
+    app.route('/', createAdminRouter(stubUM, provider, noopLog));
     app.route('/', createInternalBarsRouter(stubUM));
 
     const res = await app.request('/internal/api/market-data/bars', {

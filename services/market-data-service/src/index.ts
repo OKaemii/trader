@@ -16,7 +16,6 @@ import { QuoteWriter } from './modules/quotes/infrastructure/quote-writer.ts';
 import { buildQuoteProvider } from './modules/quotes/infrastructure/quote-providers.ts';
 import { getLiveConfig } from './shared/live-config.ts';
 import { createAdminRouter, createInternalBarsRouter } from './modules/admin/routes.ts';
-import { YahooProvider } from './modules/bars/infrastructure/providers/yahoo-provider.ts';
 import { TwelveDataProvider } from './modules/bars/infrastructure/providers/twelvedata-provider.ts';
 import { configureEodhdClient, getEodhdClient } from './modules/bars/infrastructure/providers/eodhd-client.ts';
 import type { MarketDataProvider } from './modules/bars/infrastructure/providers/market-data-provider.ts';
@@ -296,19 +295,15 @@ async function getFxClient(): Promise<FxClient> {
   return _fxClient;
 }
 
-// Provider is swappable via MARKET_DATA_PROVIDER (default `twelvedata`; `yahoo` is the
-// legacy fallback). The pollLoop / admin-routes / universe-manager all consume the
-// MarketDataProvider abstraction, never provider-specific functions directly — so flipping
-// the env var (and redeploying) is the only change needed to roll back to Yahoo.
+// The 5m OHLCV/liquidity provider. TwelveData is the only upstream now (the dormant Yahoo provider
+// was removed with the rest of the Yahoo clients — epic pit-fundamentals-lake-rearchitecture,
+// Thread C). The pollLoop / admin-routes / universe-manager all consume the MarketDataProvider
+// abstraction, never provider-specific functions directly, so a future paid feed is a one-branch add.
 function buildProvider(): MarketDataProvider {
   const fxToGBP = async (amount: number, currency: Currency) => {
     const fx = await getFxClient();
     return fx.toGBP({ amount, currency });
   };
-  if (env.MARKET_DATA_PROVIDER === 'yahoo') {
-    log.info('[market-data] provider = yahoo (free Yahoo Finance)');
-    return new YahooProvider(fxToGBP);
-  }
   if (!env.TWELVEDATA_API_KEY) {
     log.error('[market-data] MARKET_DATA_PROVIDER=twelvedata but TWELVEDATA_API_KEY is unset — provider will return no bars until the secret is wired');
   }

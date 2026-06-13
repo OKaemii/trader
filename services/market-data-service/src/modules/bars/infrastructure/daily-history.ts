@@ -1,9 +1,8 @@
 // daily-history — seed + maintain the persisted `interval:'daily'` series that backs
 // long-horizon strategy lookbacks (e.g. 12-1 momentum needs ~273 trading days, far past
-// the 60-day 5m provider cap). Sourced from Yahoo daily (free, multi-year), decoupled from
-// the metered TwelveData 5m feed — the same "stays on Yahoo regardless" split as the FX and
-// sector clients. The EOD daily emit (maybeEmitDailyAtClose) keeps the series fresh going
-// forward; this module seeds the historical depth.
+// the 60-day 5m provider cap). Sourced from EODHD `/eod` (paid bulk-EOD, multi-year),
+// decoupled from the metered TwelveData 5m feed. The EOD daily emit (maybeEmitDailyAtClose)
+// keeps the series fresh going forward; this module seeds the historical depth.
 //
 // Bi-temporal: writes go through writeBarRevisions exactly like the 5m path — idempotent
 // re-backfill is a no-op, genuine revisions append + supersede.
@@ -15,7 +14,6 @@ import { invalidateBars } from '@trader/shared-bars';
 import { Trading212TickerAdapter } from '@trader/ticker-identity';
 import type { OHLCVBar } from '@trader/shared-types';
 import { writeBarRevisions } from './persist-bars.ts';
-import { fetchYahooDailyHistory } from './providers/yahoo-client.ts';
 import { fetchEodhdDailyHistory } from './providers/eodhd-client.ts';
 import { CACHE_INVALIDATED_TOPIC, planGapWindows } from './backfill.ts';
 import { log } from '../../../logger.ts';
@@ -79,14 +77,12 @@ export async function backfillDailyHistory(
   return results;
 }
 
-// Long-range daily source dispatch. DAILY_HISTORY_PROVIDER selects 'yahoo' (free, default) or
-// 'eodhd' (paid bulk-EOD). Both return oldest-first daily OHLCVBar[] tagged interval:'daily';
-// writeBarRevisions persists them identically (bi-temporal, idempotent).
+// Long-range daily source. EODHD `/eod` is the only daily-history upstream now (the Yahoo path was
+// removed with the rest of the Yahoo clients — epic pit-fundamentals-lake-rearchitecture, Thread C).
+// Returns oldest-first daily OHLCVBar[] tagged interval:'daily'; writeBarRevisions persists them
+// bi-temporally + idempotently.
 function fetchDailyHistory(ticker: string, startMs: number, endMs: number): Promise<OHLCVBar[]> {
-  const src = (process.env.DAILY_HISTORY_PROVIDER ?? 'yahoo').toLowerCase();
-  return src === 'eodhd'
-    ? fetchEodhdDailyHistory(ticker, startMs, endMs)
-    : fetchYahooDailyHistory(ticker, startMs, endMs);
+  return fetchEodhdDailyHistory(ticker, startMs, endMs);
 }
 
 async function backfillDailyOne(
@@ -120,8 +116,7 @@ async function backfillDailyOne(
     await Promise.all(fetchWindows.map((w) => fetchDailyHistory(ticker, w.startMs, w.endMs)))
   ).flat();
   if (bars.length === 0) {
-    const src = (process.env.DAILY_HISTORY_PROVIDER ?? 'yahoo').toLowerCase();
-    log.warn(`[daily-history] ${ticker}: ${src} returned no daily history`);
+    log.warn(`[daily-history] ${ticker}: eodhd returned no daily history`);
     return { ticker, fetched: 0, upserted: 0 };
   }
   const stats = await writeBarRevisions(db, bars, 'daily');
