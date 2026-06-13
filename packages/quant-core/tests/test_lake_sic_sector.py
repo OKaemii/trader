@@ -33,7 +33,13 @@ from quant_core.fundamentals.lake.sic_sector import (
         ("7372", SECTOR_TECHNOLOGY),            # Microsoft — prepackaged software
         ("3674", SECTOR_TECHNOLOGY),            # NVIDIA / Intel — semiconductors
         ("3571", SECTOR_TECHNOLOGY),            # Apple — electronic computers
+        ("3661", SECTOR_TECHNOLOGY),            # Cisco — telephone & telegraph apparatus
         ("7370", SECTOR_TECHNOLOGY),            # computer services
+        ("3812", SECTOR_INDUSTRIALS),           # RTX / Lockheed / Northrop — defense (carve-out, not Healthcare)
+        ("3585", SECTOR_INDUSTRIALS),           # Carrier / Trane — refrigeration machinery (not Technology)
+        ("3634", SECTOR_INDUSTRIALS),           # Whirlpool — household appliances (not Technology)
+        ("3690", SECTOR_INDUSTRIALS),           # misc electrical machinery (not Technology)
+        ("2631", SECTOR_BASIC_MATERIALS),       # International Paper — paperboard mills (not Consumer Cyclical)
         (2834, SECTOR_HEALTHCARE),             # Pfizer — pharmaceutical preparations (int input)
         ("2836", SECTOR_HEALTHCARE),            # biological products
         ("3841", SECTOR_HEALTHCARE),            # surgical & medical instruments
@@ -72,8 +78,15 @@ def test_carve_outs_win_over_their_wider_band():
     # Each carve-out band is checked BEFORE the wider band it sits inside — the first containing band
     # wins, so the narrower sector label is returned, not the wider one.
     assert sector_for_sic("1311") == SECTOR_ENERGY            # oil&gas inside Mining(BasicMaterials)
+    assert sector_for_sic("2631") == SECTOR_BASIC_MATERIALS   # paper inside Textiles(Cyclical)
     assert sector_for_sic("2834") == SECTOR_HEALTHCARE        # drugs inside Chemicals(BasicMaterials)
     assert sector_for_sic("3571") == SECTOR_TECHNOLOGY        # computers inside Machinery(Industrials)
+    assert sector_for_sic("3674") == SECTOR_TECHNOLOGY        # semis inside Machinery(Industrials)
+    # The Tech electronics carve-out is 3660–3679 (comms/semis), NOT the low 36xx: appliances (3634
+    # Whirlpool) + electrical apparatus (3612) must fall through to Industrials, not the Tech band.
+    assert sector_for_sic("3634") == SECTOR_INDUSTRIALS       # household appliances — Industrials, not Tech
+    assert sector_for_sic("3612") == SECTOR_INDUSTRIALS       # power transformers — Industrials, not Tech
+    assert sector_for_sic("3812") == SECTOR_INDUSTRIALS       # defense inside Instruments(Healthcare)
     assert sector_for_sic("5411") == SECTOR_CONSUMER_DEFENSIVE  # food stores inside Retail(Cyclical)
     assert sector_for_sic("6798") == SECTOR_REAL_ESTATE       # REIT inside Holding(FinancialServices)
 

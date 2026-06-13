@@ -20,19 +20,19 @@ structure (https://www.sec.gov/corpfin/division-of-corporation-finance-standard-
   * 1000–1499  Mining (metal/coal/nonmetallic)           → Basic Materials
   * 1300–1399  Oil & Gas Extraction                      → Energy            (carve-out of Mining)
   * 1500–1799  Construction                              → Industrials
-  * 2000–2099  Food & Kindred Products                   → Consumer Defensive
-  * 2080–2085  Beverages                                 → Consumer Defensive
-  * 2100–2199  Tobacco                                   → Consumer Defensive
-  * 2200–2799  Textiles / Apparel / Paper / Printing     → Consumer Cyclical
+  * 2000–2199  Food / Beverages / Tobacco                → Consumer Defensive
+  * 2600–2699  Paper & Allied Products                   → Basic Materials   (carve-out of 2200–2799)
+  * 2200–2799  Textiles / Apparel / Lumber / Printing    → Consumer Cyclical
   * 2800–2899  Chemicals (incl. industrial/ag chem)      → Basic Materials
   * 2833–2836  Drugs / Biologicals                       → Healthcare        (carve-out of Chemicals)
   * 2900–2999  Petroleum Refining                        → Energy
   * 3000–3399  Rubber / Plastics / Leather / Stone / Metals → Basic Materials
-  * 3400–3569  Fabricated Metal / Machinery (non-computer) → Industrials
-  * 3570–3579  Computer & Office Equipment               → Technology
-  * 3600–3674  Electronics / Semiconductors              → Technology
+  * 3570–3579  Computer & Office Equipment               → Technology        (carve-out of 3400–3699)
+  * 3660–3679  Comms eqpt / Semiconductors / Components   → Technology        (carve-out of 3400–3699)
+  * 3400–3699  Machinery / appliances / electrical eqpt  → Industrials       (3585 Carrier, 3630s Whirlpool)
   * 3700–3799  Transportation Equipment (auto/aero)      → Consumer Cyclical
-  * 3800–3851  Instruments / Medical devices             → Healthcare
+  * 3812       Defense / aero-systems (search/nav/guid)  → Industrials       (carve-out of 3800–3851)
+  * 3800–3851  Measuring / lab / medical instruments     → Healthcare
   * 3852–3999  Photographic / misc manufacturing         → Industrials
   * 4000–4799  Transportation (rail/truck/air/water)     → Industrials
   * 4800–4899  Communications (telephone/broadcast)      → Communication Services
@@ -58,11 +58,11 @@ structure (https://www.sec.gov/corpfin/division-of-corporation-finance-standard-
   * 8100–8999  Legal / Educational / Social / Eng Svcs    → Industrials
   * else / unparseable / absent                          → None (caller → 'Unknown')
 
-The carve-outs (oil-&-gas inside Mining, drugs inside Chemicals, computer/semis inside Machinery,
-software inside Services, food stores inside Retail) are encoded as NARROWER bands placed BEFORE the
-wider band; the first containing band wins. An unmapped / malformed / absent SIC returns ``None`` — the
-caller renders ``'Unknown'`` (cap-exempt), never a guessed sector. Pure + total — no I/O, no
-exceptions on bad input.
+The carve-outs (oil-&-gas inside Mining, paper inside Textiles, drugs inside Chemicals, computer/semis
+inside Machinery, defense 3812 inside Instruments, software inside Services, food stores inside Retail)
+are encoded as NARROWER bands placed BEFORE the wider band; the first containing band wins. An unmapped
+/ malformed / absent SIC returns ``None`` — the caller renders ``'Unknown'`` (cap-exempt), never a
+guessed sector. Pure + total — no I/O, no exceptions on bad input.
 """
 from __future__ import annotations
 
@@ -93,7 +93,10 @@ _SIC_SECTOR_BANDS: tuple[tuple[int, int, str], ...] = (
     (1500, 1799, SECTOR_INDUSTRIALS),
     # Food / beverages / tobacco — consumer staples.
     (2000, 2199, SECTOR_CONSUMER_DEFENSIVE),
-    # Textiles / apparel / lumber / furniture / paper / printing — cyclical goods.
+    # Paper & allied products (2600–2699) — a Materials sub-range carved out to Basic Materials before
+    # the wider Textiles/Apparel/Printing cyclical band (International Paper, WestRock, Packaging Corp).
+    (2600, 2699, SECTOR_BASIC_MATERIALS),
+    # Textiles / apparel / lumber / furniture / printing — cyclical goods.
     (2200, 2799, SECTOR_CONSUMER_CYCLICAL),
     # Chemicals — drugs/biologicals (2833–2836) carved out to Healthcare before the wider Chemicals band.
     (2833, 2836, SECTOR_HEALTHCARE),
@@ -102,15 +105,26 @@ _SIC_SECTOR_BANDS: tuple[tuple[int, int, str], ...] = (
     (2900, 2999, SECTOR_ENERGY),
     # Rubber / plastics / leather / stone-clay-glass / primary & fabricated metals (non-machinery).
     (3000, 3399, SECTOR_BASIC_MATERIALS),
-    # Fabricated metal + machinery (non-computer).
-    (3400, 3569, SECTOR_INDUSTRIALS),
-    # Computer & office equipment.
+    # ── 35xx–36xx: the Technology carve-outs (computers + comms eqpt + semiconductors/components) MUST
+    #    precede the wider Industrials machinery band below — first-match-wins, narrow Tech ranges first.
+    # Computer & office equipment (Apple 3571, computer-comms 3576; 3570–3579).
     (3570, 3579, SECTOR_TECHNOLOGY),
-    # Electronic / electrical equipment incl. semiconductors.
-    (3580, 3699, SECTOR_TECHNOLOGY),
+    # Communications equipment (Cisco 3661, Motorola 3663) + electronic components / semiconductors
+    # (NVIDIA/Intel 3674, 3670–3679) — the genuine Technology sub-range of group 36. NOT the low 36xx
+    # (3600–3629 electrical apparatus, 3630s appliances, 3640s lighting) — those stay Industrials.
+    (3660, 3679, SECTOR_TECHNOLOGY),
+    # Everything else in 3400–3699 — fabricated metal + machinery (3400–3569), service/refrigeration
+    # machinery (3580–3599, Carrier/Trane 3585), electrical apparatus/appliances/lighting (3600–3659,
+    # Whirlpool 3630s), misc electrical equipment (3680–3699) — Industrials, NOT Technology (the bug the
+    # old 3580–3699 Tech band caused: it swept appliances + refrigeration machinery into Technology).
+    (3400, 3699, SECTOR_INDUSTRIALS),
     # Transportation equipment (motor vehicles, aerospace, ships) — cyclical.
     (3700, 3799, SECTOR_CONSUMER_CYCLICAL),
-    # Measuring / analysing / controlling instruments + medical/surgical devices.
+    # Defense / aero-systems primes (3812 — search/detection/navigation/guidance) — Industrials, carved
+    # out before the medical-instruments Healthcare band (RTX, Lockheed Martin, Northrop, L3Harris).
+    (3812, 3812, SECTOR_INDUSTRIALS),
+    # Measuring / analysing / controlling + lab + medical/surgical instruments (Thermo Fisher 3826,
+    # Medtronic 3845, Stryker 3841) — Healthcare. 3812 (defense) is carved out above.
     (3800, 3851, SECTOR_HEALTHCARE),
     # Photographic / watches / misc manufacturing.
     (3852, 3999, SECTOR_INDUSTRIALS),
