@@ -92,10 +92,11 @@ spec:
               value: {{ .Values.global.env.highVelocityDropN | default "10" | quote }}
             - name: HIGH_VELOCITY_VOL_LOOKBACK
               value: {{ .Values.global.env.highVelocityVolLookback | default "90" | quote }}
-            # Live fundamentals seam (epic Task 14). yahoo (forward-only snapshot, default) | pit
-            # (route US/UK to the PIT warehouse via fundamentals-api, Yahoo fallback). Reversible by env.
+            # Live fundamentals seam. PIT-only after the Yahoo removal — US → the PIT lake via
+            # fundamentals-api, non-US fail-closed. The `yahoo` option is gone; this env is now inert
+            # (resolve_provider_mode always returns `pit`), but the default is `pit` for honesty.
             - name: LIVE_FUNDAMENTALS_PROVIDER
-              value: {{ .Values.global.env.liveFundamentalsProvider | default "yahoo" | quote }}
+              value: {{ .Values.global.env.liveFundamentalsProvider | default "pit" | quote }}
             - name: FUNDAMENTALS_API_URL
               value: {{ .Values.global.env.fundamentalsApiUrl | default "http://fundamentals-api:8011" | quote }}
           livenessProbe:
@@ -212,10 +213,11 @@ spec:
               value: {{ $.Values.global.env.highVelocityVolLookback | default "90" | quote }}
             - name: SIGNAL_ORDER_TYPE
               value: {{ $.Values.global.env.signalOrderType | default "Limit" | quote }}
-            # Live fundamentals seam (epic Task 14). yahoo (forward-only snapshot, default) | pit
-            # (route US/UK to the PIT warehouse via fundamentals-api, Yahoo fallback). Reversible by env.
+            # Live fundamentals seam. PIT-only after the Yahoo removal — US → the PIT lake via
+            # fundamentals-api, non-US fail-closed. The `yahoo` option is gone; this env is now inert
+            # (resolve_provider_mode always returns `pit`), but the default is `pit` for honesty.
             - name: LIVE_FUNDAMENTALS_PROVIDER
-              value: {{ $.Values.global.env.liveFundamentalsProvider | default "yahoo" | quote }}
+              value: {{ $.Values.global.env.liveFundamentalsProvider | default "pit" | quote }}
             - name: FUNDAMENTALS_API_URL
               value: {{ $.Values.global.env.fundamentalsApiUrl | default "http://fundamentals-api:8011" | quote }}
           livenessProbe:

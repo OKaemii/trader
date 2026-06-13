@@ -1,8 +1,9 @@
-// Scanner reflects the PIT source honestly (pit-coverage-broaden Task 8). Two surfaces:
+// Scanner reflects the PIT source honestly. Two surfaces:
 //   GET /admin/api/market-data/scanner/snapshot     → each row carries a per-name `source`
-//     (`pit-edgar` US-warehouse hit / `yahoo` PIT-fall-back-or-yahoo-mode / `eodhd`; null = unfetched).
+//     (`pit-edgar` US lake hit; null = unfetched / non-US fail-closed — after the Yahoo removal a
+//     non-US name has no fundamentals doc, so it surfaces null, never `yahoo`).
 //   GET /admin/api/market-data/scanner/feed-health  → config.fundamentalsProvider is the EFFECTIVE
-//     provider the wired cache runs (FundamentalsCache.effectiveSource), `yahoo` today.
+//     provider the wired cache runs (FundamentalsCache.effectiveSource), `pit` on the live path.
 // Plus the load-bearing FundamentalsCache.refresh extension that PERSISTS the per-name source the
 // provider reports (via the optional FundamentalsProvider.sourceOf), which `peek` then serves to the
 // snapshot — the portal source badge (#150) consumes this. `process.env.FUNDAMENTALS_PROVIDER` does
@@ -52,12 +53,13 @@ const doc = (id: string, source: string, mc: number, symbol = 'X', market = 'US'
 });
 
 // A scanner router over a stubbed cache (`peek` for snapshot, `coverage` + `effectiveSource` for
-// feed-health) and a universe with two US + one LSE name. The third US name (TSLA) has NO cached
-// fundamentals doc — it must surface `source: null`, never a fabricated provenance.
+// feed-health) and a universe with two US + one LSE name. The LSE name (SHEL) is FAIL-CLOSED after
+// the Yahoo removal — no fundamentals doc — and the third US name (TSLA) is simply unfetched; both
+// must surface `source: null`, never a fabricated provenance.
 function buildApp(opts: { peekDocs?: Record<string, FundamentalsDoc>; effectiveSource?: string } = {}) {
   const peekDocs = opts.peekDocs ?? {
-    AAPL_US_EQ: doc('AAPL_US_EQ', 'pit-edgar', 3_000_000),  // US warehouse hit
-    SHELl_EQ:   doc('SHELl_EQ',   'yahoo',     2_000_000),  // non-US → Yahoo fall-back
+    AAPL_US_EQ: doc('AAPL_US_EQ', 'pit-edgar', 3_000_000),  // US lake hit
+    // SHELl_EQ (LSE) has NO doc — non-US fail-closed (the Yahoo fall-back is gone).
   };
   const universe = {
     activeTickers: ['AAPL_US_EQ', 'SHELl_EQ', 'TSLA_US_EQ'],
@@ -66,8 +68,8 @@ function buildApp(opts: { peekDocs?: Record<string, FundamentalsDoc>; effectiveS
   } as unknown as UniverseManager;
   const fundamentals = {
     peek: async (tickers: string[]) => Object.fromEntries(tickers.filter((t) => peekDocs[t]).map((t) => [t, peekDocs[t]])),
-    coverage: async () => ({ count: Object.keys(peekDocs).length, passing: 2, oldestAsOf: 1_700_000_000_000 }),
-    effectiveSource: opts.effectiveSource ?? 'yahoo',
+    coverage: async () => ({ count: Object.keys(peekDocs).length, passing: 1, oldestAsOf: 1_700_000_000_000 }),
+    effectiveSource: opts.effectiveSource ?? 'pit',
   } as unknown as FundamentalsCacheType;
   const app = new Hono();
   app.route('/', createScannerRouter(universe, fundamentals));
@@ -80,15 +82,15 @@ describe('GET /admin/api/market-data/scanner/snapshot — per-name source', () =
     expect(res.status).toBe(401);
   });
 
-  it('carries each row’s per-name source from the cached doc (pit-edgar / yahoo)', async () => {
+  it('carries the US row’s per-name source from the cached doc (pit-edgar)', async () => {
     const res = await buildApp().request('/admin/api/market-data/scanner/snapshot', {
       headers: { Authorization: await adminToken() },
     });
     expect(res.status).toBe(200);
     const body = await res.json();
     const byTicker = Object.fromEntries(body.rows.map((r: { ticker: string }) => [r.ticker, r]));
-    expect(byTicker.AAPL_US_EQ.source).toBe('pit-edgar');   // US warehouse hit
-    expect(byTicker.SHELl_EQ.source).toBe('yahoo');         // non-US fall-back
+    expect(byTicker.AAPL_US_EQ.source).toBe('pit-edgar');   // US lake hit
+    expect(byTicker.SHELl_EQ.source).toBeNull();            // non-US fail-closed → no doc → null
   });
 
   it('surfaces source: null for a name with no cached fundamentals (never a fabricated source)', async () => {
@@ -108,8 +110,8 @@ describe('GET /admin/api/market-data/scanner/snapshot — per-name source', () =
     });
     const body = await res.json();
     expect(body.universeSize).toBe(3);
-    expect(body.qualityKnown).toBe(2);       // AAPL + SHEL fetched
-    expect(body.qualityPassCount).toBe(2);
+    expect(body.qualityKnown).toBe(1);       // only AAPL fetched (SHEL fail-closed, TSLA unfetched)
+    expect(body.qualityPassCount).toBe(1);
     const aapl = body.rows.find((r: { ticker: string }) => r.ticker === 'AAPL_US_EQ');
     expect(aapl.name).toBe('Apple Inc.');
     expect(aapl.market).toBe('US');
@@ -119,19 +121,19 @@ describe('GET /admin/api/market-data/scanner/snapshot — per-name source', () =
 });
 
 describe('GET /admin/api/market-data/scanner/feed-health — effective provider', () => {
-  it('reports the effective fundamentalsProvider from the wired cache (yahoo today)', async () => {
+  it('reports the effective fundamentalsProvider from the wired cache (pit on the live path)', async () => {
     const res = await buildApp().request('/admin/api/market-data/scanner/feed-health', {
       headers: { Authorization: await adminToken() },
     });
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.config.fundamentalsProvider).toBe('yahoo');
+    expect(body.config.fundamentalsProvider).toBe('pit');
   });
 
-  it('reflects the pit mode once the cache runs pit (the capstone flip), not a process.env re-read', async () => {
-    // Prove it tracks the cache, not the env var: set the env to yahoo while the cache runs pit.
+  it('reflects the cache’s mode, not a process.env re-read', async () => {
+    // Prove it tracks the cache, not the env var: set the env to eodhd while the cache runs pit.
     const prev = process.env.FUNDAMENTALS_PROVIDER;
-    process.env.FUNDAMENTALS_PROVIDER = 'yahoo';
+    process.env.FUNDAMENTALS_PROVIDER = 'eodhd';
     try {
       const res = await buildApp({ effectiveSource: 'pit' }).request('/admin/api/market-data/scanner/feed-health', {
         headers: { Authorization: await adminToken() },
@@ -145,9 +147,11 @@ describe('GET /admin/api/market-data/scanner/feed-health — effective provider'
   });
 });
 
-// FundamentalsCache.refresh persists the per-name source the provider reports, so the later `peek`
-// (snapshot) carries `pit-edgar`/`yahoo` per ticker rather than one blanket mode string. A provider
-// without `sourceOf` (Yahoo/EODHD) stamps the configured mode — byte-for-byte the prior behaviour.
+// FundamentalsCache.refresh persists the per-name source the provider reports (via the optional
+// FundamentalsProvider.sourceOf), so the later `peek` (snapshot) carries the concrete per-name source
+// rather than one blanket mode string. A provider without `sourceOf` (eodhd) stamps the configured
+// mode. (The cache is mode-agnostic — it stores whatever the provider reports; the live PIT provider
+// only ever reports `pit-edgar`, and non-US names get no doc at all.)
 describe('FundamentalsCache.refresh — per-name source stamping', () => {
   // In-memory company_fundamentals collection capturing the $set each upsert writes.
   function stubColl() {
@@ -162,17 +166,19 @@ describe('FundamentalsCache.refresh — per-name source stamping', () => {
     return { coll, writes };
   }
 
-  it('stamps the provider’s per-name source when it exposes sourceOf (pit: pit-edgar vs yahoo)', async () => {
+  it('stamps the provider’s per-name source when it exposes sourceOf (pit-edgar for a covered US name)', async () => {
     const { coll, writes } = stubColl();
+    // The live PIT provider only returns covered US names (a hit), each stamped pit-edgar; non-US /
+    // misses are fail-closed (absent), so `refresh` never writes a doc for them.
     const provider: FundamentalsProvider = {
-      fetch: async () => ({ AAPL_US_EQ: RAW(3_000_000), SHELl_EQ: RAW(2_000_000) }),
-      sourceOf: (t) => (t === 'AAPL_US_EQ' ? 'pit-edgar' : 'yahoo'),
+      fetch: async () => ({ AAPL_US_EQ: RAW(3_000_000), MSFT_US_EQ: RAW(2_000_000) }),
+      sourceOf: () => 'pit-edgar',
     };
     const cache = new FundamentalsCache(provider, 'pit');
     // Inject the stub collection (private `coll()` is the single DB seam).
     (cache as unknown as { coll: () => Promise<typeof coll> }).coll = async () => coll;
 
-    const written = await cache.refresh(['AAPL_US_EQ', 'SHELl_EQ']);
+    const written = await cache.refresh(['AAPL_US_EQ', 'MSFT_US_EQ']);
     expect(written).toBe(2);
     // company_fundamentals is keyed on the '<symbol>:<market>' composite _id since Task 16b, with
     // symbol+market also written as fields. Assert the per-name source against the new key.
@@ -180,22 +186,22 @@ describe('FundamentalsCache.refresh — per-name source stamping', () => {
     expect(byId['AAPL:US'].source).toBe('pit-edgar');
     expect(byId['AAPL:US'].symbol).toBe('AAPL');
     expect(byId['AAPL:US'].market).toBe('US');
-    expect(byId['SHEL:LSE'].source).toBe('yahoo');
-    expect(byId['SHEL:LSE'].symbol).toBe('SHEL');
+    expect(byId['MSFT:US'].source).toBe('pit-edgar');
+    expect(byId['MSFT:US'].symbol).toBe('MSFT');
   });
 
-  it('stamps the configured mode when the provider has no sourceOf (yahoo/eodhd unchanged)', async () => {
+  it('stamps the configured mode when the provider has no sourceOf (eodhd)', async () => {
     const { coll, writes } = stubColl();
     const provider: FundamentalsProvider = { fetch: async () => ({ AAPL_US_EQ: RAW(3_000_000) }) };
-    const cache = new FundamentalsCache(provider, 'yahoo');
+    const cache = new FundamentalsCache(provider, 'eodhd');
     (cache as unknown as { coll: () => Promise<typeof coll> }).coll = async () => coll;
 
     await cache.refresh(['AAPL_US_EQ']);
-    expect(writes[0].set.source).toBe('yahoo');
+    expect(writes[0].set.source).toBe('eodhd');
   });
 
   it('exposes the configured mode as effectiveSource', () => {
     expect(new FundamentalsCache({ fetch: async () => ({}) }, 'pit').effectiveSource).toBe('pit');
-    expect(new FundamentalsCache({ fetch: async () => ({}) }, 'yahoo').effectiveSource).toBe('yahoo');
+    expect(new FundamentalsCache({ fetch: async () => ({}) }, 'eodhd').effectiveSource).toBe('eodhd');
   });
 });

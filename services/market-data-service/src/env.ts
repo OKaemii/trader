@@ -67,21 +67,21 @@ const EnvSchema = z.object({
     MIN_MARKET_CAP_GBP: z.coerce.number().nonnegative().default(5_000_000_000),
     // Long-range daily history source (decoupled from the metered intraday provider).
     DAILY_HISTORY_PROVIDER: z.enum(["yahoo", "eodhd"]).default("yahoo"),
-    // Fundamentals (QMJ) source. 'yahoo' (free quoteSummary, default) or 'eodhd' (paid add-on),
-    // or 'pit' — the bi-temporal SEC-EDGAR warehouse via fundamentals-api for US (*_US_EQ) names,
-    // delegating non-US names + PIT misses to the injected Yahoo provider. The 'pit' flip is gated
-    // on the freshness audit proving US coverage complete (a later card sets it in values.yaml).
-    FUNDAMENTALS_PROVIDER:  z.enum(["yahoo", "eodhd", "pit"]).default("yahoo"),
+    // Fundamentals (QMJ) source. 'pit' (default) — the PIT SEC-EDGAR lake via fundamentals-api for
+    // US (*_US_EQ) names; non-US names FAIL-CLOSED (no fundamentals — no Yahoo substitute, decision
+    // H). 'eodhd' is a dormant paid add-on. The 'yahoo' option was removed with the Yahoo fundamentals
+    // path (epic pit-fundamentals-lake-rearchitecture, Thread C).
+    FUNDAMENTALS_PROVIDER:  z.enum(["eodhd", "pit"]).default("pit"),
     // In-cluster base URL of fundamentals-api (the read side of the PIT warehouse). Read by the
     // 'pit' provider for GET /internal/api/fundamentals-pit. Mirrors strategy-engine's default.
     FUNDAMENTALS_API_URL:   z.string().url().default("http://fundamentals-api:8011"),
-    // Fundamentals refresh pacing. The QMJ refresh walks the universe one name at a time; a
-    // burst trips Yahoo's per-IP rate limiter (which arms a multi-minute session cooldown that
-    // zeroes the whole run). These knobs keep the background refresher gentle + resumable.
-    //   _SPACING_MS — sleep between successive per-ticker provider calls (gentleness).
+    // Fundamentals refresh pacing for the background refresher (gentle + resumable).
     //   _IDLE_MS    — sleep once coverage is complete (re-checks staleness ~twice/day).
     //   _RETRY_MS   — sleep after a no-progress pass (provider throttled); > the 15m cooldown.
     //   _PROGRESS_MS— sleep after a partial pass, to keep accreting without hammering.
+    // _SPACING_MS is now INERT — it gated the per-IP spacing of the removed Yahoo QMJ provider; the
+    // PIT path is a single in-cluster round-trip per refresh slice, no per-ticker pacing. Kept as a
+    // back-compat env default (ignored if set) so an existing deploy doesn't fail validation.
     FUNDAMENTALS_REQUEST_SPACING_MS: z.coerce.number().int().nonnegative().default(500),
     FUNDAMENTALS_REFRESH_IDLE_MS:     z.coerce.number().int().positive().default(12 * 60 * 60_000),
     FUNDAMENTALS_REFRESH_RETRY_MS:    z.coerce.number().int().positive().default(20 * 60_000),
