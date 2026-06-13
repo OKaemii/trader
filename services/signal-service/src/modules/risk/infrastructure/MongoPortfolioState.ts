@@ -2,6 +2,7 @@ import type { IPortfolioState } from '../application/IPortfolioState.ts';
 import type { Collection } from 'mongodb';
 import type { Logger } from '@trader/core';
 import { sumPositionsGBP, type FxConverter, type PositionDoc } from '@trader/shared-portfolio';
+import { tickerOf } from '../../../shared/identity.ts';
 
 export class MongoPortfolioState implements IPortfolioState {
   constructor(
@@ -14,9 +15,16 @@ export class MongoPortfolioState implements IPortfolioState {
     const positions = await this.collection.find({}).toArray();
     const weights: Record<string, number> = {};
     for (const pos of positions) {
-      if (pos.ticker && typeof pos.weight === 'number') {
-        weights[pos.ticker as string] = pos.weight as number;
+      if (typeof pos.weight !== 'number') continue;
+      // Positions are keyed on (symbol, market) since Task 16a; re-derive the T212 ticker so the
+      // returned weights map stays keyed the way GenerateSignals reads it (against the still-T212
+      // ticker_universe). A legacy row that still carries a bare `ticker` falls back to it.
+      let ticker: string | undefined;
+      if (typeof pos.symbol === 'string' && typeof pos.market === 'string') {
+        try { ticker = tickerOf(pos.symbol, pos.market); } catch { ticker = undefined; }
       }
+      if (!ticker && typeof pos.ticker === 'string') ticker = pos.ticker;
+      if (ticker) weights[ticker] = pos.weight as number;
     }
     return weights;
   }

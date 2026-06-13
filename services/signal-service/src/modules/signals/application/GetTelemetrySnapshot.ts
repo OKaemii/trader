@@ -6,16 +6,25 @@ import { SignalLifecycle } from '@trader/shared-types';
 import { sumPositionsGBP, sumOpenPnlGBP, type FxConverter, type PositionDoc } from '@trader/shared-portfolio';
 import type { StrategyDecayMonitor } from '../../approval/application/StrategyDecayMonitor.ts';
 import type { RiskEngine } from '../../risk/application/RiskEngine.ts';
+import { tryIdentityOf, tickerOf } from '../../../shared/identity.ts';
 
-// ticker → instrument currency. T212 suffix carries this — no DB round-trip needed.
-// Keeps the realised-P&L FX path identical to the trading-service order-sizing path.
-function inferCurrency(ticker: string): 'USD' | 'GBP' {
-  return /_US_EQ$/.test(ticker) ? 'USD' : 'GBP';
+// market → instrument currency. Storage carries the bare `market` since Task 16a, which is the
+// instrument-currency discriminator (US → USD, LSE → GBP) — no DB round-trip needed. Keeps the
+// realised-P&L FX path identical to the trading-service order-sizing path.
+function currencyOfMarket(market: string): 'USD' | 'GBP' {
+  return market === 'US' ? 'USD' : 'GBP';
+}
+
+// (symbol, market) → the T212 display ticker, falling back to the bare symbol if the market is
+// unrecognised (so a corrupt row still renders a human-readable label).
+function safeTicker(symbol: string, market: string): string {
+  try { return tickerOf(symbol, market); } catch { return symbol; }
 }
 
 interface ClosedSignalDoc {
   _id: string;
-  ticker: string;
+  symbol: string;
+  market: string;
   action: string;
   entryPrice?: number;
   exitPrice?: number;
@@ -66,7 +75,7 @@ export class GetTelemetrySnapshotUseCase {
         entryPrice: { $exists: true, $gt: 0 },
         exitPrice:  { $exists: true, $gt: 0 },
       })
-      .project<ClosedSignalDoc>({ _id: 1, ticker: 1, action: 1, entryPrice: 1, exitPrice: 1, executedQuantity: 1, closedAt: 1 });
+      .project<ClosedSignalDoc>({ _id: 1, symbol: 1, market: 1, action: 1, entryPrice: 1, exitPrice: 1, executedQuantity: 1, closedAt: 1 });
 
     const closed = await closedSinceQuery.toArray();
 
@@ -81,16 +90,19 @@ export class GetTelemetrySnapshotUseCase {
       const dir   = doc.action === 'SELL' ? -1 : 1;
       const pnlPct = ((exit - entry) / entry) * dir;
       const pnlNative = (exit - entry) * qty * dir;
+      // Re-derive the display ticker from the stored identity (best-effort — a corrupt market
+      // falls back to the bare symbol for the label, currency to GBP).
+      const ticker = doc.symbol && doc.market ? safeTicker(doc.symbol, doc.market) : (doc.symbol ?? '');
       let pnlGbp = 0;
       if (qty > 0) {
         try {
-          pnlGbp = await this.fx.toGBP({ amount: pnlNative, currency: inferCurrency(doc.ticker) });
+          pnlGbp = await this.fx.toGBP({ amount: pnlNative, currency: currencyOfMarket(doc.market) });
         } catch (err) {
-          this.logger.warn({ err, ticker: doc.ticker }, 'fx unavailable for realised pnl; gbp degraded to 0');
+          this.logger.warn({ err, ticker }, 'fx unavailable for realised pnl; gbp degraded to 0');
         }
       }
       pnlGbpTotal += pnlGbp;
-      const pick = { ticker: doc.ticker, pnlPct, pnlGbp };
+      const pick = { ticker, pnlPct, pnlGbp };
       if (best  === null || pnlPct > best.pnlPct)  best  = pick;
       if (worst === null || pnlPct < worst.pnlPct) worst = pick;
     }
@@ -171,8 +183,12 @@ export class GetTelemetrySnapshotUseCase {
 
     const priorAppearances: Record<string, PriorAppearance> = {};
     for (const ticker of opts.tickers ?? []) {
+      // Storage is keyed on (symbol, market); split the requested T212 ticker, fail-soft (an
+      // un-routable name simply has no prior appearance — same as a name that never emitted).
+      const id = tryIdentityOf(ticker);
+      if (!id) continue;
       const prior = await signals
-        .find({ ticker, timestamp: { $lt: sinceDate } })
+        .find({ symbol: id.symbol, market: id.market, timestamp: { $lt: sinceDate } })
         .project<{ timestamp: Date; action: string; lifecycle?: number; entryPrice?: number; exitPrice?: number }>(
           { timestamp: 1, action: 1, lifecycle: 1, entryPrice: 1, exitPrice: 1 },
         )

@@ -6,15 +6,32 @@ import type { ICache } from '@trader/shared-data/interfaces/ICache';
 import type { ICacheInvalidationBus } from '@trader/shared-data/interfaces/ICacheInvalidationBus';
 import { TradeSignal } from '../modules/signals/domain/TradeSignal.ts';
 import { COLLECTIONS } from '@trader/shared-mongo';
+import { identityOf, tickerOf, tryIdentityOf } from './identity.ts';
 import type { Db } from 'mongodb';
 import type { RedisClientType } from 'redis';
 
 const toMs = (v: unknown): number | undefined =>
   v instanceof Date ? v.getTime() : typeof v === 'number' ? v : undefined;
 
-const toSignalDoc = (s: TradeSignal): any => ({
+// Re-derive the signal's T212 ticker from the stored (symbol, market) identity. A doc written by
+// the new path always has both; a legacy/partially-migrated doc that still carries a bare `ticker`
+// (or an unrecognised market) falls back to that field rather than crashing the read.
+const tickerFromDoc = (doc: any): string => {
+  if (typeof doc.symbol === 'string' && typeof doc.market === 'string') {
+    try { return tickerOf(doc.symbol, doc.market); } catch { /* fall through to legacy field */ }
+  }
+  return typeof doc.ticker === 'string' ? doc.ticker : '';
+};
+
+const toSignalDoc = (s: TradeSignal): any => {
+  // Storage is keyed on the bare identity; split the T212 ticker at the write boundary. A
+  // freshly-emitted signal always carries a tradable US/LSE name, so a parse failure here is a real
+  // bug — surface it rather than persist an un-routable doc.
+  const { symbol, market } = identityOf(s.ticker);
+  return {
   _id: s.id,
-  ticker: s.ticker,
+  symbol,
+  market,
   strategy_id: s.strategy_id,
   action: s.action,
   confidence: s.confidence,
@@ -41,13 +58,14 @@ const toSignalDoc = (s: TradeSignal): any => ({
   // and renderers fall back to defaults.
   features_snapshot: s.features_snapshot,
   pieId: s.pieId,
-});
+  };
+};
 
 const fromSignalDoc = (doc: any): TradeSignal => {
   const params: any = {
     id: String(doc._id),
     timestamp: toMs(doc.timestamp) ?? Date.now(),
-    ticker: doc.ticker,
+    ticker: tickerFromDoc(doc),
     strategy_id: doc.strategy_id ?? 'unknown',
     action: doc.action,
     confidence: doc.confidence,

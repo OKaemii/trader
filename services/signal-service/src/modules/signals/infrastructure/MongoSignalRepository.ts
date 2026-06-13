@@ -5,6 +5,7 @@ import type { IDataManager } from '@trader/shared-data/interfaces/IDataManager';
 import type { ICache } from '@trader/shared-data/interfaces/ICache';
 import type { ICacheInvalidationBus } from '@trader/shared-data/interfaces/ICacheInvalidationBus';
 import { fromSignalDoc } from '../../../shared/data.ts';
+import { tryIdentityOf } from '../../../shared/identity.ts';
 
 export class MongoSignalRepository implements ISignalRepository {
   constructor(
@@ -60,8 +61,13 @@ export class MongoSignalRepository implements ISignalRepository {
   }
 
   async findOpenBuysByTicker(ticker: string): Promise<TradeSignal[]> {
+    // Storage is keyed on (symbol, market) since Task 16a; split the T212 ticker before the Mongo
+    // touch. Fail-soft: a stale/delisted name that no longer parses as a US/LSE equity matches no
+    // open BUYs (the FIFO walk simply finds nothing) instead of throwing the closure path.
+    const id = tryIdentityOf(ticker);
+    if (!id) return [];
     return this.manager.findMany({
-      filter: { ticker, action: 'BUY', lifecycle: SignalLifecycle.Executed },
+      filter: { symbol: id.symbol, market: id.market, action: 'BUY', lifecycle: SignalLifecycle.Executed },
       sortBy: 'executedAt',
       sortDir: 'asc',
       limit: 200,
@@ -172,8 +178,11 @@ export class MongoSignalRepository implements ISignalRepository {
   async findByTicker(ticker: string, limit: number): Promise<TradeSignal[]> {
     // Newest-first, no lifecycle filter — the Research Signals tab is a per-symbol audit
     // trail (every signal this name ever emitted), so failed/cancelled rows belong here.
+    // Keyed on the bare (symbol, market) since Task 16a; an un-routable ticker yields no rows.
+    const id = tryIdentityOf(ticker);
+    if (!id) return [];
     return this.manager.findMany({
-      filter: { ticker },
+      filter: { symbol: id.symbol, market: id.market },
       sortBy: 'timestamp',
       sortDir: 'desc',
       limit,
