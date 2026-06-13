@@ -11,12 +11,13 @@
 process.env.JWT_SECRET = 'test-jwt-secret-min-16-chars';
 import { describe, it, expect, vi } from 'vitest';
 
-// instrument_registry rows for the snapshot's name/market join. Keyed by the serialised query so a
-// single in-memory stub answers the `find({ ticker: { $in }, activeTo: null })` the route issues.
-const REGISTRY: Array<{ ticker: string; name: string; market: string; activeTo: null }> = [
-  { ticker: 'AAPL_US_EQ', name: 'Apple Inc.',  market: 'US',  activeTo: null },
-  { ticker: 'SHELl_EQ',   name: 'Shell plc',   market: 'LSE', activeTo: null },
-  { ticker: 'TSLA_US_EQ', name: 'Tesla Inc.',  market: 'US',  activeTo: null },
+// instrument_registry rows for the snapshot's name/market join. Keyed on the bare (symbol, market)
+// identity since Task 16b — the route queries find({ $or:[{symbol,market}], activeTo: null }) and
+// re-keys the result back to the T212 ticker; the stub returns the rows regardless of query.
+const REGISTRY: Array<{ symbol: string; market: string; name: string; activeTo: null }> = [
+  { symbol: 'AAPL', market: 'US',  name: 'Apple Inc.', activeTo: null },
+  { symbol: 'SHEL', market: 'LSE', name: 'Shell plc',  activeTo: null },
+  { symbol: 'TSLA', market: 'US',  name: 'Tesla Inc.', activeTo: null },
 ];
 vi.mock('@trader/shared-mongo', () => ({
   COLLECTIONS: { INSTRUMENT_REGISTRY: 'instrument_registry', COMPANY_FUNDAMENTALS: 'company_fundamentals' },
@@ -45,8 +46,8 @@ const adminToken = async () => `Bearer ${await signAccessToken({ sub: 'admin-use
 const RAW = (mc: number): FundamentalsRaw => ({
   netIncome: 100, totalEquity: 500, totalDebt: 200, currentAssets: 300, currentLiabilities: 150, marketCapGbp: mc,
 });
-const doc = (id: string, source: string, mc: number): FundamentalsDoc => ({
-  _id: id, asOf: 1_700_000_000_000, raw: RAW(mc), ratios: { roe: 0.2, debtToEquity: 0.4, currentRatio: 2.0 },
+const doc = (id: string, source: string, mc: number, symbol = 'X', market = 'US'): FundamentalsDoc => ({
+  _id: id, symbol, market, asOf: 1_700_000_000_000, raw: RAW(mc), ratios: { roe: 0.2, debtToEquity: 0.4, currentRatio: 2.0 },
   qualityPass: true, marketCapGbp: mc, source, updatedAt: 1_700_000_000_000,
 });
 
@@ -173,9 +174,14 @@ describe('FundamentalsCache.refresh — per-name source stamping', () => {
 
     const written = await cache.refresh(['AAPL_US_EQ', 'SHELl_EQ']);
     expect(written).toBe(2);
-    const sourceById = Object.fromEntries(writes.map((w) => [w.id, w.set.source]));
-    expect(sourceById.AAPL_US_EQ).toBe('pit-edgar');
-    expect(sourceById.SHELl_EQ).toBe('yahoo');
+    // company_fundamentals is keyed on the '<symbol>:<market>' composite _id since Task 16b, with
+    // symbol+market also written as fields. Assert the per-name source against the new key.
+    const byId = Object.fromEntries(writes.map((w) => [w.id, w.set]));
+    expect(byId['AAPL:US'].source).toBe('pit-edgar');
+    expect(byId['AAPL:US'].symbol).toBe('AAPL');
+    expect(byId['AAPL:US'].market).toBe('US');
+    expect(byId['SHEL:LSE'].source).toBe('yahoo');
+    expect(byId['SHEL:LSE'].symbol).toBe('SHEL');
   });
 
   it('stamps the configured mode when the provider has no sourceOf (yahoo/eodhd unchanged)', async () => {

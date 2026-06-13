@@ -588,9 +588,9 @@ async def test_rebackfill_swallows_a_bad_row_and_continues():
     summary = await rebackfill_factor_sources(store, recompute)
     assert summary["scanned"] == 2
     assert summary["rows_upgraded"] == 1          # AAPL upgraded despite BAD raising
-    aapl = next(d for d in coll.docs if d["ticker"] == "AAPL_US_EQ")
+    aapl = next(d for d in coll.docs if d["symbol"] == "AAPL")
     assert aapl["factors"]["quality"]["source"] == SOURCE_PIT_EDGAR
-    bad = next(d for d in coll.docs if d["ticker"] == "BAD_US_EQ")
+    bad = next(d for d in coll.docs if d["symbol"] == "BAD")
     assert bad["factors"]["quality"] == _null_cell()   # untouched (recompute raised)
 
 
