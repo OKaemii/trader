@@ -51,3 +51,13 @@ export function tryIdentityOf(ticker: string): TickerIdentity | null {
 export function tickerOf(symbol: string, market: string): string {
   return adapter.toT212({ symbol, market: market as TickerIdentity['market'] });
 }
+
+/**
+ * Re-derive the T212 ticker from a stored `(symbol, market)` pair fail-soft: `null` when either
+ * field is missing/non-string or the pair isn't a US/LSE form. Read call sites use this so a single
+ * un-routable stored row degrades to no-match rather than throwing the whole batch.
+ */
+export function tryTickerOf(symbol: unknown, market: unknown): string | null {
+  if (typeof symbol !== 'string' || typeof market !== 'string') return null;
+  try { return adapter.toT212({ symbol, market: market as TickerIdentity['market'] }); } catch { return null; }
+}

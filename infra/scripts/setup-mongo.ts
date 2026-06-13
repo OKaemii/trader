@@ -62,12 +62,13 @@ async function main() {
   );
   console.log(`Compound indexes on ${COLLECTIONS.SIGNALS}`);
 
-  // instrument_registry — unique ticker constraint
+  // instrument_registry — unique (symbol, market) constraint. Keyed on the bare identity since
+  // Task 16b (the concatenated T212 ticker is no longer stored).
   await db.collection(COLLECTIONS.INSTRUMENT_REGISTRY).createIndex(
-    { ticker: 1 },
-    { unique: true, name: 'unique_ticker' }
+    { symbol: 1, market: 1 },
+    { unique: true, name: 'unique_symbol_market' }
   );
-  console.log(`Unique index on ${COLLECTIONS.INSTRUMENT_REGISTRY}.ticker`);
+  console.log(`Unique index on ${COLLECTIONS.INSTRUMENT_REGISTRY}.(symbol, market)`);
 
   // users — unique email constraint
   await db.collection(COLLECTIONS.USERS).createIndex(
