@@ -139,18 +139,23 @@ async def _ingest_with_snaps(db, snaps, index, monkeypatch):
 
 
 def test_ingest_idempotent_and_index_isolated(monkeypatch):
+    """index_constituents is keyed on the bare (symbol, market) identity since Task 16b — the FTSE
+    ingest writes {symbol, market} (no concatenated T212 ticker). This proves the upsert idempotency,
+    the index isolation, and (after re-deriving each row's ticker the way the real read-sites do) the
+    as-of resolution + no SP500/FTSE bleed."""
     s0, s1 = _month_to_ms(2023, 7), _month_to_ms(2024, 1)
     db = _Db()
 
-    # Seed an existing S&P row in the SHARED collection — it must survive the FTSE ingest untouched.
+    # Seed an existing S&P row in the SHARED collection (new shape: symbol+market, US) — it must
+    # survive the FTSE ingest untouched.
     asyncio.run(db["index_constituents"].insert_one(
-        {"index": "sp500", "ticker": "AAPL", "effective_from": s0, "effective_to": None}))
+        {"index": "sp500", "symbol": "AAPL", "market": "US", "effective_from": s0, "effective_to": None}))
 
     ftse_snaps = [(s0, {"AALl_EQ", "BAl_EQ"}), (s1, {"BAl_EQ", "VODl_EQ"})]
     r1 = asyncio.run(_ingest_with_snaps(db, ftse_snaps, "FTSE100", monkeypatch))
     after_first = len(db["index_constituents"].docs)
 
-    # Re-ingest the identical snapshots → upsert-by-(index,ticker,effective_from) ⇒ no new rows.
+    # Re-ingest the identical snapshots → upsert-by-(index,symbol,market,effective_from) ⇒ no new rows.
     r2 = asyncio.run(_ingest_with_snaps(db, ftse_snaps, "FTSE100", monkeypatch))
     after_second = len(db["index_constituents"].docs)
     assert after_first == after_second, "re-ingest must be idempotent (no duplicate rows)"
@@ -160,13 +165,22 @@ def test_ingest_idempotent_and_index_isolated(monkeypatch):
     ftse_rows = [d for d in docs if d["index"] == "FTSE100"]
     sp_rows = [d for d in docs if d["index"] == "sp500"]
 
-    # The UK index filter resolves ONLY FTSE rows; the S&P row is present but excluded by the filter.
-    assert all(t.endswith("l_EQ") for t in {d["ticker"] for d in ftse_rows})
-    assert load_constituents(ftse_rows, s1 + 1) == ["BAl_EQ", "VODl_EQ"]      # FTSE as-of
-    assert "AAPL" not in load_constituents(ftse_rows, s1 + 1)                 # no SP500 bleed-in
+    # FTSE rows store the bare LSE identity (symbol + market='LSE'); the T212 ticker is no longer stored.
+    assert all(d["market"] == "LSE" for d in ftse_rows)
+    assert {d["symbol"] for d in ftse_rows} == {"AAL", "BA", "VOD"}
+
+    # Re-derive each row's T212 ticker the way the real read-sites do, then resolve as-of via the pure
+    # loader (which still reads row["ticker"]). The UK index filter resolves ONLY FTSE rows.
+    from quant_core.ticker_identity import TickerIdentity, Trading212TickerAdapter
+    _adapter = Trading212TickerAdapter()
+    def _with_ticker(rows):
+        return [{**r, "ticker": _adapter.to_t212(TickerIdentity(symbol=r["symbol"], market=r["market"]))} for r in rows]
+
+    assert load_constituents(_with_ticker(ftse_rows), s1 + 1) == ["BAl_EQ", "VODl_EQ"]   # FTSE as-of
+    assert "AAPL_US_EQ" not in load_constituents(_with_ticker(ftse_rows), s1 + 1)         # no SP500 bleed-in
     # And the S&P row is untouched / still resolvable on its own filter.
-    assert len(sp_rows) == 1 and sp_rows[0]["ticker"] == "AAPL"
-    assert load_constituents(sp_rows, s1) == ["AAPL"]
+    assert len(sp_rows) == 1 and sp_rows[0]["symbol"] == "AAPL" and sp_rows[0]["market"] == "US"
+    assert load_constituents(_with_ticker(sp_rows), s1) == ["AAPL_US_EQ"]
 
     # data_source provenance stamped (forensic) + audit row written.
     assert all(d.get("data_source") == "yfiua_index_constituents_csv" for d in ftse_rows)

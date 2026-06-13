@@ -33,6 +33,7 @@ import {
 } from '../application/MarketNarrative.ts';
 import { isResearchLinkKind, normaliseRef } from '../application/ResearchNotes.ts';
 import { MongoResearchNotesStore } from '../infrastructure/MongoResearchNotesStore.ts';
+import { tryTickerOf } from '../../../shared/identity.ts';
 
 // The SPDR sector-ETF reference set powering the sector heatmap. Mirror of market-data-service's
 // sector-etfs.ts (the source of truth for the tracked-but-untradeable ETF set) — duplicated here as
@@ -120,13 +121,18 @@ async function latestFactorCycle(
         .toArray();
     const cycleTs = newest.length > 0 ? (newest[0]!.observation_ts as number) : null;
     if (cycleTs === null) return { rows: [], cycleTs: null };
+    // factor_scores is keyed on the bare (symbol, market) identity since Task 16b — re-derive the
+    // T212 ticker per row (skip an un-routable one, fail-soft) so `breadthFlag`'s getBars read + the
+    // pure MarketSummary aggregation stay keyed on the T212 ticker exactly as before.
     const docs = await coll
-        .find({ observation_ts: cycleTs }, { projection: { _id: 0, ticker: 1, factors: 1 } })
+        .find({ observation_ts: cycleTs }, { projection: { _id: 0, symbol: 1, market: 1, factors: 1 } })
         .toArray();
-    const rows: FactorScoreRow[] = docs.map((d) => ({
-        ticker: String(d.ticker),
-        factors: (d.factors ?? {}) as FactorScoreRow['factors'],
-    }));
+    const rows: FactorScoreRow[] = [];
+    for (const d of docs) {
+        const ticker = tryTickerOf(d.symbol, d.market);
+        if (ticker === null) continue;
+        rows.push({ ticker, factors: (d.factors ?? {}) as FactorScoreRow['factors'] });
+    }
     return { rows, cycleTs };
 }
 

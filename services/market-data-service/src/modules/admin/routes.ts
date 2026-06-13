@@ -10,8 +10,9 @@ import { getMongoDb, COLLECTIONS } from '@trader/shared-mongo';
 import { getRedisClient, xAdd } from '@trader/shared-redis';
 import { getLiveConfig, invalidateLiveConfig, _envDefaultsForTest } from '../../shared/live-config.ts';
 import { getRuntimeEnv } from '../../runtime-env.ts';
-import type { UniverseManager } from '../universe/application/UniverseManager.ts';
+import { type UniverseManager, type OverridesDoc, identitiesToTickers } from '../universe/application/UniverseManager.ts';
 import { MongoInstrumentMeta } from '../universe/infrastructure/MongoInstrumentMeta.ts';
+import { tryIdentityOf, tickerOf, tickersToIdentities } from '../../shared/identity.ts';
 import type { MarketDataProvider } from '../bars/infrastructure/providers/market-data-provider.ts';
 import { aggregateBars, getBars, getBarAtOrBefore, getDailyDepth, invalidateBars, type RangeKey } from '@trader/shared-bars';
 import { Trading212TickerAdapter } from '@trader/ticker-identity';
@@ -20,14 +21,6 @@ import { backfillDailyHistory } from '../bars/infrastructure/daily-history.ts';
 import { REDIS_STREAMS, POLL_INTERVAL_OPTIONS, type BarInterval, type OHLCVBar, type PollIntervalKey } from '@trader/shared-types';
 import type { HolidayCache, ExchangeCalendar, Market } from '@trader/shared-calendar';
 import { scheduleBetween, marketStateOf } from '@trader/shared-calendar';
-
-interface UniverseOverridesDoc {
-  _id: 'singleton';
-  adds: string[];
-  removes: string[];
-  updatedBy: string;
-  updatedAt: Date;
-}
 
 // Numeric enum constants for OrderType — mirrored from
 // services/trading-service/src/domain/entities/Order.ts. Defined inline rather than
@@ -129,20 +122,33 @@ export function createAdminRouter(
   // ── Universe overrides ────────────────────────────────────────────────────
   r.get('/admin/api/market-data/universe/overrides', async (c) => {
     const db = await getMongoDb();
-    const doc = await db.collection<UniverseOverridesDoc>(COLLECTIONS.PORTAL_UNIVERSE_OVERRIDES)
+    // portal_universe_overrides stores adds/removes as { symbol, market } objects since Task 16b —
+    // re-derive the T212 strings for the response so the portal contract (string[] adds/removes) is
+    // unchanged (the bare-forced-add UX is Task 18/21).
+    const doc = await db.collection<OverridesDoc>(COLLECTIONS.PORTAL_UNIVERSE_OVERRIDES)
       .findOne({ _id: 'singleton' });
+    const adds = identitiesToTickers(doc?.adds);
+    const removes = identitiesToTickers(doc?.removes);
 
-    // Enrich the active universe from instrument_registry so the portal can render
-    // market + ADV per ticker. Fall back to bare tickers if the registry is empty
-    // (cold start before first refresh). The activeUniverse string array is kept for
-    // backwards-compat with anything that still treats it as `string[]`.
-    type RegistryDoc = { ticker: string; name?: string; sector?: string; market?: string; adv?: number };
+    // Enrich the active universe from instrument_registry so the portal can render market + ADV per
+    // ticker. The registry is keyed on (symbol, market) since Task 16b — query by the split identities
+    // and re-key the result map back to the T212 ticker. Fall back to bare tickers if the registry is
+    // empty (cold start before first refresh). The activeUniverse string array is kept for backwards-
+    // compat with anything that still treats it as `string[]`.
+    type RegistryDoc = { symbol?: string; market?: string; name?: string; sector?: string; adv?: number };
     const activeTickers = universeManager.activeTickers;
-    const registry = await db.collection<RegistryDoc>(COLLECTIONS.INSTRUMENT_REGISTRY)
-      .find({ ticker: { $in: activeTickers }, activeTo: null })
-      .project({ _id: 0, ticker: 1, name: 1, sector: 1, market: 1, adv: 1 })
+    const activeIds = activeTickers
+      .map((t) => ({ ticker: t, id: tryIdentityOf(t) }))
+      .filter((x): x is { ticker: string; id: NonNullable<typeof x.id> } => x.id !== null);
+    const registry = activeIds.length === 0 ? [] : await db.collection<RegistryDoc>(COLLECTIONS.INSTRUMENT_REGISTRY)
+      .find({ $or: activeIds.map((x) => ({ symbol: x.id.symbol, market: x.id.market })), activeTo: null })
+      .project({ _id: 0, symbol: 1, market: 1, name: 1, sector: 1, adv: 1 })
       .toArray();
-    const byTicker = new Map<string, RegistryDoc>(registry.map((r) => [r.ticker, r as RegistryDoc] as const));
+    const byTicker = new Map<string, RegistryDoc>();
+    for (const reg of registry as RegistryDoc[]) {
+      if (reg.symbol == null || reg.market == null) continue;
+      byTicker.set(tickerOf(reg.symbol, reg.market), reg);
+    }
     const activeUniverseDetailed = activeTickers.map((t) => {
       const reg = byTicker.get(t);
       const inferredMarket: 'US' | 'LSE' | 'OTHER' =
@@ -158,8 +164,8 @@ export function createAdminRouter(
     });
 
     return c.json({
-      adds: doc?.adds ?? [],
-      removes: doc?.removes ?? [],
+      adds,
+      removes,
       activeUniverse: activeTickers,
       activeUniverseDetailed,
       sectorMap: universeManager.sectorMap,
@@ -179,13 +185,23 @@ export function createAdminRouter(
         (arr ?? []).map((t) => t.trim()).filter(Boolean);
       const adds = norm(body.adds);
       const removes = norm(body.removes);
+      // Storage shape since Task 16b: split each T212 string to its bare { symbol, market } at the
+      // Mongo boundary (drop an un-routable one, fail-soft). The wire/response stays T212 strings
+      // until the bare-forced-add UX lands (Task 18/21). The reconstructed T212 strings are echoed
+      // back so the response matches what was persisted-then-re-derived.
+      const addEntries = tickersToIdentities(adds);
+      const removeEntries = tickersToIdentities(removes);
       const db = await getMongoDb();
       await db.collection(COLLECTIONS.PORTAL_UNIVERSE_OVERRIDES).updateOne(
         { _id: 'singleton' as any },
-        { $set: { adds, removes, updatedBy: body.userId ?? 'unknown', updatedAt: new Date() } },
+        { $set: { adds: addEntries, removes: removeEntries, updatedBy: body.userId ?? 'unknown', updatedAt: new Date() } },
         { upsert: true },
       );
-      return c.json({ ok: true, adds, removes });
+      return c.json({
+        ok: true,
+        adds: identitiesToTickers(addEntries),
+        removes: identitiesToTickers(removeEntries),
+      });
     },
   );
 

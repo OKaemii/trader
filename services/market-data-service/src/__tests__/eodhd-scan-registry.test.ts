@@ -10,15 +10,20 @@ process.env.JWT_SECRET = 'test-jwt-secret-min-16-chars';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ── Stateful in-memory Mongo: a single instrument_registry collection + an empty overrides
-// singleton + an empty instrument_metadata cache. Supports just the operations refresh() issues
-// under the eodhd_scan path: find({activeTo:null}), find({ticker:{$in}}), insertMany, updateMany,
-// updateOne, findOne, replaceOne.
-type RegRow = Record<string, unknown> & { ticker: string; activeTo: Date | null };
+// singleton + an empty instrument_metadata cache. The registry is keyed on the bare (symbol, market)
+// identity since Task 16b, so refresh() issues find({activeTo:null}), find({$or:[{symbol,market}]}),
+// insertMany (symbol+market docs), updateMany ({$or}), updateOne ({symbol,market,activeTo:null}),
+// findOne, replaceOne. `matches` handles $in, $or, and null equality.
+type RegRow = Record<string, unknown> & { symbol: string; market: string; activeTo: Date | null };
 const registry: RegRow[] = [];
 const metaCache: Array<Record<string, unknown> & { _id: string }> = [];
 
 function matches(row: Record<string, unknown>, q: Record<string, unknown>): boolean {
   for (const [k, cond] of Object.entries(q)) {
+    if (k === '$or') {
+      if (!(cond as Array<Record<string, unknown>>).some((clause) => matches(row, clause))) return false;
+      continue;
+    }
     const v = row[k];
     if (cond !== null && typeof cond === 'object' && '$in' in (cond as object)) {
       if (!(cond as { $in: unknown[] }).$in.includes(v)) return false;
@@ -95,8 +100,9 @@ const { UniverseManager } = await import('../modules/universe/application/Univer
 
 function seedActiveFb(): void {
   registry.length = 0;
+  // Keyed on the bare (symbol, market) identity since Task 16b — the legacy FB listing as {FB, US}.
   registry.push({
-    ticker: 'FB_US_EQ', name: 'Meta Platforms', sector: 'Communication Services', market: 'US',
+    symbol: 'FB', market: 'US', name: 'Meta Platforms', sector: 'Communication Services',
     adv: 0, activeFrom: new Date('2026-06-01'), activeTo: null, addedReason: 'universe_refresh', updatedAt: new Date('2026-06-01'),
   });
 }
@@ -117,12 +123,13 @@ describe('UniverseManager.refresh — FB→META registry migration (eodhd_scan)'
     expect(active).toContain('META_US_EQ');
     expect(active).not.toContain('FB_US_EQ');
 
-    // Registry diff: META_US_EQ inserted active; FB_US_EQ row superseded (activeTo stamped + reason).
-    const meta = registry.find((r) => r.ticker === 'META_US_EQ');
+    // Registry diff: {META, US} inserted active; {FB, US} row superseded (activeTo stamped + reason).
+    // The registry stores the bare identity (symbol, market) since Task 16b — no concatenated ticker.
+    const meta = registry.find((r) => r.symbol === 'META' && r.market === 'US');
     expect(meta).toBeDefined();
     expect(meta!.activeTo).toBeNull();
 
-    const fb = registry.find((r) => r.ticker === 'FB_US_EQ');
+    const fb = registry.find((r) => r.symbol === 'FB' && r.market === 'US');
     expect(fb).toBeDefined();
     expect(fb!.activeTo).toBeInstanceOf(Date);          // retired, not left active
     expect(fb!.removedReason).toBe('universe_refresh');
@@ -137,6 +144,6 @@ describe('UniverseManager.refresh — FB→META registry migration (eodhd_scan)'
     const active = await mgr.refresh();
 
     expect(active).toEqual(['META_US_EQ']);
-    expect(registry.find((r) => r.ticker === 'FB_US_EQ')!.activeTo).toBeInstanceOf(Date);
+    expect(registry.find((r) => r.symbol === 'FB' && r.market === 'US')!.activeTo).toBeInstanceOf(Date);
   });
 });

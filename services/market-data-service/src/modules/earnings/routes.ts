@@ -18,7 +18,7 @@ export function createEarningsRouter(store: EarningsStore, refresher: EarningsRe
         return c.json({
             days,
             events: events.map((d) => ({
-                ticker: d._id,
+                ticker: d.ticker,
                 nextEarningsDate: d.nextEarningsDate ?? null,
                 dividendDate: d.dividendDate ?? null,
                 source: d.source,

@@ -192,14 +192,31 @@ async def load_coverage(
     universe_tickers: list[str] = []
     index_rows: list[dict] = []
 
+    # instrument_registry + index_constituents are keyed on the bare (symbol, market) identity since
+    # Task 16b — the concatenated T212 ticker is no longer stored. Re-derive each row's T212 `ticker`
+    # from (symbol, market) so the rest of this resolver (which strips US `_US_EQ` → bare symbol for
+    # the CIK map) is byte-identical. A row that can't be re-joined to a US/LSE form is dropped.
+    from quant_core.ticker_identity import TickerIdentity, Trading212TickerAdapter
+
+    _adapter = Trading212TickerAdapter()
+
+    def _ticker_of(doc: dict) -> Optional[str]:
+        sym, mkt = doc.get("symbol"), doc.get("market")
+        if not isinstance(sym, str) or not isinstance(mkt, str):
+            return None
+        try:
+            return _adapter.to_t212(TickerIdentity(symbol=sym, market=mkt))  # type: ignore[arg-type]
+        except Exception:  # noqa: BLE001 — drop an un-routable stored row
+            return None
+
     if mode != COVERAGE_INDEX_ONLY:
         try:
             cursor = mongo_db[COLL_INSTRUMENT_REGISTRY].find(
-                {"activeTo": None}, {"_id": 0, "ticker": 1}
+                {"activeTo": None}, {"_id": 0, "symbol": 1, "market": 1}
             )
             async for doc in cursor:
-                tk = doc.get("ticker")
-                if isinstance(tk, str) and tk:
+                tk = _ticker_of(doc)
+                if tk is not None:
                     universe_tickers.append(tk)
         except Exception as exc:  # noqa: BLE001 — degrade to the index source, never abort the run
             log.warning("[coverage] instrument_registry read failed (%s): %s", type(exc).__name__, exc)
@@ -208,10 +225,13 @@ async def load_coverage(
         try:
             cursor = mongo_db[COLL_INDEX_CONSTITUENTS].find(
                 {"index": index},
-                {"_id": 0, "ticker": 1, "effective_from": 1, "effective_to": 1},
+                {"_id": 0, "symbol": 1, "market": 1, "effective_from": 1, "effective_to": 1},
             )
             async for doc in cursor:
-                index_rows.append(doc)
+                tk = _ticker_of(doc)
+                if tk is None:
+                    continue
+                index_rows.append({**doc, "ticker": tk})
         except Exception as exc:  # noqa: BLE001 — degrade to the universe source, never abort the run
             log.warning("[coverage] index_constituents read failed (%s): %s", type(exc).__name__, exc)
 

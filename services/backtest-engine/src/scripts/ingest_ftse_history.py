@@ -210,19 +210,36 @@ async def ingest(
         )
     intervals = build_intervals(snapshots, index)
 
+    # index_constituents is keyed on the bare (symbol, market) identity since Task 16b — the
+    # concatenated T212 ticker is no longer stored. The build_intervals tickers are the T212 LSE form
+    # (`AALl_EQ`), so split each through the canonical adapter (the one suffix parser) → {symbol, market}
+    # = {'AAL', 'LSE'}; the upsert key + the row drop `ticker` for `symbol`+`market`. A token that
+    # can't be parsed to a US/LSE form is skipped (fail-soft). Consumers keep filtering by `index`.
+    from quant_core.ticker_identity import Trading212TickerAdapter
+
+    adapter = Trading212TickerAdapter()
     now = datetime.now(timezone.utc)
+    written = 0
     for row in intervals:
+        try:
+            ident = adapter.from_t212(row["ticker"])
+        except Exception:  # noqa: BLE001 — an un-routable token is dropped, never aborts the ingest
+            continue
+        doc = {"index": row["index"], "symbol": ident.symbol, "market": ident.market,
+               "effective_from": row["effective_from"], "effective_to": row["effective_to"]}
         await db["index_constituents"].update_one(
-            {"index": row["index"], "ticker": row["ticker"], "effective_from": row["effective_from"]},
-            {"$set": {**row, "data_source": "yfiua_index_constituents_csv", "ingested_at": now}},
+            {"index": doc["index"], "symbol": doc["symbol"], "market": doc["market"],
+             "effective_from": doc["effective_from"]},
+            {"$set": {**doc, "data_source": "yfiua_index_constituents_csv", "ingested_at": now}},
             upsert=True,
         )
+        written += 1
     await db["index_constituents_audit"].insert_one(
-        {"index": index, "source_url": f"{base_url} ({start_ym}..{end_ym})", "rows": len(intervals),
+        {"index": index, "source_url": f"{base_url} ({start_ym}..{end_ym})", "rows": written,
          "snapshots": len(snapshots), "ingested_at": now}
     )
     span = (snapshots[0][0], snapshots[-1][0])
-    return {"intervals": len(intervals), "snapshots": len(snapshots),
+    return {"intervals": written, "snapshots": len(snapshots),
             "from_ms": span[0], "to_ms": span[1]}
 
 

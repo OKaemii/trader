@@ -69,10 +69,54 @@ from typing import Any, Callable, Iterable, Optional
 import motor.motor_asyncio
 from pymongo import ASCENDING, DESCENDING, UpdateOne
 
+from quant_core.ticker_identity import Trading212TickerAdapter
+
 # Mirrors COLLECTIONS.FACTOR_SCORES in packages/shared-mongo/src/collections.ts. The collection
 # name is the cross-service contract from T5 — keep this literal in lockstep with that constant
 # (Python has no import of the TS module; this single literal is the one source on this side).
 COLLECTION = "factor_scores"
+
+# The storage-boundary ticker↔identity bridge (Thread A, Task 16b). Each factor_scores doc is keyed on
+# the bare (symbol, market) identity, never the concatenated T212 ticker. The reader endpoints take a
+# T212 ticker from the portal and the cycle host hands compute_research_factors rows keyed on the T212
+# ticker — this single adapter splits a ticker to (symbol, market) before any Mongo touch and re-joins
+# it on the way out, so the portal contract (a `ticker` on each row) is unchanged. fromT212 throws on a
+# non-US/LSE form; on the WRITE side a freshly-emitted name is always tradable (a parse failure is a
+# real bug worth surfacing — we skip+log rather than poison the cycle), and on the READ/query side the
+# split is fail-soft (an un-routable name simply matches nothing).
+_ADAPTER = Trading212TickerAdapter()
+
+
+def _split_ticker(ticker: str) -> Optional[tuple[str, str]]:
+    """Split a T212 ticker into (symbol, market) fail-soft — None when it isn't a US/LSE form."""
+    try:
+        ident = _ADAPTER.from_t212(ticker)
+        return ident.symbol, ident.market
+    except Exception:  # noqa: BLE001 — an un-routable ticker degrades to no-match, never throws
+        return None
+
+
+def _join_ticker(symbol: Any, market: Any) -> Optional[str]:
+    """Re-derive the T212 ticker from a stored (symbol, market) — None when it can't be re-joined."""
+    if not isinstance(symbol, str) or not isinstance(market, str):
+        return None
+    try:
+        from quant_core.ticker_identity import TickerIdentity
+
+        return _ADAPTER.to_t212(TickerIdentity(symbol=symbol, market=market))  # type: ignore[arg-type]
+    except Exception:  # noqa: BLE001 — a stored value outside US/LSE is dropped, never throws
+        return None
+
+
+def _with_ticker(doc: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Attach a re-derived `ticker` to a read doc (from its stored symbol/market) so the reader's
+    return shape carries the same `ticker` the portal contract expects. None passes through."""
+    if doc is None:
+        return None
+    ticker = _join_ticker(doc.get("symbol"), doc.get("market"))
+    if ticker is not None:
+        doc["ticker"] = ticker
+    return doc
 
 # The four research factors in a fixed order — every persisted doc carries the same factor keys.
 RESEARCH_FACTORS = ("momentum", "quality", "value", "volatility")
@@ -157,8 +201,17 @@ def build_docs(
     leg was present this cycle (those get value source ``div``)."""
     docs: list[dict[str, Any]] = []
     for ticker in sorted(factor_rows.keys()):
+        split = _split_ticker(ticker)
+        if split is None:
+            # An un-routable name (not a US/LSE form) can't be stored on the (symbol, market) key —
+            # skip it rather than poison the cycle. A freshly-emitted name is always tradable, so this
+            # is only hit by a stray/legacy ticker; log so it surfaces without breaking emission.
+            print(f"[strategy-engine:factor-store] skip un-routable ticker (no symbol/market): {ticker!r}", flush=True)
+            continue
+        symbol, market = split
         docs.append({
-            "ticker": ticker,
+            "symbol": symbol,
+            "market": market,
             "observation_ts": observation_ts,
             "factors": stamp_factor_sources(
                 factor_rows[ticker],
@@ -268,22 +321,23 @@ class FactorStore:
         """Create the factor_scores index (T5 documents the intent; the writer task — this one —
         creates it). Idempotent: Mongo no-ops a create on an existing index.
 
-        ONE compound ``(ticker asc, observation_ts desc)`` index serves every read path:
-        - ``latest_for`` / ``as_of`` — ticker equality on the prefix, newest-first by the descending
-          ``observation_ts`` (index-only, no fetch-then-sort);
-        - ``latest_all`` — matches the ``{ticker:1, observation_ts:-1}`` aggregation sort exactly.
+        ONE compound ``(symbol asc, market asc, observation_ts desc)`` index serves every read path
+        (the store is keyed on the bare (symbol, market) identity since Task 16b):
+        - ``latest_for`` / ``as_of`` — (symbol, market) equality on the prefix, newest-first by the
+          descending ``observation_ts`` (index-only, no fetch-then-sort);
+        - ``latest_all`` — matches the ``{symbol:1, market:1, observation_ts:-1}`` aggregation sort.
         A second index keyed the same way would only double write cost for no read benefit (a
-        genuinely-useful "latest per ticker" partial index would need an ``is_latest`` flag we don't
+        genuinely-useful "latest per name" partial index would need an ``is_latest`` flag we don't
         write), so this is deliberately the single index.
         """
         await self._coll.create_index(
-            [("ticker", ASCENDING), ("observation_ts", DESCENDING)],
-            name="factor_scores_ticker_obs",
+            [("symbol", ASCENDING), ("market", ASCENDING), ("observation_ts", DESCENDING)],
+            name="factor_scores_symbol_market_obs",
         )
 
     # ── Write path ───────────────────────────────────────────────────────────────────────────
     async def persist_cycle(self, docs: list[dict[str, Any]]) -> int:
-        """Upsert one doc per ticker for this cycle, idempotent per ``(ticker, observation_ts)``
+        """Upsert one doc per name for this cycle, idempotent per ``(symbol, market, observation_ts)``
         (a replay of the same cycle overwrites rather than duplicating). Returns the number of docs
         written. Raises on a Mongo failure — the HOST wraps this in the best-effort guard (mirroring
         the feature-store persist), so a store outage logs but never blocks signal emission."""
@@ -291,7 +345,7 @@ class FactorStore:
             return 0
         ops = [
             UpdateOne(
-                {"ticker": d["ticker"], "observation_ts": d["observation_ts"]},
+                {"symbol": d["symbol"], "market": d["market"], "observation_ts": d["observation_ts"]},
                 {"$set": d},
                 upsert=True,
             )
@@ -302,56 +356,79 @@ class FactorStore:
 
     # ── Read path (T10 builds endpoints on these) ────────────────────────────────────────────
     async def latest_all(self) -> dict[str, dict[str, Any]]:
-        """Newest factor row per ticker across the whole universe — powers the Overview factor
-        bars for any symbol + entity-search enrichment. Returns ``{ ticker: {observation_ts,
-        factors} }``. Empty ``{}`` pre-backfill (the scores endpoint then returns ``{}``)."""
-        # One aggregation: newest observation_ts wins per ticker (descending sort + $first).
+        """Newest factor row per name across the whole universe — powers the Overview factor bars for
+        any symbol + entity-search enrichment. Keyed on (symbol, market) since Task 16b; the dict key
+        is the re-derived T212 ticker so the callers (``build_fundamentals_source_response``'s
+        by_ticker, the ``/scores`` no-ticker response) stay keyed exactly as before. A row whose
+        (symbol, market) can't be re-joined to a US/LSE ticker is dropped (fail-soft). Empty ``{}``
+        pre-backfill (the scores endpoint then returns ``{}``)."""
+        # One aggregation: newest observation_ts wins per (symbol, market) (descending sort + $first).
         pipeline = [
-            {"$sort": {"ticker": 1, "observation_ts": DESCENDING}},
+            {"$sort": {"symbol": 1, "market": 1, "observation_ts": DESCENDING}},
             {"$group": {
-                "_id": "$ticker",
+                "_id": {"symbol": "$symbol", "market": "$market"},
                 "observation_ts": {"$first": "$observation_ts"},
                 "factors": {"$first": "$factors"},
             }},
         ]
         out: dict[str, dict[str, Any]] = {}
         async for row in self._coll.aggregate(pipeline):
-            out[row["_id"]] = {"observation_ts": row["observation_ts"], "factors": row["factors"]}
+            key = row.get("_id") or {}
+            ticker = _join_ticker(key.get("symbol"), key.get("market"))
+            if ticker is None:
+                continue
+            out[ticker] = {"observation_ts": row["observation_ts"], "factors": row["factors"]}
         return out
 
     async def latest_for(self, ticker: str) -> Optional[dict[str, Any]]:
-        """Newest factor row for one ticker, or None. Backs ``GET .../scores?ticker=`` (no asOf)."""
+        """Newest factor row for one ticker, or None. Backs ``GET .../scores?ticker=`` (no asOf). The
+        input T212 ticker is split to (symbol, market) for the query; the returned doc carries a
+        re-derived ``ticker`` so the portal contract is unchanged. An un-routable ticker → None."""
+        split = _split_ticker(ticker)
+        if split is None:
+            return None
+        symbol, market = split
         doc = await self._coll.find_one(
-            {"ticker": ticker},
+            {"symbol": symbol, "market": market},
             sort=[("observation_ts", DESCENDING)],
             projection={"_id": False},
         )
-        return doc
+        return _with_ticker(doc)
 
     async def as_of(self, ticker: str, as_of_ms: int) -> Optional[dict[str, Any]]:
         """Newest factor row for ``ticker`` with ``observation_ts <= as_of_ms`` — the point-in-time
         read (the signal "Why?" reads as-of ``signal.timestamp`` for honesty). None when nothing was
-        known at that knowledge time. Backs ``GET .../scores?ticker=&asOf=``."""
+        known at that knowledge time. Backs ``GET .../scores?ticker=&asOf=``. The input ticker is
+        split to (symbol, market); the returned doc carries a re-derived ``ticker``."""
+        split = _split_ticker(ticker)
+        if split is None:
+            return None
+        symbol, market = split
         doc = await self._coll.find_one(
-            {"ticker": ticker, "observation_ts": {"$lte": as_of_ms}},
+            {"symbol": symbol, "market": market, "observation_ts": {"$lte": as_of_ms}},
             sort=[("observation_ts", DESCENDING)],
             projection={"_id": False},
         )
-        return doc
+        return _with_ticker(doc)
 
     async def history(self, ticker: str, *, limit: int = 365) -> list[dict[str, Any]]:
         """The ticker's factor rows as a TIME-SERIES, oldest → newest by ``observation_ts`` — the
         four factor percentiles over time for the Factor-Evolution chart. Backs
         ``GET .../factor-history?ticker=``. Empty list for an unseen ticker.
 
-        We pull the most-recent ``limit`` rows newest-first off the ``(ticker, observation_ts desc)``
-        index (so a long-lived ticker returns the latest window, not the oldest), then reverse to
+        We pull the most-recent ``limit`` rows newest-first off the ``(symbol, market, observation_ts
+        desc)`` index (so a long-lived name returns the latest window, not the oldest), then reverse to
         chronological order so the consumer plots left-to-right with no re-sort. Each row carries
         ``{observation_ts, factors}`` (``_id`` projected out) — the same per-row shape as the latest
-        reads, so a chart can reuse the same cell-extraction. ``limit`` is the doc cap (≈ a year of
-        daily cycles by default); the host clamps the query value to a sane bound."""
+        reads, so a chart can reuse the same cell-extraction. The input T212 ticker is split to
+        (symbol, market) since Task 16b (an un-routable ticker → empty list). ``limit`` is the doc cap
+        (≈ a year of daily cycles by default); the host clamps the query value to a sane bound."""
+        split = _split_ticker(ticker)
+        if split is None:
+            return []
+        symbol, market = split
         cursor = self._coll.find(
-            {"ticker": ticker},
+            {"symbol": symbol, "market": market},
             sort=[("observation_ts", DESCENDING)],
             projection={"_id": False},
         ).limit(limit)
@@ -365,8 +442,10 @@ class FactorStore:
     ) -> list[dict[str, Any]]:
         """Historical rows with AT LEAST ONE upgradeable (no-source) cell among ``factors`` — the
         re-backfill candidate set. A cell is upgradeable iff its ``source`` is null (the honest
-        no-source cell the forward-only seam left). Returns ``{ticker, observation_ts, factors}`` per
-        candidate (``_id`` projected out), oldest → newest so a long backfill makes monotonic progress.
+        no-source cell the forward-only seam left). Returns ``{symbol, market, ticker, observation_ts,
+        factors}`` per candidate (``_id`` projected out; ``ticker`` re-derived from (symbol, market) so
+        the driver's ``recompute_fn`` keeps its ticker contract), oldest → newest so a long backfill
+        makes monotonic progress. A row whose (symbol, market) can't be re-joined is dropped (fail-soft).
 
         Only the fundamentals-derived factors are candidates by default (``quality`` + ``value``); the
         price factors (``momentum``/``volatility``) are ``eod`` and were never null for lack of
@@ -379,17 +458,28 @@ class FactorStore:
             sort=[("observation_ts", ASCENDING)],
             projection={"_id": False},
         ).limit(limit)
-        return [doc async for doc in cursor]
+        out: list[dict[str, Any]] = []
+        async for doc in cursor:
+            row = _with_ticker(doc)
+            if row is not None and row.get("ticker"):
+                out.append(row)
+        return out
 
     async def rebackfill_row(
         self, ticker: str, observation_ts: int, merged_factors: dict[str, dict[str, Any]]
     ) -> bool:
-        """Write the upgraded ``factors`` block back to the row matched by ``(ticker, observation_ts)``.
+        """Write the upgraded ``factors`` block back to the row matched by
+        ``(symbol, market, observation_ts)``. The input T212 ticker is split to (symbol, market) since
+        Task 16b (an un-routable ticker → no-op, returns False).
         Returns True iff a row was actually modified (no-op when the merge changed nothing). The match
         key is the same idempotency key the writer uses, so this never creates a row (``upsert=False``)
         — it only upgrades an existing historical row in place."""
+        split = _split_ticker(ticker)
+        if split is None:
+            return False
+        symbol, market = split
         res = await self._coll.update_one(
-            {"ticker": ticker, "observation_ts": observation_ts},
+            {"symbol": symbol, "market": market, "observation_ts": observation_ts},
             {"$set": {"factors": merged_factors}},
         )
         return bool(getattr(res, "modified_count", 0))
