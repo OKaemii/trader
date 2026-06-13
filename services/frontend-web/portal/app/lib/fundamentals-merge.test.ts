@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   buildSummary,
   filterRows,
+  lastCycleMs,
   mergeFundamentalsRows,
   provenanceKind,
   sortRows,
@@ -123,6 +124,39 @@ describe('mergeFundamentalsRows (full outer join on bare symbol)', () => {
     expect(rows.filter((r) => r.symbol === 'AAPL')).toHaveLength(1)
   })
 
+  it('US-preferred: a cross-listed name keeps the US source clock, not the LSE one (single row)', () => {
+    // A cross-listed name (SHEL on US + LSE) appears under BOTH T212 forms in by_ticker but only the US
+    // listing is on the freshness side. The merge must keep ONE row carrying the US source/clock, never
+    // letting the LSE listing clobber it — regardless of by_ticker iteration order.
+    const rows = mergeFundamentalsRows(
+      { ...freshness(), names: [] }, // source-only, exercise the US-preference directly
+      source({
+        by_ticker: {
+          // LSE first, US second — US must still win.
+          SHELl_EQ: { source: 'pit-edgar', built_at: 5_000 },
+          SHEL_US_EQ: { source: 'pit-edgar', built_at: 9_000 },
+        },
+      }),
+    )
+    const shel = rows.filter((r) => r.symbol === 'SHEL')
+    expect(shel).toHaveLength(1) // collapsed to one row, not two
+    expect(shel[0].lastReadBuiltMs).toBe(9_000) // the US listing's clock, not the LSE 5_000
+  })
+
+  it('US-preference holds when the US source is iterated FIRST (no LSE clobber)', () => {
+    const rows = mergeFundamentalsRows(
+      { ...freshness(), names: [] },
+      source({
+        by_ticker: {
+          SHEL_US_EQ: { source: 'pit-edgar', built_at: 9_000 },
+          SHELl_EQ: { source: 'pit-edgar', built_at: 5_000 },
+        },
+      }),
+    )
+    const shel = rows.find((r) => r.symbol === 'SHEL')!
+    expect(shel.lastReadBuiltMs).toBe(9_000)
+  })
+
   it('yields one row per distinct bare symbol across both sides', () => {
     const rows = mergeFundamentalsRows(freshness(), source())
     expect(new Set(rows.map((r) => r.symbol)).size).toBe(rows.length)
@@ -182,6 +216,20 @@ describe('filterRows', () => {
   })
 })
 
+describe('lastCycleMs (coerces the strategy ISO string → ms)', () => {
+  it('parses an ISO-8601 string to epoch-ms (the live backend emits a string, not ms)', () => {
+    expect(lastCycleMs('2026-06-13T12:00:00Z')).toBe(Date.parse('2026-06-13T12:00:00Z'))
+  })
+  it('passes a raw ms number through', () => {
+    expect(lastCycleMs(9_000)).toBe(9_000)
+  })
+  it('null/undefined/unparseable → null (never NaN)', () => {
+    expect(lastCycleMs(null)).toBeNull()
+    expect(lastCycleMs(undefined)).toBeNull()
+    expect(lastCycleMs('not a date')).toBeNull()
+  })
+})
+
 describe('buildSummary', () => {
   it('rolls up the live source counts + lake coverage gate (no yahoo line — retired)', () => {
     const s = buildSummary(freshness(), source())
@@ -196,6 +244,13 @@ describe('buildSummary', () => {
     expect(s.noEdgar).toEqual([]) // no exceptions in the base fixture
     // the summary no longer carries a yahooServed field (the live cycle never serves Yahoo)
     expect('yahooServed' in s).toBe(false)
+  })
+
+  it('coerces a real-shaped ISO last_cycle_ts to ms (the live backend emits a string)', () => {
+    const iso = '2026-06-13T12:00:00Z'
+    const s = buildSummary(freshness(), source({ last_cycle_ts: iso }))
+    expect(s.lastCycleMs).toBe(Date.parse(iso)) // not NaN, not the raw string
+    expect(Number.isFinite(s.lastCycleMs as number)).toBe(true)
   })
 
   it('is all-null when both reads are null', () => {

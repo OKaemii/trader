@@ -64,7 +64,17 @@ export interface FundamentalsSource {
   sources: Record<string, number> // raw source → count (a null source is the literal "null" key)
   by_ticker: Record<string, SourceEntry> // keyed by T212 ticker
   pit_served: number
-  last_cycle_ts: number | null
+  // strategy-engine emits this as an ISO-8601 STRING ('2026-06-13T12:00:00Z'), NOT epoch-ms — it is
+  // coerced to ms in buildSummary (a string would otherwise render 'NaNd ago').
+  last_cycle_ts: string | number | null
+}
+
+// Coerce the strategy's last_cycle_ts (an ISO string, or — in tests — a raw ms number, or null) to
+// epoch-ms. A non-finite/unparseable value → null (so the UI shows '—', never 'NaN…').
+export function lastCycleMs(value: string | number | null | undefined): number | null {
+  if (value == null) return null
+  const ms = typeof value === 'number' ? value : Date.parse(value)
+  return Number.isFinite(ms) ? ms : null
 }
 
 // ── The merged per-name row (one per BARE symbol present on EITHER side). ──────────────────────────
@@ -96,18 +106,29 @@ export function provenanceKind(source: string | null | undefined): ProvenanceKin
   return 'none'
 }
 
-// The bare symbol a source row keys to: parse its T212 ticker, falling back to the raw key (already
-// bare, or unparseable) so a source-only name still lands on a row.
-function symbolOfSourceKey(ticker: string): string {
-  return fromT212(ticker)?.symbol ?? ticker
+// The bare symbol + the listing market a source row keys to: parse its T212 ticker, falling back to the
+// raw key (already bare, or unparseable) as a US symbol so a source-only name still lands on a row.
+function identityOfSourceKey(ticker: string): { symbol: string; market: 'US' | 'LSE' } {
+  const id = fromT212(ticker)
+  return id ? { symbol: id.symbol.toUpperCase(), market: id.market } : { symbol: ticker.toUpperCase(), market: 'US' }
 }
 
 // Full outer join freshness.names ⋈ source.by_ticker on the BARE symbol. Either side may be absent.
+//
+// The two sides key on different alphabets: freshness is US-only bare symbols (EDGAR), source is T212
+// tickers across the whole universe (incl. LSE l_EQ names the strategy ranks on price factors). A
+// cross-listed name (e.g. SHEL on US + LSE) can therefore appear under BOTH `SHEL_US_EQ` and `SHELl_EQ`
+// in the source map but only as `SHEL` (US) in freshness. To keep that a single coherent row we join on
+// the bare symbol and apply the platform's US-preferred rule: a US source claims the row, and an LSE
+// source only fills it when no US source has (so the LSE listing's clock never clobbers the US one the
+// freshness side describes). The chosen source's market is tracked per row to enforce this.
 export function mergeFundamentalsRows(
   freshness: FreshnessAudit | null,
   source: FundamentalsSource | null,
 ): MergedRow[] {
   const bySymbol = new Map<string, MergedRow>()
+  // Which market's source currently populates each row (US-preferred); absent until a source fills it.
+  const sourceMarket = new Map<string, 'US' | 'LSE'>()
 
   for (const n of freshness?.names ?? []) {
     const symbol = n.symbol.toUpperCase()
@@ -128,13 +149,20 @@ export function mergeFundamentalsRows(
   }
 
   for (const [ticker, entry] of Object.entries(source?.by_ticker ?? {})) {
-    const symbol = symbolOfSourceKey(ticker).toUpperCase()
+    const { symbol, market } = identityOfSourceKey(ticker)
     const existing = bySymbol.get(symbol)
     if (existing) {
       existing.inSource = true
-      existing.source = entry.source
-      existing.lastReadBuiltMs = entry.built_at
+      // US-preferred: don't let an LSE listing overwrite a US source already on the row (the freshness
+      // side is the US name). Fill from LSE only when no US source has claimed it yet.
+      const claimedMarket = sourceMarket.get(symbol)
+      if (claimedMarket !== 'US' || market === 'US') {
+        existing.source = entry.source
+        existing.lastReadBuiltMs = entry.built_at
+        sourceMarket.set(symbol, market)
+      }
     } else {
+      sourceMarket.set(symbol, market)
       bySymbol.set(symbol, {
         symbol,
         inFreshness: false,
@@ -269,7 +297,8 @@ export function buildSummary(
     provider: source?.provider ?? null,
     pitServed: source ? pit : null,
     nullServed,
-    lastCycleMs: source?.last_cycle_ts ?? null,
+    // strategy-engine emits last_cycle_ts as an ISO string — coerce to ms so agoMs doesn't render NaN.
+    lastCycleMs: lastCycleMs(source?.last_cycle_ts),
     covered: freshness?.covered ?? null,
     universe: freshness?.universe ?? null,
     stale: freshness?.stale ?? null,
