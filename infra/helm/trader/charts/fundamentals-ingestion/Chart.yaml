@@ -1,5 +1,0 @@
-apiVersion: v2
-name: fundamentals-ingestion
-description: fundamentals-ingestion microservice (PIT Fundamentals Warehouse write-side)
-type: application
-version: 0.1.0

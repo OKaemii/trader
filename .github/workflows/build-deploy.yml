@@ -63,9 +63,6 @@ jobs:
           - service: backtest-engine
             dockerfile: infra/docker/backtest-engine.Dockerfile
             build_args: ""
-          - service: fundamentals-ingestion
-            dockerfile: infra/docker/fundamentals-ingestion.Dockerfile
-            build_args: ""
           - service: fundamentals-api
             dockerfile: infra/docker/fundamentals-api.Dockerfile
             build_args: ""

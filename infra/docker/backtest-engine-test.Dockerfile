@@ -56,34 +56,21 @@ COPY services/strategy-engine/tests/test_lru_cache.py ./strategy_engine/tests/te
 COPY services/strategy-engine/tests/test_pipeline.py ./strategy_engine/tests/test_pipeline.py
 COPY services/strategy-engine/tests/test_fundamentals_source_endpoint.py ./strategy_engine/tests/test_fundamentals_source_endpoint.py
 
-# fundamentals-ingestion skeleton suite (PIT Fundamentals Warehouse write-side). Deps-clean: the app +
-# stage stubs import only fastapi/pydantic + the installed quant_core (TestClient needs httpx from the
-# [http] extra above) — no Mongo/Timescale connection. Isolated under ./fundamentals_ingestion so its
-# `src.*` package root doesn't collide with backtest-engine's `src` at /app, and run from that dir so
-# `import src.main` resolves via its own conftest (same approach as the strategy-engine suite above).
-# PyYAML (epic Task 6): the metric registry (src/stage/metadata/metric_registry.yaml) is loaded with
-# yaml.safe_load; it is not in quant-core's deps nor backtest-engine's requirements, so install it here
-# (pinned to the service requirements.txt) before the fundamentals-ingestion suite runs.
-# prometheus-client (epic Task 20): both fundamentals services' src/main.py now expose a /metrics
-# endpoint (liveness gauge + request-latency histogram), so their FastAPI apps import prometheus_client
-# at module load — install it here (pinned to the service requirements.txt) so the import resolves in
-# the gate exactly as in the deployed image, mirroring the strategy-engine suite above.
-# redis (Ops backend card): the write-side config provider (src/config.py) publishes `config:invalidated`
-# via redis.asyncio (LAZILY imported inside the publish path); the run-store/status suites import it. The
-# pin matches the service requirements.txt so the lazy import path resolves in the gate as in the image.
-RUN pip install --no-cache-dir 'PyYAML==6.0.2' 'prometheus-client==0.20.0' 'redis==5.0.7'
-COPY services/fundamentals-ingestion/src ./fundamentals_ingestion/src
-COPY services/fundamentals-ingestion/conftest.py ./fundamentals_ingestion/conftest.py
-COPY services/fundamentals-ingestion/tests ./fundamentals_ingestion/tests
+# prometheus-client + redis: needed by the read-side fundamentals services' FastAPI hosts AND the
+# strategy-engine source endpoint suite gated below. Both `fundamentals-api/src/main.py` and
+# `fundamentals-harvester/src/app.py` expose a /metrics endpoint, importing prometheus_client at module
+# load; the read-side cache + the strategy source endpoint import redis (the async client is imported
+# lazily in request handlers, the tests inject in-memory fakes). Pins match the service requirements so
+# the imports resolve in the gate exactly as in the deployed images. (The old fundamentals-INGESTION
+# suite + its PyYAML metric-registry dep were removed with the Timescale write-side — Task 24.)
+RUN pip install --no-cache-dir 'prometheus-client==0.20.0' 'redis==5.0.7'
 
-# fundamentals-api skeleton + resolver suite (PIT Fundamentals Warehouse read-side, epic Task 11).
-# Deps-clean: the app + resolver import only fastapi/pydantic + the installed quant_core (TestClient
-# needs httpx from the [http] extra above); asyncpg + redis are imported LAZILY inside request handlers
-# and the tests inject in-memory fakes (FakeTimescale/FakeRedis), so no live Timescale/Redis is needed.
-# `redis` is installed (pinned to the service requirements.txt) so the lazy import path in src.main is
-# resolvable, mirroring the deployed image. Isolated under ./fundamentals_api so its `src.*` package root
-# doesn't collide with backtest-engine's `src` at /app, run from that dir via its own conftest.
-RUN pip install --no-cache-dir 'redis==5.0.7'
+# fundamentals-api skeleton + resolver suite (PIT Fundamentals LAKE read-side). Deps-clean: the app +
+# resolver import only fastapi/pydantic + the installed quant_core (TestClient needs httpx from the
+# [http] extra above); asyncpg + redis are imported LAZILY inside request handlers and the tests inject
+# in-memory fakes (FakeRedis), so no live Redis is needed. Isolated under ./fundamentals_api so its
+# `src.*` package root doesn't collide with backtest-engine's `src` at /app, run from that dir via its
+# own conftest.
 COPY services/fundamentals-api/src ./fundamentals_api/src
 COPY services/fundamentals-api/conftest.py ./fundamentals_api/conftest.py
 COPY services/fundamentals-api/tests ./fundamentals_api/tests
@@ -118,7 +105,6 @@ ENV PYTHONDONTWRITEBYTECODE=1
 RUN python -m pytest quant_core_tests -q -p no:cacheprovider \
  && python -m pytest tests -q -p no:cacheprovider \
  && (cd strategy_engine && python -m pytest tests -q -p no:cacheprovider) \
- && (cd fundamentals_ingestion && python -m pytest tests -q -p no:cacheprovider) \
  && (cd fundamentals_api && python -m pytest tests -q -p no:cacheprovider) \
  && (cd warehouse_snapshotter && python -m pytest tests -q -p no:cacheprovider) \
  && (cd fundamentals_harvester && python -m pytest tests -q -p no:cacheprovider)

@@ -2,18 +2,15 @@
   One ServiceMonitor per trader service that exposes /metrics, so kube-prometheus-stack scrapes
   them all and (with remote_write) ships the samples to Mimir. The TS services get /metrics from
   @trader/core's shared `mountMetrics` (Node runtime metrics + any business counters); strategy-engine,
-  fundamentals-ingestion, fundamentals-api, and fundamentals-harvester expose prometheus_client metrics
-  (a liveness gauge + a per-route request-latency histogram — the API p50/p95 source). `targetPort`
-  (numeric) is used so we don't have to name the Service port on every subchart. backtest-engine is
-  intentionally omitted — it's a low-traffic job runner with no app /metrics; its pod-level metrics
-  come from kube-state-metrics.
+  fundamentals-api, and fundamentals-harvester expose prometheus_client metrics (a liveness gauge + a
+  per-route request-latency histogram — the API p50/p95 source). `targetPort` (numeric) is used so we
+  don't have to name the Service port on every subchart. backtest-engine is intentionally omitted — it's
+  a low-traffic job runner with no app /metrics; its pod-level metrics come from kube-state-metrics.
 
-  fundamentals-ingestion's HEAVY ingest counters (filings/facts ingested, ingestion lag, factor-gen
-  duration) are NOT here: that work runs in the separate `fundamentals-ingest` CronJob/backfill-Job
-  pods — short-lived batch containers a ServiceMonitor can't reliably scrape. Scraping their last-run
-  gauges is a documented follow-up (Pushgateway, or a last_run table the read API surfaces); see
-  CLAUDE.md "Fundamentals (PIT warehouse)". The Deployment scrape below gives liveness + trigger/read
-  latency; the Jobs' health is observed via kube-state-metrics (job success/failure + last-completion).
+  The harvester's bootstrap/sweep counters are emitted from its single long-running Deployment process
+  (it co-hosts the write loop with the status API), so the Deployment scrape below covers liveness +
+  the lake write loop. (The old Timescale fundamentals-ingestion CronJob/backfill-Job pods — short-lived
+  batch containers a ServiceMonitor couldn't reliably scrape — were retired with that stack, Task 24.)
 */}}
 {{- $svcs := list
   (dict "app" "auth-service"         "port" 3001)
@@ -23,7 +20,6 @@
   (dict "app" "trading-service"      "port" 3005)
   (dict "app" "portfolio-service"    "port" 3006)
   (dict "app" "strategy-engine"      "port" 8000)
-  (dict "app" "fundamentals-ingestion" "port" 8010)
   (dict "app" "fundamentals-api"       "port" 8011)
   (dict "app" "fundamentals-harvester" "port" 8012)
 -}}

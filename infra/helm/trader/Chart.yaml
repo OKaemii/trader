@@ -28,8 +28,6 @@ dependencies:
     version: ">=0.0.0"
   - name: backtest-engine
     version: ">=0.0.0"
-  - name: fundamentals-ingestion
-    version: ">=0.0.0"
   - name: fundamentals-api
     version: ">=0.0.0"
   - name: fundamentals-harvester
