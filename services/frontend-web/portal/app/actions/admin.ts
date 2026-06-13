@@ -2,6 +2,7 @@
 
 import { revalidatePath } from 'next/cache'
 import { authedFetch } from '@/app/lib/auth-fetch'
+import { fromT212, type TickerIdentity } from '@/app/lib/ticker-identity'
 
 export interface ActiveInstrument {
   ticker: string
@@ -11,13 +12,40 @@ export interface ActiveInstrument {
   adv: number
 }
 
+// Forced-add/remove entries are the BARE identity ({symbol, market}) since the epic's bare-ticker
+// flag-day (Task 21). The universe-overrides API still echoes the legacy T212 string[] on the wire
+// (Task 16b/18 deferred removing that to this card), so `getUniverseOverrides` parses each to the
+// bare identity for the portal; `saveUniverseOverrides` posts the bare objects back (the backend PUT
+// has accepted {symbol, market} since Task 18).
 export interface UniverseOverrides {
-  adds: string[]
-  removes: string[]
+  adds: TickerIdentity[]
+  removes: TickerIdentity[]
   activeUniverse: string[]
   activeUniverseDetailed?: ActiveInstrument[]
   updatedBy: string | null
   updatedAt: string | null
+}
+
+// Wire shape of the overrides GET (the backend still re-derives T212 strings from the stored bare
+// identities). Parsed to the bare identity below.
+interface UniverseOverridesWire {
+  adds?: string[]
+  removes?: string[]
+  activeUniverse?: string[]
+  activeUniverseDetailed?: ActiveInstrument[]
+  updatedBy?: string | null
+  updatedAt?: string | null
+}
+
+// Map the wire T212 strings → bare identities, dropping any that don't parse to a US/LSE listing (an
+// `OTHER`/malformed legacy value is silently skipped rather than rendered with a broker suffix).
+function identitiesFromWire(tickers: string[] | undefined): TickerIdentity[] {
+  const out: TickerIdentity[] = []
+  for (const t of tickers ?? []) {
+    const id = fromT212(t)
+    if (id) out.push(id)
+  }
+  return out
 }
 
 import type { OrderType } from '@/types/trader'
@@ -53,13 +81,26 @@ export async function getUniverseOverrides(): Promise<
 > {
   const r = await authedFetch('/admin/api/market-data/universe/overrides')
   if (!r.ok) return { ok: false, status: r.status }
-  return { ok: true, data: (await r.json()) as UniverseOverrides }
+  const wire = (await r.json()) as UniverseOverridesWire
+  return {
+    ok: true,
+    data: {
+      adds: identitiesFromWire(wire.adds),
+      removes: identitiesFromWire(wire.removes),
+      activeUniverse: wire.activeUniverse ?? [],
+      activeUniverseDetailed: wire.activeUniverseDetailed,
+      updatedBy: wire.updatedBy ?? null,
+      updatedAt: wire.updatedAt ?? null,
+    },
+  }
 }
 
 export async function saveUniverseOverrides(
-  adds: string[],
-  removes: string[],
+  adds: TickerIdentity[],
+  removes: TickerIdentity[],
 ): Promise<{ ok: boolean; status: number }> {
+  // Post the BARE {symbol, market} objects — the backend PUT resolves an add against the T212 catalog
+  // and persists it as a bare identity (the wire no longer carries the broker suffix from the portal).
   const r = await authedFetch('/admin/api/market-data/universe/overrides', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
