@@ -123,14 +123,17 @@ describe('getBarAtOrBefore — Mongo live path (asOf undefined)', () => {
   it('returns the newest unsuperseded bar and carries the asOf-anchored window bound', async () => {
     delete process.env.BARS_BACKEND;
     const coll = makeCollectionWith([
-      { ticker: 'A', observation_ts: _now - 5*day, knowledge_ts: _now - 5*day, interval: 'daily', is_superseded: false, open: 1, high: 1, low: 1, close: 10, volume: 1 },
-      { ticker: 'A', observation_ts: _now - 1*day, knowledge_ts: _now - 1*day, interval: 'daily', is_superseded: false, open: 1, high: 1, low: 1, close: 20, volume: 1 },
+      { symbol: 'A', market: 'US', observation_ts: _now - 5*day, knowledge_ts: _now - 5*day, interval: 'daily', is_superseded: false, open: 1, high: 1, low: 1, close: 10, volume: 1 },
+      { symbol: 'A', market: 'US', observation_ts: _now - 1*day, knowledge_ts: _now - 1*day, interval: 'daily', is_superseded: false, open: 1, high: 1, low: 1, close: 20, volume: 1 },
     ]);
-    const bar = await getBarAtOrBefore(makeRedis() as never, makeDb(coll), 'A', 'daily');
+    const bar = await getBarAtOrBefore(makeRedis() as never, makeDb(coll), 'A_US_EQ', 'daily');
     expect(bar?.close).toBe(20);                       // newest within the window
-    // The filter is BOUNDED below at `now - window` (this bound is the OOM fix — it prunes the
-    // per-chunk lock fan on Timescale). Upper bound `$lte: now`, lower bound `$gt: now - window`.
-    const f = coll.findFilters[0] as { is_superseded?: boolean; observation_ts?: { $lte: number; $gt: number } };
+    // The filter splits the ticker to (symbol, market) and is BOUNDED below at `now - window` (this
+    // bound is the OOM fix — it prunes the per-chunk lock fan on Timescale). Upper `$lte: now`,
+    // lower `$gt: now - window`.
+    const f = coll.findFilters[0] as { symbol?: string; market?: string; is_superseded?: boolean; observation_ts?: { $lte: number; $gt: number } };
+    expect(f.symbol).toBe('A');
+    expect(f.market).toBe('US');
     expect(f.is_superseded).toBe(false);
     expect(f.observation_ts).toBeDefined();
     expect(f.observation_ts!.$gt).toBeLessThan(f.observation_ts!.$lte);
@@ -141,9 +144,9 @@ describe('getBarAtOrBefore — Mongo live path (asOf undefined)', () => {
     // The only bar sits ~600 days back — outside the ~400d primary, inside the ~5y wide fallback.
     const ts = _now - 600 * day;
     const coll = makeCollectionWith([
-      { ticker: 'A', observation_ts: ts, knowledge_ts: ts, interval: 'daily', is_superseded: false, open: 1, high: 1, low: 1, close: 42, volume: 1 },
+      { symbol: 'A', market: 'US', observation_ts: ts, knowledge_ts: ts, interval: 'daily', is_superseded: false, open: 1, high: 1, low: 1, close: 42, volume: 1 },
     ]);
-    const bar = await getBarAtOrBefore(makeRedis() as never, makeDb(coll), 'A', 'daily');
+    const bar = await getBarAtOrBefore(makeRedis() as never, makeDb(coll), 'A_US_EQ', 'daily');
     expect(bar?.close).toBe(42);
     expect(bar?.observation_ts).toBe(ts);
     // Two reads: the empty primary then the wider fallback. The fallback's lower bound is deeper.
@@ -158,9 +161,9 @@ describe('getBarAtOrBefore — Mongo live path (asOf undefined)', () => {
     // A 2006 bar is outside the ~5y wide window when read LIVE ('now') — deep reads must pass asOf.
     const oldTs = Date.UTC(2006, 5, 15);
     const coll = makeCollectionWith([
-      { ticker: 'A', observation_ts: oldTs, knowledge_ts: oldTs, interval: 'daily', is_superseded: false, open: 1, high: 1, low: 1, close: 42, volume: 1 },
+      { symbol: 'A', market: 'US', observation_ts: oldTs, knowledge_ts: oldTs, interval: 'daily', is_superseded: false, open: 1, high: 1, low: 1, close: 42, volume: 1 },
     ]);
-    const bar = await getBarAtOrBefore(makeRedis() as never, makeDb(coll), 'A', 'daily');
+    const bar = await getBarAtOrBefore(makeRedis() as never, makeDb(coll), 'A_US_EQ', 'daily');
     expect(bar).toBeNull();
     // Confirms the window never widens to the whole series: both reads keep a finite lower bound.
     expect(coll.findFilters).toHaveLength(2);
@@ -172,17 +175,17 @@ describe('getBarAtOrBefore — Mongo live path (asOf undefined)', () => {
   it('returns null when the ticker has no bars', async () => {
     delete process.env.BARS_BACKEND;
     const coll = makeCollectionWith([]);
-    const bar = await getBarAtOrBefore(makeRedis() as never, makeDb(coll), 'NONE', 'daily');
+    const bar = await getBarAtOrBefore(makeRedis() as never, makeDb(coll), 'NONE_US_EQ', 'daily');
     expect(bar).toBeNull();
   });
 
-  it('writes the cache under the distinct :at: segment (live bucket)', async () => {
+  it('writes the cache under the distinct :at: segment (live bucket, keyed on symbol:market)', async () => {
     delete process.env.BARS_BACKEND;
     const coll = makeCollectionWith([]);
     const redis = makeRedis();
-    await getBarAtOrBefore(redis as never, makeDb(coll), 'A', 'daily');
+    await getBarAtOrBefore(redis as never, makeDb(coll), 'A_US_EQ', 'daily');
     const setKeys = redis.calls.filter((c) => c.op === 'setEx').map((c) => c.key);
-    expect(setKeys).toEqual(['bars:v2:A:daily:at:live']);
+    expect(setKeys).toEqual(['bars:v2:A:US:daily:at:live']);
   });
 });
 
@@ -193,12 +196,12 @@ describe('getBarAtOrBefore — Mongo as-of path (asOf set)', () => {
     const obsNew = _now - 1 * day;
     const kNewLate = obsNew + 3 * 60_000;
     const coll = makeCollectionWith([
-      { ticker: 'A', observation_ts: obsOld, knowledge_ts: obsOld,      interval: 'daily', is_superseded: false, open: 1, high: 1, low: 1, close: 5,   volume: 1 },
-      { ticker: 'A', observation_ts: obsNew, knowledge_ts: obsNew,      interval: 'daily', is_superseded: true,  open: 1, high: 1, low: 1, close: 100, volume: 1 },
-      { ticker: 'A', observation_ts: obsNew, knowledge_ts: kNewLate,    interval: 'daily', is_superseded: false, open: 1, high: 1, low: 1, close: 101, volume: 1 },
+      { symbol: 'A', market: 'US', observation_ts: obsOld, knowledge_ts: obsOld,      interval: 'daily', is_superseded: false, open: 1, high: 1, low: 1, close: 5,   volume: 1 },
+      { symbol: 'A', market: 'US', observation_ts: obsNew, knowledge_ts: obsNew,      interval: 'daily', is_superseded: true,  open: 1, high: 1, low: 1, close: 100, volume: 1 },
+      { symbol: 'A', market: 'US', observation_ts: obsNew, knowledge_ts: kNewLate,    interval: 'daily', is_superseded: false, open: 1, high: 1, low: 1, close: 101, volume: 1 },
     ]);
     // asOf after the late revision → newest observation (obsNew) at its latest known revision (101).
-    const bar = await getBarAtOrBefore(makeRedis() as never, makeDb(coll), 'A', 'daily', { asOf: kNewLate + 1 });
+    const bar = await getBarAtOrBefore(makeRedis() as never, makeDb(coll), 'A_US_EQ', 'daily', { asOf: kNewLate + 1 });
     expect(bar?.observation_ts).toBe(obsNew);
     expect(bar?.close).toBe(101);
   });
@@ -209,10 +212,10 @@ describe('getBarAtOrBefore — Mongo as-of path (asOf set)', () => {
     // bar that a LIVE ('now') read would (correctly) not reach.
     const obs2006 = Date.UTC(2006, 0, 3);
     const coll = makeCollectionWith([
-      { ticker: 'A', observation_ts: obs2006, knowledge_ts: obs2006, interval: 'daily', is_superseded: false, open: 1, high: 1, low: 1, close: 11, volume: 1 },
-      { ticker: 'A', observation_ts: _now - 1*day, knowledge_ts: _now - 1*day, interval: 'daily', is_superseded: false, open: 1, high: 1, low: 1, close: 99, volume: 1 },
+      { symbol: 'A', market: 'US', observation_ts: obs2006, knowledge_ts: obs2006, interval: 'daily', is_superseded: false, open: 1, high: 1, low: 1, close: 11, volume: 1 },
+      { symbol: 'A', market: 'US', observation_ts: _now - 1*day, knowledge_ts: _now - 1*day, interval: 'daily', is_superseded: false, open: 1, high: 1, low: 1, close: 99, volume: 1 },
     ]);
-    const bar = await getBarAtOrBefore(makeRedis() as never, makeDb(coll), 'A', 'daily', { asOf: obs2006 + day });
+    const bar = await getBarAtOrBefore(makeRedis() as never, makeDb(coll), 'A_US_EQ', 'daily', { asOf: obs2006 + day });
     expect(bar?.observation_ts).toBe(obs2006);
     expect(bar?.close).toBe(11);
     // The window is anchored at asOf (2006), not now: upper bound is asOf, lower bound is asOf - window.
@@ -227,11 +230,11 @@ describe('getBarAtOrBefore — Mongo as-of path (asOf set)', () => {
     const kEarly = obs + 60_000;
     const kLate  = obs + 5 * 60_000;
     const coll = makeCollectionWith([
-      { ticker: 'A', observation_ts: obs, knowledge_ts: kEarly, interval: 'daily', is_superseded: true,  open: 1, high: 1, low: 1, close: 50, volume: 1 },
-      { ticker: 'A', observation_ts: obs, knowledge_ts: kLate,  interval: 'daily', is_superseded: false, open: 1, high: 1, low: 1, close: 60, volume: 1 },
+      { symbol: 'A', market: 'US', observation_ts: obs, knowledge_ts: kEarly, interval: 'daily', is_superseded: true,  open: 1, high: 1, low: 1, close: 50, volume: 1 },
+      { symbol: 'A', market: 'US', observation_ts: obs, knowledge_ts: kLate,  interval: 'daily', is_superseded: false, open: 1, high: 1, low: 1, close: 60, volume: 1 },
     ]);
     // asOf between the two revisions → only the early one is knowable.
-    const bar = await getBarAtOrBefore(makeRedis() as never, makeDb(coll), 'A', 'daily', { asOf: kLate - 1 });
+    const bar = await getBarAtOrBefore(makeRedis() as never, makeDb(coll), 'A_US_EQ', 'daily', { asOf: kLate - 1 });
     expect(bar?.close).toBe(50);
   });
 
@@ -239,9 +242,9 @@ describe('getBarAtOrBefore — Mongo as-of path (asOf set)', () => {
     delete process.env.BARS_BACKEND;
     const obs = _now;
     const coll = makeCollectionWith([
-      { ticker: 'A', observation_ts: obs, knowledge_ts: obs, interval: 'daily', is_superseded: false, open: 1, high: 1, low: 1, close: 9, volume: 1 },
+      { symbol: 'A', market: 'US', observation_ts: obs, knowledge_ts: obs, interval: 'daily', is_superseded: false, open: 1, high: 1, low: 1, close: 9, volume: 1 },
     ]);
-    const bar = await getBarAtOrBefore(makeRedis() as never, makeDb(coll), 'A', 'daily', { asOf: obs - day });
+    const bar = await getBarAtOrBefore(makeRedis() as never, makeDb(coll), 'A_US_EQ', 'daily', { asOf: obs - day });
     expect(bar).toBeNull();
   });
 
@@ -250,9 +253,9 @@ describe('getBarAtOrBefore — Mongo as-of path (asOf set)', () => {
     const coll = makeCollectionWith([]);
     const redis = makeRedis();
     const asOf = 1_700_000_000_000;
-    await getBarAtOrBefore(redis as never, makeDb(coll), 'A', 'daily', { asOf });
+    await getBarAtOrBefore(redis as never, makeDb(coll), 'A_US_EQ', 'daily', { asOf });
     const setKeys = redis.calls.filter((c) => c.op === 'setEx').map((c) => c.key);
-    expect(setKeys).toEqual([`bars:v2:A:daily:at:${Math.floor(asOf / 60_000)}`]);
+    expect(setKeys).toEqual([`bars:v2:A:US:daily:at:${Math.floor(asOf / 60_000)}`]);
   });
 });
 
@@ -260,7 +263,7 @@ describe('getBarAtOrBefore — dispatcher', () => {
   it('throws when db is undefined and BARS_BACKEND defaults to mongo', async () => {
     delete process.env.BARS_BACKEND;
     await expect(
-      getBarAtOrBefore(makeRedis() as never, undefined, 'A', 'daily'),
+      getBarAtOrBefore(makeRedis() as never, undefined, 'A_US_EQ', 'daily'),
     ).rejects.toThrow(/db parameter required/);
   });
 });
@@ -312,28 +315,28 @@ describe.skipIf(!dockerAvailable)('getBarAtOrBefore — real Postgres (the OOM r
     // Two bars 18+ years apart — the span that opened ~5,200 chunks under range='max'.
     for (const [ts, close] of [[oldTs, 11.0], [recentTs, 99.0]] as Array<[number, number]>) {
       await pool.query(
-        `INSERT INTO bars (ticker, observation_ts, knowledge_ts, interval,
+        `INSERT INTO bars (symbol, market, observation_ts, knowledge_ts, interval,
                            open, high, low, close, volume, raw_close, content_hash, is_superseded)
-         VALUES ('A', $1, $1, 'daily', $2, $2, $2, $2, 1000, $2, $3, FALSE)`,
+         VALUES ('A', 'US', $1, $1, 'daily', $2, $2, $2, $2, 1000, $2, $3, FALSE)`,
         [ts, close, `h${ts}`],
       );
     }
 
     // Live: the newest bar (the window anchors at now).
-    const live = await getBarAtOrBefore(makeRedis() as never, undefined, 'A', 'daily');
+    const live = await getBarAtOrBefore(makeRedis() as never, undefined, 'A_US_EQ', 'daily');
     expect(live?.close).toBe(99.0);
 
     // As-of in 2006: the window anchors at asOf (2006), so the deep bar is reachable — the read the
     // OOM scan could never complete.
-    const deep = await getBarAtOrBefore(makeRedis() as never, undefined, 'A', 'daily', { asOf: oldTs + day });
+    const deep = await getBarAtOrBefore(makeRedis() as never, undefined, 'A_US_EQ', 'daily', { asOf: oldTs + day });
     expect(deep?.close).toBe(11.0);
     expect(deep?.observation_ts).toBe(oldTs);
 
-    // Cache lands under the PG :at: namespace.
+    // Cache lands under the PG :at: namespace, keyed on the bare identity A:US.
     const redis = makeRedis();
-    await getBarAtOrBefore(redis as never, undefined, 'A', 'daily');
+    await getBarAtOrBefore(redis as never, undefined, 'A_US_EQ', 'daily');
     const setKeys = redis.calls.filter((c) => c.op === 'setEx').map((c) => c.key);
-    expect(setKeys).toEqual(['bars:pg:v1:A:daily:at:live']);
+    expect(setKeys).toEqual(['bars:pg:v1:A:US:daily:at:live']);
   }, TEST_TIMEOUT_MS);
 
   it('as-of excludes a revision whose knowledge_ts is after asOf', async () => {
@@ -344,20 +347,20 @@ describe.skipIf(!dockerAvailable)('getBarAtOrBefore — real Postgres (the OOM r
     const kLate  = obs + 5 * 60_000;
     // First-print then a later revision of the same observation.
     await pool.query(
-      `INSERT INTO bars (ticker, observation_ts, knowledge_ts, interval,
+      `INSERT INTO bars (symbol, market, observation_ts, knowledge_ts, interval,
                          open, high, low, close, volume, raw_close, content_hash, is_superseded)
-       VALUES ('A', $1, $2, 'daily', 50, 50, 50, 50, 1, 50, 'h1', TRUE)`,
+       VALUES ('A', 'US', $1, $2, 'daily', 50, 50, 50, 50, 1, 50, 'h1', TRUE)`,
       [obs, kEarly],
     );
     await pool.query(
-      `INSERT INTO bars (ticker, observation_ts, knowledge_ts, interval,
+      `INSERT INTO bars (symbol, market, observation_ts, knowledge_ts, interval,
                          open, high, low, close, volume, raw_close, content_hash, is_superseded)
-       VALUES ('A', $1, $2, 'daily', 60, 60, 60, 60, 1, 60, 'h2', FALSE)`,
+       VALUES ('A', 'US', $1, $2, 'daily', 60, 60, 60, 60, 1, 60, 'h2', FALSE)`,
       [obs, kLate],
     );
-    const early = await getBarAtOrBefore(makeRedis() as never, undefined, 'A', 'daily', { asOf: kLate - 1 });
+    const early = await getBarAtOrBefore(makeRedis() as never, undefined, 'A_US_EQ', 'daily', { asOf: kLate - 1 });
     expect(early?.close).toBe(50);
-    const late = await getBarAtOrBefore(makeRedis() as never, undefined, 'A', 'daily', { asOf: kLate + 1 });
+    const late = await getBarAtOrBefore(makeRedis() as never, undefined, 'A_US_EQ', 'daily', { asOf: kLate + 1 });
     expect(late?.close).toBe(60);
   }, TEST_TIMEOUT_MS);
 });
@@ -410,9 +413,9 @@ describe.skipIf(!dockerAvailable)('getBarAtOrBefore — many-chunk lock-table OO
     for (let lo = startTs; lo < endTs; lo += INSERT_BATCH_MS) {
       const hi = Math.min(lo + INSERT_BATCH_MS - 24 * 60 * 60 * 1000, endTs);
       await pool.query(
-        `INSERT INTO bars (ticker, observation_ts, knowledge_ts, interval,
+        `INSERT INTO bars (symbol, market, observation_ts, knowledge_ts, interval,
                            open, high, low, close, volume, raw_close, content_hash, is_superseded)
-         SELECT 'A', g, g, 'daily', 10, 10, 10, 10, 1000, 10, 'h' || g::text, FALSE
+         SELECT 'A', 'US', g, g, 'daily', 10, 10, 10, 10, 1000, 10, 'h' || g::text, FALSE
            FROM generate_series($1::bigint, $2::bigint, $3::bigint) AS g`,
         [lo, hi, 24 * 60 * 60 * 1000],
       );
@@ -442,12 +445,12 @@ describe.skipIf(!dockerAvailable)('getBarAtOrBefore — many-chunk lock-table OO
     // assertion that the original unit test was missing — it must FAIL if the lower bound is removed.
     await expect(
       pool.query(
-        `SELECT ticker, observation_ts, close
+        `SELECT symbol, market, observation_ts, close
            FROM bars
-          WHERE ticker = $1 AND interval = $2 AND is_superseded = FALSE
+          WHERE symbol = $1 AND market = $2 AND interval = $3 AND is_superseded = FALSE
           ORDER BY observation_ts DESC
           LIMIT 1`,
-        ['A', 'daily'],
+        ['A', 'US', 'daily'],
       ),
     ).rejects.toMatchObject({ code: '53200' }); // 53200 = out_of_memory (shared lock table)
   });
@@ -455,14 +458,14 @@ describe.skipIf(!dockerAvailable)('getBarAtOrBefore — many-chunk lock-table OO
   it('the NEW bounded getBarAtOrBefore does NOT exhaust locks — recent AND deep 2006 asOf both return', async () => {
     process.env.BARS_BACKEND = 'timescale';
     // Live ('now'): returns the most recent bar without the lock fan the old query hit above.
-    const live = await getBarAtOrBefore(makeRedis() as never, undefined, 'A', 'daily');
+    const live = await getBarAtOrBefore(makeRedis() as never, undefined, 'A_US_EQ', 'daily');
     expect(live).not.toBeNull();
     expect(live?.close).toBe(10);
 
     // Deep as-of (~2006): the window anchors at asOf, so it touches only the chunks around 2006 —
     // reachable AND lock-safe. This is the read that 500'd in production.
     const asOf2006 = Date.UTC(2006, 5, 15);
-    const deep = await getBarAtOrBefore(makeRedis() as never, undefined, 'A', 'daily', { asOf: asOf2006 });
+    const deep = await getBarAtOrBefore(makeRedis() as never, undefined, 'A_US_EQ', 'daily', { asOf: asOf2006 });
     expect(deep).not.toBeNull();
     expect(deep!.observation_ts).toBeLessThanOrEqual(asOf2006);
     // The returned bar is the latest daily bar at/<= the asOf (within a day of it).
@@ -478,14 +481,14 @@ describe.skipIf(!dockerAvailable)('getBarAtOrBefore — many-chunk lock-table OO
     const windowMs = 400 * day;
     const { rows } = await pool.query(
       `EXPLAIN (FORMAT TEXT)
-       SELECT ticker, observation_ts, knowledge_ts, close
+       SELECT symbol, market, observation_ts, knowledge_ts, close
          FROM bars
-        WHERE ticker = $1 AND interval = $2
-          AND observation_ts <= $3 AND observation_ts > $4
-          AND knowledge_ts <= $3
+        WHERE symbol = $1 AND market = $2 AND interval = $3
+          AND observation_ts <= $4 AND observation_ts > $5
+          AND knowledge_ts <= $4
         ORDER BY observation_ts DESC, knowledge_ts DESC
         LIMIT 1`,
-      ['A', 'daily', asOf2006, asOf2006 - windowMs],
+      ['A', 'US', 'daily', asOf2006, asOf2006 - windowMs],
     );
     const plan = rows.map((r) => r['QUERY PLAN'] as string).join('\n');
     const chunkScans = (plan.match(/_hyper_\d+_\d+_chunk/g) ?? []).length;
@@ -508,15 +511,15 @@ describe.skipIf(!dockerAvailable)('getBarAtOrBefore — many-chunk lock-table OO
       pool.query(
         `SELECT min(observation_ts) AS oldest, count(*)::bigint AS n
            FROM bars
-          WHERE ticker = $1 AND interval = $2 AND is_superseded = FALSE`,
-        ['A', 'daily'],
+          WHERE symbol = $1 AND market = $2 AND interval = $3 AND is_superseded = FALSE`,
+        ['A', 'US', 'daily'],
       ),
     ).rejects.toMatchObject({ code: '53200' });
   });
 
   it('getDailyDepth returns the 2006 oldest + full count over the deep series WITHOUT OOMing', async () => {
     process.env.BARS_BACKEND = 'timescale';
-    const depth = await getDailyDepth(undefined, 'A', 'daily');
+    const depth = await getDailyDepth(undefined, 'A_US_EQ', 'daily');
     // Oldest reaches the 2006 floor of the seeded series (within a chunk of 2006-01-01).
     expect(depth.oldest).not.toBeNull();
     expect(depth.oldest!).toBeLessThanOrEqual(Date.UTC(2006, 0, 8));
@@ -543,9 +546,9 @@ describe.skipIf(!dockerAvailable)('getBarAtOrBefore — many-chunk lock-table OO
       `EXPLAIN (FORMAT TEXT)
        SELECT count(*)::bigint AS n, min(observation_ts) AS oldest
          FROM bars
-        WHERE ticker = $1 AND interval = $2 AND is_superseded = FALSE
-          AND observation_ts >= $3 AND observation_ts < $4`,
-      ['A', 'daily', lo, hi],
+        WHERE symbol = $1 AND market = $2 AND interval = $3 AND is_superseded = FALSE
+          AND observation_ts >= $4 AND observation_ts < $5`,
+      ['A', 'US', 'daily', lo, hi],
     );
     const plan = rows.map((r) => r['QUERY PLAN'] as string).join('\n');
     const chunkScans = (plan.match(/_hyper_\d+_\d+_chunk/g) ?? []).length;

@@ -104,7 +104,8 @@ function makeDbWith(docs: Array<Record<string, unknown>>) {
         findCalls.push({ filter, options });
         const obsFilter = (filter.observation_ts as { $gte?: number } | undefined);
         const matched = docs.filter((d) => {
-          if (filter.ticker !== undefined && d.ticker !== filter.ticker) return false;
+          if (filter.symbol !== undefined && d.symbol !== filter.symbol) return false;
+          if (filter.market !== undefined && d.market !== filter.market) return false;
           if (filter.interval !== undefined && d.interval !== filter.interval) return false;
           if (filter.is_superseded !== undefined && d.is_superseded !== filter.is_superseded) return false;
           if (obsFilter?.$gte !== undefined && (d.observation_ts as number) < obsFilter.$gte) return false;
@@ -127,8 +128,8 @@ describe('coverageOf', () => {
 
   it('returns held observations ascending + the [now-range, now] needed bounds, plugging into computeMissingRanges', async () => {
     const db = makeDbWith([
-      { ticker: 'AAPL_US_EQ', interval: 'daily', is_superseded: false, observation_ts: 98 * DAY },
-      { ticker: 'AAPL_US_EQ', interval: 'daily', is_superseded: false, observation_ts: 99 * DAY },
+      { symbol: 'AAPL', market: 'US', interval: 'daily', is_superseded: false, observation_ts: 98 * DAY },
+      { symbol: 'AAPL', market: 'US', interval: 'daily', is_superseded: false, observation_ts: 99 * DAY },
     ]);
     const { observed, neededStart, neededEnd } = await coverageOf(
       db as never, 'AAPL_US_EQ', 'daily', '5y', NOW,
@@ -142,13 +143,15 @@ describe('coverageOf', () => {
     expect(gaps[gaps.length - 1]!.end).toBe(NOW);
   });
 
-  it('queries the live fast lane: is_superseded:false, matching ticker/interval, observation_ts ≥ neededStart', async () => {
+  it('queries the live fast lane: is_superseded:false, matching (symbol, market)/interval, observation_ts ≥ neededStart', async () => {
     const db = makeDbWith([]);
     await coverageOf(db as never, 'VOD_l_EQ', 'daily', '1y', NOW);
     expect(db.findCalls).toHaveLength(1);
     const { filter, options } = db.findCalls[0]!;
+    // The T212 ticker VOD_l_EQ splits to (symbol VOD_, market LSE) at the storage boundary.
     expect(filter).toMatchObject({
-      ticker: 'VOD_l_EQ',
+      symbol: 'VOD_',
+      market: 'LSE',
       interval: 'daily',
       is_superseded: false,
       observation_ts: { $gte: NOW - 365 * DAY },
@@ -169,8 +172,8 @@ describe('coverageOf', () => {
 
   it('drops non-numeric observation_ts defensively', async () => {
     const db = makeDbWith([
-      { ticker: 'X_US_EQ', interval: 'daily', is_superseded: false, observation_ts: 99 * DAY },
-      { ticker: 'X_US_EQ', interval: 'daily', is_superseded: false, observation_ts: 'bad' },
+      { symbol: 'X', market: 'US', interval: 'daily', is_superseded: false, observation_ts: 99 * DAY },
+      { symbol: 'X', market: 'US', interval: 'daily', is_superseded: false, observation_ts: 'bad' },
     ]);
     const { observed } = await coverageOf(db as never, 'X_US_EQ', 'daily', '5y', NOW);
     expect(observed).toEqual([99 * DAY]);

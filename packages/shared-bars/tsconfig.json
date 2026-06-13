@@ -11,6 +11,7 @@
     "references": [
         { "path": "../shared-types" },
         { "path": "../shared-mongo" },
-        { "path": "../shared-pg" }
+        { "path": "../shared-pg" },
+        { "path": "../ticker-identity" }
     ]
 }
