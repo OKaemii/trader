@@ -197,6 +197,22 @@ export function identitiesToTickers(entries: OverrideEntry[] | undefined): strin
 function idKeyOf(symbol: string, market: string): string { return `${symbol}|${market}`; }
 
 /**
+ * Normalise stored override entries to the canonical `(UPPER symbol, US/LSE market)` form, dropping an
+ * empty-symbol or non-US/LSE entry. The SINGLE predicate for every override read site (the refresh
+ * override-load + applyUniverseOverrides), so a stale/hand-edited doc with a lower-case or whitespace
+ * symbol still matches the upper-cased selected set, and there is one place to change if the accepted
+ * markets ever widen. Exported for unit testing.
+ */
+export function normaliseOverrideEntries(entries: OverrideEntry[] | undefined): OverrideEntry[] {
+  return (entries ?? []).flatMap((e) => {
+    if (!e || typeof e.symbol !== 'string') return [];
+    const symbol = e.symbol.trim().toUpperCase();
+    if (symbol === '' || (e.market !== 'US' && e.market !== 'LSE')) return [];
+    return [{ symbol, market: e.market }];
+  });
+}
+
+/**
  * Apply portal-driven adds/removes on top of the eligibility-filtered selection. Native to the bare
  * `(symbol, market)` identity since Task 18: adds/removes are `OverrideEntry`s (already resolved to a
  * tradable identity by the caller's bare-forced-add resolution), matched on `(symbol, market)` — so
@@ -211,21 +227,14 @@ export function applyUniverseOverrides(
 ): { result: InstrumentMeta[]; added: number; removed: number } {
   if (!overrides) return { result: selected, added: 0, removed: 0 };
 
-  const cleanEntries = (entries: OverrideEntry[] | undefined): OverrideEntry[] =>
-    (entries ?? []).filter(
-      (e): e is OverrideEntry =>
-        !!e && typeof e.symbol === 'string' && e.symbol.trim() !== '' &&
-        (e.market === 'US' || e.market === 'LSE'),
-    );
-
-  const removeSet = new Set(cleanEntries(overrides.removes).map((e) => idKeyOf(e.symbol, e.market)));
+  const removeSet = new Set(normaliseOverrideEntries(overrides.removes).map((e) => idKeyOf(e.symbol, e.market)));
   const before = selected.length;
   const result = selected.filter((i) => !removeSet.has(idKeyOf(i.symbol, i.market)));
   const removed = before - result.length;
 
   const present = new Set(result.map((i) => idKeyOf(i.symbol, i.market)));
   let added = 0;
-  for (const e of cleanEntries(overrides.adds)) {
+  for (const e of normaliseOverrideEntries(overrides.adds)) {
     const key = idKeyOf(e.symbol, e.market);
     if (present.has(key)) continue;
     // A forced add bypasses the sector cap, carries 'Unknown' sector (enriched later if a source
@@ -261,49 +270,6 @@ export function indexT212ByMarket(rawInstruments: Awaited<ReturnType<typeof fetc
  *  allows `undefined` to match the zod-inferred contract type under `exactOptionalPropertyTypes`. */
 export type BareForcedAdd = string | { symbol: string; market?: string | undefined };
 
-/**
- * Resolve a forced-add to a tradable `(symbol, market)` identity against the T212 catalog, reusing the
- * curated include-list resolution (shortName match per market) + the US-preferred cross-listing rule:
- *  - A legacy T212 string (`'GOOGL_US_EQ'`/`'SHELl_EQ'`) parses straight through the adapter (the
- *    pre-bare portal still sends this form until Task 21) — its identity is used directly.
- *  - An explicit `market` is honoured (the symbol must exist on that market in the catalog).
- *  - A bare symbol (no market) defaults to **US** and, when the symbol is cross-listed, prefers the
- *    US listing — falling back to LSE only when the symbol is LSE-only.
- *  - The market-aware rename (FB→META) is applied first so `FB` resolves to the canonical `META`.
- *  - A symbol the catalog doesn't carry on the requested/any market → `null` (dropped, logged).
- * Exported + pure (takes a pre-built index) for unit testing.
- */
-export function resolveForcedAdd(raw: BareForcedAdd, index: T212MarketIndex): OverrideEntry | null {
-  // A legacy T212 string parses directly to its identity (no catalog gate — it already names a listing).
-  if (typeof raw === 'string') {
-    try { const id = metaAdapter.fromT212(raw.trim()); return { symbol: id.symbol, market: id.market }; }
-    catch { /* not a T212 string — fall through to the bare-symbol catalog resolution */ }
-  }
-  const rawSymbol = (typeof raw === 'string' ? raw : raw.symbol ?? '').trim().toUpperCase();
-  if (rawSymbol === '') return null;
-  const requested = typeof raw === 'string' ? undefined : (raw.market ?? '').trim().toUpperCase();
-
-  // Candidate markets in preference order. Explicit market → that one only. Bare → US then LSE
-  // (US-preferred cross-listing), so a dual-listed name lands on its US listing as elsewhere.
-  let markets: Market[];
-  if (requested === 'US' || requested === 'LSE') markets = [requested];
-  else if (requested && requested !== '') return null;   // an explicit non-US/LSE market is unsupported
-  else markets = ['US', 'LSE'];
-
-  for (const market of markets) {
-    // Canonicalise per market (FB→META on US) before the catalog lookup. The catalog is probed under
-    // BOTH the canonical symbol and any legacy alias that renames to it (FB for META) so a broker
-    // catalog still echoing the pre-rebrand shortName resolves whether the operator typed the new
-    // symbol (META) or the old one (FB) — the emitted identity is always canonical.
-    const canonical = metaAdapter.applyRename({ symbol: rawSymbol, market }).symbol;
-    const lookups = new Set<string>([canonical, rawSymbol, ...legacyAliasesFor(canonical, market)]);
-    for (const sym of lookups) {
-      if (index[market][sym]) return { symbol: canonical, market };
-    }
-  }
-  return null;
-}
-
 // The legacy symbols the adapter rename knows about (the LHS of the rename table) — kept narrow
 // (FB→META today). A bare-add resolver probes these against the broker catalog so a name still echoed
 // under its pre-rebrand shortName resolves regardless of which symbol the operator typed.
@@ -317,27 +283,79 @@ function legacyAliasesFor(canonical: string, market: Market): string[] {
   );
 }
 
-/**
- * Resolve a forced-REMOVE to a `(symbol, market)` identity WITHOUT a catalog gate — a removed name may
- * be delisted/untradeable, so it need not exist in the live catalog (removes match the active set by
- * identity). Accepts a legacy T212 string (parsed via the adapter), a bare symbol (default US), or a
- * `{ symbol, market? }` object. Returns `null` only for an empty symbol / unsupported market.
- */
-export function resolveForcedRemove(raw: BareForcedAdd): OverrideEntry | null {
+/** A normalised forced-entry candidate: an upper-cased symbol + an optional explicit market. The single
+ *  parse point for the three accepted shapes (bare string, legacy T212 string, `{symbol, market?}`), so
+ *  case-handling + the legacy-T212 parse is identical for adds AND removes. Returns `null` on an empty
+ *  symbol or an explicit-but-unsupported market. */
+function normaliseForcedEntry(raw: BareForcedAdd): { symbol: string; market?: Market } | null {
   if (typeof raw === 'string') {
     const s = raw.trim();
     if (s === '') return null;
-    // A legacy T212 string round-trips through the single suffix parser; a bare symbol defaults to US.
-    try { const id = metaAdapter.fromT212(s); return { symbol: id.symbol, market: id.market }; } catch { /* not T212 — treat as bare */ }
-    const market: Market = 'US';
-    return { symbol: metaAdapter.applyRename({ symbol: s.toUpperCase(), market }).symbol, market };
+    // A legacy T212 string carries an explicit listing — parse it. The suffix match is case-sensitive
+    // (`_US_EQ` upper, `l_EQ` lower-`l`), so try the canonical-case string first (handles `SGLNl_EQ`,
+    // `AAPL_US_EQ`), then an upper-cased retry to catch a lower-cased US form (`aapl_us_eq` →
+    // `AAPL_US_EQ`). Anything that still doesn't parse is treated as a bare symbol.
+    for (const candidate of s === s.toUpperCase() ? [s] : [s, s.toUpperCase()]) {
+      try { const id = metaAdapter.fromT212(candidate); return { symbol: id.symbol, market: id.market }; }
+      catch { /* try the next candidate, else fall through to bare */ }
+    }
+    return { symbol: s.toUpperCase() };               // a bare symbol — market unspecified
   }
   const symbol = (raw.symbol ?? '').trim().toUpperCase();
   if (symbol === '') return null;
-  const m = (raw.market ?? 'US').trim().toUpperCase();
-  if (m !== 'US' && m !== 'LSE') return null;
-  const market = m as Market;
-  return { symbol: metaAdapter.applyRename({ symbol, market }).symbol, market };
+  const m = (raw.market ?? '').trim().toUpperCase();
+  if (m === '') return { symbol };                  // market unspecified → caller's default
+  if (m !== 'US' && m !== 'LSE') return null;        // an explicit non-US/LSE market is unsupported
+  return { symbol, market: m as Market };
+}
+
+/**
+ * Resolve a forced-add to a tradable `(symbol, market)` identity against the T212 catalog, reusing the
+ * curated include-list resolution (shortName match per market) + the US-preferred cross-listing rule:
+ *  - Accepts a bare symbol (`'GOOGL'`), a legacy T212 string (`'GOOGL_US_EQ'`/`'SHELl_EQ'`, the pre-bare
+ *    portal form until Task 21), or a `{ symbol, market? }` object — all normalised the same way.
+ *  - An explicit `market` (legacy-string listing OR object field) is honoured (the symbol must exist on
+ *    that market in the catalog). A bare symbol (no market) defaults to **US** and, when cross-listed,
+ *    prefers the US listing — falling back to LSE only when the symbol is LSE-only.
+ *  - The market-aware rename (FB→META) is applied uniformly, so `FB`, `FB_US_EQ`, and `META` all resolve
+ *    to the canonical `META` (the catalog is probed under the legacy shortName when the broker lags).
+ *  - A symbol the catalog doesn't carry on the requested/any market → `null` (dropped, never a phantom).
+ * Exported + pure (takes a pre-built index) for unit testing.
+ */
+export function resolveForcedAdd(raw: BareForcedAdd, index: T212MarketIndex): OverrideEntry | null {
+  const norm = normaliseForcedEntry(raw);
+  if (norm === null) return null;
+  // Candidate markets in preference order. Explicit market → that one only. Bare → US then LSE
+  // (US-preferred cross-listing), so a dual-listed name lands on its US listing as elsewhere.
+  const markets: Market[] = norm.market ? [norm.market] : ['US', 'LSE'];
+
+  for (const market of markets) {
+    // Canonicalise per market (FB→META on US) before the catalog lookup. The catalog is probed under
+    // BOTH the canonical symbol and any legacy alias that renames to it (FB for META) so a broker
+    // catalog still echoing the pre-rebrand shortName resolves whether the operator typed the new
+    // symbol (META) or the old one (FB) — the emitted identity is always canonical.
+    const canonical = metaAdapter.applyRename({ symbol: norm.symbol, market }).symbol;
+    const lookups = new Set<string>([canonical, norm.symbol, ...legacyAliasesFor(canonical, market)]);
+    for (const sym of lookups) {
+      if (index[market][sym]) return { symbol: canonical, market };
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve a forced-REMOVE to a `(symbol, market)` identity WITHOUT a catalog gate — a removed name may
+ * be delisted/untradeable, so it need not exist in the live catalog (removes match the active set by
+ * identity). Accepts the same three shapes as {@link resolveForcedAdd}; the market-aware rename
+ * (FB→META) is applied so a remove keys the canonical identity. A bare symbol defaults to US (a
+ * cross-listed bare remove should name its market explicitly — the active-set portal UI does, Task 21).
+ * Returns `null` only for an empty symbol / an explicit unsupported market.
+ */
+export function resolveForcedRemove(raw: BareForcedAdd): OverrideEntry | null {
+  const norm = normaliseForcedEntry(raw);
+  if (norm === null) return null;
+  const market: Market = norm.market ?? 'US';
+  return { symbol: metaAdapter.applyRename({ symbol: norm.symbol, market }).symbol, market };
 }
 
 /**
@@ -687,14 +705,13 @@ export class UniverseManager {
     // T212 round-trip. The override-add identity set drives the addedReason='override_add' stamp below.
     const overridesDocRaw = await db.collection<OverridesDoc>(COLLECTIONS.PORTAL_UNIVERSE_OVERRIDES)
       .findOne({ _id: 'singleton' });
-    const overrideAddEntries = (overridesDocRaw?.adds ?? []).filter(
-      (e): e is OverrideEntry => !!e && (e.market === 'US' || e.market === 'LSE') && typeof e.symbol === 'string',
-    );
+    // Normalise the stored entries to the canonical (UPPER symbol, US/LSE market) form ONCE, so the
+    // override_add stamp keys below match the identities applyUniverseOverrides actually adds (it
+    // normalises internally too — keeping both sides on the same projection avoids a stale-case miss).
+    const overrideAddEntries = normaliseOverrideEntries(overridesDocRaw?.adds);
     const overridesDoc = overridesDocRaw === null ? null : {
       adds: overrideAddEntries,
-      removes: (overridesDocRaw.removes ?? []).filter(
-        (e): e is OverrideEntry => !!e && (e.market === 'US' || e.market === 'LSE') && typeof e.symbol === 'string',
-      ),
+      removes: normaliseOverrideEntries(overridesDocRaw.removes),
     };
 
     const overrideResult = applyUniverseOverrides(selected, overridesDoc);

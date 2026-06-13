@@ -54,6 +54,27 @@ describe('resolveForcedAdd', () => {
     expect(resolveForcedAdd('SHELl_EQ', index)).toEqual({ symbol: 'SHEL', market: 'LSE' });
   });
 
+  it('canonicalises a legacy T212 string through the rename (FB_US_EQ → {META, US}, not the dead FB)', () => {
+    // The legacy-string path must apply FB→META + the catalog gate identically to the bare path, so it
+    // never persists a dead ticker. (Catalog carries the row under shortName FB.)
+    expect(resolveForcedAdd('FB_US_EQ', index)).toEqual({ symbol: 'META', market: 'US' });
+  });
+
+  it('gates a legacy T212 string on the catalog (a delisted *_US_EQ add is dropped, never a phantom)', () => {
+    expect(resolveForcedAdd('DELISTED_US_EQ', index)).toBeNull();
+  });
+
+  it('parses a lower-cased US legacy T212 string (canonical-case LSE keeps its lower-l suffix)', () => {
+    // The US suffix is upper (`_US_EQ`), so a fully lower-cased US ticker upper-cases cleanly. The LSE
+    // suffix is the lower-`l` `l_EQ`, which is preserved in the canonical form and parses as-is.
+    expect(resolveForcedAdd('googl_us_eq', index)).toEqual({ symbol: 'GOOGL', market: 'US' });
+    expect(resolveForcedAdd('SHELl_EQ', index)).toEqual({ symbol: 'SHEL', market: 'LSE' });
+  });
+
+  it('treats an explicit empty-string market as unspecified (US-preferred resolution)', () => {
+    expect(resolveForcedAdd({ symbol: 'SHEL', market: '' }, index)).toEqual({ symbol: 'SHEL', market: 'US' });
+  });
+
   it('returns null for a symbol the catalog does not carry (never a phantom add)', () => {
     expect(resolveForcedAdd('NOPE', index)).toBeNull();
     expect(resolveForcedAdd({ symbol: 'GOOGL', market: 'LSE' }, index)).toBeNull();   // not LSE-listed
@@ -70,9 +91,11 @@ describe('resolveForcedRemove (no catalog gate)', () => {
     expect(resolveForcedRemove('TSLA')).toEqual({ symbol: 'TSLA', market: 'US' });
   });
 
-  it('parses a legacy T212 string', () => {
+  it('parses a legacy T212 string (case-insensitively) and canonicalises the rename', () => {
     expect(resolveForcedRemove('SGLNl_EQ')).toEqual({ symbol: 'SGLN', market: 'LSE' });
     expect(resolveForcedRemove('AAPL_US_EQ')).toEqual({ symbol: 'AAPL', market: 'US' });
+    expect(resolveForcedRemove('aapl_us_eq')).toEqual({ symbol: 'AAPL', market: 'US' });   // lower-case
+    expect(resolveForcedRemove('FB_US_EQ')).toEqual({ symbol: 'META', market: 'US' });     // FB→META
   });
 
   it('honours the object form market and canonicalises the rename', () => {

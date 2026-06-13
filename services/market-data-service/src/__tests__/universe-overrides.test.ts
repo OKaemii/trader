@@ -80,6 +80,19 @@ describe('applyUniverseOverrides', () => {
     expect(added).toBe(1);
   });
 
+  it('normalises a stale lower-case / whitespace stored symbol so it still matches (remove)', () => {
+    // A migrated/hand-edited override doc may carry { symbol: 'aapl' } — it must still remove the
+    // upper-cased AAPL in the selection (the resolver upper-cases on write, but old docs may not have).
+    const { result, removed } = applyUniverseOverrides(base, { removes: [{ symbol: ' aapl ', market: 'US' }] });
+    expect(removed).toBe(1);
+    expect(result.map((i) => i.symbol)).toEqual(['MSFT', 'GOOGL']);
+  });
+
+  it('normalises a stale lower-case stored symbol so an add dedups against the selection', () => {
+    const { added } = applyUniverseOverrides(base, { adds: [{ symbol: 'aapl', market: 'US' }] });
+    expect(added).toBe(0);   // 'aapl' normalises to AAPL, already present → no duplicate
+  });
+
   it('handles missing adds/removes fields', () => {
     const { result, added, removed } = applyUniverseOverrides(base, {});
     expect(result).toHaveLength(3);
