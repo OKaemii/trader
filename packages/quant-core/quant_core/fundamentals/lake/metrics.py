@@ -65,11 +65,66 @@ AsOf = int | date
 # this tuple is documentation, not a filter.
 ACCEPTED_TAXONOMIES: tuple[str, ...] = ("us-gaap", "ifrs-full", "dei", "srt")
 
-# The sector templates the registry's `<metric>.sectors.<template>` overrides are keyed by. The
-# SIC → template map is the contract/store layer's job (it reads `entities.parquet`); here a template
-# is just an optional selector handed to `metric_series` / `merged_series`. `general` is the default
-# (the metric's `default` concept list) when no template is supplied or a metric has no override.
+# The sector templates the registry's `<metric>.sectors.<template>` overrides are keyed by. A template
+# is the optional selector handed to `metric_series` / `merged_series`. `general` is the default (the
+# metric's `default` concept list) when no template is supplied or a metric has no override.
 SECTOR_TEMPLATES: tuple[str, ...] = ("general", "bank", "insurance", "reit", "utility")
+
+# (low, high) inclusive SIC bands → template, checked in order (first containing band wins). Singleton
+# SICs (e.g. REIT 6798) are (n, n). Ported VERBATIM from the retired
+# `services/fundamentals-ingestion/src/normalize/sectors.py` (whose SIC→template map fed the old
+# ingest-time normalizer); it now lives here so the LAKE read path — which standardizes at query time —
+# can pick the same registry sector override the old normalizer baked in, with the ingestion service
+# gone. The bands are deliberately CONSERVATIVE: only the SEC SIC ranges whose accounting genuinely
+# breaks the default tag choices (a financial has no gross profit / current-asset split; a bank's
+# "revenue" is net interest income; Division H 6000–6799 + Division E utilities 4900–4991) are mapped —
+# a borderline SIC stays `general` (its default tags still resolve). See that module's docstring for the
+# per-band provenance.
+_SIC_BANDS: tuple[tuple[int, int, str], ...] = (
+    # Banks / depositories / bank holding companies.
+    (6020, 6079, "bank"),
+    (6120, 6120, "bank"),
+    (6712, 6712, "bank"),
+    # Insurance carriers + agents.
+    (6300, 6411, "insurance"),
+    # Real estate investment trusts.
+    (6798, 6798, "reit"),
+    # Electric / gas / water / sanitary / combination utilities.
+    (4900, 4991, "utility"),
+)
+
+
+def _coerce_sic(sic: object) -> int | None:
+    """A SIC value (int, a `'6021'` string, or None) → its int code, or None when absent/unparseable.
+
+    EDGAR's `submissions.json` gives `sic` as a 4-digit string (sometimes whitespace-padded); a few
+    feeds give an int. Anything non-numeric (a description slipped in, an empty string) ⇒ None so the
+    caller falls back to `general` rather than crashing on a malformed code. `bool` is excluded
+    explicitly (it is an `int` subclass — `True` must not read as SIC 1)."""
+    if sic is None or isinstance(sic, bool):
+        return None
+    if isinstance(sic, int):
+        return sic
+    s = str(sic).strip()
+    return int(s) if s.isdigit() else None
+
+
+def template_for_sic(sic: object) -> str:
+    """Classify a filer's SEC SIC code into a registry sector template.
+
+    Returns one of `general | bank | insurance | reit | utility` — the exact key `metric_series(…,
+    sector=…)` switches the candidate-tag overrides on (`_concepts_for`). A SIC in a mapped
+    financial/utility band returns that template; everything else (and a missing/unparseable SIC)
+    returns `general`. Pure + total — no I/O, no exceptions on bad input (a malformed SIC degrades to
+    `general`, the safe default that never *suppresses* a metric the way a wrong financial template
+    would). Ported verbatim from the retired ingestion-service normalizer."""
+    code = _coerce_sic(sic)
+    if code is None:
+        return "general"
+    for low, high, template in _SIC_BANDS:
+        if low <= code <= high:
+            return template
+    return "general"
 
 
 def _ifrs_after_us_gaap(concepts: list[tuple[str, str]]) -> list[tuple[str, str]]:

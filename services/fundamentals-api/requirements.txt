@@ -1,31 +1,22 @@
-# fundamentals-api — the READ-side of the PIT Fundamentals Warehouse (epic Task 11).
+# fundamentals-api — the READ-side of the PIT Fundamentals LAKE (epic Task 10).
 #
-# The scientific stack and the fundamentals contract (quant_core.fundamentals: LINE_ITEMS / market_of /
-# SOURCE_*) come from the quant-core package, installed FIRST from packages/quant-core (see
-# infra/docker/fundamentals-api.Dockerfile). quant-core is the single source of truth for those pins —
-# do NOT re-pin them here. asyncpg is listed below to make the Timescale-reader dependency explicit at
-# the service level; the version MUST match quant-core's core pin (it already ships asyncpg==0.29.0).
+# The scientific stack, the fundamentals contract (quant_core.fundamentals: LINE_ITEMS / market_of /
+# SOURCE_*), AND the lake read engine (quant_core.fundamentals.lake: store/metrics/contract — the
+# DuckDB-over-Parquet PIT reader) come from the quant-core package, installed with the [lake] extra
+# (duckdb + pyarrow) FIRST from packages/quant-core (see infra/docker/fundamentals-api.Dockerfile).
+# quant-core is the single source of truth for those pins — do NOT re-pin them here. The service no
+# longer holds a Timescale connection (the lake replaced the bi-temporal hypertable), so asyncpg /
+# motor / pymongo are GONE from this list.
 fastapi==0.111.0
 uvicorn==0.30.1
 
-# Timescale (the bi-temporal `fundamentals` as-of read surface, epic Task 7's write target). Async
-# driver, same as quant_core/features/timescale_store.py and the fundamentals-ingestion writer. Pinned
-# to quant-core's core version to avoid a split.
-asyncpg==0.29.0
-
-# Redis read-through cache fronting the as-of resolver (mirrors packages/shared-bars/pg-bar-reader.ts's
-# Redis-first → Postgres-on-miss path). redis-py's async client; the same major the platform uses.
+# Redis read-through cache fronting the as-of resolver + the shared FX-key reader the Gap-2 enrichment
+# uses (market_cap.py). redis-py's async client; the same major the platform uses.
 redis==5.0.7
 
-# Prometheus /metrics exposition (epic Task 20) — the read-side ServiceMonitor scrapes it (request-
-# latency histogram → API p50/p95). Same pin as strategy-engine.
+# Prometheus /metrics exposition — the read-side ServiceMonitor scrapes it (request-latency histogram →
+# API p50/p95). Same pin as strategy-engine.
 prometheus-client==0.20.0
-
-# Security-master lookups + coverage bookkeeping ride Mongo-adjacent singletons in some surfaces; the
-# instrument resolution itself is over Timescale's security_master schema (asyncpg above), but the
-# motor pin is kept available for parity with the write-side service should a Mongo read be added.
-motor==3.5.1
-pymongo==4.7.0
 
 # Test-only
 pytest==8.3.3

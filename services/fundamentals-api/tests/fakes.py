@@ -1,252 +1,175 @@
-"""In-memory fakes for the read-side tests — an asyncpg-pool stand-in over the `fundamentals` +
-`security_master.*` tables, and a trivial async Redis double — so the resolver/endpoints are exercised
-with NO live Timescale and NO Redis.
+"""Test fakes + a synthetic-lake builder for the lake-backed read side (epic Task 10).
 
-WHY a hand-rolled fake DB rather than a real Postgres in the gate: the python gate
-(`backtest-engine-test.Dockerfile`) is a pure pytest image with no database. What this card must verify
-at the DB seam is (a) the as-of read returns ONLY facts with knowledge_ts ≤ asOf (the no-look-ahead
-guard, which lives in the SQL — so the fake faithfully reproduces that WHERE clause), (b) the live path
-reads the is_superseded=FALSE fast lane, (c) the pivot produces the snake_case LINE_ITEMS dict, and (d)
-ticker → instrument_id resolves as-of (FB→META). A faithful in-memory store that reproduces exactly the
-query shapes the resolver issues covers all four deterministically. It is a TEST DOUBLE, not a SQL
-engine — it understands only the statements this service's code emits.
+The resolver now reads the PIT-fundamentals **lake** (per-CIK Parquet, via the quant-core lake `Store`)
+instead of the old Timescale hypertable, so the in-memory `FakeTimescale` is gone. Instead these helpers
+build a SYNTHETIC lake on disk in the EXACT on-disk shape the harvester writes (the Task-3 `SCHEMA` for
+facts + `ticker_history.parquet` + `entities.parquet`), reusing the shapes the quant-core lake tests
+(`test_lake_contract.py` / `test_lake_store.py`) pin — so the resolver is exercised through the REAL read
+engine (`store` + `metrics` + `contract`), no mock of the lake.
 
-The `fundamentals` row model + the security_master tables mirror the deployed 0009/0008 schema and the
-ingestion service's FakeTimescale, so a row seeded here is the same shape the write-side writer lands.
+`FakeRedis` (the read-through cache double) and `FakeMarketDataReader` (the Gap-2 enrichment edge) are
+carried over verbatim — they are lake-agnostic. duckdb + pyarrow are the `quant-core[lake]` extra; the
+docker gate installs it, and these helpers `importorskip` both so the suite collects where they are
+absent (the resolver tests that need a real lake skip there; the pure-cache/identity tests do not).
 """
 from __future__ import annotations
 
-import re
-from typing import Any, Optional
+import json
+from datetime import date, datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+import pytest
+
+pa = pytest.importorskip("pyarrow")
+pq = pytest.importorskip("pyarrow.parquet")
+pytest.importorskip("duckdb")
+
+from quant_core.fundamentals.lake.schema import SCHEMA  # noqa: E402
+
+# The identity-table schemas the store reads by column name — same as the lake store/contract tests.
+_TICKER_SCHEMA = pa.schema(
+    [
+        ("cik", pa.int32()),
+        ("ticker", pa.string()),
+        ("valid_from", pa.date32()),
+        ("valid_to", pa.date32()),
+    ]
+)
+_ENTITY_SCHEMA = pa.schema(
+    [
+        ("cik", pa.int32()),
+        ("name", pa.string()),
+        ("sic", pa.string()),
+        ("sic_desc", pa.string()),
+        ("exchanges", pa.string()),
+        ("tickers", pa.string()),
+        ("former_names", pa.string()),
+    ]
+)
 
 
-class _Acquire:
-    """async context manager returned by `pool.acquire()`."""
-
-    def __init__(self, conn: "FakeConnection") -> None:
-        self._conn = conn
-
-    async def __aenter__(self) -> "FakeConnection":
-        return self._conn
-
-    async def __aexit__(self, *exc: Any) -> bool:
-        return False
+def ms(y: int, mo: int, d: int, h: int = 14, mi: int = 30) -> int:
+    """A UTC wall-clock instant as a UTC-ms epoch (the `knowledge_ts` / `as_of_ms` unit)."""
+    return int(datetime(y, mo, d, h, mi, tzinfo=timezone.utc).timestamp() * 1000)
 
 
-class FakeConnection:
-    """The asyncpg connection surface the resolver + endpoints use: fetch / fetchrow."""
+def fact(
+    *,
+    cik: int,
+    concept: str,
+    value: float,
+    end: str,
+    knowledge_ts: int,
+    accession: str,
+    start: Optional[str] = None,
+    taxonomy: str = "us-gaap",
+    unit: str = "USD",
+    fy: int = 2023,
+    fp: str = "FY",
+    form: str = "10-K",
+    filed: str = "2024-02-15",
+) -> dict:
+    """One fact row in the Task-3 SCHEMA shape (dates as `date`, ms axes as int)."""
+    return {
+        "cik": cik,
+        "taxonomy": taxonomy,
+        "concept": concept,
+        "unit": unit,
+        "start": date.fromisoformat(start) if start else None,
+        "end": date.fromisoformat(end),
+        "value": float(value),
+        "fy": fy,
+        "fp": fp,
+        "form": form,
+        "accession": accession,
+        "filed": date.fromisoformat(filed),
+        "accepted_ts": None,
+        "knowledge_ts": knowledge_ts,
+        "frame": None,
+    }
 
-    def __init__(self, db: "FakeTimescale") -> None:
-        self._db = db
 
-    async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
-        return self._db.run_fetch(query, args)
-
-    async def fetchrow(self, query: str, *args: Any) -> Optional[dict[str, Any]]:
-        rows = self._db.run_fetch(query, args)
-        return rows[0] if rows else None
+def annual(cik: int, concept: str, fy: int, value: float, kts: int, *, taxonomy: str = "us-gaap",
+           unit: str = "USD") -> dict:
+    """A full-year duration fact (Jan 1 .. Dec 31 of `fy`) — `split_periods` classes it annual."""
+    return fact(cik=cik, concept=concept, value=value, start=f"{fy}-01-01", end=f"{fy}-12-31",
+                knowledge_ts=kts, accession=f"{concept[:4]}-{fy}", taxonomy=taxonomy, unit=unit,
+                fy=fy, fp="FY", form="10-K", filed=f"{fy + 1}-02-15")
 
 
-class FakeTimescale:
-    """A tiny in-memory stand-in for `fundamentals` + `security_master.{instruments,identifiers,companies}`
-    + the asyncpg pool API. Answers exactly the queries the read service issues."""
+def instant(cik: int, concept: str, end: str, value: float, kts: int, *, taxonomy: str = "us-gaap",
+            unit: str = "USD") -> dict:
+    """A balance-sheet / cover-page instant fact (no `start`)."""
+    return fact(cik=cik, concept=concept, value=value, start=None, end=end, knowledge_ts=kts,
+                accession=f"{concept[:4]}-inst", taxonomy=taxonomy, unit=unit, form="10-K")
 
-    def __init__(self) -> None:
-        # security_master
-        self.companies: list[dict[str, Any]] = []
-        self.instruments: list[dict[str, Any]] = []
-        self.identifiers: list[dict[str, Any]] = []
-        # canonical facts (bi-temporal; the read surface). Seed rows here as the writer would land them.
-        self.fundamentals: list[dict[str, Any]] = []
-        self.fundamentals_quarantine: list[dict[str, Any]] = []
 
-    # ── pool API ────────────────────────────────────────────────────────────────
-    def acquire(self) -> _Acquire:
-        return _Acquire(FakeConnection(self))
+def write_facts(lake: Path, cik: int, rows: list[dict]) -> None:
+    out = lake / "facts"
+    out.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.Table.from_pylist(rows, schema=SCHEMA),
+                   out / f"cik={int(cik):010d}.parquet", compression="zstd")
 
-    @staticmethod
-    def _norm(q: str) -> str:
-        return re.sub(r"\s+", " ", q).strip().lower()
 
-    # ── seed helpers ──────────────────────────────────────────────────────────────
-    def add_instrument(
-        self, *, instrument_id: int, t212_ticker: str, company_id: int = 1, cik: Optional[str] = None
-    ) -> None:
-        self.instruments.append(
-            {"instrument_id": instrument_id, "company_id": company_id, "t212_ticker": t212_ticker}
-        )
-        if not any(c["company_id"] == company_id for c in self.companies):
-            self.companies.append({"company_id": company_id, "cik": cik, "sector": None})
+def write_ticker_history(lake: Path, rows: list[dict]) -> None:
+    pq.write_table(pa.Table.from_pylist(rows, schema=_TICKER_SCHEMA),
+                   lake / "ticker_history.parquet", compression="zstd")
 
-    def add_identifier(
-        self,
-        *,
-        instrument_id: int,
-        identifier_value: str,
-        effective_from: int,
-        effective_to: Optional[int] = None,
-        identifier_type: str = "ticker",
-    ) -> None:
-        self.identifiers.append(
-            {
-                "instrument_id": instrument_id,
-                "identifier_type": identifier_type,
-                "identifier_value": identifier_value,
-                "effective_from": effective_from,
-                "effective_to": effective_to,
-            }
-        )
 
-    def add_fact(
-        self,
-        *,
-        instrument_id: int,
-        metric: str,
-        observation_ts: int,
-        knowledge_ts: int,
-        value: Optional[float],
-        is_superseded: bool = False,
-        dim_signature: str = "",
-        source: str = "pit-edgar",
-        content_hash: str = "h",
-    ) -> None:
-        self.fundamentals.append(
-            {
-                "instrument_id": instrument_id,
-                "metric": metric,
-                "observation_ts": observation_ts,
-                "knowledge_ts": knowledge_ts,
-                "dim_signature": dim_signature,
-                "value": value,
-                "source": source,
-                "is_superseded": is_superseded,
-                "content_hash": content_hash,
-            }
-        )
+def write_entities(lake: Path, rows: list[dict]) -> None:
+    pq.write_table(pa.Table.from_pylist(rows, schema=_ENTITY_SCHEMA),
+                   lake / "entities.parquet", compression="zstd")
 
-    # ── fetch ─────────────────────────────────────────────────────────────────────
-    def run_fetch(self, query: str, args: tuple) -> list[dict[str, Any]]:
-        q = self._norm(query)
 
-        # coverage: aggregate over current facts. Checked BEFORE the live fast lane below — the coverage
-        # query also says `from fundamentals` + `is_superseded = false`, so it must be matched first by
-        # its distinctive COUNT(DISTINCT …) shape (else it would fall into the per-instrument live branch).
-        if "count(distinct instrument_id)" in q and "from fundamentals" in q:
-            current = [r for r in self.fundamentals if not r["is_superseded"]]
-            instruments = len({r["instrument_id"] for r in current})
-            facts = len(current)
-            oldest = min((r["observation_ts"] for r in current), default=None)
-            newest = max((r["knowledge_ts"] for r in current), default=None)
-            return [{
-                "instruments": instruments, "facts": facts,
-                "oldest_observation_ts": oldest, "newest_knowledge_ts": newest,
-            }]
+def full_name_facts(cik: int) -> list[dict]:
+    """Every leg the contract assembles, for a fully-covered US name (mirrors the lake-contract test's
+    `_full_name_facts`): 4 flows (FY2021..FY2023 net income so earnings_stability is defined) + 7
+    instants at 2023-12-31. Resolves to 12 raw legs; the API adds market_cap_gbp + dividend_yield."""
+    k = ms(2024, 2, 16)            # FY2023 10-K knowable
+    k22, k21 = ms(2023, 2, 16), ms(2022, 2, 16)
+    rows: list[dict] = []
+    rows += [
+        annual(cik, "NetIncomeLoss", 2021, 90.0, k21),
+        annual(cik, "NetIncomeLoss", 2022, 100.0, k22),
+        annual(cik, "NetIncomeLoss", 2023, 110.0, k),
+    ]
+    rows += [
+        annual(cik, "Revenues", 2023, 1000.0, k),
+        annual(cik, "GrossProfit", 2023, 400.0, k),
+        annual(cik, "NetCashProvidedByUsedInOperatingActivities", 2023, 150.0, k),
+    ]
+    rows += [
+        instant(cik, "StockholdersEquity", "2023-12-31", 500.0, k),
+        instant(cik, "Assets", "2023-12-31", 1500.0, k),
+        instant(cik, "Liabilities", "2023-12-31", 1000.0, k),
+        instant(cik, "AssetsCurrent", "2023-12-31", 600.0, k),
+        instant(cik, "LiabilitiesCurrent", "2023-12-31", 300.0, k),
+        instant(cik, "LongTermDebt", "2023-12-31", 250.0, k),
+        instant(cik, "EntityCommonStockSharesOutstanding", "2023-12-31", 50.0, k,
+                taxonomy="dei", unit="shares"),
+    ]
+    return rows
 
-        # Resolver: fundamentals LIVE fast lane — is_superseded=FALSE, dim_signature='' for one instrument.
-        if "from fundamentals" in q and "is_superseded = false" in q and "knowledge_ts <= $2" not in q \
-                and "distinct on" not in q:
-            (instrument_id,) = args
-            rows = [
-                r for r in self.fundamentals
-                if r["instrument_id"] == instrument_id and not r["is_superseded"]
-                and r["dim_signature"] == ""
-            ]
-            rows.sort(key=lambda r: (r["metric"], -r["observation_ts"]))
-            return [self._fact_proj(r) for r in rows]
 
-        # Resolver: fundamentals AS-OF — DISTINCT ON (metric, observation_ts, dim) latest knowledge_ts ≤ asOf.
-        # THE NO-LOOK-AHEAD GUARD reproduced exactly: only rows with knowledge_ts <= $2 survive.
-        if "from fundamentals" in q and "knowledge_ts <= $2" in q and "distinct on" in q:
-            instrument_id, as_of = args
-            candidates = [
-                r for r in self.fundamentals
-                if r["instrument_id"] == instrument_id and r["dim_signature"] == ""
-                and r["knowledge_ts"] <= as_of
-            ]
-            # DISTINCT ON (metric, observation_ts, dim) ORDER BY …, knowledge_ts DESC → per logical fact,
-            # the latest revision known at asOf.
-            best: dict[tuple, dict[str, Any]] = {}
-            for r in candidates:
-                key = (r["metric"], r["observation_ts"], r["dim_signature"])
-                cur = best.get(key)
-                if cur is None or r["knowledge_ts"] > cur["knowledge_ts"]:
-                    best[key] = r
-            return [self._fact_proj(r) for r in best.values()]
+def entity_row(cik: int, ticker: str, *, sic: str = "7372", sic_desc: str = "Software") -> dict:
+    """One `entities.parquet` row (defaults to a software SIC → the `general` sector template)."""
+    return {
+        "cik": cik, "name": f"Co {cik}", "sic": sic, "sic_desc": sic_desc,
+        "exchanges": json.dumps(["NYSE"]), "tickers": json.dumps([ticker]),
+        "former_names": json.dumps([]),
+    }
 
-        # Resolver candidate-intervals (security_master): every ticker-typed interval on any instrument
-        # that ever carried identifier_value=$2.
-        if "from security_master.identifiers i" in q and "join security_master.instruments inst" in q:
-            itype, ival = args[0], args[1]
-            target = {
-                r["instrument_id"] for r in self.identifiers
-                if r["identifier_type"] == itype and r["identifier_value"] == ival
-            }
-            out = []
-            for r in self.identifiers:
-                if r["identifier_type"] != itype or r["instrument_id"] not in target:
-                    continue
-                inst = self._instrument(r["instrument_id"])
-                out.append({
-                    "instrument_id": r["instrument_id"],
-                    "identifier_value": r["identifier_value"],
-                    "effective_from": r["effective_from"],
-                    "effective_to": r["effective_to"],
-                    "company_id": inst["company_id"] if inst else None,
-                    "t212_ticker": inst["t212_ticker"] if inst else None,
-                })
-            return out
 
-        # resolve_instrument direct t212 join.
-        if "from security_master.instruments inst" in q and "where inst.t212_ticker = $1" in q:
-            inst = next((i for i in self.instruments if i["t212_ticker"] == args[0]), None)
-            if inst is None:
-                return []
-            return [{
-                "instrument_id": inst["instrument_id"], "company_id": inst["company_id"],
-                "t212_ticker": inst["t212_ticker"],
-            }]
-
-        # quarantine by-reason / recent (endpoint). since param is args[0]; recent also binds limit.
-        if "from fundamentals_quarantine" in q and "group by reason" in q:
-            counts: dict[str, int] = {}
-            for r in self.fundamentals_quarantine:
-                counts[r["reason"]] = counts.get(r["reason"], 0) + 1
-            return [{"reason": reason, "n": n}
-                    for reason, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
-        if "from fundamentals_quarantine" in q and "order by occurred_at desc" in q:
-            limit = args[1] if len(args) > 1 else 50
-            rows = list(self.fundamentals_quarantine)
-            rows.sort(key=lambda r: r["event_id"], reverse=True)
-            return [
-                {
-                    "event_id": r["event_id"], "occurred_at": r.get("occurred_at"),
-                    "instrument_id": r["instrument_id"], "filing_id": r["filing_id"],
-                    "reason": r["reason"], "payload": r["payload"],
-                }
-                for r in rows[:limit]
-            ]
-
-        raise AssertionError(f"FakeTimescale.run_fetch: unrecognised query: {q}")
-
-    @staticmethod
-    def _fact_proj(r: dict[str, Any]) -> dict[str, Any]:
-        """The columns the resolver's SELECTs project."""
-        return {
-            "metric": r["metric"],
-            "observation_ts": r["observation_ts"],
-            "knowledge_ts": r["knowledge_ts"],
-            "dim_signature": r["dim_signature"],
-            "value": r["value"],
-            "source": r["source"],
-        }
-
-    def _instrument(self, instrument_id: int) -> Optional[dict[str, Any]]:
-        return next((i for i in self.instruments if i["instrument_id"] == instrument_id), None)
+def ticker_row(cik: int, ticker: str, *, valid_from: date = date(2010, 1, 1),
+               valid_to: Optional[date] = None) -> dict:
+    """One `ticker_history.parquet` row (a bare symbol → CIK window)."""
+    return {"cik": cik, "ticker": ticker, "valid_from": valid_from, "valid_to": valid_to}
 
 
 class FakeRedis:
-    """A trivial in-memory async Redis double: get / set(ex=) over a dict, plus a hit counter so a test
-    can assert the read-through cache short-circuited Postgres."""
+    """A trivial in-memory async Redis double: get / set(ex=) over a dict, plus hit counters so a test
+    can assert the read-through cache short-circuited the lake."""
 
     def __init__(self) -> None:
         self.store: dict[str, str] = {}
@@ -263,21 +186,19 @@ class FakeRedis:
 
 
 class FakeMarketDataReader:
-    """An in-memory stand-in for `src.market_cap.MarketDataReader` — the Gap-2 enrichment edge — so the
+    """In-memory stand-in for `src.market_cap.MarketDataReader` — the Gap-2 enrichment edge — so the
     resolver's market-cap/dividend wiring is tested with NO HTTP and NO Redis. Seed the as-of adjusted
-    close per (ticker, asOf), the FX→GBP multiplier per currency, and the dividend yield per ticker; the
-    resolver calls exactly these three methods.
+    close per (T212 ticker, asOf), the FX→GBP multiplier per currency, and the dividend yield per T212
+    ticker; the resolver calls exactly these three methods (keyed on the T212 form).
 
-    The async signatures match the real reader so it is a faithful injection. A ticker/asOf with no
-    seeded close → None (the real reader's 'no bar at/<= as_of'); a currency with no seeded rate → None
-    (the real reader's 'no FX basis'); a ticker with no seeded yield is simply absent from the batch."""
+    Carried over verbatim from the Timescale build (lake-agnostic). A ticker/asOf with no seeded close →
+    None; a currency with no seeded rate → None; a ticker with no seeded yield is absent from the batch.
+    """
 
     def __init__(self) -> None:
         self.closes: dict[tuple[str, Optional[int]], Optional[float]] = {}
         self.fx: dict[Optional[str], Optional[float]] = {"GBP": 1.0}
         self.dividend_yields: dict[str, float] = {}
-        # Call recorders so a test can assert the coalesced upstream reads (one batch dividend-yield, one
-        # batch close, FX once per distinct currency) — and that an unresolved name is excluded from them.
         self.close_calls: list[tuple[str, Optional[int]]] = []
         self.batch_close_calls: list[tuple[tuple[str, ...], Optional[int]]] = []
         self.dividend_calls: list[tuple[tuple[str, ...], Optional[int]]] = []
@@ -299,8 +220,6 @@ class FakeMarketDataReader:
     async def adjusted_closes_as_of(
         self, tickers: list[str], as_of_ms: Optional[int]
     ) -> dict[str, float]:
-        # The batch read the resolver uses on the hot path — back it with the same seeded closes, and
-        # record the call (tickers + asOf) so a test can assert the ONE coalesced round-trip.
         self.batch_close_calls.append((tuple(tickers), as_of_ms))
         out: dict[str, float] = {}
         for t in tickers:

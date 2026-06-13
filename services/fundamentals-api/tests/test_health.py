@@ -1,13 +1,15 @@
-"""Smoke + endpoint tests for the fundamentals-api FastAPI app (epic Task 11).
+"""Smoke + endpoint tests for the lake-backed fundamentals-api FastAPI app (epic Task 10).
 
-Asserts: the app builds; `/health` answers `ok` with the service name; the prefix-aliased admin health is
-reachable; the internal seam path + the headline `/pit` path serve the PIT-resolved payload (driven via a
-patched resolver over the FakeTimescale, no live Timescale/Redis); the EMPTY-but-200 live path (no rows
-seeded — the legitimate state until the operator runs the Task-9 backfill); and the ingress-prefix /
-contract invariants the next cards depend on. Exercised against the in-process app via the Starlette test
-client.
+Asserts: the app builds; `/health` answers `ok`; the prefix-aliased admin health is reachable; the
+internal seam path + the headline `/pit` path serve the byte-compatible PIT payload (driven via a patched
+resolver over a SYNTHETIC lake, no live Timescale/Redis); the not-yet-normalized-name path (empty but
+200 — the legitimate state while the harvester bootstraps); `/coverage` reports the lake's covered-CIK
+count; `/quarantine` is GONE (404 — decision D); and the ingress-prefix / contract invariants. Exercised
+against the in-process app via the Starlette test client.
 """
 from __future__ import annotations
+
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -15,35 +17,57 @@ from fastapi.testclient import TestClient
 import src.main as main
 from src.main import SERVICE_NAME, app
 from src.resolver import FundamentalsResolver
-from src.security_master import SecurityMasterResolver
-from tests.fakes import FakeMarketDataReader, FakeTimescale
+from tests.fakes import (
+    FakeMarketDataReader,
+    entity_row,
+    full_name_facts,
+    ms,
+    ticker_row,
+    write_entities,
+    write_facts,
+    write_ticker_history,
+)
+
+from quant_core.fundamentals.lake.store import Store
 
 client = TestClient(app)
 
-_T2018 = 1_500_000_000_000
-_KNOW = 1_580_000_000_000
-_AS_OF = 1_600_000_000_000
+CIK_FULL = 100
+AS_OF = ms(2024, 6, 1)
 
 
-def _patch_resolver(monkeypatch, db: FakeTimescale, market_data=None) -> None:
-    """Patch the app's resolver factory to hand handlers a resolver over the in-memory db (no real
-    Timescale/Redis); cache disabled (redis=None). `market_data` optionally injects the Gap-2
-    market-cap/dividend reader (a FakeMarketDataReader) so the enrichment path is exercised through the
-    app with no HTTP."""
+@pytest.fixture()
+def lake(tmp_path: Path) -> Path:
+    """A one-name synthetic lake (a fully-covered US software name)."""
+    root = tmp_path / "lake"
+    root.mkdir()
+    write_facts(root, CIK_FULL, full_name_facts(CIK_FULL))
+    write_ticker_history(root, [ticker_row(CIK_FULL, "AAPL")])
+    write_entities(root, [entity_row(CIK_FULL, "AAPL")])
+    return root
+
+
+def _patch_resolver(monkeypatch, lake: Path, market_data=None) -> None:
+    """Patch the app's resolver factory to hand handlers a resolver over a real lake Store (no live
+    Timescale/Redis); cache disabled. `market_data` optionally injects the Gap-2 reader."""
 
     async def _fake_build():
-        return FundamentalsResolver(db, SecurityMasterResolver(db), redis=None, market_data=market_data)
+        return FundamentalsResolver(Store(lake), redis=None, market_data=market_data)
 
     monkeypatch.setattr(main, "_build_resolver", _fake_build)
+
+
+def _patch_lake_dir(monkeypatch, lake: Path) -> None:
+    """Point the /coverage handler's `lake_dir()` at the synthetic lake."""
+    monkeypatch.setattr("src.store.lake_dir", lambda: str(lake))
 
 
 # ── health ───────────────────────────────────────────────────────────────────────
 def test_health_ok() -> None:
     res = client.get("/health")
     assert res.status_code == 200
-    body = res.json()
-    assert body["status"] == "ok"
-    assert body["service"] == SERVICE_NAME
+    assert res.json()["status"] == "ok"
+    assert res.json()["service"] == SERVICE_NAME
 
 
 def test_admin_aliased_health_ok() -> None:
@@ -53,8 +77,6 @@ def test_admin_aliased_health_ok() -> None:
 
 
 def test_metrics_exposes_prometheus() -> None:
-    # The read-side ServiceMonitor scrapes /metrics (epic Task 20): a Prometheus exposition carrying the
-    # liveness gauge + the request-latency histogram whose buckets give the API p50/p95. text/plain, 200.
     client.get("/health")  # drive one request so the histogram has a sample
     res = client.get("/metrics")
     assert res.status_code == 200
@@ -65,8 +87,6 @@ def test_metrics_exposes_prometheus() -> None:
 
 
 def test_metrics_unmatched_path_uses_stable_label() -> None:
-    # A 404 on a random path must NOT spawn a per-path histogram series (unbounded cardinality) — the
-    # latency middleware labels an unmatched route with the stable `<unmatched>` sentinel, never the URL.
     client.get("/this/path/does/not/exist/abc123")
     body = client.get("/metrics").text
     assert 'route="<unmatched>"' in body
@@ -74,188 +94,144 @@ def test_metrics_unmatched_path_uses_stable_label() -> None:
 
 
 # ── internal seam hot path ─────────────────────────────────────────────────────────
-def test_internal_fundamentals_returns_pit_payload(monkeypatch) -> None:
-    db = FakeTimescale()
-    db.add_instrument(instrument_id=10, t212_ticker="AAPL_US_EQ")
-    db.add_fact(instrument_id=10, metric="net_income", observation_ts=_T2018,
-                knowledge_ts=_KNOW, value=100.0)
-    _patch_resolver(monkeypatch, db)
-
-    res = client.get(f"/internal/api/fundamentals-pit?tickers=AAPL_US_EQ&asOf={_AS_OF}")
+def test_internal_fundamentals_returns_pit_payload(monkeypatch, lake: Path) -> None:
+    _patch_resolver(monkeypatch, lake)
+    res = client.get(f"/internal/api/fundamentals-pit?tickers=AAPL_US_EQ&asOf={AS_OF}")
     assert res.status_code == 200
     body = res.json()
     aapl = body["fundamentals"]["AAPL_US_EQ"]
-    assert aapl["net_income"] == 100.0
+    assert aapl["net_income"] == 110.0
     assert aapl["source"] == "pit-edgar"
-    assert aapl["knowledge_ts"] == _KNOW
-    assert body["asOf"] == _AS_OF
+    assert aapl["knowledge_ts"] is not None
+    assert body["asOf"] == AS_OF
 
 
-def test_internal_fundamentals_empty_but_200_live(monkeypatch) -> None:
-    # The cluster has no fundamentals rows until the operator runs the Task-9 backfill, so a live read
-    # legitimately returns an empty per-name dict with a 200 — NOT a 500. This is the exact path QA hits.
-    db = FakeTimescale()
-    db.add_instrument(instrument_id=10, t212_ticker="AAPL_US_EQ")  # resolves, but no facts
-    _patch_resolver(monkeypatch, db)
-    res = client.get("/internal/api/fundamentals-pit?tickers=AAPL_US_EQ")  # no asOf ⇒ live
+def test_internal_fundamentals_empty_but_200_for_uncovered(monkeypatch, lake: Path) -> None:
+    # A name not in the lake (or not yet normalized while the harvester bootstraps) returns an empty
+    # per-name dict with a 200 — NOT a 500. This is the graceful-empty path QA hits on a filling lake.
+    _patch_resolver(monkeypatch, lake)
+    res = client.get(f"/internal/api/fundamentals-pit?tickers=ZZZZ_US_EQ&asOf={AS_OF}")
     assert res.status_code == 200
-    body = res.json()
-    aapl = body["fundamentals"]["AAPL_US_EQ"]
-    # No facts → the line-item keys are simply absent (never a fabricated 0), and the provenance is null.
-    assert "net_income" not in aapl
-    assert aapl["source"] is None
-    assert aapl["observation_ts"] is None
+    zz = res.json()["fundamentals"]["ZZZZ_US_EQ"]
+    assert "net_income" not in zz
+    assert zz["source"] is None
+    assert zz["observation_ts"] is None
 
 
-def test_internal_fundamentals_no_tickers_is_empty(monkeypatch) -> None:
-    db = FakeTimescale()
-    _patch_resolver(monkeypatch, db)
+def test_internal_fundamentals_non_us_is_empty(monkeypatch, lake: Path) -> None:
+    # A non-US name → {} fail-closed (no Yahoo, no error).
+    _patch_resolver(monkeypatch, lake)
+    res = client.get(f"/internal/api/fundamentals-pit?tickers=SHELl_EQ&asOf={AS_OF}")
+    assert res.status_code == 200
+    shel = res.json()["fundamentals"]["SHELl_EQ"]
+    assert shel["source"] is None
+    assert "net_income" not in shel
+
+
+def test_internal_fundamentals_no_tickers_is_empty(monkeypatch, lake: Path) -> None:
+    _patch_resolver(monkeypatch, lake)
     res = client.get("/internal/api/fundamentals-pit")
     assert res.status_code == 200
     assert res.json()["fundamentals"] == {}
 
 
 # ── headline /pit path ──────────────────────────────────────────────────────────────
-def test_admin_pit_headline_no_look_ahead(monkeypatch) -> None:
-    db = FakeTimescale()
-    db.add_instrument(instrument_id=10, t212_ticker="AAPL_US_EQ")
-    # A fact knowable before the asOf and one only after it.
-    db.add_fact(instrument_id=10, metric="net_income", observation_ts=_T2018,
-                knowledge_ts=_KNOW, value=100.0)
-    db.add_fact(instrument_id=10, metric="net_income", observation_ts=_T2018 + 1,
-                knowledge_ts=_AS_OF + 5_000_000_000, value=999.0)  # accepted after as_of
-    _patch_resolver(monkeypatch, db)
-
-    res = client.get(f"/admin/api/fundamentals-pit/pit?symbols=AAPL_US_EQ&as_of={_AS_OF}")
+def test_admin_pit_headline_resolves(monkeypatch, lake: Path) -> None:
+    _patch_resolver(monkeypatch, lake)
+    res = client.get(f"/admin/api/fundamentals-pit/pit?symbols=AAPL_US_EQ&as_of={AS_OF}")
     assert res.status_code == 200
     aapl = res.json()["fundamentals"]["AAPL_US_EQ"]
-    assert aapl["net_income"] == 100.0  # the post-as_of fact (999.0) is NOT visible — no look-ahead
+    assert aapl["net_income"] == 110.0
 
 
-# ── coverage / quarantine endpoints ────────────────────────────────────────────────
-def test_coverage_empty_warehouse_is_200_zero(monkeypatch) -> None:
-    db = FakeTimescale()
+def test_admin_pit_accepts_bare_symbol(monkeypatch, lake: Path) -> None:
+    # The seam accepts a bare symbol too (transition-safe).
+    _patch_resolver(monkeypatch, lake)
+    res = client.get(f"/admin/api/fundamentals-pit/pit?symbols=AAPL&as_of={AS_OF}")
+    assert res.status_code == 200
+    assert res.json()["fundamentals"]["AAPL"]["net_income"] == 110.0
 
-    async def _fake_get_pool():
-        return db
 
-    monkeypatch.setattr("src.pool.get_pool", _fake_get_pool)
+# ── coverage from the lake ──────────────────────────────────────────────────────────
+def test_coverage_counts_covered_ciks(monkeypatch, lake: Path) -> None:
+    _patch_lake_dir(monkeypatch, lake)
+    res = client.get("/admin/api/fundamentals-pit/coverage")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["instruments"] == 1          # one facts/cik=*.parquet file
+    assert body["entities_present"] is True
+    assert body["oldest_observation_ts"] is None  # deep scan is the harvester /freshness surface
+
+
+def test_coverage_cold_lake_is_200_zero(monkeypatch, tmp_path: Path) -> None:
+    cold = tmp_path / "cold"
+    cold.mkdir()  # no facts/ dir at all (harvester hasn't bootstrapped)
+    monkeypatch.setattr("src.store.lake_dir", lambda: str(cold))
     res = client.get("/admin/api/fundamentals-pit/coverage")
     assert res.status_code == 200
     body = res.json()
     assert body["instruments"] == 0
-    assert body["facts"] == 0
-    assert body["oldest_observation_ts"] is None
+    assert body["entities_present"] is False
 
 
-def test_coverage_counts_current_facts(monkeypatch) -> None:
-    db = FakeTimescale()
-    db.add_instrument(instrument_id=10, t212_ticker="AAPL_US_EQ")
-    db.add_fact(instrument_id=10, metric="net_income", observation_ts=_T2018,
-                knowledge_ts=_KNOW, value=100.0)
-    db.add_fact(instrument_id=10, metric="total_equity", observation_ts=_T2018,
-                knowledge_ts=_KNOW, value=500.0, is_superseded=True)  # superseded — not counted
-
-    async def _fake_get_pool():
-        return db
-
-    monkeypatch.setattr("src.pool.get_pool", _fake_get_pool)
-    res = client.get("/admin/api/fundamentals-pit/coverage")
-    assert res.status_code == 200
-    body = res.json()
-    assert body["instruments"] == 1
-    assert body["facts"] == 1  # only the current (is_superseded=FALSE) row
-
-
-def test_quarantine_reports_by_reason(monkeypatch) -> None:
-    db = FakeTimescale()
-    db.fundamentals_quarantine.append({
-        "event_id": 1, "occurred_at": None, "instrument_id": None, "filing_id": None,
-        "reason": "value_disagreement", "payload": {"check": "value_agreement"},
-    })
-
-    async def _fake_get_pool():
-        return db
-
-    monkeypatch.setattr("src.pool.get_pool", _fake_get_pool)
+# ── quarantine is GONE (decision D) ─────────────────────────────────────────────────
+def test_quarantine_route_removed_404() -> None:
+    # The quarantine surface was removed in the lake rewrite (no quarantine in the lake design).
     res = client.get("/admin/api/fundamentals-pit/quarantine")
-    assert res.status_code == 200
-    body = res.json()
-    assert body["total"] == 1
-    assert body["by_reason"] == {"value_disagreement": 1}
+    assert res.status_code == 404
 
 
-def test_coverage_degrades_to_503_on_db_error(monkeypatch) -> None:
-    async def _boom():
-        raise OSError("timescale unreachable")
-
-    monkeypatch.setattr("src.pool.get_pool", _boom)
-    res = client.get("/admin/api/fundamentals-pit/coverage")
-    assert res.status_code == 503
-    assert "detail" in res.json()
+def test_quarantine_not_registered() -> None:
+    paths = {r.path for r in app.routes}
+    assert "/admin/api/fundamentals-pit/quarantine" not in paths
 
 
 # ── Gap-2: market cap surfaced in the seam payload + the /factors endpoint ──────────
-def _seeded_db_md():
-    """A db + market-data reader seeding one US name with the facts a PIT market cap + factors need."""
-    db = FakeTimescale()
-    db.add_instrument(instrument_id=10, t212_ticker="AAPL_US_EQ")
-    db.add_fact(instrument_id=10, metric="net_income", observation_ts=_T2018, knowledge_ts=_KNOW, value=100.0)
-    db.add_fact(instrument_id=10, metric="total_equity", observation_ts=_T2018, knowledge_ts=_KNOW, value=500.0)
-    db.add_fact(instrument_id=10, metric="shares_outstanding", observation_ts=_T2018,
-                knowledge_ts=_KNOW, value=16.0)
+def _seeded_md() -> FakeMarketDataReader:
     md = FakeMarketDataReader()
-    md.set_close("AAPL_US_EQ", _AS_OF, 150.0)
+    md.set_close("AAPL_US_EQ", AS_OF, 30.0)
     md.set_fx("USD", 0.79)
     md.set_dividend_yield("AAPL_US_EQ", 0.0055)
-    return db, md
+    return md
 
 
-def test_internal_seam_payload_includes_computed_market_cap(monkeypatch) -> None:
-    db, md = _seeded_db_md()
-    _patch_resolver(monkeypatch, db, market_data=md)
-    res = client.get(f"/internal/api/fundamentals-pit?tickers=AAPL_US_EQ&asOf={_AS_OF}")
+def test_internal_seam_payload_includes_computed_market_cap(monkeypatch, lake: Path) -> None:
+    _patch_resolver(monkeypatch, lake, market_data=_seeded_md())
+    res = client.get(f"/internal/api/fundamentals-pit?tickers=AAPL_US_EQ&asOf={AS_OF}")
     assert res.status_code == 200
     aapl = res.json()["fundamentals"]["AAPL_US_EQ"]
-    # market_cap_gbp is the computed PIT value (price×shares×fx), and the dividend_yield leg is present.
-    assert aapl["market_cap_gbp"] == 150.0 * 16.0 * 0.79
+    assert aapl["market_cap_gbp"] == 30.0 * 50.0 * 0.79
     assert aapl["dividend_yield"] == 0.0055
 
 
-def test_factors_endpoint_returns_value_quality_legs(monkeypatch) -> None:
-    db, md = _seeded_db_md()
-    _patch_resolver(monkeypatch, db, market_data=md)
-    res = client.get(f"/admin/api/fundamentals-pit/factors?universe=AAPL_US_EQ&as_of={_AS_OF}")
+def test_factors_endpoint_returns_value_quality_legs(monkeypatch, lake: Path) -> None:
+    _patch_resolver(monkeypatch, lake, market_data=_seeded_md())
+    res = client.get(f"/admin/api/fundamentals-pit/factors?universe=AAPL_US_EQ&as_of={AS_OF}")
     assert res.status_code == 200
     body = res.json()
     entry = body["factors"]["AAPL_US_EQ"]
     f = entry["factors"]
-    market_cap = 150.0 * 16.0 * 0.79
-    # Value legs computed on the COMPUTED PIT market cap; ROE on equity. Matches the live factor math.
-    assert f["earnings_yield"] == 100.0 / market_cap
+    market_cap = 30.0 * 50.0 * 0.79
+    assert f["earnings_yield"] == 110.0 / market_cap
     assert f["book_to_market"] == 500.0 / market_cap
-    assert f["roe"] == 100.0 / 500.0
+    assert f["roe"] == 110.0 / 500.0
     assert f["dividend_yield"] == 0.0055
     assert entry["source"] == "pit-edgar"
     assert body["count"] == 1
 
 
-def test_factors_endpoint_empty_but_200_live(monkeypatch) -> None:
-    # No rows seeded (the pre-backfill cluster state) → 200 with the name's factors all null, not a 500.
-    db = FakeTimescale()
-    db.add_instrument(instrument_id=10, t212_ticker="AAPL_US_EQ")
-    md = FakeMarketDataReader()
-    _patch_resolver(monkeypatch, db, market_data=md)
-    res = client.get("/admin/api/fundamentals-pit/factors?universe=AAPL_US_EQ")  # no as_of ⇒ live
+def test_factors_endpoint_empty_but_200_for_uncovered(monkeypatch, lake: Path) -> None:
+    # A name not in the lake → 200 with its factors all null, not a 500.
+    _patch_resolver(monkeypatch, lake, market_data=FakeMarketDataReader())
+    res = client.get("/admin/api/fundamentals-pit/factors?universe=ZZZZ_US_EQ")
     assert res.status_code == 200
-    f = res.json()["factors"]["AAPL_US_EQ"]["factors"]
+    f = res.json()["factors"]["ZZZZ_US_EQ"]["factors"]
     assert f["roe"] is None
     assert f["earnings_yield"] is None
 
 
-def test_factors_endpoint_no_universe_is_empty(monkeypatch) -> None:
-    db = FakeTimescale()
-    _patch_resolver(monkeypatch, db, market_data=FakeMarketDataReader())
+def test_factors_endpoint_no_universe_is_empty(monkeypatch, lake: Path) -> None:
+    _patch_resolver(monkeypatch, lake, market_data=FakeMarketDataReader())
     res = client.get("/admin/api/fundamentals-pit/factors")
     assert res.status_code == 200
     assert res.json()["factors"] == {}

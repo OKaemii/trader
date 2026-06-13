@@ -1,48 +1,50 @@
-"""The point-in-time as-of resolver — the heart of epic Task 11.
+"""The lake-backed point-in-time as-of resolver — the heart of the rewired read API (epic Task 10).
 
 `get_pit_fundamentals(tickers, as_of_ms)` answers "what fundamentals were KNOWABLE for these names on
-`as_of`?" by reading the bi-temporal `fundamentals` table the write-side (Task 7 writer) lands, and
-pivoting the long facts into the snake_case line-item dict the factors + QMJ screen read. It mirrors
-`packages/shared-bars/src/pg-bar-reader.ts` 1:1 — the SAME bi-temporal read shape, just keyed on a
-fact tuple `(instrument_id, metric, observation_ts, dim_signature)` instead of a bar's `observation_ts`:
+`as_of`?" by reading the PIT-fundamentals **lake** (`quant_core.fundamentals.lake`) instead of the old
+Timescale `fundamentals` hypertable. The HTTP contract is byte-for-byte unchanged — the seam consumers
+(strategy-engine `fundamentals_as_of.py`, market-data-service `PitFundamentalsProvider.ts`) parse the
+same `{ticker: {<14 snake_case line_items>, source, observation_ts, knowledge_ts}}` shape — only the
+ENGINE under it changed.
 
-  Live path (no asOf)  — the `fundamentals_latest_unique` partial-unique index fast lane:
-                         `WHERE is_superseded = FALSE`. Exactly one current row per logical fact, one
-                         index scan, no aggregation. (Same cost shape as bars' live read.)
-  As-of path (asOf)    — `DISTINCT ON (metric, observation_ts, dim_signature) … WHERE knowledge_ts <= $asOf
-                         ORDER BY metric, observation_ts, dim_signature, knowledge_ts DESC`. PG's native
-                         equivalent of Mongo's `$sort + $group({$first})`; the `fundamentals_knowledge_lookup`
-                         index covers the range scan, DISTINCT ON does the per-logical-fact latest-≤-asOf pick.
+WHAT THE LAKE GIVES US (vs the old asyncpg resolver):
+  * The no-look-ahead guard is the lake store's `knowledge_ts <= ?` clause IN SQL
+    (`Store.pit_series` / `metric_series`), exactly as before it was the Timescale SELECT's clause — a
+    fact made knowable after `as_of` is never returned because the store never hands it over. There is
+    no app-layer date filter a refactor could drop.
+  * A restatement is "more rows with a later `knowledge_ts`"; the store's `row_number() OVER (… ORDER BY
+    knowledge_ts DESC) = 1` returns the latest-known ≤ as_of, so an as-of read at the original date
+    still returns the first print. No `is_superseded` flag, no transaction log (those were the
+    Timescale model).
+  * Query-time standardization + Q4/TTM + the entity-SIC sector template all live in
+    `lake.contract.pit_line_items` — the SAME pivot replay uses (`LakePitFundamentals`), so live and
+    replay cannot drift.
 
-THE NO-LOOK-AHEAD INVARIANT IS IN SQL, NOT APP CODE (the card's hard constraint). The `knowledge_ts <= $asOf`
-predicate lives in the query — a fact from a filing accepted (and so made knowable) after `as_of` is never
-returned, because the database never hands it to us. There is no app-layer date filter that a refactor could
-drop; the guard is the WHERE clause.
+TICKER → IDENTITY AT THE EDGE (transition-safe). Callers still send the legacy T212 form (`AAPL_US_EQ`)
+until the storage-migration cards land, but the lake speaks `TickerIdentity {symbol, market}`. This
+resolver builds an identity from each request ticker via the canonical `Trading212TickerAdapter` — which
+accepts a T212 string (`from_t212`) OR a bare symbol (treated as US, the curated-US default) — so the
+seam works for BOTH forms with no caller change mid-cutover. `apply_rename` (market-aware FB→META) maps
+a legacy symbol so the lake resolves the surviving CIK.
 
-THE PIVOT. Each surviving fact is one canonical `metric` (a `quant_core.fundamentals.LINE_ITEMS` key) with a
-`value`. We collapse a name's facts to the MOST-RECENT observation per metric (the latest fiscal period whose
-availability ≤ asOf) and emit `{metric: value, …}` plus the provenance triple `source` / `observation_ts` /
-`knowledge_ts` (carried from the metric that drove the as-of, so a consumer can see how stale the snapshot is).
-LINE_ITEMS is IMPORTED, never re-listed — that is the whole point of the shared contract (writer emits these
-spellings, reader reads them; they cannot drift).
+GAP-2 ENRICHMENT (UNCHANGED). The market-cap (`adjusted_close × shares × fx`, null-never-£0) +
+dividend-yield enrichment in `market_cap.py` is LAKE-AGNOSTIC (it operates on the `line_items` dict +
+calls market-data-service over the internal-JWT HTTP path) — kept VERBATIM and run AFTER `pit_line_items`
+so `market_cap_gbp` + `dividend_yield` fill the 13th/14th legs. Those reads key on the T212 ticker (the
+bars view + dividend-yield endpoint use it), so the resolver carries each name's T212 form for the
+enrichment edge regardless of whether the request was bare or T212.
 
-PERIOD SELECTION. A name has many `(metric, observation_ts)` facts (FY2018, FY2019, …). The factors want the
-latest *annual* figure knowable as-of, so per (metric, dim='') we keep the row with the greatest `observation_ts`
-among those that survived the knowledge_ts filter. Segment facts (`dim_signature != ''`) are dropped from the
-consolidated line-item dict — the canonical dict is the consolidated view (the writer already isolates segments
-into their own dim_signature; the factors read consolidated totals).
+NO YAHOO (Thread C). US miss → those legs omitted (the contract pivot already fail-closes per leg);
+non-US (`market != 'US'`) → `{}` (the lake `resolve` returns None for non-US, and the contract
+short-circuits). Source stamp is `pit-edgar` (any leg resolved) | `null` (a miss). The `yahoo-snapshot`
+stamp + every Yahoo fallback branch are gone.
 
-INSTRUMENT RESOLUTION. The `fundamentals` PK keys on `instrument_id`, but callers speak T212 tickers, so we
-resolve ticker → instrument_id via the `security_master` (effective-dated, as-of aware: `resolve_symbol`/
-`resolve_instrument` from the write-side service's resolver, reused here). A ticker that doesn't resolve, or a
-covered ticker with no fact ≤ asOf, yields `{}` for that name — never a fabricated value (the forward-only
-degrade the seam contract mandates). The cluster has no fundamentals rows until the operator runs the Task-9
-backfill, so the live read is legitimately empty today; the resolver is proven correct via the unit suite.
-
-CACHE. Redis read-through, mirroring pg-bar-reader: Redis-first → Postgres-on-miss → populate. The cache key
-includes a 60-second `asOf` bucket so live consumers share one entry and an audit at a fixed instant is stable;
-a cache read/write failure NEVER blocks a request (it falls through to Postgres). Namespace `fund:pg:v1:` is
-distinct from the bars `bars:pg:v1:` so the two never collide.
+CACHE. Redis read-through (mirroring the old resolver + pg-bar-reader): Redis-first → lake-on-miss →
+populate. The cache key includes a 60-second `asOf` bucket so live consumers share one entry and an
+audit at a fixed instant is stable; a cache read/write failure NEVER blocks a request (it falls through
+to the lake). Namespace `fund:lake:v1:` is distinct from the bars `bars:pg:v1:` and the old
+`fund:pg:v1:` so the caches never collide. The Gap-2 enrichment runs OUTSIDE the cache (as before) so it
+always uses fresh price/FX/dividends while the slower lake read stays cached.
 """
 from __future__ import annotations
 
@@ -58,6 +60,8 @@ from quant_core.fundamentals import (
     SOURCE_PIT_EDGAR,
     market_of,
 )
+from quant_core.fundamentals.lake.contract import pit_line_items
+from quant_core.ticker_identity import TickerIdentity, Trading212TickerAdapter
 
 from src.market_cap import (
     apply_dividend_yield,
@@ -68,36 +72,82 @@ from src.market_cap import (
 
 log = logging.getLogger("fundamentals-api.resolver")
 
-# Cache TTL + key namespace mirror pg-bar-reader.ts. v1 + a distinct `fund:` prefix so the bars cache
-# and this cache never share a key even though both front a Timescale bi-temporal read.
+# Cache TTL + key namespace. v1 + a distinct `fund:lake:` prefix so neither the bars cache
+# (`bars:pg:v1:`) nor the OLD Timescale resolver's cache (`fund:pg:v1:`) ever shares a key with the
+# lake-backed read — a stale entry from the pre-cutover image can't be served by the new one.
 CACHE_TTL_SECONDS = 3600
-_CACHE_PREFIX = "fund:pg:v1"
+_CACHE_PREFIX = "fund:lake:v1"
 
-# The line-item metric set we project. IMPORTED from the shared contract — the as-of read pivots its
-# long facts INTO exactly these keys, so the writer (which emits these spellings) and this reader cannot
-# drift. A metric a source never supplied is simply absent from a name's dict (the factor NaN-excludes
-# it; never a fabricated 0).
+# The canonical ticker adapter — the ONLY suffix parser. Used to build a `TickerIdentity` from each
+# request ticker (T212 or bare) and to render the name's T212 form for the Gap-2 market-data reads.
+_ADAPTER = Trading212TickerAdapter()
+
+# The line-item metric set the seam projects. IMPORTED from the shared contract so the producer (the
+# lake contract pivot) and this reader cannot drift; the pivot already emits exactly these spellings.
 LINE_ITEM_SET = set(LINE_ITEMS)
 
 
 def as_of_bucket(as_of_ms: Optional[int]) -> str:
     """Cache-key bucket for the knowledge-time cutoff. `None` (live) → 'live'; otherwise a 60s bucket so
-    live consumers calling with ≈now share one entry (mirror pg-bar-reader.ts asOfBucket)."""
+    live consumers calling with ≈now share one entry (mirror the bars asOfBucket)."""
     if as_of_ms is None:
         return "live"
     return str(as_of_ms // 60_000)
 
 
 def cache_key(ticker: str, as_of_ms: Optional[int]) -> str:
-    """Redis key for one name's resolved line-item dict at an asOf bucket."""
+    """Redis key for one name's resolved line-item dict at an asOf bucket. Keyed on the ORIGINAL request
+    ticker (bare or T212) so two spellings of the same name don't accidentally share a cached entry."""
     return f"{_CACHE_PREFIX}:{ticker}:{as_of_bucket(as_of_ms)}"
 
 
 def source_for(ticker: str) -> str:
     """The PIT `source` stamp a covered name's facts carry, by jurisdiction (mirror the seam's
-    `source_for`): UK → Companies House, else US EDGAR. The actual `source` column on each row is
-    authoritative; this is the expected stamp for routing/provenance."""
+    `source_for`): UK → Companies House, else US EDGAR. With Yahoo gone (Thread C), a covered US name
+    stamps `pit-edgar`; a non-US name is fail-closed `{}` so this stamp is the routing default only."""
     return SOURCE_PIT_COMPANIES_HOUSE if market_of(ticker) == MARKET_UK else SOURCE_PIT_EDGAR
+
+
+def identity_of(ticker: str) -> Optional[TickerIdentity]:
+    """Build the canonical (rename-applied) `TickerIdentity` for a request ticker — accepting BOTH the
+    legacy T212 form (`AAPL_US_EQ`, `SHELl_EQ`) and a bare symbol (`AAPL`, `GOOGL`), so the seam is
+    transition-safe while callers still send T212 (note 1).
+
+    A recognised T212 string parses via `from_t212` (the only suffix parser). A bare token (no
+    `_US_EQ`/`l_EQ` suffix) is treated as a US listing — the curated-US default, matching the universe's
+    US-preferred resolution; a bare LSE name would have to arrive in its T212 (`…l_EQ`) form, which is
+    correct since the bare-LSE case is non-US-fundamentals (fail-closed) anyway. `apply_rename` maps a
+    legacy symbol (FB→META) so the lake resolves the surviving CIK. A malformed/empty token → None (the
+    caller degrades that name to `{}`)."""
+    raw = (ticker or "").strip()
+    if not raw:
+        return None
+    try:
+        ident = _ADAPTER.from_t212(raw)
+    except ValueError:
+        # Not a recognised US/LSE T212 form — treat a bare symbol as a US listing (curated-US default).
+        ident = TickerIdentity(symbol=raw, market="US")
+    return _ADAPTER.apply_rename(ident)
+
+
+def t212_of(ticker: str, ident: Optional[TickerIdentity]) -> str:
+    """The T212 form to drive the Gap-2 market-data reads for a name (the bars view + dividend-yield
+    endpoint key on the T212 string). When the request ticker is already a recognised T212 form we keep
+    it verbatim (it IS the bars key); otherwise we render the identity's T212 form via the adapter (a
+    bare `AAPL` → `AAPL_US_EQ`). Falls back to the raw ticker when there is no identity (an unresolved
+    name is excluded from the reads anyway)."""
+    raw = (ticker or "").strip()
+    try:
+        _ADAPTER.from_t212(raw)
+        return raw  # already a T212 form — the bars view's key
+    except ValueError:
+        pass
+    if ident is not None:
+        try:
+            return _ADAPTER.to_t212(ident)
+        except ValueError:
+            return raw
+    return raw
 
 
 @dataclass(frozen=True)
@@ -105,7 +155,8 @@ class TickerFundamentals:
     """One name's resolved point-in-time line items + provenance. `line_items` are the snake_case
     `LINE_ITEMS` keys present for this name as-of (absent keys are genuinely unavailable, not 0).
     `observation_ts`/`knowledge_ts` are carried from the latest-driving fact so a consumer sees the
-    fiscal period + the availability instant behind the snapshot; `source` is the row's PIT stamp."""
+    fiscal period + the availability instant behind the snapshot; `source` is the PIT stamp
+    (`pit-edgar` for a covered US name, `None` for a miss)."""
 
     line_items: dict[str, float]
     source: Optional[str]
@@ -114,7 +165,9 @@ class TickerFundamentals:
 
     def to_payload(self) -> dict[str, Any]:
         """The JSON shape the seam's hot path returns per ticker: the line items spread at the top
-        level + the provenance triple alongside (matches the plan's §5 response shape)."""
+        level + the provenance triple alongside. BYTE-FOR-BYTE identical to the old resolver's
+        `to_payload` (the seam consumers parse this exact shape) — `dict(line_items)` then the three
+        provenance keys."""
         out: dict[str, Any] = dict(self.line_items)
         out["source"] = self.source
         out["observation_ts"] = self.observation_ts
@@ -122,130 +175,53 @@ class TickerFundamentals:
         return out
 
 
-# ── SQL ────────────────────────────────────────────────────────────────────────
-# Live fast lane — the partial-unique index `fundamentals_latest_unique` picks exactly one current row
-# per logical fact. No knowledge_ts predicate (the current row IS "as of now").
-_SELECT_LIVE = """
-SELECT metric, observation_ts, knowledge_ts, dim_signature, value, source
-FROM fundamentals
-WHERE instrument_id = $1
-  AND is_superseded = FALSE
-  AND dim_signature = ''
-ORDER BY metric, observation_ts DESC
-"""
-
-# As-of path — DISTINCT ON the logical fact, latest revision with knowledge_ts ≤ asOf. This is the PG
-# native equivalent of `$sort + $group({$first})`; `fundamentals_knowledge_lookup` covers the range.
-# The NO-LOOK-AHEAD GUARD is the `knowledge_ts <= $2` clause here, in SQL — never in app code.
-_SELECT_AS_OF = """
-SELECT DISTINCT ON (metric, observation_ts, dim_signature)
-       metric, observation_ts, knowledge_ts, dim_signature, value, source
-FROM fundamentals
-WHERE instrument_id = $1
-  AND knowledge_ts <= $2
-  AND dim_signature = ''
-ORDER BY metric, observation_ts, dim_signature, knowledge_ts DESC
-"""
-
-
-def _pivot_rows(rows: list[dict[str, Any]]) -> TickerFundamentals:
-    """Collapse a name's surviving consolidated facts to the latest-observation value per metric, into
-    the snake_case line-item dict + provenance. `rows` are already filtered (knowledge_ts ≤ asOf for the
-    as-of path; is_superseded=FALSE for live) and dim_signature='' (consolidated). We pick, per metric,
-    the greatest observation_ts (the most recent fiscal period knowable as-of), and carry the provenance
-    of the single most-recent driving fact across the whole name."""
-    by_metric: dict[str, dict[str, Any]] = {}
-    for r in rows:
-        metric = r["metric"]
-        if metric not in LINE_ITEM_SET:
-            # A row whose metric isn't a current LINE_ITEMS key (a writer ran ahead of the contract).
-            # Skip it rather than leak an unknown key into the factor dict — the contract pins spelling.
-            continue
-        if r["value"] is None:
-            continue
-        obs = int(r["observation_ts"])
-        cur = by_metric.get(metric)
-        if cur is None or obs > int(cur["observation_ts"]):
-            by_metric[metric] = r
-
-    line_items: dict[str, float] = {m: float(r["value"]) for m, r in by_metric.items()}
-
-    # Provenance: the single most-recent driving fact across the whole name (greatest observation_ts,
-    # tie-broken by knowledge_ts) so a consumer reads ONE coherent (source, period, availability) triple
-    # for the snapshot. None when the name has no facts.
-    driving = None
-    for r in by_metric.values():
-        if driving is None:
-            driving = r
-            continue
-        if (int(r["observation_ts"]), int(r["knowledge_ts"])) > (
-            int(driving["observation_ts"]),
-            int(driving["knowledge_ts"]),
-        ):
-            driving = r
-
-    if driving is None:
-        return TickerFundamentals(line_items={}, source=None, observation_ts=None, knowledge_ts=None)
-    return TickerFundamentals(
-        line_items=line_items,
-        source=driving["source"],
-        observation_ts=int(driving["observation_ts"]),
-        knowledge_ts=int(driving["knowledge_ts"]),
-    )
-
-
 class FundamentalsResolver:
-    """As-of read over `fundamentals`, ticker → instrument_id via the security master, Redis read-through.
+    """As-of read over the PIT-fundamentals lake, with the Gap-2 market-cap/dividend enrichment + a
+    Redis read-through cache. Drop-in for the old Timescale resolver: the SAME class name + the SAME
+    `get_pit_fundamentals(tickers, as_of_ms)` signature + the SAME `TickerFundamentals.to_payload`
+    shape, so `main.py`'s handlers are unchanged.
 
-    Inject an asyncpg.Pool (the Timescale reader — `security_master.pool.get_pool`), a security-master
-    resolver (ticker → instrument_id), and optionally a redis client (the read-through cache front; a
-    None client disables caching — useful in tests). Holds no global state and opens no socket on import.
+    Inject the lake `Store` (the per-CIK Parquet read engine — `src.store.get_store`), optionally a
+    redis client (the read-through cache front; None disables caching — useful in tests), and optionally
+    a `market_data` reader (`src.market_cap.MarketDataReader`) for the Gap-2 enrichment. Holds no global
+    state and opens no socket on import.
 
-    `market_data` (optional `src.market_cap.MarketDataReader`) is the Gap-2 enrichment edge: when present,
-    the resolver OVERRIDES each covered name's `market_cap_gbp` with the computed PIT value
-    (adjusted_close(as_of) × shares_outstanding(as_of) × fx_to_gbp) and wires the PIT `dividend_yield`
-    leg, so Value's three legs share one as-of basis and earnings_yield/book_to_market are point-in-time.
-    None (tests / a degraded boot) leaves the warehouse pivot untouched — the warehouse never stores a
-    provider market-cap scalar (the writer doesn't land `market_cap_gbp`), so without the reader the key
-    is simply absent (the factor NaN-excludes it), never a fabricated value. The enrichment runs OUTSIDE
-    the Redis cache (below) so it always uses fresh price/FX/dividends while the slow warehouse read stays
-    cached."""
+    `market_data` is the Gap-2 enrichment edge: when present, the resolver OVERRIDES each covered name's
+    `market_cap_gbp` with the computed PIT value (adjusted_close(as_of) × shares_outstanding(as_of) ×
+    fx_to_gbp) and wires the PIT `dividend_yield` leg, so Value's three legs share one as-of basis. None
+    (tests / a degraded boot) leaves the lake pivot untouched — the lake never stores a provider market
+    cap, so without the reader the key is simply absent (the factor NaN-excludes it), never fabricated.
+    The enrichment runs OUTSIDE the Redis cache so it always uses fresh price/FX/dividends while the
+    slower lake read stays cached."""
 
-    def __init__(self, pool, resolver, redis=None, market_data=None) -> None:
-        self._pool = pool
-        self._resolver = resolver
+    def __init__(self, store, redis=None, market_data=None) -> None:
+        self._store = store
         self._redis = redis
         self._market_data = market_data
 
-    async def _instrument_id(self, ticker: str, as_of_ms: Optional[int]) -> Optional[int]:
-        """Resolve a T212 ticker to its instrument_id via the security master, as-of aware. A ticker
-        that doesn't resolve (no security-master row yet, or a non-covered name) → None, and the caller
-        degrades that name to `{}` (never a fabricated id/value)."""
-        resolved = await self._resolver.resolve_instrument(ticker, as_of_ms)
-        return resolved.instrument_id if resolved is not None else None
+    def _resolve_one(self, ticker: str, as_of_ms: Optional[int]) -> TickerFundamentals:
+        """Resolve ONE name from the lake: request ticker → identity → `pit_line_items` (sector-aware,
+        PIT-filtered in the store) → the byte-compatible `TickerFundamentals`. Empty on a non-US name,
+        an unresolved/cold CIK, or no fact ≤ asOf (the forward-only, fail-closed degrade — no Yahoo).
 
-    async def _read_rows(self, instrument_id: int, as_of_ms: Optional[int]) -> list[dict[str, Any]]:
-        """Run the live or as-of SELECT for one resolved instrument. The query carries the
-        knowledge_ts ≤ asOf guard (as-of path) — the no-look-ahead invariant is here, in SQL."""
-        async with self._pool.acquire() as conn:
-            if as_of_ms is None:
-                records = await conn.fetch(_SELECT_LIVE, instrument_id)
-            else:
-                records = await conn.fetch(_SELECT_AS_OF, instrument_id, as_of_ms)
-        return [dict(r) for r in records]
-
-    async def _resolve_one(self, ticker: str, as_of_ms: Optional[int]) -> TickerFundamentals:
-        """Resolve ONE name: ticker → instrument_id → as-of rows → pivot. Empty on an unresolved ticker
-        or no fact ≤ asOf (the forward-only degrade)."""
-        instrument_id = await self._instrument_id(ticker, as_of_ms)
-        if instrument_id is None:
+        `as_of_ms=None` (live) is mapped to 'now' for the lake read: the lake has no `is_superseded`
+        fast lane — "live" IS "as of now", so an unbounded knowledge cutoff is the current wall-clock.
+        A past `as_of_ms` filters `knowledge_ts <= as_of_ms` in the store (the no-look-ahead guard)."""
+        ident = identity_of(ticker)
+        if ident is None:
             return TickerFundamentals(line_items={}, source=None, observation_ts=None, knowledge_ts=None)
-        rows = await self._read_rows(instrument_id, as_of_ms)
-        return _pivot_rows(rows)
+        cutoff = as_of_ms if as_of_ms is not None else _now_ms()
+        line_items, source, observation_ts, knowledge_ts = pit_line_items(self._store, ident, cutoff)
+        return TickerFundamentals(
+            line_items=line_items,
+            source=source,
+            observation_ts=observation_ts,
+            knowledge_ts=knowledge_ts,
+        )
 
     async def _cache_get(self, ticker: str, as_of_ms: Optional[int]) -> Optional[TickerFundamentals]:
-        """Redis-first read (mirror pg-bar-reader). A cache miss or any failure returns None and the
-        caller falls through to Postgres — the cache never blocks a request."""
+        """Redis-first read. A cache miss or any failure returns None and the caller falls through to
+        the lake — the cache never blocks a request."""
         if self._redis is None:
             return None
         key = cache_key(ticker, as_of_ms)
@@ -290,24 +266,26 @@ class FundamentalsResolver:
     ) -> dict[str, TickerFundamentals]:
         """THE HEADLINE. Resolve point-in-time line items for `tickers` as known at `as_of_ms`.
 
-        `as_of_ms=None` is the live fast lane (current rows); a past `as_of_ms` returns ONLY facts whose
-        `knowledge_ts <= as_of_ms` (the guard is in SQL). Names that don't resolve, or have no fact ≤ asOf,
-        are present in the result with an empty `line_items` dict (the caller can choose to include or drop
-        them) — never a fabricated value. Redis read-through fronts the WAREHOUSE pivot per name; a cache
-        failure degrades to a direct Postgres read.
+        `as_of_ms=None` is live ('as of now'); a past `as_of_ms` returns ONLY facts whose `knowledge_ts
+        <= as_of_ms` (the guard is the lake store's SQL). Names that don't resolve (non-US, cold lake,
+        unknown CIK), or have no fact ≤ asOf, are present in the result with an empty `line_items` dict
+        and `source=None` — never a fabricated value. Redis read-through fronts the lake read per name; a
+        cache failure degrades to a direct lake read.
 
-        Gap-2 ENRICHMENT (when a `MarketDataReader` is injected) runs AFTER the cache layer, on the merged
-        warehouse result: each covered name's `market_cap_gbp` is overridden with the computed PIT value
-        (price×shares×fx) and the PIT `dividend_yield` leg is wired in — both from the fresh in-cluster
-        reads (market-data's own Redis cache keeps them cheap), so the slow warehouse read stays cached
-        while the fast-moving price/FX/dividend inputs are never stale-cached against an old market cap."""
+        Gap-2 ENRICHMENT (when a `MarketDataReader` is injected) runs AFTER the cache layer, on the
+        merged lake result: each covered name's `market_cap_gbp` is overridden with the computed PIT
+        value (price×shares×fx) and the PIT `dividend_yield` leg is wired in — both from the fresh
+        in-cluster reads (market-data's own Redis cache keeps them cheap), so the slow lake read stays
+        cached while the fast-moving price/FX/dividend inputs are never stale-cached against an old
+        market cap. The lake read is synchronous (DuckDB), so it runs directly; the cache + enrichment
+        edges are async."""
         out: dict[str, TickerFundamentals] = {}
         for ticker in tickers:
             cached = await self._cache_get(ticker, as_of_ms)
             if cached is not None:
                 out[ticker] = cached
                 continue
-            resolved = await self._resolve_one(ticker, as_of_ms)
+            resolved = self._resolve_one(ticker, as_of_ms)
             await self._cache_set(ticker, as_of_ms, resolved)
             out[ticker] = resolved
         return await self._enrich_market_data(out, as_of_ms)
@@ -316,41 +294,52 @@ class FundamentalsResolver:
         self, resolved: dict[str, TickerFundamentals], as_of_ms: Optional[int]
     ) -> dict[str, TickerFundamentals]:
         """Override `market_cap_gbp` with the computed PIT value + wire the PIT `dividend_yield` leg
-        (Gap 2). No-op when no `MarketDataReader` is injected. Computes market cap per name from the as-of
-        adjusted close (the SAME series momentum uses) × the name's as-of `shares_outstanding` (the dei
-        cover-page fact already in `line_items`) × FX→GBP, and drops the key when any input is missing
-        (NaN-excluded, never a fabricated 0).
+        (Gap 2) — the UNCHANGED enrichment, byte-for-byte the old resolver's. No-op when no
+        `MarketDataReader` is injected. Computes market cap per name from the as-of adjusted close (the
+        SAME series momentum uses) × the name's as-of `shares_outstanding` × FX→GBP, and drops the key
+        when any input is missing (NaN-excluded, never a fabricated 0).
 
-        HOT-PATH SHAPE: the whole-universe live seam (Task 14) calls this per cycle, so the upstream reads
-        are batched/coalesced — ONE batch dividend-yield round-trip, ONE batch adjusted-close round-trip,
-        and FX resolved ONCE per distinct currency (at most USD+GBP) rather than per ticker. A name that
-        didn't resolve (empty line items, no source) is skipped (nothing to value) and excluded from the
-        upstream reads."""
+        The market-data reads (`adjusted_closes_as_of`, `dividend_yields_as_of`, `fx_to_gbp`) key on the
+        T212 ticker form (the bars view's key), so each name's T212 string is derived via the adapter
+        (`t212_of`) regardless of whether the request was bare or T212. The reads are batched/coalesced:
+        ONE batch close round-trip, ONE batch dividend-yield round-trip, FX once per distinct currency.
+        An unresolved name (empty line items, no source) is skipped (nothing to value) and excluded from
+        the upstream reads — keyed by the original request ticker in the returned map."""
         if self._market_data is None:
             return resolved
-        # The names worth valuing — resolved with at least one fact (an unresolved name has nothing to
-        # compute a market cap from; we don't fabricate one from a price alone).
-        valuable = [t for t, tf in resolved.items() if not (tf.source is None and not tf.line_items)]
+        # The names worth valuing — resolved with at least one fact. Map each to its T212 form for the
+        # market-data reads (the bars view / dividend endpoint key on T212).
+        valuable_t212: dict[str, str] = {}  # request ticker → T212 form
+        for t, tf in resolved.items():
+            if tf.source is None and not tf.line_items:
+                continue  # unresolved — nothing to value
+            valuable_t212[t] = t212_of(t, identity_of(t))
 
-        # Coalesced upstream reads (one round-trip each); FX resolved once per distinct currency.
-        dy_by_ticker = await self._market_data.dividend_yields_as_of(valuable, as_of_ms)
-        closes = await self._market_data.adjusted_closes_as_of(valuable, as_of_ms)
+        t212_tickers = list(dict.fromkeys(valuable_t212.values()))  # de-duped, order-preserving
+
+        # Coalesced upstream reads (one round-trip each); FX resolved once per distinct currency. Keyed
+        # by the T212 form the market-data service returns.
+        dy_by_t212 = await self._market_data.dividend_yields_as_of(t212_tickers, as_of_ms)
+        closes_by_t212 = await self._market_data.adjusted_closes_as_of(t212_tickers, as_of_ms)
         fx_by_currency: dict[Optional[str], Optional[float]] = {}
-        for ticker in valuable:
-            ccy = currency_of(ticker)
+        for t212 in t212_tickers:
+            ccy = currency_of(t212)
             if ccy not in fx_by_currency:
                 fx_by_currency[ccy] = await self._market_data.fx_to_gbp(ccy)
 
         enriched: dict[str, TickerFundamentals] = {}
         for ticker, tf in resolved.items():
-            if tf.source is None and not tf.line_items:
+            if ticker not in valuable_t212:
                 enriched[ticker] = tf  # unresolved — pass through untouched
                 continue
+            t212 = valuable_t212[ticker]
             market_cap = compute_market_cap_gbp(
-                closes.get(ticker), tf.line_items.get("shares_outstanding"), fx_by_currency.get(currency_of(ticker))
+                closes_by_t212.get(t212),
+                tf.line_items.get("shares_outstanding"),
+                fx_by_currency.get(currency_of(t212)),
             )
             new_items = apply_pit_market_cap(tf.line_items, market_cap)
-            new_items = apply_dividend_yield(new_items, dy_by_ticker.get(ticker))
+            new_items = apply_dividend_yield(new_items, dy_by_t212.get(t212))
             enriched[ticker] = TickerFundamentals(
                 line_items=new_items,
                 source=tf.source,
@@ -358,3 +347,12 @@ class FundamentalsResolver:
                 knowledge_ts=tf.knowledge_ts,
             )
         return enriched
+
+
+def _now_ms() -> int:
+    """Current wall-clock UTC ms — the knowledge cutoff for a live (asOf-less) read. The lake has no
+    `is_superseded` fast lane (that was the Timescale model); 'live' is 'everything knowable as of now',
+    so an unbounded live read is `knowledge_ts <= now`."""
+    import time
+
+    return int(time.time() * 1000)
