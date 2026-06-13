@@ -9,6 +9,7 @@ import { BarValidator } from './modules/bars/infrastructure/bar-validator.ts';
 import { GapDetector } from './modules/bars/infrastructure/gap-detector.ts';
 import { StaleDetector } from './modules/bars/infrastructure/stale-detector.ts';
 import { UniverseManager } from './modules/universe/application/UniverseManager.ts';
+import { EdgarSicSectorClient } from './modules/universe/infrastructure/edgar-sic-sector-client.ts';
 import { getPgPool } from '@trader/shared-pg';
 import { QuotePoll } from './modules/quotes/application/quote-poll.ts';
 import { QuoteWriter } from './modules/quotes/infrastructure/quote-writer.ts';
@@ -116,6 +117,10 @@ const universeManager = new UniverseManager(
     // Live max-universe-size override (portal_market_config), resolved per refresh — a portal
     // save takes effect on the next universe refresh with no restart. Falls back to env maxSize.
     maxSizeResolver: async () => (await getLiveConfig()).universeMaxSize,
+    // Curated/US SECONDARY sector source (Task 19): the EDGAR SIC from the PIT lake, via fundamentals-api
+    // in-cluster. The eodhd_scan primary (the live path) needs no client — sectors ride the screener row.
+    // Graceful: a cold/partial lake leaves names 'Unknown' and retries next refresh (never blocks).
+    sectorClient: new EdgarSicSectorClient({ baseUrl: env.FUNDAMENTALS_API_URL }),
   },
 );
 

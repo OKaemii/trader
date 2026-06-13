@@ -1,23 +1,27 @@
 // Mongo wrapper around the `instrument_metadata` collection. Holds the read-through
-// cache for Yahoo-sourced sector enrichment so UniverseManager.refresh doesn't have
-// to re-hit Yahoo on every cycle.
+// cache for sector enrichment so UniverseManager.refresh doesn't have to re-source on
+// every cycle.
 //
 // Doc shape (one per ticker, _id == ticker):
 //   {
 //     _id:        "AAPL_US_EQ",
 //     sector:     "Technology",
 //     industry:   "Consumer Electronics",
-//     source:     "yahoo" | "manual",
+//     source:     "eodhd" | "edgar" | "manual",
 //     fetchedAt:  Date,
 //   }
 //
-// `source: 'manual'` is the operator's override — the periodic Yahoo refresh skips
-// these rows (see UniverseManager.refresh). Useful when Yahoo returns the wrong sector
-// or doesn't know the ticker at all (OTC, delisted, etc.).
+// `source`: 'eodhd' (the EODHD screener row, the eodhd_scan primary), 'edgar' (the lake's EDGAR SIC,
+// the curated/US secondary — Task 19), or 'manual' (the operator's override). The 'yahoo' source is
+// retired with the Yahoo sector client (Thread C); a legacy 'yahoo' row simply ages out / is overwritten
+// by the next eodhd/edgar enrichment. `source: 'manual'` always wins — the periodic refresh skips those
+// rows. Useful when a source returns the wrong sector or doesn't know the ticker at all (OTC, delisted).
 import { Db, Collection } from 'mongodb';
 import { COLLECTIONS } from '@trader/shared-mongo';
 
-export type InstrumentMetaSource = 'yahoo' | 'manual' | 'eodhd';
+// 'yahoo' is retained in the union ONLY so a legacy cached row (pre-Thread-C) still type-checks on read;
+// nothing WRITES it any more (the Yahoo sector client is deleted). New writes are 'eodhd' | 'edgar' | 'manual'.
+export type InstrumentMetaSource = 'yahoo' | 'eodhd' | 'edgar' | 'manual';
 
 export interface InstrumentMetaDoc {
   _id:       string;          // ticker
@@ -31,7 +35,7 @@ export interface InstrumentMetaUpsert {
   ticker:    string;
   sector:    string;
   industry?: string;
-  source?:   InstrumentMetaSource;  // default 'yahoo'
+  source?:   InstrumentMetaSource;  // default 'edgar' (callers always pass an explicit source today)
   fetchedAt?: Date;                  // default now()
 }
 
@@ -57,14 +61,14 @@ export class MongoInstrumentMeta {
   }
 
   /**
-   * Idempotent write. `source` defaults to 'yahoo'; an explicit 'manual' marks the row
-   * as operator-pinned and the periodic Yahoo refresh will skip it.
+   * Idempotent write. `source` defaults to 'edgar'; an explicit 'manual' marks the row
+   * as operator-pinned and the periodic refresh will skip it.
    */
   async upsert(meta: InstrumentMetaUpsert): Promise<void> {
     const doc: InstrumentMetaDoc = {
       _id:       meta.ticker,
       sector:    meta.sector,
-      source:    meta.source    ?? 'yahoo',
+      source:    meta.source    ?? 'edgar',
       fetchedAt: meta.fetchedAt ?? new Date(),
       ...(meta.industry !== undefined ? { industry: meta.industry } : {}),
     };
@@ -76,7 +80,7 @@ export class MongoInstrumentMeta {
    * (source='manual') are excluded from the staleness check by design — they should
    * only change via explicit admin write, not via auto-refresh.
    *
-   * Returns the subset of `tickers` that need a Yahoo lookup. The complement is the
+   * Returns the subset of `tickers` that need a fresh lookup. The complement is the
    * cache hit set.
    */
   async needsRefresh(tickers: string[], staleMs: number, now = Date.now()): Promise<string[]> {
