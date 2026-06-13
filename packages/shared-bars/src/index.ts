@@ -577,8 +577,10 @@ function docToBar(doc: Record<string, unknown>): OHLCVBar {
   }
   const knowledgeMs = typeof doc.knowledge_ts === 'number' ? doc.knowledge_ts : undefined;
   // New Mongo docs carry (symbol, market); re-derive the T212 ticker so OHLCVBar.ticker is
-  // byte-identical for downstream consumers. A legacy doc that still has `ticker` falls through to it.
-  const ticker = typeof doc.symbol === 'string' && typeof doc.market === 'string'
+  // byte-identical for downstream consumers. `tickerOf` (adapter.toT212) throws on an unrecognised
+  // market, so only call it for a recognised market value — a corrupt/partial doc (market '' or
+  // unexpected) falls through to the legacy `ticker` field rather than crashing the whole read.
+  const ticker = typeof doc.symbol === 'string' && (doc.market === 'US' || doc.market === 'LSE')
     ? tickerOf(doc.symbol, doc.market)
     : String(doc.ticker ?? '');
 

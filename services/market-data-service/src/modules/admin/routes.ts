@@ -14,6 +14,7 @@ import type { UniverseManager } from '../universe/application/UniverseManager.ts
 import { MongoInstrumentMeta } from '../universe/infrastructure/MongoInstrumentMeta.ts';
 import type { MarketDataProvider } from '../bars/infrastructure/providers/market-data-provider.ts';
 import { aggregateBars, getBars, getBarAtOrBefore, getDailyDepth, invalidateBars, type RangeKey } from '@trader/shared-bars';
+import { Trading212TickerAdapter } from '@trader/ticker-identity';
 import { backfillTickers, CACHE_INVALIDATED_TOPIC } from '../bars/infrastructure/backfill.ts';
 import { backfillDailyHistory } from '../bars/infrastructure/daily-history.ts';
 import { REDIS_STREAMS, POLL_INTERVAL_OPTIONS, type BarInterval, type OHLCVBar, type PollIntervalKey } from '@trader/shared-types';
@@ -439,23 +440,32 @@ export function createAdminRouter(
   // flag tickers Yahoo has been actively revising.
   r.get('/admin/api/market-data/coverage', async (c) => {
     const db = await getMongoDb();
+    // ohlcv_bars / bar_revisions_log are keyed on the bare identity (symbol, market); group on it
+    // and re-derive the T212 ticker for the operator-facing coverage map keys.
+    const adapter = new Trading212TickerAdapter();
+    const tickerOf = (id: { symbol: string; market: string }): string | null => {
+      try { return adapter.toT212({ symbol: id.symbol, market: id.market as 'US' | 'LSE' }); }
+      catch { return null; }
+    };
     const [obsAgg, revAgg] = await Promise.all([
       db.collection(COLLECTIONS.OHLCV_BARS).aggregate([
         { $match: { interval: '5m', is_superseded: false } },
-        { $group: { _id: '$ticker', count: { $sum: 1 } } },
+        { $group: { _id: { symbol: '$symbol', market: '$market' }, count: { $sum: 1 } } },
       ]).toArray(),
       db.collection(COLLECTIONS.BAR_REVISIONS_LOG).aggregate([
         { $match: { interval: '5m', prior_hash: { $ne: null } } },  // skip first-prints
-        { $group: { _id: '$ticker', revisions: { $sum: 1 } } },
+        { $group: { _id: { symbol: '$symbol', market: '$market' }, revisions: { $sum: 1 } } },
       ]).toArray(),
     ]);
     const coverage: Record<string, { count: number; revisions: number }> = {};
-    for (const row of obsAgg) coverage[row._id as string] = {
-      count:     (row as Record<string, number>).count ?? 0,
-      revisions: 0,
-    };
+    for (const row of obsAgg) {
+      const k = tickerOf(row._id as { symbol: string; market: string });
+      if (k === null) continue;
+      coverage[k] = { count: (row as Record<string, number>).count ?? 0, revisions: 0 };
+    }
     for (const row of revAgg) {
-      const k = row._id as string;
+      const k = tickerOf(row._id as { symbol: string; market: string });
+      if (k === null) continue;
       if (coverage[k]) coverage[k].revisions = (row as Record<string, number>).revisions ?? 0;
       else coverage[k] = { count: 0, revisions: (row as Record<string, number>).revisions ?? 0 };
     }
@@ -545,9 +555,14 @@ export function createAdminRouter(
     if (!Number.isFinite(since) || since < 0) {
       return c.json({ error: 'since must be a non-negative integer (UTC ms)' }, 400);
     }
+    // bar_revisions_log is keyed on the bare identity (symbol, market); split the T212 path param.
+    // A malformed/non-US-LSE ticker is a client error (400), not a 500.
+    let symbol: string, market: string;
+    try { ({ symbol, market } = new Trading212TickerAdapter().fromT212(ticker)); }
+    catch { return c.json({ error: `unrecognised ticker: ${ticker}` }, 400); }
     const db = await getMongoDb();
     const rows = await db.collection(COLLECTIONS.BAR_REVISIONS_LOG)
-      .find({ ticker, knowledge_ts: { $gte: since } })
+      .find({ symbol, market, knowledge_ts: { $gte: since } })
       .sort({ knowledge_ts: -1 })
       .limit(limit)
       .toArray();

@@ -21,6 +21,20 @@ function activeBackend(): 'mongo' | 'timescale' {
 
 const tickerAdapter = new Trading212TickerAdapter();
 
+// Split a batch of T212 tickers to their (symbol, market) identities, fail-soft: a ticker that does
+// not parse as a US/LSE equity (a stale override, a delisted/renamed name persisted in an old signal)
+// is dropped from the storage query rather than throwing the whole batch — the caller's
+// `if (!(t in out)) out[t]=null` backfill then reports it as null, matching the pre-Thread-A
+// `{$in}` / `ANY()` behaviour where an unknown ticker simply produced no match.
+function splitBatch(tickers: string[]): Array<{ ticker: string; symbol: string; market: string }> {
+  const out: Array<{ ticker: string; symbol: string; market: string }> = [];
+  for (const ticker of tickers) {
+    try { const { symbol, market } = tickerAdapter.fromT212(ticker); out.push({ ticker, symbol, market }); }
+    catch { /* unparseable → omitted; reported null by the caller's backfill */ }
+  }
+  return out;
+}
+
 export class PriceLookup implements IPriceLookup {
   constructor(private readonly db: Db) {}
 
@@ -65,9 +79,10 @@ export class PriceLookup implements IPriceLookup {
   private async _lastCloseManyMongo(tickers: string[], asOf?: number): Promise<Record<string, number | null>> {
     const out: Record<string, number | null> = {};
     const coll = this.db.collection(COLLECTIONS.OHLCV_BARS);
-    // Split each requested ticker to its identity; key results back to the original ticker so the
-    // returned record's keys are unchanged for callers.
-    const ids = tickers.map((t) => ({ ticker: t, ...tickerAdapter.fromT212(t) }));
+    // Split each requested ticker to its identity (fail-soft); key results back to the original
+    // ticker so the returned record's keys are unchanged for callers.
+    const ids = splitBatch(tickers);
+    if (ids.length === 0) { for (const t of tickers) out[t] = null; return out; }
     const tickerByIdentity = new Map(ids.map((i) => [`${i.symbol}|${i.market}`, i.ticker]));
     const match: Record<string, unknown> = { $or: ids.map((i) => ({ symbol: i.symbol, market: i.market })) };
     if (asOf === undefined) match.is_superseded = false;
@@ -122,9 +137,10 @@ export class PriceLookup implements IPriceLookup {
   private async _lastCloseManyPg(tickers: string[], asOf?: number): Promise<Record<string, number | null>> {
     const pool = getPgPool();
     const out: Record<string, number | null> = {};
-    // Split each ticker; the (symbol, market) membership replaces the single-column ANY(). Results
-    // come back keyed by (symbol, market) and are re-keyed to the caller's original ticker strings.
-    const ids = tickers.map((t) => ({ ticker: t, ...tickerAdapter.fromT212(t) }));
+    // Split each ticker (fail-soft); the (symbol, market) membership replaces the single-column
+    // ANY(). Results come back keyed by (symbol, market) and re-keyed to the caller's tickers.
+    const ids = splitBatch(tickers);
+    if (ids.length === 0) { for (const t of tickers) out[t] = null; return out; }
     const symbols = ids.map((i) => i.symbol);
     const markets = ids.map((i) => i.market);
     const tickerByIdentity = new Map(ids.map((i) => [`${i.symbol}|${i.market}`, i.ticker]));

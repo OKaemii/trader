@@ -5,29 +5,41 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { healMissingHistory } from '../modules/bars/infrastructure/backfill.ts';
 import type { MarketDataProvider } from '../modules/bars/infrastructure/providers/market-data-provider.ts';
+import { Trading212TickerAdapter } from '@trader/ticker-identity';
 
 const FRIDAY_CLOSE_MS = Date.parse('2026-05-15T20:00:00Z');   // NYSE Fri 16:00 EDT = 20:00 UTC
 const THU_CLOSE_MS    = Date.parse('2026-05-14T20:00:00Z');
 const NOW_MONDAY      = Date.parse('2026-05-18T13:30:00Z');   // Mon NYSE open
 
-interface BarDoc { ticker: string; timestamp: Date; interval: string }
+// ohlcv_bars is keyed on (symbol, market) now; the stub splits the fixture's T212 ticker and the
+// aggregate groups on the identity, matching the real healMissingHistory query.
+const _adapter = new Trading212TickerAdapter();
+interface BarDoc { symbol: string; market: string; timestamp: Date; interval: string }
 
 class StubMongo {
   ohlcv: BarDoc[] = [];
   badTicks: any[] = [];
+  pushBar(ticker: string, timestamp: Date, interval: string) {
+    const { symbol, market } = _adapter.fromT212(ticker);
+    this.ohlcv.push({ symbol, market, timestamp, interval });
+  }
   collection(name: string) {
     if (name === 'ohlcv_bars') {
       return {
         aggregate: (_pipeline: any[]) => ({
           toArray: async () => {
-            const byTicker = new Map<string, number>();
+            const byIdentity = new Map<string, number>();
             for (const b of this.ohlcv) {
               if (b.interval !== '5m') continue;
-              const cur = byTicker.get(b.ticker);
+              const key = `${b.symbol}|${b.market}`;
+              const cur = byIdentity.get(key);
               const t = b.timestamp.getTime();
-              if (cur === undefined || t > cur) byTicker.set(b.ticker, t);
+              if (cur === undefined || t > cur) byIdentity.set(key, t);
             }
-            return [...byTicker.entries()].map(([_id, ms]) => ({ _id, latest: new Date(ms) }));
+            return [...byIdentity.entries()].map(([key, ms]) => {
+              const [symbol, market] = key.split('|');
+              return { _id: { symbol, market }, latest: new Date(ms) };
+            });
           },
         }),
         insertOne: async (doc: any) => { this.badTicks.push(doc); },
@@ -69,7 +81,7 @@ describe('healMissingHistory — session-aware threshold', () => {
     // 150 US tickers, each with latest bar = Friday close. expectedLatestMs = Friday
     // close. No ticker is older than that → 0 heals → 0 fetchHistory calls.
     const tickers = Array.from({ length: 150 }, (_, i) => `T${i}_US_EQ`);
-    for (const t of tickers) db.ohlcv.push({ ticker: t, timestamp: new Date(FRIDAY_CLOSE_MS), interval: '5m' });
+    for (const t of tickers) db.pushBar(t, new Date(FRIDAY_CLOSE_MS), '5m');
     const result = await healMissingHistory(db as any, stubRedis, provider, tickers, { expectedLatestMs: FRIDAY_CLOSE_MS });
     expect(result.healed).toBe(0);
     expect(provider.calls).toHaveLength(0);
@@ -78,8 +90,8 @@ describe('healMissingHistory — session-aware threshold', () => {
   it('DOES flag tickers whose latest bar is older than expectedLatestMs', async () => {
     // One ticker stuck at Thursday close (Yahoo glitch / trading halt). Others fine.
     const tickers = ['AAPL_US_EQ', 'MSFT_US_EQ'];
-    db.ohlcv.push({ ticker: 'AAPL_US_EQ', timestamp: new Date(THU_CLOSE_MS),    interval: '5m' });
-    db.ohlcv.push({ ticker: 'MSFT_US_EQ', timestamp: new Date(FRIDAY_CLOSE_MS), interval: '5m' });
+    db.pushBar('AAPL_US_EQ', new Date(THU_CLOSE_MS), '5m');
+    db.pushBar('MSFT_US_EQ', new Date(FRIDAY_CLOSE_MS), '5m');
     const result = await healMissingHistory(db as any, stubRedis, provider, tickers, { expectedLatestMs: FRIDAY_CLOSE_MS });
     expect(result.healed).toBe(1);
     expect(provider.calls).toHaveLength(1);
@@ -88,7 +100,7 @@ describe('healMissingHistory — session-aware threshold', () => {
 
   it('60s grace covers Yahoo late-print: latest = expectedLatest - 30s is NOT flagged', async () => {
     const tickers = ['AAPL_US_EQ'];
-    db.ohlcv.push({ ticker: 'AAPL_US_EQ', timestamp: new Date(FRIDAY_CLOSE_MS - 30_000), interval: '5m' });
+    db.pushBar('AAPL_US_EQ', new Date(FRIDAY_CLOSE_MS - 30_000), '5m');
     const result = await healMissingHistory(db as any, stubRedis, provider, tickers, { expectedLatestMs: FRIDAY_CLOSE_MS });
     expect(result.healed).toBe(0);
     expect(provider.calls).toHaveLength(0);
@@ -96,7 +108,7 @@ describe('healMissingHistory — session-aware threshold', () => {
 
   it('latest = expectedLatest - 5min IS flagged (real gap)', async () => {
     const tickers = ['AAPL_US_EQ'];
-    db.ohlcv.push({ ticker: 'AAPL_US_EQ', timestamp: new Date(FRIDAY_CLOSE_MS - 5 * 60_000), interval: '5m' });
+    db.pushBar('AAPL_US_EQ', new Date(FRIDAY_CLOSE_MS - 5 * 60_000), '5m');
     const result = await healMissingHistory(db as any, stubRedis, provider, tickers, { expectedLatestMs: FRIDAY_CLOSE_MS });
     expect(result.healed).toBe(1);
     expect(provider.calls).toHaveLength(1);
@@ -106,7 +118,7 @@ describe('healMissingHistory — session-aware threshold', () => {
     // Without an expectedLatestMs, ANY ticker with latest bar > 24h old gets flagged.
     // Monday morning latest-Friday-close is ~64h old → would be flagged.
     const tickers = ['AAPL_US_EQ'];
-    db.ohlcv.push({ ticker: 'AAPL_US_EQ', timestamp: new Date(FRIDAY_CLOSE_MS), interval: '5m' });
+    db.pushBar('AAPL_US_EQ', new Date(FRIDAY_CLOSE_MS), '5m');
     const origDateNow = Date.now;
     Date.now = () => NOW_MONDAY;
     try {

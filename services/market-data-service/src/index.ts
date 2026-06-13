@@ -191,11 +191,12 @@ export async function maybeEmitDailyAtClose(
     try {
       const db = await getMongoDb();
       // Read the latest unsuperseded 5m bars for the UTC day. is_superseded:false
-      // picks one row per (ticker, observation_ts) via the partial-unique index;
-      // observation_ts:$gte bounds the day.
+      // picks one row per (symbol, market, observation_ts) via the partial-unique index;
+      // observation_ts:$gte bounds the day. Storage is keyed on the bare identity, so the
+      // T212 partition tickers are split to (symbol, market) for the membership match.
       const docs = await db.collection(COLLECTIONS.OHLCV_BARS)
         .find({
-          ticker:         { $in: tickers },
+          $or:            tickers.map((t) => { const id = tickerAdapter.fromT212(t); return { symbol: id.symbol, market: id.market }; }),
           interval:       '5m',
           is_superseded:  false,
           observation_ts: { $gte: utcMidnightMs },
@@ -217,8 +218,9 @@ export async function maybeEmitDailyAtClose(
         const obsTs = typeof d.observation_ts === 'number'
           ? d.observation_ts
           : (d.timestamp instanceof Date ? d.timestamp.getTime() : Number(d.timestamp ?? 0));
+        // Docs carry (symbol, market); re-derive the T212 ticker for the aggregate + downstream emit.
         const bar: OHLCVBar = {
-          ticker:         d.ticker as string,
+          ticker:         tickerAdapter.toT212({ symbol: d.symbol as string, market: d.market as 'US' | 'LSE' }),
           observation_ts: obsTs,
           timestamp:      obsTs,
           interval:       '5m',

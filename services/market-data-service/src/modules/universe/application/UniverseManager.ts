@@ -452,14 +452,21 @@ export class UniverseManager {
       const allTickers = instruments.map((i) => i.ticker);
       const lookbackDate = new Date(now.getTime() - ADV_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
 
-      // Aggregate 20-day ADV and latest close per ticker from stored OHLCV bars.
-      // volume=0 from the T212 fill-price approximation means ADV filter is
-      // currently a pass-through; it activates automatically once real volume data flows.
+      // Aggregate 20-day ADV and latest close per name from stored OHLCV bars. Storage is keyed on
+      // the bare identity (symbol, market) and stamps observation_ts (UTC ms), not the legacy
+      // `timestamp` Date — split the T212 tickers, group on the identity over observation_ts, and
+      // re-key back to the T212 ticker for the statsMap below. volume=0 from the T212 fill-price
+      // approximation means the ADV filter is currently a pass-through; it activates once real
+      // volume data flows.
+      const adapter = new Trading212TickerAdapter();
+      const statIds = allTickers.map((t) => ({ ticker: t, ...adapter.fromT212(t) }));
+      const tickerByIdentity = new Map(statIds.map((i) => [`${i.symbol}|${i.market}`, i.ticker]));
+      const lookbackMs = lookbackDate.getTime();
       const ohlcvStats = await db.collection(COLLECTIONS.OHLCV_BARS).aggregate([
-        { $match: { ticker: { $in: allTickers }, timestamp: { $gte: lookbackDate } } },
-        { $sort: { timestamp: 1 } },
+        { $match: { $or: statIds.map((i) => ({ symbol: i.symbol, market: i.market })), observation_ts: { $gte: lookbackMs } } },
+        { $sort: { observation_ts: 1 } },
         { $group: {
-          _id: '$ticker',
+          _id: { symbol: '$symbol', market: '$market' },
           avgVolume:   { $avg: '$volume' },
           latestClose: { $last: '$close' },
         }},
@@ -467,7 +474,10 @@ export class UniverseManager {
 
       const statsMap: Record<string, { avgVolume: number; latestClose: number }> = {};
       for (const s of ohlcvStats) {
-        statsMap[s._id as string] = { avgVolume: s.avgVolume as number ?? 0, latestClose: s.latestClose as number ?? 0 };
+        const id = s._id as { symbol: string; market: string };
+        const ticker = tickerByIdentity.get(`${id.symbol}|${id.market}`);
+        if (ticker === undefined) continue;
+        statsMap[ticker] = { avgVolume: s.avgVolume as number ?? 0, latestClose: s.latestClose as number ?? 0 };
       }
 
       // ── 3. Apply eligibility filters (Section 29b) ───────────────────────────
