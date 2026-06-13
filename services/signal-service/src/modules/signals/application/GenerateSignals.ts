@@ -404,7 +404,18 @@ export class GenerateSignalsUseCase {
       `GenerateSignals.execute: emitted ${signals.length} actionable signal(s) of ${universeSize} candidates`,
     );
 
-    await Promise.all(signals.map((s) => this.signalRepo.save(s)));
+    // Persist per-signal-resilient: a single un-routable ticker (toSignalDoc splits it to
+    // (symbol, market) and throws on a non-US/LSE form — Task 16a) must not poison the whole
+    // cycle's batch. allSettled isolates the failure; the rest of the cycle still persists + emits.
+    const saveResults = await Promise.allSettled(signals.map((s) => this.signalRepo.save(s)));
+    const saveFailures = saveResults.filter((r) => r.status === 'rejected');
+    if (saveFailures.length > 0) {
+      this.logger.warn(
+        { failed: saveFailures.length, total: signals.length,
+          reasons: saveFailures.slice(0, 5).map((r) => String((r as PromiseRejectedResult).reason)) },
+        'GenerateSignals: some signals failed to persist (continuing with the rest)',
+      );
+    }
     // Notification policy (b): emails fire only on lifecycle='executed', not on emission.
     // The publish-to-TRADE_SIGNALS hop happens in the internal-router /executed callback so
     // notification-service sees a signal exactly once, after T212 confirms placement.

@@ -17,13 +17,25 @@
 //     fall back to the stored ticker), never throw the whole batch, preserving the pre-Thread-A
 //     behaviour where an unknown ticker simply produced no match.
 
-import { Trading212TickerAdapter, type TickerIdentity } from '@trader/ticker-identity';
+import { Trading212TickerAdapter, type Market, type TickerIdentity } from '@trader/ticker-identity';
+import type { Currency } from '@trader/shared-types';
 
 const adapter = new Trading212TickerAdapter();
 
 /** Split a T212 ticker into its bare `(symbol, market)` identity. Throws on a non-US/LSE form. */
 export function identityOf(ticker: string): TickerIdentity {
   return adapter.fromT212(ticker);
+}
+
+/**
+ * Instrument currency for a stored `market` value, routed through the adapter's single
+ * market→currency map (US→USD, LSE→GBP) rather than a hand-rolled suffix/string check. An
+ * unrecognised market falls back to the account base (GBP) — the same default the old
+ * `inferCurrency` suffix-sniffer used for any non-`_US_EQ` ticker.
+ */
+export function currencyOfMarket(market: string): Currency {
+  if (market === 'US' || market === 'LSE') return adapter.currencyOf({ symbol: 'x', market: market as Market });
+  return 'GBP';
 }
 
 /**

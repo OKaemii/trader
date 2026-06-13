@@ -6,17 +6,12 @@ import { SignalLifecycle } from '@trader/shared-types';
 import { sumPositionsGBP, sumOpenPnlGBP, type FxConverter, type PositionDoc } from '@trader/shared-portfolio';
 import type { StrategyDecayMonitor } from '../../approval/application/StrategyDecayMonitor.ts';
 import type { RiskEngine } from '../../risk/application/RiskEngine.ts';
-import { tryIdentityOf, tickerOf } from '../../../shared/identity.ts';
-
-// market → instrument currency. Storage carries the bare `market` since Task 16a, which is the
-// instrument-currency discriminator (US → USD, LSE → GBP) — no DB round-trip needed. Keeps the
-// realised-P&L FX path identical to the trading-service order-sizing path.
-function currencyOfMarket(market: string): 'USD' | 'GBP' {
-  return market === 'US' ? 'USD' : 'GBP';
-}
+import { tryIdentityOf, tickerOf, currencyOfMarket } from '../../../shared/identity.ts';
 
 // (symbol, market) → the T212 display ticker, falling back to the bare symbol if the market is
-// unrecognised (so a corrupt row still renders a human-readable label).
+// unrecognised (so a corrupt row still renders a human-readable label). Storage carries the bare
+// `market` since Task 16a; the realised-P&L FX currency is resolved via currencyOfMarket (the
+// adapter's single market→currency map) so the path matches the trading-service order-sizing path.
 function safeTicker(symbol: string, market: string): string {
   try { return tickerOf(symbol, market); } catch { return symbol; }
 }
