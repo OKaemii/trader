@@ -1,0 +1,37 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: fundamentals-harvester
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    kubernetes.io/ingress.class: nginx
+spec:
+  rules:
+    - host: trader.local
+      http:
+        paths:
+          # The harvester status surface — the SAME `/admin/api/fundamentals-ingest` prefix the portal
+          # Operations › PIT Fundamentals panel fans out to (status / config / freshness / runs /
+          # force-sweep). The harvester is the lake's write path + its thin status API (src/app.py),
+          # and it OWNS this prefix now that the portal panel reads the lake-shaped surface.
+          #
+          # SUPERSEDES the retired fundamentals-ingestion ingress that previously claimed this exact
+          # path → fundamentals-ingestion:8010 (the Timescale write-side). That ingress is removed in
+          # the same change, so there is no host+prefix collision (two Ingress objects with the same
+          # host + path would let nginx pick a backend nondeterministically — the very defect this
+          # fixes). The old ingestion *Deployment* stays up for rollback until teardown (epic Task 24),
+          # but it is no longer reachable through the ingress; the portal panel now resolves to the
+          # harvester, which serves the lake shape (no quarantine — decision D; runs + force-sweep
+          # present; the EDGAR UA reduced to a boolean, never the contact string).
+          #
+          # nginx ingress uses longest-prefix matching, and `/admin/api/fundamentals-ingest`,
+          # `/admin/api/fundamentals-pit` (fundamentals-api read-side), and the bare
+          # `/admin/api/fundamentals` (307 → portal) are mutually non-prefixing, so each still resolves
+          # to its own backend with no rewrite.
+          - path: /admin/api/fundamentals-ingest
+            pathType: Prefix
+            backend:
+              service:
+                name: fundamentals-harvester
+                port:
+                  number: 8012
