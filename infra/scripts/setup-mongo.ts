@@ -50,10 +50,11 @@ async function main() {
   );
   console.log(`TTL index on ${COLLECTIONS.STRATEGY_HEALTH_LOG}.createdAt (30 days)`);
 
-  // signals — compound index for fast per-ticker lookups ordered by time
+  // signals — compound index for fast per-name lookups ordered by time. Keyed on the bare
+  // (symbol, market) identity since Task 16a (the concatenated T212 ticker is no longer stored).
   await db.collection(COLLECTIONS.SIGNALS).createIndex(
-    { ticker: 1, generatedAt: -1 },
-    { name: 'ticker_time' }
+    { symbol: 1, market: 1, generatedAt: -1 },
+    { name: 'symbol_market_time' }
   );
   await db.collection(COLLECTIONS.SIGNALS).createIndex(
     { status: 1, generatedAt: -1 },
@@ -75,10 +76,11 @@ async function main() {
   );
   console.log(`Unique index on ${COLLECTIONS.USERS}.email`);
 
-  // orders — compound index for portfolio queries
+  // orders — compound index for portfolio queries. Keyed on the bare (symbol, market) identity
+  // since Task 16a (the concatenated T212 ticker is no longer stored).
   await db.collection(COLLECTIONS.ORDERS).createIndex(
-    { ticker: 1, placedAt: -1 },
-    { name: 'ticker_placed' }
+    { symbol: 1, market: 1, placedAt: -1 },
+    { name: 'symbol_market_placed' }
   );
   console.log(`Compound index on ${COLLECTIONS.ORDERS}`);
 
