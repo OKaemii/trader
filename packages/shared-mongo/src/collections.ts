@@ -55,6 +55,20 @@ export const COLLECTIONS = {
   // which returns {} for every name, so the store stays empty (no doc is ever written) until a PIT-backed
   // earnings source is wired by a later epic. The shape is migrated for that future writer's sake.
   EARNINGS_CALENDAR:     'earnings_calendar',
+  // Pipeline A (analyst-free-estimates-engine, Task 10) — HISTORICAL earnings-announcement EVENT dates,
+  // the true SUE/PEAD event date = the 8-K Item 2.02 release ("Results of Operations and Financial
+  // Condition"), NOT the 10-Q (the 8-K precedes the periodic report and is what the market reacts to).
+  // AUTHORITATIVE STORE IS THE PIT LAKE, NOT MONGO: the fundamentals-harvester is a pure EDGAR→Parquet
+  // service with no Mongo, and persists these per CIK at `<lake>/events/cik=<cik:010d>.parquet` (atomic
+  // replace, the same model as `facts/`), each row { cik, symbol, event_date, accession, items,
+  // accepted_ts, knowledge_ts, source } extracted from the 8-K's /submissions items column behind the
+  // shared EDGAR_REQS_PER_SEC limiter, fail-closed without a real EDGAR_USER_AGENT. This constant is the
+  // future Mongo READ-SIDE mirror (the shape a market-data read path would mirror events into for the
+  // portal/strategy seam) — registered now alongside the rest of the earnings sub-domain so the read-side
+  // writer has a typed home; like EARNINGS_CALENDAR it stays empty until that mirror is wired. Keyed on
+  // the bare (symbol, market) identity: `_id` is `<symbol>:<market>:<accession>`, `symbol`/`market`/`cik`
+  // queryable. Doc: { _id, cik, symbol, market, eventDate, accession, knowledgeTs, source, updatedAt }.
+  EARNINGS_EVENTS:       'earnings_events',
   // Pipeline C (analyst-free-estimates-engine, Task 12) — forward analyst-consensus estimates. Written
   // by market-data-service's ConsensusStore from a ConsensusProvider. SHIPPED STUBBED: the wired
   // StubConsensusProvider returns {} for every name (no consensus vendor entitled), so this store stays

@@ -10,9 +10,15 @@ Bootstrap once, then run forever:
 The only contract with the read service is the lake on shared storage:
 
   <lake>/facts/cik=##########.parquet   PIT facts (one file per CIK, atomic replace)
+  <lake>/events/cik=##########.parquet  PIT earnings-event dates (8-K Item 2.02, one file per CIK)
   <lake>/ticker_history.parquet         bare symbol -> CIK with validity ranges
   <lake>/entities.parquet               names, SIC, former names
   <lake>/bootstrap_complete.json        SENTINEL — written ONLY after a full bulk pass finishes
+
+The earnings-EVENT store (Pipeline A) is filled by the sweep, not the bulk bootstrap: the bulk zip is
+companyfacts (XBRL) only — it carries no 8-K item codes — so the announcement dates accrue from each
+sweep's `/submissions` fetch (which DOES carry the items), exactly as the precise per-accession
+`knowledge_ts` refinement does.
 
 The schema + the next-session `knowledge_ts` derivation come from quant-core
 (`quant_core.fundamentals.lake.{schema,calendar}`), shared with the read engine so writer and reader
@@ -34,6 +40,7 @@ from pathlib import Path
 import httpx
 
 from edgar import Edgar
+from events import write_earnings_events
 from identity import seed_ticker_history, snapshot_tickers, upsert_entities
 from normalize import parse_acceptance_ms, write_company_facts
 
@@ -94,6 +101,10 @@ async def refresh_cik(edgar: Edgar, cik: int) -> dict | None:
     Fetches `/submissions` FIRST so its `accession -> acceptanceDateTime` map is available when
     `write_company_facts` derives `knowledge_ts` — the sweep path's whole purpose is the precise
     next-session availability, so the map must be built before (not after) the write.
+
+    The SAME `/submissions` doc is the Pipeline A earnings-event source: its `filings.recent` carries
+    the item codes (the daily form index does not), so the Item-2.02 8-K announcement dates are
+    extracted from it here — no extra EDGAR request, the same fetch the facts write already needs.
     """
     try:
         cf = await edgar.companyfacts(cik)
@@ -103,7 +114,11 @@ async def refresh_cik(edgar: Edgar, cik: int) -> dict | None:
         raise
     subs = await edgar.submissions(cik)
     n = write_company_facts(LAKE, cf, acceptance_map(subs))
-    log.info("refreshed cik=%s (%s) facts=%d", cik, subs.get("name"), n)
+    # Pipeline A: persist this CIK's historical earnings-announcement (8-K Item 2.02) dates from the
+    # submissions doc already in hand. Returns 0 (no file written) for a CIK with no recent earnings 8-K
+    # — the common steady state; never an error.
+    events = write_earnings_events(LAKE, subs)
+    log.info("refreshed cik=%s (%s) facts=%d earnings_events=%d", cik, subs.get("name"), n, events)
     return subs
 
 
