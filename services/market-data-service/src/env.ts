@@ -99,6 +99,13 @@ const EnvSchema = z.object({
     // ⇒ the provider falls back to the no-op stub (it can only miss without a scrape stack).
     FIRECRAWL_BASE_URL:              z.string().url().or(z.literal("")).default("http://192.168.50.2:3002"),
 
+    // Analyst-consensus source (Pipeline C — analyst-free-estimates-engine, Task 12). 'stub' (default)
+    // returns no consensus → the consensus_estimate/earnings_surprise stores stay empty and the surprise
+    // fields render "requires consensus — not sourced" (a proper surprise REQUIRES consensus and is "not
+    // built rather than faked"). 'eodhd' is the swap-ready slot for EODHD's analyst estimates (a one-
+    // provider change in the consensus wiring; not entitled today, so it warns + falls back to the stub).
+    CONSENSUS_PROVIDER:              z.enum(["stub", "eodhd"]).default("stub"),
+
     // Corporate-actions (EODHD Dividends + Splits) incremental sync. The store re-checks a ticker no
     // more often than the TTL and fetches only events past its stored cursor (§I), so a current
     // universe spends ~no credits. The idle interval paces full passes; spacing throttles per-ticker

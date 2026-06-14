@@ -175,6 +175,11 @@ global:
     earningsProvider: ir_calendar
     # Firecrawl scrape-stack base URL (homeserver) backing the ir_calendar earnings provider.
     firecrawlBaseUrl: "http://192.168.50.2:3002"
+    # Analyst-consensus source (Pipeline C — analyst-free-estimates-engine). stub (default — no consensus
+    # vendor entitled; consensus_estimate/earnings_surprise stay empty and the surprise fields render
+    # "requires consensus — not sourced") | eodhd (swap-ready slot for EODHD analyst estimates; dormant).
+    # A proper surprise REQUIRES consensus and is "not built rather than faked" — no mechanical proxy.
+    consensusProvider: stub
     # Sector-rotation reference ETFs (comma-separated T212 tickers). Empty → built-in 11 SPDRs + SPY.
     # Tracked for the heatmap only — never added to the tradeable universe.
     sectorEtfTickers: ""
