@@ -40,6 +40,8 @@ import { StubAnalystEstimates } from './modules/fundamentals/infrastructure/Stub
 import { buildEarningsStore } from './modules/earnings/wiring.ts';
 import { EarningsRefreshScheduler } from './modules/earnings/application/EarningsRefreshScheduler.ts';
 import { createEarningsRouter } from './modules/earnings/routes.ts';
+import { buildConsensusStore } from './modules/consensus/wiring.ts';
+import { createConsensusRouter } from './modules/consensus/routes.ts';
 import { nextDividendDateMs } from './modules/earnings/infrastructure/next-dividend.ts';
 import { buildCorporateActionsStore } from './modules/corporate-actions/wiring.ts';
 import { CorporateActionsRefreshScheduler } from './modules/corporate-actions/application/CorporateActionsRefreshScheduler.ts';
@@ -789,6 +791,17 @@ const earningsRefresher = new EarningsRefreshScheduler(
   { idleMs: env.EARNINGS_REFRESH_IDLE_MS },
 );
 app.route('/', createEarningsRouter(earningsStore, earningsRefresher));
+
+// Consensus (Pipeline C — analyst-free-estimates-engine, Task 12). consensus_estimate +
+// earnings_surprise stores behind a ConsensusProvider, with the read routes that back the Research ›
+// Fundamentals surprise/estimate-revision fields. SHIPPED STUBBED (no consensus vendor entitled): the
+// wired StubConsensusProvider returns {} for every name, so both stores stay empty and the routes serve
+// the honest "requires consensus — not sourced" shape. A proper surprise REQUIRES consensus and is "not
+// built rather than faked" — no mechanical SUE/EAR proxy is ever served. The provider is the single swap
+// point (CONSENSUS_PROVIDER): an EodhdConsensusProvider / gold-standard vendor drops in later with no
+// store/route/collection change. No background refresher — the stub has nothing to refresh.
+const consensusStore = buildConsensusStore(env.CONSENSUS_PROVIDER);
+app.route('/', createConsensusRouter(consensusStore));
 
 // News — `news` store (EODHD News feed, incremental sync §I) + the admin GET
 // /admin/api/market-data/news?ticker= that backs the Overview "Recent Events" panel + the
