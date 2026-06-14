@@ -26,6 +26,33 @@ function installFetch(payloadFor: (url: string) => unknown): { calls: FetchCall[
   return { calls, restore: () => { globalThis.fetch = original; } };
 }
 
+// Like installFetch but lets a test drive the HTTP status (and a JSON body) per URL — used
+// to reproduce TwelveData's HTTP-404 entitlement wall, which carries a status:"error" body
+// alongside a non-200 status. `respond` returns { status, body }.
+function installFetchWithStatus(
+  respond: (url: string) => { status: number; body: unknown },
+): { calls: FetchCall[]; restore: () => void } {
+  const calls: FetchCall[] = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (url: unknown) => {
+    const u = String(url);
+    calls.push({ url: u });
+    const { status, body } = respond(u);
+    return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+  }) as typeof fetch;
+  return { calls, restore: () => { globalThis.fetch = original; } };
+}
+
+// Capture console.warn output — the logger shim routes warn-level through console.warn when
+// no Pino logger is wired (the test environment), so this proves the failure log names the
+// offending ticker.
+function captureWarnings(): { lines: string[]; restore: () => void } {
+  const lines: string[] = [];
+  const original = console.warn;
+  console.warn = ((...args: unknown[]) => { lines.push(args.map(String).join(' ')); }) as typeof console.warn;
+  return { lines, restore: () => { console.warn = original; } };
+}
+
 // TwelveData /time_series payload (single symbol). `values` newest-or-oldest order is the
 // caller's choice — the provider sorts oldest-first defensively, which we assert below.
 function tdSeries(values: Array<[string, number]>, currency?: string): unknown {
@@ -249,6 +276,100 @@ describe('TwelveDataProvider', () => {
       expect(bars).toHaveLength(1);
       expect(spy.calls).toHaveLength(1);
       expect(paramsOf(spy.calls[0].url).get('mic_code')).toBe('XLON');
+    });
+  });
+
+  // HTTP-404 / entitlement-wall hardening. A recurring HTTP 404 (the free-tier paid-wall:
+  // "available starting with the Grow or Venture plan") must blacklist the ticker after the
+  // FIRST failure — otherwise the poll + per-cycle self-heal re-request it every cycle, each
+  // a wasted credit and an anonymous 404 log line. Distinct from the unparseable-skip class:
+  // here the ticker IS well-formed and a request goes out; it's the upstream that walls it.
+  describe('HTTP-404 + plan-gated blacklist', () => {
+    it('blacklists a ticker after one HTTP 404 and stops re-requesting it', async () => {
+      // TwelveData's entitlement 404: non-200 status WITH a status:"error" body.
+      const statusSpy = installFetchWithStatus(() => ({
+        status: 404,
+        body: { code: 404, message: 'This symbol is available starting with the Grow or Venture plan.', status: 'error' },
+      }));
+      try {
+        const p = new TwelveDataProvider(OPTS);
+        const first = await p.fetchHistory('AZNl_EQ', Date.now() - 60_000);
+        const second = await p.fetchHistory('AZNl_EQ', Date.now() - 60_000);
+        expect(first).toEqual([]);
+        expect(second).toEqual([]);
+        expect(statusSpy.calls).toHaveLength(1);             // second poll short-circuited by the blacklist
+        expect(p.creditsUsedToday).toBe(1);                  // only the first request spent a credit
+      } finally {
+        statusSpy.restore();
+      }
+    });
+
+    it('logs the offending ticker on an HTTP 404 (not just the path)', async () => {
+      const statusSpy = installFetchWithStatus(() => ({
+        status: 404,
+        body: { code: 404, message: 'This symbol is available starting with the Grow or Venture plan.', status: 'error' },
+      }));
+      const warn = captureWarnings();
+      try {
+        const p = new TwelveDataProvider(OPTS);
+        await p.fetchHistory('AZNl_EQ', Date.now() - 60_000);
+        // The HTTP 404 line in get() AND the blacklist line in requestTimeSeries both name the
+        // ticker — the elimination-investigation gap (anonymous "HTTP 404 on /time_series") is closed.
+        const ticketed = warn.lines.filter((l) => l.includes('AZNl_EQ'));
+        expect(ticketed.length).toBeGreaterThan(0);
+        expect(warn.lines.some((l) => /HTTP 404/.test(l) && l.includes('AZNl_EQ'))).toBe(true);
+      } finally {
+        warn.restore();
+        statusSpy.restore();
+      }
+    });
+
+    it('blacklists a plan-gated status:error body even when the HTTP status is 200', async () => {
+      // Defence in depth: if TwelveData ever returns the upgrade message with a 200 envelope,
+      // the body-message test still catches it (the prior /not found/i test would have missed it).
+      let calls = 0;
+      const statusSpy = installFetchWithStatus(() => {
+        calls++;
+        return { status: 200, body: { code: 404, message: 'This symbol is only available on the Pro plan. Please upgrade.', status: 'error' } };
+      });
+      try {
+        const p = new TwelveDataProvider(OPTS);
+        await p.fetchHistory('AZNl_EQ', Date.now() - 60_000);
+        await p.fetchHistory('AZNl_EQ', Date.now() - 60_000);
+        expect(calls).toBe(1);                               // blacklisted after the first body-error
+      } finally {
+        statusSpy.restore();
+      }
+    });
+
+    it('does NOT blacklist on HTTP 429 (transient throttle stays pollable)', async () => {
+      const statusSpy = installFetchWithStatus(() => ({
+        status: 429,
+        body: { code: 429, message: 'You have run out of API credits for the current minute.', status: 'error' },
+      }));
+      try {
+        const p = new TwelveDataProvider({ apiKey: 'k', creditsPerMinute: 1000, dailyCreditLimit: 1000 });
+        await p.fetchHistory('AAPL_US_EQ', Date.now() - 60_000);
+        await p.fetchHistory('AAPL_US_EQ', Date.now() - 60_000);
+        expect(statusSpy.calls).toHaveLength(2);             // 429 is transient — re-requested, not blacklisted
+      } finally {
+        statusSpy.restore();
+      }
+    });
+
+    it('does NOT blacklist on a transient body error ("no data on the specified dates")', async () => {
+      const statusSpy = installFetchWithStatus(() => ({
+        status: 200,
+        body: { code: 400, message: 'No data is available on the specified dates.', status: 'error' },
+      }));
+      try {
+        const p = new TwelveDataProvider(OPTS);
+        await p.fetchHistory('AAPL_US_EQ', Date.now() - 60_000);
+        await p.fetchHistory('AAPL_US_EQ', Date.now() - 60_000);
+        expect(statusSpy.calls).toHaveLength(2);             // stays pollable (not a permanent unavailability)
+      } finally {
+        statusSpy.restore();
+      }
     });
   });
 });
