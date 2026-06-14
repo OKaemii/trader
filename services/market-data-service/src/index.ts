@@ -20,7 +20,7 @@ import { TwelveDataProvider } from './modules/bars/infrastructure/providers/twel
 import { configureEodhdClient, getEodhdClient } from './modules/bars/infrastructure/providers/eodhd-client.ts';
 import type { MarketDataProvider } from './modules/bars/infrastructure/providers/market-data-provider.ts';
 import { FxClient, TwelveDataFxProvider } from '@trader/shared-fx';
-import { aggregateBars, invalidateBarsBulk, getBarAtOrBefore, getRecentBarsForTickers } from '@trader/shared-bars';
+import { aggregateBars, invalidateBarsBulk, getBarAtOrBefore } from '@trader/shared-bars';
 import {
   HolidayCache, NyseIcalProvider, UkGovBankHolidayProvider, EodhdExchangeHolidayProvider,
   StaticFallbackProvider, STATIC_FALLBACK,
@@ -31,6 +31,7 @@ import {
 import { Trading212TickerAdapter, type TickerIdentity } from '@trader/ticker-identity';
 import { backfillTickers, tickersMissingHistory, healMissingHistory } from './modules/bars/infrastructure/backfill.ts';
 import { backfillDailyHistory, tickersMissingDailyHistory } from './modules/bars/infrastructure/daily-history.ts';
+import { foldDailyEmit } from './modules/bars/infrastructure/daily-emit.ts';
 import { runEodhdDailyFeed } from './modules/bars/infrastructure/eodhd-daily-feed.ts';
 import { buildFundamentalsCache } from './modules/fundamentals/wiring.ts';
 import { FundamentalsRefreshScheduler } from './modules/fundamentals/application/FundamentalsRefreshScheduler.ts';
@@ -194,51 +195,24 @@ export async function maybeEmitDailyAtClose(
 
     try {
       const db = await getMongoDb();
-      // Read the latest unsuperseded 5m bars for the UTC day through the BARS_BACKEND dispatcher,
-      // NOT a raw Mongo query: live config is BARS_BACKEND=timescale + DUAL_WRITE_BARS=false, so the
-      // poll path writes 5m bars only to Timescale and the wipe emptied Mongo ohlcv_bars — a direct
-      // Mongo read returns 0 rows forever, starving market:raw:daily and idling the strategy. The
-      // dispatched set-reader honours the backend; it splits each T212 partition ticker to its bare
-      // (symbol, market) identity (storage is keyed bare), filters is_superseded:false + the
-      // observation_ts >= utcMidnight day bound, and returns OHLCVBar[] with the T212 ticker
-      // re-derived per row. Bounded by sinceTs so Timescale chunk-exclusion prunes to the day.
-      const ids = tickers.map((t) => tickerAdapter.fromT212(t));
-      const bars = await getRecentBarsForTickers(redis, db, ids, { interval: '5m', sinceTs: utcMidnightMs });
-      if (bars.length === 0) {
-        // Release the gate so a later cycle retries once today's 5m bars land. An early
-        // CLOSED-state cycle (or a pod restart) can run this BEFORE the EOD poll has fetched
-        // today's bars; without the release the gate burned here blocks the real emit for 25h,
-        // so market:raw:daily never publishes and the strategy-engine never cycles that day.
+      // The read→group→aggregate→persist→publish fold is shared verbatim with the operator
+      // force-emit route (foldDailyEmit) — the NX gate above is the ONLY thing this gated path
+      // adds. It reads today's 5m bars through the BARS_BACKEND dispatcher (not a raw Mongo find:
+      // under BARS_BACKEND=timescale + DUAL_WRITE_BARS=false the poll path writes 5m only to
+      // Timescale and the wipe emptied Mongo, so a direct read returns 0 rows forever). No upper
+      // bound — "today" has no past-day trimming to do; the sinceTs floor is what keeps the
+      // Timescale read chunk-exclusion-pruned.
+      const { emitted } = await foldDailyEmit(redis, db, tickers, utcMidnightMs);
+      if (emitted === 0) {
+        // No 5m bars yet (or the aggregation produced none) → release the gate so a later cycle
+        // retries once today's bars land. An early CLOSED-state cycle / a pod restart can run this
+        // BEFORE the EOD poll fetched today's bars; without the release the gate burned here blocks
+        // the real emit for 25h, so market:raw:daily never publishes and the strategy never cycles.
         await redis.del(gateKey).catch(() => {});
-        log.warn(`[market-data] daily-emit ${market} ${utcDate}: no 5m bars found — gate released, will retry`);
+        log.warn(`[market-data] daily-emit ${market} ${utcDate}: no daily bars to emit — gate released, will retry`);
         continue;
       }
-      // Group by ticker then aggregate-to-daily so aggregateBars sees one ticker's bars
-      // at a time (it folds all rows into a single output bar keyed by the head ticker).
-      // The reader already returns fully-formed OHLCVBar[] (T212 ticker re-derived, OHLCV fields
-      // populated) for both backends, so we group on bar.ticker directly — no doc→bar conversion.
-      const byTicker = new Map<string, OHLCVBar[]>();
-      for (const bar of bars) {
-        let list = byTicker.get(bar.ticker);
-        if (!list) { list = []; byTicker.set(bar.ticker, list); }
-        list.push(bar);
-      }
-      const dailyBars: OHLCVBar[] = [];
-      for (const list of byTicker.values()) {
-        const agg = aggregateBars(list, 'daily');
-        const last = agg[agg.length - 1];
-        if (last) dailyBars.push(last);
-      }
-      if (dailyBars.length === 0) {
-        await redis.del(gateKey).catch(() => {});
-        log.warn(`[market-data] daily-emit ${market} ${utcDate}: aggregation produced 0 bars — gate released`);
-        continue;
-      }
-      await persistBars(dailyBars, 'daily');
-      // Drop the daily read-cache so the next getBars('daily', …) reflects today's close.
-      await invalidateBarsBulk(redis as any, dailyBars.map((b) => ({ ticker: b.ticker, interval: 'daily' as BarInterval })));
-      await xAdd(redis, REDIS_STREAMS.MARKET_RAW_DAILY, dailyBars);
-      log.info(`[market-data] daily-emit ${market} ${utcDate} cycle=${cycleCounter}: ${dailyBars.length} bars → market:raw:daily`);
+      log.info(`[market-data] daily-emit ${market} ${utcDate} cycle=${cycleCounter}: ${emitted} bars → market:raw:daily`);
     } catch (err) {
       // Release the gate on failure so the next cycle retries. Without this, a transient
       // Mongo blip would silently skip the daily emit for the entire day.

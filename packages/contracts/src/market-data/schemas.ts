@@ -63,6 +63,18 @@ export const ClearCacheRequestSchema = z.object({
 });
 export type ClearCacheRequest = z.infer<typeof ClearCacheRequestSchema>;
 
+// Operator-driven on-demand daily emit (POST /admin/api/market-data/daily-emit/force). Folds
+// a UTC day's persisted 5m bars into daily bars and publishes them to market:raw:daily,
+// BYPASSING the once-per-(market, UTC-date) NX gate the session-close path uses — so a
+// missed/past day can be re-emitted manually (the RC1 QA hook proving pit_served>0 end-to-end).
+// `market` narrows the emit to one market (omitted ⇒ both US + LSE). `date` is the UTC day to
+// fold as YYYY-MM-DD (omitted ⇒ today, UTC); a past date folds only that single day.
+export const DailyEmitForceRequestSchema = z.object({
+    market: z.enum(["US", "LSE"]).optional(),
+    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "date must be YYYY-MM-DD (UTC)").optional(),
+});
+export type DailyEmitForceRequest = z.infer<typeof DailyEmitForceRequestSchema>;
+
 export const MarketConfigRequestSchema = z.object({
     barFrequency: z.enum(["daily", "intraday"]).nullable().optional(),
     pollIntervalMs: z.number().int().positive().nullable().optional(),
