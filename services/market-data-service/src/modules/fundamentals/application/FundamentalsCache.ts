@@ -186,10 +186,14 @@ export class FundamentalsCache {
   async refresh(tickers: string[]): Promise<number> {
     if (tickers.length === 0) return 0;
     const coll = await this.coll();
+    // `fetch` now returns `{ values, status }`: `values` is the resolved (`hit`) names — the same map
+    // this loop already upserted. The per-name `status` (hit / terminal / outage) is the seam for the
+    // refresh-convergence work (writing tombstones for `terminal` names so the stale set drains); this
+    // cache continues to upsert only the real `values` rows here.
     const fetched = await this.provider.fetch(tickers);
     const now = Date.now();
     let written = 0;
-    for (const [ticker, raw] of Object.entries(fetched)) {
+    for (const [ticker, raw] of Object.entries(fetched.values)) {
       const identity = tryIdentityOf(ticker);
       if (identity === null) continue;   // un-routable form — never store a concatenated/legacy key
       // Persist the provider's per-name source when it exposes one (the `pit` provider stamps

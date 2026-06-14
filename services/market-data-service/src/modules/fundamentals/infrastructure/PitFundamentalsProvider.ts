@@ -11,17 +11,26 @@
 //   - non-US (LSE, anything else) → FAIL-CLOSED: no fundamentals (no EDGAR for them, no Yahoo
 //                         substitute). The name is simply absent from the result.
 //
-// FAIL-CLOSED, no fallback. Three paths yield "no fundamentals for this name" (absent from the map):
-//   1. a non-US name (never had a US EDGAR fact);
-//   2. a US name the lake has no fact for ≤ now (a PIT *miss* — the resolver returns it with an empty
-//      line-item dict + null source);
-//   3. a hard fundamentals-api outage / non-200 / malformed payload (the whole US slice degrades to
-//      "no fundamentals" — logged, never thrown).
+// FAIL-CLOSED, no fallback. Three paths yield "no fundamentals for this name" (absent from `values`),
+// but they are NOT the same — `fetch` classifies each input ticker `hit | terminal | outage` in
+// `status` so the QMJ cache can converge (tombstone the never-resolvable, retry the transient):
+//   1. a non-US name (never had a US EDGAR fact)                                        → `terminal`;
+//   2. a US name the lake has no fact for ≤ now (a PIT *miss* — the resolver returns it
+//      present with an empty line-item dict + null source, i.e. seam HTTP 200 / name absent) → `terminal`;
+//   3. a hard fundamentals-api outage / non-200 / timeout / malformed payload (the whole US
+//      slice's resolvability is unknown — logged, never thrown)                          → `outage`.
 // A name with no fundamentals gets no company_fundamentals doc, so the scanner / Research render it
 // `source: null` / `—` — honest "not covered", never a fabricated value and never a silent Yahoo read.
+// The crux for the convergence fix: the seam HTTP outcome (an outage) is surfaced DISTINCTLY from an
+// empty-but-valid body (every US name a miss) — `fetchPit` returns a tagged result, not a flat `{}`.
 
 import { mintInternalJwt } from '@trader/shared-auth';
-import type { FundamentalsProvider, FundamentalsRaw } from './FundamentalsProvider.ts';
+import type {
+  FundamentalsProvider,
+  FundamentalsRaw,
+  FundamentalsFetchResult,
+  NameStatus,
+} from './FundamentalsProvider.ts';
 import { tryIdentityOf } from '../../../shared/identity.ts';
 import { log } from '../../../logger.ts';
 
@@ -100,38 +109,63 @@ export class PitFundamentalsProvider implements FundamentalsProvider {
     return this.lastSources.get(ticker);
   }
 
-  async fetch(tickers: string[]): Promise<Record<string, FundamentalsRaw>> {
-    if (tickers.length === 0) return {};
-    const usNames = tickers.filter(isUsTicker);
+  async fetch(tickers: string[]): Promise<FundamentalsFetchResult> {
+    if (tickers.length === 0) return { values: {}, status: {} };
 
-    const out: Record<string, FundamentalsRaw> = {};
+    const values: Record<string, FundamentalsRaw> = {};
+    const status: Record<string, NameStatus> = {};
 
-    // US slice → PIT lake (as-of now). A hit is mapped + stamped `pit-edgar`; a miss is fail-closed
-    // (omitted). Non-US names are never sent and never appear in the result. A whole-slice outage
-    // degrades the US slice to "no fundamentals" (fetchPit returns {}), never throws.
+    // Non-US names never route to the lake (no EDGAR, no Yahoo substitute) — they are TERMINAL by
+    // design (the source does not exist), not a transient gap. Classify them up front; they are never
+    // sent on the wire and never appear in `values`.
+    const usNames: string[] = [];
+    for (const ticker of tickers) {
+      if (isUsTicker(ticker)) usNames.push(ticker);
+      else status[ticker] = 'terminal';
+    }
+
+    // US slice → PIT lake (as-of now). `fetchPit` surfaces the seam HTTP outcome distinctly from an
+    // empty body: a successful (2xx, parseable) response classifies each US name on its payload — a
+    // hit is mapped + stamped `pit-edgar`, an absent/miss name is `terminal` (fail-closed, no doc).
+    // A non-2xx / timeout / malformed response is an OUTAGE for the whole US batch (resolvability
+    // unknown — retry next cycle, never tombstone). Never throws.
     if (usNames.length > 0) {
       const pit = await this.fetchPit(usNames);
-      for (const ticker of usNames) {
-        const payload = pit[ticker];
-        if (isPitHit(payload)) {
-          out[ticker] = toFundamentalsRaw(payload);
-          this.lastSources.set(ticker, SOURCE_PIT_EDGAR);
+      if (!pit.ok) {
+        for (const ticker of usNames) status[ticker] = 'outage';
+      } else {
+        for (const ticker of usNames) {
+          const payload = pit.payloads[ticker];
+          if (isPitHit(payload)) {
+            values[ticker] = toFundamentalsRaw(payload);
+            this.lastSources.set(ticker, SOURCE_PIT_EDGAR);
+            status[ticker] = 'hit';
+          } else {
+            // Seam answered 200 but this US name is absent / a miss (no CIK, no facts ≤ now):
+            // terminal — it can never resolve, so it is safe to tombstone. No fallback.
+            status[ticker] = 'terminal';
+          }
         }
-        // else: PIT miss → fail-closed (no doc, scanner shows source:null). No fallback.
       }
     }
 
-    return out;
+    return { values, status };
   }
 
   /**
-   * One round-trip to fundamentals-api for the whole US slice. Returns the per-ticker payload map
-   * (`{ ticker: { <line items>, source, observation_ts, knowledge_ts } }`). NEVER throws: any
-   * transport error, non-2xx, timeout, or malformed body degrades to `{}` so the whole US slice
-   * fail-closes to "no fundamentals" — the screen must not break on a research-fundamentals service
-   * being down (and there is no Yahoo fallback to mask it).
+   * One round-trip to fundamentals-api for the whole US slice. NEVER throws. The result TAGS the seam
+   * HTTP outcome so the caller can tell an OUTAGE from an empty-but-valid body — the distinction the
+   * old flat-`{}` return collapsed (and the reason the QMJ refresh loop could not converge):
+   *   - `{ ok: true, payloads }`  — a 2xx, parseable response. `payloads` is the per-ticker map
+   *     (`{ ticker: { <line items>, source, observation_ts, knowledge_ts } }`); it may be EMPTY
+   *     (every US name a miss) — that is a definite "200, name absent", not an outage.
+   *   - `{ ok: false }`           — any non-2xx (incl. a cold-lake 503 or a future 403), timeout,
+   *     transport error, or malformed body: the slice's resolvability is unknown (retry next cycle).
+   * The screen must not break on a research-fundamentals service being down (and there is no Yahoo
+   * fallback to mask it), so a failure degrades to "no fundamentals" for the slice either way — but
+   * the caller now keeps the hit/terminal/outage distinction instead of treating both as `{}`.
    */
-  private async fetchPit(usNames: string[]): Promise<Record<string, PitPayload>> {
+  private async fetchPit(usNames: string[]): Promise<FetchPitResult> {
     const asOf = Date.now();
     const url = `${this.baseUrl.replace(/\/$/, '')}/internal/api/fundamentals-pit`
       + `?tickers=${encodeURIComponent(usNames.join(','))}&asOf=${asOf}`;
@@ -144,22 +178,29 @@ export class PitFundamentalsProvider implements FundamentalsProvider {
         signal: controller.signal,
       });
       // A cold lake answers 503; any non-2xx (incl. 403 if the route ever adds a caller allow-list)
-      // fail-closes the whole US slice rather than surfacing a broken screen.
+      // is an OUTAGE for the whole US slice (resolvability unknown), not a definite "name absent".
       if (!res.ok) {
         log.warn(`[fundamentals/pit] fundamentals-api ${res.status} — no fundamentals for ${usNames.length} US name(s) this refresh`);
-        return {};
+        return { ok: false };
       }
       const body = (await res.json()) as { fundamentals?: unknown };
       const fundamentals = body?.fundamentals;
-      // A structurally-malformed-but-JSON-valid payload also degrades to {} (don't trust the upstream
-      // shape never regresses) — exactly the strategy seam's "parse failure ⇒ {}" contract.
-      if (!fundamentals || typeof fundamentals !== 'object') return {};
-      return fundamentals as Record<string, PitPayload>;
+      // A structurally-malformed-but-JSON-valid payload is also treated as an OUTAGE (don't trust the
+      // upstream shape never regresses) — we cannot trust ANY per-name classification from it, so it
+      // must not tombstone names. An EMPTY-but-valid object, by contrast, is `ok` (every name absent).
+      if (!fundamentals || typeof fundamentals !== 'object') return { ok: false };
+      return { ok: true, payloads: fundamentals as Record<string, PitPayload> };
     } catch (err) {
       log.warn(`[fundamentals/pit] read failed (fail-closed, no fallback): ${err instanceof Error ? err.message : String(err)}`);
-      return {};
+      return { ok: false };
     } finally {
       clearTimeout(timer);
     }
   }
 }
+
+// The tagged outcome of one fundamentals-api round-trip — keeps "200 / name absent" (a terminal miss)
+// distinct from "couldn't reach / parse the seam" (a transient outage). See `fetchPit`.
+type FetchPitResult =
+  | { ok: true; payloads: Record<string, PitPayload> }
+  | { ok: false };
