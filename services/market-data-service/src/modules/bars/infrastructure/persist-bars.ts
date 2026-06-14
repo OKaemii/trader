@@ -80,6 +80,21 @@ export async function fetchFirstPrintCloses(
  * decision. Cosmetic skips never enter a transaction; only genuine revisions
  * (or first-prints) start a session + transaction. In steady state (Yahoo
  * doesn't revise), the cost is one `find` per call, zero writes.
+ *
+ * STORE INVERSION — KNOWN DEFECT (RC4 audit, card 218; NOT fixed in that card — its own follow-up).
+ * This writer is Mongo-PRIMARY: it always writes Mongo and writes Timescale only as a best-effort
+ * dual-write when DUAL_WRITE_BARS=true. But the live config is BARS_BACKEND=timescale +
+ * DUAL_WRITE_BARS=false, so EVERY consumer read (getBars / getRecentBarsForTickers / getDailyDepth
+ * / getBarAtOrBefore) dispatches to TIMESCALE while every write here lands in MONGO ONLY. The
+ * three-DB cutover flipped the READ backend (runbook step 6) and turned dual-write off (step 8) but
+ * the "final code drop" (step 9 — flip this writer to Timescale-primary) was never done, so the two
+ * sides are inverted. Today both stores happen to agree (the dual-write soak left them ~identical),
+ * which is why RC1's stream-publish revival works; but new Mongo-only writes will diverge from the
+ * Timescale read store over time (force-emit revisions already do). The fix is to make this writer
+ * dispatch on BARS_BACKEND (write Timescale-primary under `timescale`), at which point the five
+ * Mongo-direct coverage/read sites annotated "STORE NOTE (RC4 audit)" move to the dispatcher with
+ * it. Do that as one cohesive change (high blast radius — the single bar write path — needs its own
+ * review + live soak), in the safe window while both stores still agree.
  */
 export async function writeBarRevisions(
   db: Db,

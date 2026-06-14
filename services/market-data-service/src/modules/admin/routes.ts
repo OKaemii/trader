@@ -479,6 +479,12 @@ export function createAdminRouter(
   // Use this to clean up the existing duplicate intraday-snapshot rows that the buggy
   // insertMany loop persisted before the upsert switch. Also drops shared-bars Redis
   // cache entries for matching (ticker, interval) pairs.
+  //
+  // STORE NOTE (RC4 audit, card 218). This is a Mongo-targeted maintenance WRITE (deleteMany on
+  // the Mongo `ohlcv_bars` collection), not a bar read — correct as-is. It deliberately scopes to
+  // the Mongo collection (the legacy `timestamp` Date field filter is Mongo-shaped), so it must
+  // NOT be routed through the `BARS_BACKEND` dispatcher. A Timescale equivalent (truncate/delete on
+  // the hypertable) would be a separate operator tool if ever needed; out of scope here.
   r.post(
     '/admin/api/market-data/clear-cache',
     zValidator('json', MarketDataContracts.ClearCacheRequestSchema),
@@ -532,6 +538,16 @@ export function createAdminRouter(
   // `count` is unsuperseded rows (observation count); `revisions` is the total
   // bar_revisions_log entries for that ticker — operator dashboards use the ratio to
   // flag tickers Yahoo has been actively revising.
+  //
+  // STORE NOTE (RC4 audit, card 218). Reads Mongo `ohlcv_bars` + `bar_revisions_log` directly. This
+  // is correct TODAY: the bar writer (`writeBarRevisions`) is still Mongo-primary, so Mongo IS where
+  // 5m history + the revision log physically live (the post-wipe "Mongo is empty" premise no longer
+  // holds — the Mongo-primary poll re-populated it). This endpoint reports what is PERSISTED, and
+  // the persisted store is Mongo. The `bar_revisions_log` audit ledger is Mongo-only regardless of
+  // backend. When the writer flips to Timescale-primary (the follow-up card — see backfill.ts
+  // `planGapWindows` STORE NOTE), this count moves to the dispatched reader together with it, and
+  // the revision-log read stays whichever store the audit ledger then lives in. Until then, leaving
+  // it on Mongo keeps the operator's "what's persisted" view honest about the actual write store.
   r.get('/admin/api/market-data/coverage', async (c) => {
     const db = await getMongoDb();
     // ohlcv_bars / bar_revisions_log are keyed on the bare identity (symbol, market); group on it

@@ -135,6 +135,14 @@ async function backfillDailyOne(
  * Bootstrap check: the subset of tickers with INSUFFICIENT persisted daily history for a
  * long lookback. `minBars` defaults to 280 (≈ 12-1 momentum's 252 lookback + 21 skip + a
  * small buffer). Counts only the latest unsuperseded revision per (ticker, observation_ts).
+ *
+ * STORE NOTE (RC4 audit, card 218). Reads Mongo `ohlcv_bars` — correct: this gates the deep daily
+ * backfill, so it must read the store the daily series is WRITTEN to (Mongo, via the still-Mongo-
+ * primary `writeBarRevisions`), NOT the `BARS_BACKEND` read store. (The OOM-safe Timescale daily
+ * depth read is `getDailyDepth` / `GET /admin/api/market-data/daily-depth`, used to PROVE depth
+ * post-backfill — a read-side surface, distinct from this write-gating count.) Moves to dispatch
+ * with the writer flip — see backfill.ts `planGapWindows` STORE NOTE + the "writeBarRevisions
+ * Timescale-primary" follow-up card.
  */
 export async function tickersMissingDailyHistory(
   db: Db,
