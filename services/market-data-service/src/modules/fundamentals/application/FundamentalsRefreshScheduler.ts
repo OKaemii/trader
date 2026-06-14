@@ -53,17 +53,25 @@ export class FundamentalsRefreshScheduler {
       let nextMs = this.idleMs;
       try {
         const tickers = this.activeTickers();
-        const { stale, refreshed } = await this.cache.refreshStale(tickers);
+        // `refreshed` counts PROGRESS = real `hit` rows + `terminal` tombstones (a tombstone drains a
+        // name from the stale set, so it is progress). `outage` is names left to retry because the
+        // upstream was unreachable. The "made no progress" warning fires ONLY when nothing advanced AND
+        // ≥1 name was a genuine outage — an all-`terminal` residual is "done" (it just got tombstoned
+        // and converges to `stale === 0` next pass), NOT a perpetual warning. This is the fix for the
+        // `[fundamentals] refresh made no progress (32 stale)` loop on fail-closed / no-EDGAR names.
+        const { stale, refreshed, outage } = await this.cache.refreshStale(tickers);
         if (stale === 0) {
           nextMs = this.idleMs;
-        } else if (refreshed === 0) {
-          log.warn(`[fundamentals] refresh made no progress (${stale} stale; provider throttled?) — retrying in ${Math.round(this.retryMs / 60_000)}m`);
+        } else if (refreshed === 0 && outage > 0) {
+          log.warn(`[fundamentals] refresh made no progress (${stale} stale, ${outage} outage; provider unreachable?) — retrying in ${Math.round(this.retryMs / 60_000)}m`);
           nextMs = this.retryMs;
-        } else if (refreshed < stale) {
-          log.info(`[fundamentals] refreshed ${refreshed}/${stale}; ${stale - refreshed} still missing — continuing`);
+        } else if (outage > 0) {
+          // Some names advanced (hits and/or tombstones) but an outage subset remains — keep accreting.
+          log.info(`[fundamentals] refreshed ${refreshed}/${stale}; ${outage} outage still pending — continuing`);
           nextMs = this.progressMs;
         } else {
-          log.info(`[fundamentals] refreshed all ${refreshed} stale ticker(s) — idle`);
+          // No outage left: every stale name resolved to a hit or a tombstone — the set has converged.
+          log.info(`[fundamentals] refreshed all ${stale} stale ticker(s) (${refreshed} written/tombstoned) — idle`);
           nextMs = this.idleMs;
         }
       } catch (err) {
