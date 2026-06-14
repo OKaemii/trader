@@ -18,7 +18,7 @@ import { MongoInstrumentMeta } from '../universe/infrastructure/MongoInstrumentM
 import { fetchT212Instruments } from '../universe/infrastructure/t212-client.ts';
 import { tryIdentityOf, tickerOf } from '../../shared/identity.ts';
 import type { MarketDataProvider } from '../bars/infrastructure/providers/market-data-provider.ts';
-import { aggregateBars, getBars, getBarAtOrBefore, getDailyDepth, invalidateBars, type RangeKey } from '@trader/shared-bars';
+import { aggregateBars, getBars, getBarAtOrBefore, getDailyDepth, countAllBars, countRevisionsForTickers, getRevisionsForTicker, invalidateBars, type RangeKey } from '@trader/shared-bars';
 import { Trading212TickerAdapter } from '@trader/ticker-identity';
 import { backfillTickers, CACHE_INVALIDATED_TOPIC } from '../bars/infrastructure/backfill.ts';
 import { backfillDailyHistory } from '../bars/infrastructure/daily-history.ts';
@@ -537,47 +537,42 @@ export function createAdminRouter(
   // Returns { ticker: { count, revisions } } for every ticker with at least one 5m bar.
   // `count` is unsuperseded rows (observation count); `revisions` is the total
   // bar_revisions_log entries for that ticker — operator dashboards use the ratio to
-  // flag tickers Yahoo has been actively revising.
+  // flag tickers the provider has been actively revising.
   //
-  // STORE NOTE (RC4 audit, card 218). Reads Mongo `ohlcv_bars` + `bar_revisions_log` directly. This
-  // is correct TODAY: the bar writer (`writeBarRevisions`) is still Mongo-primary, so Mongo IS where
-  // 5m history + the revision log physically live (the post-wipe "Mongo is empty" premise no longer
-  // holds — the Mongo-primary poll re-populated it). This endpoint reports what is PERSISTED, and
-  // the persisted store is Mongo. The `bar_revisions_log` audit ledger is Mongo-only regardless of
-  // backend. When the writer flips to Timescale-primary (the follow-up card — see backfill.ts
-  // `planGapWindows` STORE NOTE), this count moves to the dispatched reader together with it, and
-  // the revision-log read stays whichever store the audit ledger then lives in. Until then, leaving
-  // it on Mongo keeps the operator's "what's persisted" view honest about the actual write store.
+  // STORE: both reads are `BARS_BACKEND`-dispatched (`countAllBars` over `bars`; `countRevisionsForTickers`
+  // over the revision ledger), so this "what's persisted" view reflects the store the writer writes to.
+  // The revision ledger lives in the SAME store as the bars writer writes it — Mongo `bar_revisions_log`
+  // on the mongo path, the Timescale `bar_revisions_log` hypertable on the timescale path — so post the
+  // writer flip the revisions column reads Timescale, not an empty Mongo ledger. The 5m count is bounded
+  // by the provider's ~60d 5m cap (75d window) for Timescale lock safety.
   r.get('/admin/api/market-data/coverage', async (c) => {
     const db = await getMongoDb();
-    // ohlcv_bars / bar_revisions_log are keyed on the bare identity (symbol, market); group on it
-    // and re-derive the T212 ticker for the operator-facing coverage map keys.
+    // Storage is keyed on the bare identity (symbol, market); the dispatched reads return Maps keyed
+    // `symbol|market`; re-derive the T212 ticker for the operator-facing coverage map keys.
     const adapter = new Trading212TickerAdapter();
-    const tickerOf = (id: { symbol: string; market: string }): string | null => {
-      try { return adapter.toT212({ symbol: id.symbol, market: id.market as 'US' | 'LSE' }); }
+    const tickerOf = (key: string): string | null => {
+      const [symbol, market] = key.split('|');
+      try { return adapter.toT212({ symbol: symbol ?? '', market: (market ?? '') as 'US' | 'LSE' }); }
       catch { return null; }
     };
-    const [obsAgg, revAgg] = await Promise.all([
-      db.collection(COLLECTIONS.OHLCV_BARS).aggregate([
-        { $match: { interval: '5m', is_superseded: false } },
-        { $group: { _id: { symbol: '$symbol', market: '$market' }, count: { $sum: 1 } } },
-      ]).toArray(),
-      db.collection(COLLECTIONS.BAR_REVISIONS_LOG).aggregate([
-        { $match: { interval: '5m', prior_hash: { $ne: null } } },  // skip first-prints
-        { $group: { _id: { symbol: '$symbol', market: '$market' }, revisions: { $sum: 1 } } },
-      ]).toArray(),
+    // 5m is provider-capped at ~60d; the 75d floor keeps the dispatched Timescale aggregate pruned to a
+    // bounded chunk slice while still counting every extant 5m bar.
+    const sinceMs = Date.now() - 75 * 24 * 60 * 60_000;
+    const [obsCounts, revCounts] = await Promise.all([
+      countAllBars(db, '5m', sinceMs),
+      countRevisionsForTickers(db, '5m'),
     ]);
     const coverage: Record<string, { count: number; revisions: number }> = {};
-    for (const row of obsAgg) {
-      const k = tickerOf(row._id as { symbol: string; market: string });
+    for (const [key, count] of obsCounts) {
+      const k = tickerOf(key);
       if (k === null) continue;
-      coverage[k] = { count: (row as Record<string, number>).count ?? 0, revisions: 0 };
+      coverage[k] = { count, revisions: 0 };
     }
-    for (const row of revAgg) {
-      const k = tickerOf(row._id as { symbol: string; market: string });
+    for (const [key, revisions] of revCounts) {
+      const k = tickerOf(key);
       if (k === null) continue;
-      if (coverage[k]) coverage[k].revisions = (row as Record<string, number>).revisions ?? 0;
-      else coverage[k] = { count: 0, revisions: (row as Record<string, number>).revisions ?? 0 };
+      if (coverage[k]) coverage[k].revisions = revisions;
+      else coverage[k] = { count: 0, revisions };
     }
     return c.json({ coverage });
   });
@@ -656,6 +651,9 @@ export function createAdminRouter(
   // Returns the per-(ticker, observation_ts) revision audit trail since the given
   // knowledge_ts. Drives the portal's revisions panel — operator looks here when a
   // bar value seems suspicious or when a `revision_zscore_anomaly` lands.
+  //
+  // STORE: dispatched via `getRevisionsForTicker`, so it reads the revision ledger the bars writer
+  // writes to — post the writer flip that is the Timescale `bar_revisions_log`, not an empty Mongo one.
   r.get('/admin/api/market-data/revisions/:ticker', async (c) => {
     const ticker = c.req.param('ticker');
     const sinceRaw = c.req.query('since');
@@ -665,17 +663,13 @@ export function createAdminRouter(
     if (!Number.isFinite(since) || since < 0) {
       return c.json({ error: 'since must be a non-negative integer (UTC ms)' }, 400);
     }
-    // bar_revisions_log is keyed on the bare identity (symbol, market); split the T212 path param.
+    // The ledger is keyed on the bare identity (symbol, market); split the T212 path param.
     // A malformed/non-US-LSE ticker is a client error (400), not a 500.
     let symbol: string, market: string;
     try { ({ symbol, market } = new Trading212TickerAdapter().fromT212(ticker)); }
     catch { return c.json({ error: `unrecognised ticker: ${ticker}` }, 400); }
     const db = await getMongoDb();
-    const rows = await db.collection(COLLECTIONS.BAR_REVISIONS_LOG)
-      .find({ symbol, market, knowledge_ts: { $gte: since } })
-      .sort({ knowledge_ts: -1 })
-      .limit(limit)
-      .toArray();
+    const rows = await getRevisionsForTicker(db, symbol, market, since, limit);
     return c.json({ ticker, since, count: rows.length, revisions: rows });
   });
 
