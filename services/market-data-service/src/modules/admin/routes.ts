@@ -560,7 +560,11 @@ export function createAdminRouter(
     const sinceMs = Date.now() - 75 * 24 * 60 * 60_000;
     const [obsCounts, revCounts] = await Promise.all([
       countAllBars(db, '5m', sinceMs),
-      countRevisionsForTickers(db, '5m'),
+      // Same 75d floor: bar_revisions_log is an observation_ts-partitioned hypertable, so an
+      // un-windowed count locks every chunk of the deep ledger → 53200. The floor bounds the PG
+      // window-walk to a single ~75d window for the 5m series (the daily backfill writes first-print
+      // rows back to the 1990s, hence the OOM without a bound).
+      countRevisionsForTickers(db, '5m', sinceMs),
     ]);
     const coverage: Record<string, { count: number; revisions: number }> = {};
     for (const [key, count] of obsCounts) {

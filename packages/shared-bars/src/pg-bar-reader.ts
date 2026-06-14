@@ -215,6 +215,14 @@ const OBSERVED_WALK_WINDOW_MS = 730 * 24 * 60 * 60 * 1000; // 2 years ≈ 104 7-
 // Same bounded-window size for the per-set count walk (countBarsForTickersPg) — keeps each windowed
 // count(*) plan under the lock budget regardless of how wide a `sinceMs` the caller passes.
 const COUNT_WALK_WINDOW_MS = 730 * 24 * 60 * 60 * 1000; // 2 years ≈ 104 7-day chunks per query.
+// Same bounded-window discipline for the `bar_revisions_log` ledger reads (countRevisionsForTickersPg /
+// getRevisionsForTickerPg). `bar_revisions_log` is ALSO a hypertable partitioned on `observation_ts`
+// (packages/shared-pg/sql/0012), and the deep-daily backfill writes a first-print row per bar back to
+// the 1990s, so the ledger spans hundreds-to-thousands of 7-day chunks — its low ROW count is
+// irrelevant, the lock fan is per-CHUNK. So any aggregate/scan over it without an `observation_ts`
+// bound locks every chunk → "out of shared memory" (the same 53200 the `bars` reads fight). These walk
+// `observation_ts` in bounded 2-year windows, exactly like the `bars` count/observed walks.
+const REVLOG_WALK_WINDOW_MS = 730 * 24 * 60 * 60 * 1000; // 2 years ≈ 104 7-day chunks per query.
 
 /**
  * Observed unsuperseded `observation_ts` values for ONE ticker within `[sinceMs, untilMs]`, from
@@ -384,63 +392,116 @@ export interface BarRevisionLogRow {
  * Per-(symbol, market) revision COUNT for `interval` from the Timescale `bar_revisions_log` ledger,
  * EXCLUDING first-prints (`prior_hash IS NOT NULL`) — the genuine-revisions count the `/coverage`
  * endpoint reports beside the bar count. The PG writer writes this ledger in the SAME transaction as
- * each bar supersede, so post-flip the revisions live here, not in Mongo. `bar_revisions_log` is a
- * small append-only ledger (one row per revision/first-print, NOT per bar) — its chunk count is tiny
- * relative to `bars`, so an interval-scoped scan is cheap; no window bound is needed for correctness or
- * lock safety here. Returns a Map keyed `${symbol}|${market}`.
+ * each bar supersede, so post-flip the revisions live here, not in Mongo. Returns a Map keyed
+ * `${symbol}|${market}`.
+ *
+ * OOM-safe by WALKING `[sinceMs, now]` in bounded ~2-year windows and summing per identity. The earlier
+ * "the ledger is small, no window bound needed" assumption was WRONG and shipped a live SQLSTATE 53200:
+ * `bar_revisions_log` is a hypertable partitioned on `observation_ts` (0012), and the deep-daily
+ * backfill writes a first-print row per bar back to the 1990s, so the ledger spans hundreds-to-thousands
+ * of 7-day chunks. ROW count is irrelevant — an un-windowed `GROUP BY` aggregate takes a lock on EVERY
+ * chunk at executor startup (the `interval` predicate can't chunk-exclude; chunks partition on
+ * `observation_ts`) → "out of shared memory". Each windowed query's `observation_ts >= lo AND < hi`
+ * prunes chunk-exclusion to that window's ~104 chunks (the getDailyDepthPg / countBarsForTickersPg
+ * pattern). `sinceMs` is the lower bound the caller passes (the `/coverage` 5m path passes a ~75d floor,
+ * so it is a single window); pass a deep floor for a daily-scoped count.
  */
 export async function countRevisionsForTickersPg(
   interval: BarInterval,
+  sinceMs: number = DEPTH_FLOOR_MS,
 ): Promise<Map<string, number>> {
   const out = new Map<string, number>();
   const pool = getPgPool();
-  const { rows } = await pool.query<{ symbol: string; market: string; n: string }>(
-    `SELECT symbol, market, count(*)::bigint AS n
-       FROM bar_revisions_log
-      WHERE interval = $1
-        AND prior_hash IS NOT NULL
-      GROUP BY symbol, market`,
-    [interval],
-  );
-  for (const r of rows) out.set(`${r.symbol}|${r.market}`, Number(r.n));
+  const nowMs = Date.now();
+  // Walk forward in bounded windows so no single aggregate plan spans more chunks than one window
+  // holds. +DAY_MS on the final upper edge so the newest row's window is inclusive.
+  for (let lo = sinceMs; lo < nowMs; lo += REVLOG_WALK_WINDOW_MS) {
+    const hi = Math.min(lo + REVLOG_WALK_WINDOW_MS, nowMs + DAY_MS);
+    const { rows } = await pool.query<{ symbol: string; market: string; n: string }>(
+      `SELECT symbol, market, count(*)::bigint AS n
+         FROM bar_revisions_log
+        WHERE interval = $1
+          AND prior_hash IS NOT NULL
+          AND observation_ts >= $2
+          AND observation_ts < $3
+        GROUP BY symbol, market`,
+      [interval, lo, hi],
+    );
+    for (const r of rows) {
+      const k = `${r.symbol}|${r.market}`;
+      out.set(k, (out.get(k) ?? 0) + Number(r.n));
+    }
+  }
   return out;
 }
 
 /**
- * The bi-temporal revision audit trail for ONE ticker since a knowledge instant, newest-first, from
- * the Timescale `bar_revisions_log` ledger — the operator-facing `/revisions/:ticker` read, dispatched
- * so it reflects the store the writer now writes its audit log to. Bounded by `knowledge_ts >= since`
- * + `LIMIT`. Returns identity-keyed rows; the route re-derives the T212 ticker for display.
+ * The bi-temporal revision audit trail for ONE ticker since a knowledge instant, newest-first (by
+ * `knowledge_ts`), from the Timescale `bar_revisions_log` ledger — the operator-facing
+ * `/revisions/:ticker` read, dispatched so it reflects the store the writer now writes its audit log to.
+ * Returns up to `limit` identity-keyed rows with `knowledge_ts >= since`, ordered `knowledge_ts DESC`;
+ * the route re-derives the T212 ticker for display.
+ *
+ * OOM-safe by WALKING the `observation_ts` partition dimension in bounded ~2-year windows. The prior
+ * shape — a single `WHERE knowledge_ts >= $3 ORDER BY knowledge_ts DESC LIMIT $4` — shipped a live
+ * SQLSTATE 53200: `bar_revisions_log` is a hypertable partitioned on `observation_ts`, and a
+ * `knowledge_ts` predicate is NOT the partition key, so it prunes NO chunks — the planner opens (and
+ * locks) every chunk of the deep ledger (first-prints back to the 1990s from the deep-daily backfill)
+ * at executor startup → "out of shared memory". So the read walks `[floor, now]` on `observation_ts` in
+ * bounded windows (each query's `observation_ts >= lo AND < hi` prunes chunk-exclusion to ~104 chunks),
+ * accumulates the rows matching `knowledge_ts >= since`, then sorts by `knowledge_ts DESC` and takes
+ * `limit`. Walking the full bounded range (not early-stopping at the first window below `since`) is
+ * required for correctness: a LATE revision has a recent `knowledge_ts` but an old `observation_ts`, so
+ * a matching row can live in an old observation window. The floor defaults to the 1990 deep floor (the
+ * deepest a 35y backfill seeds); ~18 windows worst case — cheap for an operator audit, never a hot path.
  */
 export async function getRevisionsForTickerPg(
   symbol: string,
   market: string,
   since: number,
   limit: number,
+  floorMs: number = DEPTH_FLOOR_MS,
 ): Promise<BarRevisionLogRow[]> {
   const pool = getPgPool();
-  const { rows } = await pool.query<{
-    symbol: string; market: string; observation_ts: string; interval: string;
-    knowledge_ts: string; prior_hash: string | null; new_hash: string;
-  }>(
-    `SELECT symbol, market, observation_ts, interval, knowledge_ts, prior_hash, new_hash
-       FROM bar_revisions_log
-      WHERE symbol = $1
-        AND market = $2
-        AND knowledge_ts >= $3
-      ORDER BY knowledge_ts DESC
-      LIMIT $4`,
-    [symbol, market, since, limit],
-  );
-  return rows.map((r) => ({
-    symbol: r.symbol,
-    market: r.market,
-    observation_ts: Number(r.observation_ts),
-    interval: r.interval,
-    knowledge_ts: Number(r.knowledge_ts),
-    prior_hash: r.prior_hash,
-    new_hash: r.new_hash,
-  }));
+  const nowMs = Date.now();
+  const acc: BarRevisionLogRow[] = [];
+  // Walk observation windows over [floor, now]. Each window is bounded on BOTH observation_ts sides, so
+  // chunk-exclusion prunes to that window's chunks — never the whole ledger's lock table. Within a
+  // window we still apply `knowledge_ts >= since` (the operator's filter) + per-window LIMIT to cap the
+  // row volume returned, then merge-sort across windows below.
+  for (let lo = floorMs; lo < nowMs; lo += REVLOG_WALK_WINDOW_MS) {
+    const hi = Math.min(lo + REVLOG_WALK_WINDOW_MS, nowMs + DAY_MS);
+    const { rows } = await pool.query<{
+      symbol: string; market: string; observation_ts: string; interval: string;
+      knowledge_ts: string; prior_hash: string | null; new_hash: string;
+    }>(
+      `SELECT symbol, market, observation_ts, interval, knowledge_ts, prior_hash, new_hash
+         FROM bar_revisions_log
+        WHERE symbol = $1
+          AND market = $2
+          AND observation_ts >= $3
+          AND observation_ts < $4
+          AND knowledge_ts >= $5
+        ORDER BY knowledge_ts DESC
+        LIMIT $6`,
+      [symbol, market, lo, hi, since, limit],
+    );
+    for (const r of rows) {
+      acc.push({
+        symbol: r.symbol,
+        market: r.market,
+        observation_ts: Number(r.observation_ts),
+        interval: r.interval,
+        knowledge_ts: Number(r.knowledge_ts),
+        prior_hash: r.prior_hash,
+        new_hash: r.new_hash,
+      });
+    }
+  }
+  // Merge across windows: newest knowledge_ts first, then take `limit` (each window already capped at
+  // `limit`, so `acc` holds at most windows×limit rows — bounded; the global top-`limit` is the answer).
+  acc.sort((a, b) => b.knowledge_ts - a.knowledge_ts);
+  return acc.slice(0, limit);
 }
 
 interface CachedBar {
