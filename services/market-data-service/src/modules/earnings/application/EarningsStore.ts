@@ -9,17 +9,22 @@ import { tryIdentityOf, tryIdOf, idOf, tickerOf } from '../../../shared/identity
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 
-// NOTE: earnings_calendar is VESTIGIAL post-Yahoo-removal (Thread C / Task 20) — the wired provider
-// is StubEarningsProvider, which returns {} for every name, so refreshStale never writes a row and
-// the store stays empty. The (symbol, market) keying below is migrated for a future PIT-backed
-// earnings writer's sake; today every read returns nothing.
+// earnings_calendar is now fed by IrCalendarEarningsProvider (Pipeline B — analyst-free estimates
+// engine): future expected earnings dates scraped from company IR/press pages via Firecrawl, with a
+// per-date `source`/`confidence` (best-effort scraping — see the provider). `dividendDate` comes from
+// the EODHD corporate_actions dividends (injected into the provider), not scraped. A name with no
+// scraped date and no dividend is omitted by the provider, so the store accretes nothing for it and
+// overlap stays `within:false` — never a false flag. The (symbol, market) keying is the storage
+// shape (Task 16b); reads re-derive the T212 ticker.
 export interface EarningsDoc {
     _id: string;                 // '<symbol>:<market>' (the bare-identity composite key since Task 16b)
     symbol: string;              // bare exchange symbol
     market: string;              // 'US' | 'LSE'
     nextEarningsDate?: number;   // UTC ms
     dividendDate?: number;       // UTC ms
-    source: string;
+    source: string;              // per-date provenance (e.g. 'ir-calendar:investor.apple.com'); the
+                                 // provider's value wins, falling back to the store's source stamp.
+    confidence?: number;         // 0..1 source reliability for the next-earnings date (IR scraping)
     asOf: number;
     updatedAt: number;
 }
@@ -97,10 +102,13 @@ export class EarningsStore {
             if (!info) continue;            // unknown this pass — leave any prior doc untouched
             const identity = tryIdentityOf(ticker);
             if (identity === null) continue;
-            const set: Record<string, unknown> = { symbol: identity.symbol, market: identity.market, source: this.source, asOf: at, updatedAt: at };
+            // Per-date source wins (e.g. 'ir-calendar:investor.apple.com'); the store's coarse stamp
+            // is the fallback when the provider supplied a date without provenance.
+            const set: Record<string, unknown> = { symbol: identity.symbol, market: identity.market, source: info.source ?? this.source, asOf: at, updatedAt: at };
             const unset: Record<string, ''> = {};
             if (info.nextEarningsDate !== undefined) set.nextEarningsDate = info.nextEarningsDate; else unset.nextEarningsDate = '';
             if (info.dividendDate !== undefined) set.dividendDate = info.dividendDate; else unset.dividendDate = '';
+            if (info.confidence !== undefined) set.confidence = info.confidence; else unset.confidence = '';
             const update: Record<string, unknown> = { $set: set };
             if (Object.keys(unset).length > 0) update.$unset = unset;
             await coll.updateOne({ _id: idOf(identity) }, update, { upsert: true });

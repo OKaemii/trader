@@ -22,6 +22,7 @@ export function createEarningsRouter(store: EarningsStore, refresher: EarningsRe
                 nextEarningsDate: d.nextEarningsDate ?? null,
                 dividendDate: d.dividendDate ?? null,
                 source: d.source,
+                confidence: d.confidence ?? null,
             })),
         });
     });

@@ -40,6 +40,7 @@ import { StubAnalystEstimates } from './modules/fundamentals/infrastructure/Stub
 import { buildEarningsStore } from './modules/earnings/wiring.ts';
 import { EarningsRefreshScheduler } from './modules/earnings/application/EarningsRefreshScheduler.ts';
 import { createEarningsRouter } from './modules/earnings/routes.ts';
+import { nextDividendDateMs } from './modules/earnings/infrastructure/next-dividend.ts';
 import { buildCorporateActionsStore } from './modules/corporate-actions/wiring.ts';
 import { CorporateActionsRefreshScheduler } from './modules/corporate-actions/application/CorporateActionsRefreshScheduler.ts';
 import { CorporateActionsWatcher } from './modules/corporate-actions/application/CorporateActionsWatcher.ts';
@@ -733,18 +734,6 @@ const analystEstimates = new StubAnalystEstimates();
 app.route('/', createFundamentalsRouter(fundamentalsCache, universeManager, fundamentalsRefresher, analystEstimates));
 app.route('/', createScannerRouter(universeManager, fundamentalsCache));
 
-// Earnings/dividend calendar — earnings_calendar store (stubbed no-op provider per decision I; the
-// Yahoo source was dropped and no PIT source is wired yet) + the upcoming/overlap admin routes
-// backing the portal /calendar page and the dashboard "holding reports within 10 days" red flag.
-// With the stub the store stays empty, so overlap reports no flags. Refresher started in bootstrap().
-const earningsStore = buildEarningsStore(env.EARNINGS_PROVIDER, { requestSpacingMs: env.EARNINGS_REQUEST_SPACING_MS });
-const earningsRefresher = new EarningsRefreshScheduler(
-  earningsStore,
-  () => universeManager.activeTickers,
-  { idleMs: env.EARNINGS_REFRESH_IDLE_MS },
-);
-app.route('/', createEarningsRouter(earningsStore, earningsRefresher));
-
 // Corporate actions — corporate_actions store (EODHD Dividends + Splits, incremental sync §I) +
 // the admin corporate-actions list (History page) and the INTERNAL dividend-yield leg the strategy
 // factor host injects into HistoryView.fundamentals (the point-in-time, backfillable Value div-yield
@@ -781,6 +770,25 @@ app.route('/', createCorporateActionsRouter(corporateActionsStore, corporateActi
   const bar = await getBarAtOrBefore(redis as never, db, ticker, 'daily', { asOf: asOfMs });
   return bar ? closeAtOrBefore([bar], asOfMs) : null;
 }));
+
+// Earnings/dividend calendar — earnings_calendar store fed by IrCalendarEarningsProvider (Pipeline B):
+// future expected earnings dates scraped from company IR/press pages via Firecrawl; the dividend date
+// is injected from the corporate_actions feed above (decoupled pipelines — built after the
+// corporate-actions store so the dividend lookup can reference it). Backs the portal /calendar page +
+// the dashboard "holding reports within 10 days" red flag. Refresher started in bootstrap(). With
+// EARNINGS_PROVIDER=stub (or no Firecrawl URL) the store stays empty and overlap reports no flags.
+const earningsStore = buildEarningsStore(env.EARNINGS_PROVIDER, {
+  firecrawlBaseUrl: env.FIRECRAWL_BASE_URL,
+  requestSpacingMs: env.EARNINGS_REQUEST_SPACING_MS,
+  dividendDateLookup: async (ticker) =>
+    nextDividendDateMs((await corporateActionsStore.dividendsFor(ticker)).map((d) => d.date), Date.now()),
+});
+const earningsRefresher = new EarningsRefreshScheduler(
+  earningsStore,
+  () => universeManager.activeTickers,
+  { idleMs: env.EARNINGS_REFRESH_IDLE_MS },
+);
+app.route('/', createEarningsRouter(earningsStore, earningsRefresher));
 
 // News — `news` store (EODHD News feed, incremental sync §I) + the admin GET
 // /admin/api/market-data/news?ticker= that backs the Overview "Recent Events" panel + the

@@ -169,8 +169,12 @@ global:
     # from SEC's bulk zip then sweeps every `sweepMinutes` (above) — there is no nightly/heal CronJob, no
     # coverage cap, and no one-shot backfill Job. Coverage is the full companyfacts universe by
     # construction; the freshness audit is served by the harvester's status API.
-    # Earnings/dividend calendar source. yahoo (free calendarEvents) | eodhd (dormant — falls back to yahoo).
-    earningsProvider: yahoo
+    # Earnings/dividend calendar source. ir_calendar (default — future expected earnings dates scraped
+    # from company IR/press pages via Firecrawl, Pipeline B; dividend dates from corporate_actions) |
+    # stub (no dates — a Firecrawl-down fallback).
+    earningsProvider: ir_calendar
+    # Firecrawl scrape-stack base URL (homeserver) backing the ir_calendar earnings provider.
+    firecrawlBaseUrl: "http://192.168.50.2:3002"
     # Sector-rotation reference ETFs (comma-separated T212 tickers). Empty → built-in 11 SPDRs + SPY.
     # Tracked for the heatmap only — never added to the tradeable universe.
     sectorEtfTickers: ""
