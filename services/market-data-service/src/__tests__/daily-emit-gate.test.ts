@@ -11,15 +11,16 @@
 // later cycle is NOT blocked); bars present → emit + gate retained.
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { OHLCVBar } from '@trader/shared-types';
+import { Trading212TickerAdapter } from '@trader/ticker-identity';
+
+const adapter = new Trading212TickerAdapter();
 
 // Hoisted mutable state the mocks read (vi.mock factories are hoisted above imports).
-const h = vi.hoisted(() => ({ docs: [] as any[], xAdd: vi.fn(async () => {}) }));
+const h = vi.hoisted(() => ({ docs: [] as any[], xAdd: vi.fn(async () => {}), recentBars: vi.fn() }));
 
 vi.mock('@trader/shared-mongo', async (orig) => ({
   ...(await orig() as any),
-  getMongoDb: async () => ({
-    collection: () => ({ find: () => ({ toArray: async () => h.docs }) }),
-  }),
+  getMongoDb: async () => ({}),       // db handle is opaque here — the 5m read goes through the seam below
 }));
 vi.mock('@trader/shared-redis', async (orig) => ({
   ...(await orig() as any),
@@ -29,9 +30,14 @@ vi.mock('../modules/bars/infrastructure/persist-bars.ts', async (orig) => ({
   ...(await orig() as any),
   writeBarRevisions: async () => ({ attempted: 0, inserted: 0, revisions: 0, skipped: 0 }),
 }));
+// maybeEmitDailyAtClose now reads 5m bars through the BARS_BACKEND-dispatched set-reader, not a raw
+// Mongo find — so the test controls the bars via getRecentBarsForTickers. The mock returns OHLCVBar[]
+// built from h.docs exactly as the real reader does (T212 ticker re-derived), keying the gate-release
+// regression on what the dispatcher returns regardless of backend.
 vi.mock('@trader/shared-bars', async (orig) => ({
   ...(await orig() as any),
   invalidateBarsBulk: async () => {},
+  getRecentBarsForTickers: (...a: any[]) => h.recentBars(...a),
 }));
 // Force the market state emit-eligible without touching the real holiday-cache mongo path.
 vi.mock('@trader/shared-calendar', async (orig) => ({
@@ -61,15 +67,27 @@ function fakeRedis() {
   };
 }
 
-// ohlcv_bars docs are keyed on (symbol, market) now; maybeEmitDailyAtClose re-derives the T212
-// ticker from them. Build docs with the bare identity (the mongo find stub ignores the filter).
+// The set-reader returns fully-formed OHLCVBar[] with the T212 ticker re-derived from (symbol, market).
+// Build fixtures with the bare identity; the reader mock maps them to bars exactly as production does.
 function doc(symbol: string, market: 'US' | 'LSE', ts: number, close: number) {
   return { symbol, market, observation_ts: ts, interval: '5m', open: close, high: close, low: close, close, volume: 100 };
+}
+function docToBar(d: ReturnType<typeof doc>): OHLCVBar {
+  return {
+    ticker:         adapter.toT212({ symbol: d.symbol, market: d.market }),
+    observation_ts: d.observation_ts,
+    timestamp:      d.observation_ts,
+    interval:       '5m',
+    open:           d.open, high: d.high, low: d.low, close: d.close, volume: d.volume,
+  };
 }
 
 beforeEach(() => {
   h.docs = [];
   h.xAdd.mockClear();
+  // Default: the dispatched reader returns bars derived from h.docs (whichever the test set up).
+  h.recentBars.mockReset();
+  h.recentBars.mockImplementation(async () => h.docs.map(docToBar));
 });
 
 describe('maybeEmitDailyAtClose — gate release on empty (PR #152 regression)', () => {
@@ -120,5 +138,63 @@ describe('maybeEmitDailyAtClose — gate release on empty (PR #152 regression)',
     await maybeEmitDailyAtClose(redis as any, { US: ['AAPL_US_EQ'], LSE: [] }, 4, ALL_STATES);
 
     expect(h.xAdd).not.toHaveBeenCalled();             // NX blocked the second emit
+  });
+});
+
+// RC1 core (this card): the emit MUST read 5m bars through the BARS_BACKEND dispatcher, never a raw
+// Mongo find. Under the live config (BARS_BACKEND=timescale, DUAL_WRITE_BARS=false) the wipe left
+// Mongo ohlcv_bars empty, so a direct Mongo read returns 0 rows forever and market:raw:daily never
+// publishes — the strategy-starve bug. These tests pin that the dispatched reader is the read path
+// and that Timescale-sourced bars still publish even when the Mongo collection is empty/inert.
+describe('maybeEmitDailyAtClose — reads via the dispatched set-reader, publishes market:raw:daily (RC1)', () => {
+  it('with BARS_BACKEND=timescale: reads through getRecentBarsForTickers (not Mongo) and publishes', async () => {
+    const prev = process.env.BARS_BACKEND;
+    process.env.BARS_BACKEND = 'timescale';
+    try {
+      // Timescale holds Friday's 5m bars; Mongo ohlcv_bars is empty (the wipe). The reader returns the
+      // Timescale rows regardless — wire them as if read from Timescale.
+      const tsBars: OHLCVBar[] = [
+        doc('AAPL', 'US', UTC_MIDNIGHT + 14 * 3_600_000, 100),
+        doc('AAPL', 'US', UTC_MIDNIGHT + 14 * 3_600_000 + 60_000, 101),
+      ].map(docToBar);
+      h.recentBars.mockImplementation(async () => tsBars);
+      const redis = fakeRedis();
+
+      await maybeEmitDailyAtClose(redis as any, { US: ['AAPL_US_EQ'], LSE: [] }, 5, ALL_STATES);
+
+      // The dispatched reader was the 5m read path, queried with the day-bounded 5m set query.
+      expect(h.recentBars).toHaveBeenCalledTimes(1);
+      const [, , idsArg, queryArg] = h.recentBars.mock.calls[0]!;
+      expect(idsArg).toEqual([{ symbol: 'AAPL', market: 'US' }]);   // T212 split to the bare identity set
+      expect(queryArg).toEqual({ interval: '5m', sinceTs: UTC_MIDNIGHT });
+
+      // …and the Timescale-sourced bars published to market:raw:daily (one rolled-up daily bar).
+      expect(h.xAdd).toHaveBeenCalledTimes(1);
+      const [, stream, payload] = h.xAdd.mock.calls[0]!;
+      expect(stream).toBe('market:raw:daily');
+      expect(payload).toHaveLength(1);
+      expect(payload[0]).toMatchObject({ ticker: 'AAPL_US_EQ', interval: 'daily' });
+    } finally {
+      if (prev === undefined) delete process.env.BARS_BACKEND; else process.env.BARS_BACKEND = prev;
+    }
+  });
+
+  it('publishes from Timescale bars even when the Mongo ohlcv_bars collection is empty', async () => {
+    const prev = process.env.BARS_BACKEND;
+    process.env.BARS_BACKEND = 'timescale';
+    try {
+      // The reader (Timescale) returns bars; an empty Mongo collection would have starved the old
+      // direct read. The emit must still publish — proving the read no longer depends on Mongo.
+      h.recentBars.mockImplementation(async () => [doc('AAPL', 'US', UTC_MIDNIGHT + 14 * 3_600_000, 100)].map(docToBar));
+      const redis = fakeRedis();
+
+      await maybeEmitDailyAtClose(redis as any, { US: ['AAPL_US_EQ'], LSE: [] }, 6, ALL_STATES);
+
+      expect(h.xAdd).toHaveBeenCalledTimes(1);
+      expect(h.xAdd.mock.calls[0]![1]).toBe('market:raw:daily');
+      expect(redis.store.has(US_GATE)).toBe(true);     // emit succeeded → gate retained for the day
+    } finally {
+      if (prev === undefined) delete process.env.BARS_BACKEND; else process.env.BARS_BACKEND = prev;
+    }
   });
 });
