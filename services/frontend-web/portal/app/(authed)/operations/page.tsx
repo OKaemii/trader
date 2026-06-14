@@ -13,8 +13,11 @@ import { FundamentalsTab } from './FundamentalsTab'
 // matching ?tab=. /operations/console is a separate workspace (Build) and stays its own route. The
 // Market Data tab (relocated here from Research) is the OPERATIONAL poll-config / session-calendar /
 // holiday-feed admin — a run-the-platform concern; /market-data + /market-data/calendar redirect here.
-// The PIT Fundamentals tab (card 134) is the operator surface over the fundamentals-ingestion
-// write-side — monitor coverage/lag/quarantine/feed-health, force a backfill, edit the EDGAR UA.
+// The PIT Fundamentals tab is the operator surface over the fundamentals-HARVESTER (the per-CIK
+// Parquet lake's write path; the retired Timescale ingestion service is gone) — monitor lake coverage,
+// bootstrap/sweep state, and per-name freshness, and force a sweep. There is NO quarantine panel (the
+// lake design fail-closed-omits a dirty fact at write time, never quarantines), NO backfill control,
+// and NO EDGAR-UA editor (the UA is a deploy-time env; the panel only reports whether it's set).
 const TABS = [
   { key: 'trade-audit', label: 'Trade Audit' },
   { key: 'reconciliation', label: 'Reconciliation' },
