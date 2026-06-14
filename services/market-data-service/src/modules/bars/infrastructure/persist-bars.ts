@@ -19,7 +19,7 @@ import { hashBarContent } from '@trader/shared-bars';
 import { Trading212TickerAdapter } from '@trader/ticker-identity';
 import type { BarInterval, OHLCVBar } from '@trader/shared-types';
 import { log } from '../../../logger.ts';
-import { writeBarRevisionsPg } from './pg-bar-writer.ts';
+import { writeBarRevisionsPg, fetchFirstPrintClosesPg } from './pg-bar-writer.ts';
 
 // Mongo bar docs are keyed on the bare identity (symbol, market), not the concatenated T212 ticker.
 // Bars carry OHLCVBar.ticker (the T212 form) during the Thread A transition; split it here at the
@@ -39,6 +39,14 @@ export interface WriteBarRevisionsStats {
  * Used by the validator to distinguish revisions (key present) from first-prints (key
  * absent), and to compute revision drift for the `revision_zscore_anomaly` audit.
  *
+ * Dispatched on `BARS_BACKEND` so it reads the SAME store the writer writes to: under
+ * `BARS_BACKEND=timescale` it delegates to the PG twin (`fetchFirstPrintClosesPg`) — otherwise it
+ * would read an empty Mongo `ohlcv_bars` post-flip, treat every revision as a first-print, and the
+ * validator's `revision_zscore_anomaly` audit + z-score-window revision isolation would silently go
+ * dark. The lookup is bounded to the incoming bars' specific (symbol, market, observation_ts) keys
+ * (today's bars), so no window/OOM concern. Returns the same `symbol|market|observation_ts` → close
+ * map on both backends.
+ *
  * Returns an empty map when input is empty. Tickers/observation_ts pairs with no prior
  * row are simply absent from the map — callers must treat that as "first-print".
  */
@@ -49,6 +57,9 @@ export async function fetchFirstPrintCloses(
 ): Promise<Map<string, number>> {
   const out = new Map<string, number>();
   if (bars.length === 0) return out;
+  if (barsBackend() === 'timescale') {
+    return fetchFirstPrintClosesPg(bars, interval);
+  }
   const coll = db.collection(COLLECTIONS.OHLCV_BARS);
   const keys = bars.map((b) => {
     const { symbol, market } = tickerAdapter.fromT212(b.ticker);

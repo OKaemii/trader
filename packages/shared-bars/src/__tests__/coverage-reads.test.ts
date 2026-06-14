@@ -314,6 +314,35 @@ describe.skipIf(!dockerAvailable)('dispatched coverage reads — Mongo↔pg pari
     expect(pgRevs.get('AAPL|US')).toBe(1);   // first-print excluded
   }, TEST_TIMEOUT_MS);
 
+  // The walked reads (count + observed) split a multi-year range into bounded 2-year windows. This pins
+  // that the windowing is EXACT — a fixture spanning >4 years (crossing two window boundaries) must
+  // return the same count + the same timestamp set as the Mongo single-query branch: no bar
+  // double-counted at a boundary, none dropped between windows.
+  it('count/observed walk EXACTLY matches Mongo across multiple window boundaries (no double-count, no gap)', async () => {
+    // 5 bars, one every ~13 months, spanning ~4.3 years back from a fixed recent anchor — guaranteed to
+    // straddle ≥2 of the 2-year walk windows.
+    const anchor = Date.parse(`${new Date(_now).toISOString().slice(0, 10)}T00:00:00.000Z`) - 7 * day;
+    const span = 13 * 30 * day;                       // ~13 months between bars
+    const obsList = [0, 1, 2, 3].map((i) => anchor - i * span);
+    const bars = obsList.map((ts) => makeBarsDoc('AAPL', 'US', ts, { interval: 'daily' }));
+    await seedBars(bars);
+    const sinceMs = anchor - 5 * 365 * day;            // 5-year window ⇒ ~3 walk windows
+
+    process.env.BARS_BACKEND = 'timescale';
+    const pgCount = await countBarsForTickers(undefined, [AAPL], 'daily', sinceMs);
+    const pgObs   = (await getObservedTimestamps(undefined, 'AAPL_US_EQ', 'daily', sinceMs, anchor + day)).sort((a, b) => a - b);
+
+    delete process.env.BARS_BACKEND;
+    const db = makeDb(bars);
+    const moCount = await countBarsForTickers(db, [AAPL], 'daily', sinceMs);
+    const moObs   = (await getObservedTimestamps(db, 'AAPL_US_EQ', 'daily', sinceMs, anchor + day)).sort((a, b) => a - b);
+
+    expect(pgCount.get('AAPL|US')).toBe(4);            // all four, each counted exactly once
+    expect(moCount.get('AAPL|US')).toBe(4);
+    expect(pgObs).toEqual(obsList.slice().sort((a, b) => a - b));
+    expect(pgObs).toEqual(moObs);                      // identical timestamp set across the boundary
+  }, TEST_TIMEOUT_MS);
+
   it('getRevisionsForTicker agrees across Mongo and pg (newest-first, cutoff, limit)', async () => {
     const revs = [
       makeRevDoc('AAPL', 'US', utcMidnight, 100, null),
@@ -407,6 +436,58 @@ describe.skipIf(!dockerAvailable)('countAllBars — many-chunk bounded-read (OOM
     const n = counts.get('AAPL|US') ?? 0;
     expect(n).toBeGreaterThan(0);
     expect(n).toBeLessThan(20);  // bounded — not the whole 2006→now series
+  }, TEST_TIMEOUT_MS);
+
+  // getObservedTimestamps is the planGapWindows seam. backfillDailyOne hands it the daily backfill's
+  // MULTI-YEAR range (now-5y..35y). A single query bounded only at the range edges still locks every
+  // chunk in that span → OOM; the read must WALK the range in bounded windows. These pin both halves.
+  it('a SINGLE observed-ts query over the multi-year backfill range exhausts the lock table — the regression', async () => {
+    const pool = getPgPool();
+    const sinceMs = Date.now() - 20 * 365 * day;  // a deep backfill-shaped lower bound (20y into 2006-now)
+    await expect(
+      pool.query(
+        `SELECT observation_ts FROM bars
+          WHERE symbol = $1 AND market = $2 AND interval = $3 AND is_superseded = FALSE
+            AND observation_ts >= $4 AND observation_ts <= $5`,
+        ['AAPL', 'US', 'daily', sinceMs, Date.now()],
+      ),
+    ).rejects.toMatchObject({ code: '53200' });
+  });
+
+  it('getObservedTimestamps WALKS the multi-year range and returns every day WITHOUT OOMing', async () => {
+    process.env.BARS_BACKEND = 'timescale';
+    const sinceMs = Date.now() - 20 * 365 * day;
+    const ts = await getObservedTimestamps(undefined, 'AAPL_US_EQ', 'daily', sinceMs, Date.now());
+    // The deep series is one bar/day from 2006 — a 20y window yields thousands of rows (the walk did
+    // NOT OOM and did NOT drop windows), and there are no duplicates across window boundaries.
+    expect(ts.length).toBeGreaterThan(3000);
+    expect(new Set(ts).size).toBe(ts.length);  // contiguous half-open windows ⇒ no double-count
+  }, TEST_TIMEOUT_MS);
+
+  // countBarsForTickers carries the same multi-year window on the DAILY bootstrap-coverage gate
+  // (tickersMissingDailyHistory passes a 3y sinceMs). It WALKS the range in bounded windows so the
+  // count stays under the lock budget regardless of how wide the caller's window is (the same
+  // defensive bound as the observed-ts walk and getDailyDepthPg). This pins that the walk is EXACT —
+  // it sums to the same total a direct bounded count returns (no bar double-counted at a window
+  // boundary, none dropped between windows), and never OOMs.
+  it('countBarsForTickers WALKS the 3-year window: exact total, no OOM', async () => {
+    const pool = getPgPool();
+    const sinceMs = Date.now() - 3 * 365 * day;
+    // The direct bounded count for the same range (the ground truth the walk must reproduce). At this
+    // ~156-chunk / 16-lock scale the single count happens to stay under budget — that's fine; the walk's
+    // job is to stay safe at ANY width while returning this exact number.
+    const { rows } = await pool.query<{ n: string }>(
+      `SELECT count(*)::bigint AS n FROM bars
+        WHERE symbol = $1 AND market = $2 AND interval = $3 AND is_superseded = FALSE
+          AND observation_ts >= $4`,
+      ['AAPL', 'US', 'daily', sinceMs],
+    );
+    const direct = Number(rows[0]?.n ?? 0);
+    expect(direct).toBeGreaterThan(900);  // sanity: the 3y deep series really has ~1090 bars
+
+    process.env.BARS_BACKEND = 'timescale';
+    const counts = await countBarsForTickers(undefined, [AAPL], 'daily', sinceMs);
+    expect(counts.get('AAPL|US')).toBe(direct);  // the walk EXACTLY equals the direct count
   }, TEST_TIMEOUT_MS);
 });
 

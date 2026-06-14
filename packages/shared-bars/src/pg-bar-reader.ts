@@ -204,15 +204,27 @@ export async function getRecentBarsForTickersPg(
   return rows.map(rowToBar);
 }
 
+// Window size for the observed-ts walk. The gap planner hands ranges as wide as the daily backfill's
+// 5y default (or the 35y deep-backfill) — and a SINGLE query bounded only at the range edges still
+// opens (and locks) EVERY 7-day chunk in that multi-year span at executor startup → "out of shared
+// memory" (the range='max' lock-fan; the OOM-safe rule is "prune to a SMALL slice", not just "have a
+// bound"). So the read walks the requested range in bounded ~2-year windows — each query's
+// `observation_ts >= lo AND < hi` prunes chunk-exclusion to that window's ~104 chunks — exactly the
+// getDailyDepthPg pattern. A 60d 5m range is a single window; a 35y daily range is ~18.
+const OBSERVED_WALK_WINDOW_MS = 730 * 24 * 60 * 60 * 1000; // 2 years ≈ 104 7-day chunks per query.
+// Same bounded-window size for the per-set count walk (countBarsForTickersPg) — keeps each windowed
+// count(*) plan under the lock budget regardless of how wide a `sinceMs` the caller passes.
+const COUNT_WALK_WINDOW_MS = 730 * 24 * 60 * 60 * 1000; // 2 years ≈ 104 7-day chunks per query.
+
 /**
- * Observed unsuperseded `observation_ts` values for ONE ticker within a bounded `[sinceMs, untilMs]`
- * window, from Timescale. The set-of-timestamps the gap-aware fetch planner (`planGapWindows`) diffs
- * against the step grid to find the windows it must re-fetch. Bounded on BOTH sides of the time
- * dimension by the caller's window, so chunk-exclusion prunes the plan to that window's chunks — the
- * same OOM-safe rule as every other Timescale read here (an unbounded `observation_ts` read of a deep
- * daily series would lock every chunk → "out of shared memory"). Live (`is_superseded = FALSE`) rows
- * only — the same fast lane the gap planner's Mongo branch reads. Returns the raw `observation_ts`
- * numbers (no row mapping — the planner only needs the timestamps).
+ * Observed unsuperseded `observation_ts` values for ONE ticker within `[sinceMs, untilMs]`, from
+ * Timescale. The set-of-timestamps the gap-aware fetch planner (`planGapWindows`) diffs against the
+ * step grid to find the windows it must re-fetch. The range is WALKED in bounded ~2-year windows so no
+ * single query plan spans more chunks than one window holds — the OOM-safe rule (a single query over
+ * the daily backfill's multi-year range would lock every chunk → "out of shared memory"; see
+ * OBSERVED_WALK_WINDOW_MS). Live (`is_superseded = FALSE`) rows only — the same fast lane the gap
+ * planner's Mongo branch reads. Returns the raw `observation_ts` numbers (no row mapping — the planner
+ * only needs the timestamps), accumulated across windows.
  */
 export async function getObservedTimestampsPg(
   ticker: string,
@@ -220,36 +232,45 @@ export async function getObservedTimestampsPg(
   sinceMs: number,
   untilMs: number,
 ): Promise<number[]> {
+  if (untilMs < sinceMs) return [];
   const pool = getPgPool();
   const { symbol, market } = identityOf(ticker);
-  const { rows } = await pool.query<{ observation_ts: string }>(
-    `SELECT observation_ts
-       FROM bars
-      WHERE symbol = $1
-        AND market = $2
-        AND interval = $3
-        AND is_superseded = FALSE
-        AND observation_ts >= $4
-        AND observation_ts <= $5`,
-    [symbol, market, interval, sinceMs, untilMs],
-  );
-  return rows.map((r) => Number(r.observation_ts));
+  const out: number[] = [];
+  // Walk [sinceMs, untilMs] in bounded windows. Each query is bounded on BOTH sides of the time
+  // dimension, so the planner prunes to that window's chunks — never the whole multi-year range.
+  for (let lo = sinceMs; lo <= untilMs; lo += OBSERVED_WALK_WINDOW_MS) {
+    const hi = Math.min(lo + OBSERVED_WALK_WINDOW_MS - 1, untilMs); // inclusive upper edge per window
+    const { rows } = await pool.query<{ observation_ts: string }>(
+      `SELECT observation_ts
+         FROM bars
+        WHERE symbol = $1
+          AND market = $2
+          AND interval = $3
+          AND is_superseded = FALSE
+          AND observation_ts >= $4
+          AND observation_ts <= $5`,
+      [symbol, market, interval, lo, hi],
+    );
+    for (const r of rows) out.push(Number(r.observation_ts));
+  }
+  return out;
 }
 
 /**
- * Unsuperseded `interval` bar COUNT per (symbol, market) identity in a SET, from Timescale, bounded
- * below by `sinceMs`. Backs the bootstrap "does this ticker have ≥N bars?" checks
- * (`tickersMissingHistory` / `tickersMissingDailyHistory`) and the `/coverage` count — exactly the
- * counts the Mongo `$group({$sum:1})` aggregations produced, now dispatched so the write store and the
- * coverage read agree post-flip. Returns a Map keyed `${symbol}|${market}` (only names with ≥1 row in
- * the window appear; absent ⇒ count 0).
+ * Unsuperseded `interval` bar COUNT per (symbol, market) identity in a SET, from Timescale, over
+ * `[sinceMs, now]`. Backs the bootstrap "does this ticker have ≥N bars?" checks
+ * (`tickersMissingHistory` / `tickersMissingDailyHistory`) and is the per-set count behind `/coverage`.
+ * Returns a Map keyed `${symbol}|${market}` (only names with ≥1 row in the window appear; absent ⇒ 0).
  *
- * `sinceMs` is the load-bearing OOM-safe bound: an UNBOUNDED `count(*)` over a deep daily hypertable
- * locks every chunk → "out of shared memory" (the same fan the depth-check walks windows to avoid).
- * Callers pass a window wide enough to cover the `minBars` threshold but far short of the whole
- * hypertable (5m: ~the 60d provider cap; daily: a few years — comfortably more than the ~280-bar
- * threshold needs). The `(symbol, market, interval, observation_ts DESC) WHERE is_superseded = FALSE`
- * partial index (`bars_asof_lookup`) backs the scan.
+ * OOM-safe by WALKING `[sinceMs, now]` in bounded ~2-year windows and summing per identity — a
+ * `sinceMs`-only lower bound is NOT enough on its own: the daily threshold needs ≥~400 days of window
+ * (to fit the ~280-bar `minBars`), and the daily-backfill gate passes a multi-year `sinceMs`, so a
+ * single `count(*) … observation_ts >= sinceMs` would still open (and lock) every chunk back to the
+ * floor → "out of shared memory" (the default max_locks_per_transaction is 64; a 3y span is ~156
+ * chunks). Each windowed query's `observation_ts >= lo AND < hi` prunes chunk-exclusion to ~104 chunks
+ * (the getDailyDepthPg pattern). A 5m 75d call is a single window; a daily 3y call is ~2. The
+ * `(symbol, market, interval, observation_ts DESC) WHERE is_superseded = FALSE` partial index
+ * (`bars_asof_lookup`) backs each window scan.
  */
 export async function countBarsForTickersPg(
   ids: ReadonlyArray<TickerIdentity>,
@@ -261,19 +282,29 @@ export async function countBarsForTickersPg(
   const pool = getPgPool();
   const symbols = ids.map((id) => id.symbol);
   const markets = ids.map((id) => id.market);
-  const { rows } = await pool.query<{ symbol: string; market: string; n: string }>(
-    `SELECT symbol, market, count(*)::bigint AS n
-       FROM bars
-      WHERE (symbol, market) IN (
-              SELECT unnest($1::text[]), unnest($2::text[])
-            )
-        AND interval = $3
-        AND is_superseded = FALSE
-        AND observation_ts >= $4
-      GROUP BY symbol, market`,
-    [symbols, markets, interval, sinceMs],
-  );
-  for (const r of rows) out.set(`${r.symbol}|${r.market}`, Number(r.n));
+  const nowMs = Date.now();
+  // Walk forward in bounded windows so no single aggregate plan spans more chunks than one window
+  // holds. +DAY_MS on the final upper edge so the newest bar's window is inclusive.
+  for (let lo = sinceMs; lo < nowMs; lo += COUNT_WALK_WINDOW_MS) {
+    const hi = Math.min(lo + COUNT_WALK_WINDOW_MS, nowMs + 24 * 60 * 60 * 1000);
+    const { rows } = await pool.query<{ symbol: string; market: string; n: string }>(
+      `SELECT symbol, market, count(*)::bigint AS n
+         FROM bars
+        WHERE (symbol, market) IN (
+                SELECT unnest($1::text[]), unnest($2::text[])
+              )
+          AND interval = $3
+          AND is_superseded = FALSE
+          AND observation_ts >= $4
+          AND observation_ts < $5
+        GROUP BY symbol, market`,
+      [symbols, markets, interval, lo, hi],
+    );
+    for (const r of rows) {
+      const key = `${r.symbol}|${r.market}`;
+      out.set(key, (out.get(key) ?? 0) + Number(r.n));
+    }
+  }
   return out;
 }
 
