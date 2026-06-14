@@ -12,8 +12,15 @@ import { TickerChip } from '@/components/TickerChip'
 
 interface Ratios { roe: number; debtToEquity: number; currentRatio: number }
 interface Row {
-  ticker: string; name: string; market: string; sector: string
+  // `ticker` is the runtime/wire T212 form (e.g. 'AAPL_US_EQ') — kept for the pie-membership match
+  // and the research-drawer canonical id. The DISPLAY identity is the bare `symbol` + `market` badge
+  // (RC5): the operator sees 'AAPL' / 'STAN', never the reconstructed suffix form.
+  ticker: string; symbol: string; name: string; market: string; sector: string
   marketCapGbp: number | null; ratios: Ratios | null; qualityPass: boolean | null
+  // RC3 by-design marker (Task 8 tombstone): true ⇒ the provider can never resolve this name (non-US
+  // fail-closed / no-EDGAR). Rendered as "no fundamentals (by design)", distinct from a pending `—`.
+  // null/false ⇒ a real or not-yet-fetched row.
+  unavailable: boolean | null
   // card 148: per-name fundamentals provenance — 'pit-edgar' | 'yahoo' | 'eodhd' | null
   // (null = not yet fetched). Tagged honestly by <FundamentalsSourceTag> in the row.
   source: string | null
@@ -21,7 +28,9 @@ interface Row {
 interface Snapshot { universeSize: number; qualityKnown: number; qualityPassCount: number; rows: Row[] }
 interface Health {
   eodhd: { callsUsedToday: number; dailyCallLimit: number }
-  fundamentals: { count: number; passing: number; oldestAsOf: number | null }
+  // Task 8 split: `covered` = real rows, `unavailable` = by-design tombstones, `count` = covered +
+  // unavailable. `covered`/`unavailable` are optional so a pre-Task-8 pod (no split) still renders.
+  fundamentals: { count: number; covered?: number; unavailable?: number; passing: number; oldestAsOf: number | null }
   feed: { date: string; usPulledToday: boolean; lsePulledToday: boolean }
   config: { universeSource: string; dailyHistoryProvider: string; fundamentalsProvider: string; minMarketCapGbp: number }
 }
@@ -113,7 +122,7 @@ export function ScannerPanel({
       switch (sortBy) {
         case 'cap':    return (b.marketCapGbp ?? 0) - (a.marketCapGbp ?? 0)
         case 'roe':    return (b.ratios?.roe ?? -Infinity) - (a.ratios?.roe ?? -Infinity)
-        case 'ticker': return a.ticker.localeCompare(b.ticker)
+        case 'ticker': return a.symbol.localeCompare(b.symbol)   // sort by the bare display symbol (RC5)
         case 'sector': return a.sector.localeCompare(b.sector)
       }
     }
@@ -160,7 +169,13 @@ export function ScannerPanel({
             <span title={SCREENER_FUND_TITLE}>
               Screener fundamentals — PIT (US) / Yahoo (other):{' '}
               <span className="text-gray-100">{health.config.fundamentalsProvider}</span>{' '}
-              ({health.fundamentals.count} cached / {health.fundamentals.passing} pass)
+              {/* Task 8 honesty split: show real `covered` rows + `passing`, and the by-design
+                  `unavailable` count separately so the tombstones don't read as a coverage gap.
+                  Falls back to the bare cached/pass shape on a pre-Task-8 pod (no split fields). */}
+              {health.fundamentals.covered != null
+                ? <>({health.fundamentals.covered} covered / {health.fundamentals.passing} pass
+                    {health.fundamentals.unavailable ? <>, {health.fundamentals.unavailable} by design</> : null})</>
+                : <>({health.fundamentals.count} cached / {health.fundamentals.passing} pass)</>}
             </span>
             <span>Min market cap: <span className="text-gray-100">{fmtCap(health.config.minMarketCapGbp)}</span></span>
             <span>Bulk EOD {health.feed.date}: US <span className={health.feed.usPulledToday ? 'text-emerald-400' : 'text-amber-300'}>{health.feed.usPulledToday ? '✓' : 'pending'}</span>, LSE <span className={health.feed.lsePulledToday ? 'text-emerald-400' : 'text-amber-300'}>{health.feed.lsePulledToday ? '✓' : 'pending'}</span></span>
@@ -237,10 +252,12 @@ export function ScannerPanel({
               {rows.map((r) => {
                 const held = pieTickers.has(r.ticker)
                 return (
-                  <tr key={r.ticker} className={`hover:bg-gray-900/50 ${held ? 'bg-emerald-950/20' : ''}`}>
+                  <tr key={`${r.symbol}:${r.market}`} className={`hover:bg-gray-900/50 ${held ? 'bg-emerald-950/20' : ''}`}>
                     <td className="px-3 py-1.5 font-mono text-gray-100">
                       {held && <span title="In the selected basket" className="mr-1 text-emerald-400">●</span>}
-                      <TickerChip symbol={r.ticker} />
+                      {/* Display the BARE symbol (RC5); the chip still opens the canonical T212 id so
+                          the research drawer resolves the instrument unchanged. */}
+                      <TickerChip symbol={r.ticker}>{r.symbol}</TickerChip>
                     </td>
                     <td className="px-3 py-1.5 text-gray-400" title={r.name}>{truncate(r.name, 30)}</td>
                     <td className="px-3 py-1.5"><MarketBadge market={(r.market === 'US' || r.market === 'LSE') ? r.market : 'OTHER'} /></td>
@@ -251,11 +268,7 @@ export function ScannerPanel({
                     <td className="px-3 py-1.5 text-right">{r.ratios ? r.ratios.debtToEquity.toFixed(2) : '—'}</td>
                     <td className="px-3 py-1.5 text-right">{r.ratios ? r.ratios.currentRatio.toFixed(2) : '—'}</td>
                     <td className="px-3 py-1.5 text-center" title={QMJ_TITLE}>
-                      {r.qualityPass === null
-                        ? <span className="text-gray-600">—</span>
-                        : r.qualityPass
-                          ? <span className="text-emerald-400">PASS</span>
-                          : <span className="text-red-400">FAIL</span>}
+                      <QualityCell qualityPass={r.qualityPass} unavailable={r.unavailable} />
                     </td>
                   </tr>
                 )
@@ -283,6 +296,25 @@ function Tile({ label, value, accent }: { label: string; value: number; accent?:
       <div className={`mt-1 font-mono text-2xl ${color}`}>{value}</div>
     </div>
   )
+}
+
+// QMJ quality cell with the RC3 by-design state. Three distinct renders, in priority order:
+//   • unavailable (Task 8 tombstone) → "by design" — the name CAN NEVER have fundamentals (non-US
+//     fail-closed / no-EDGAR). Honest + visually distinct from a pending dash, so the operator reads
+//     "expected, not a failure" rather than "broken coverage".
+//   • qualityPass null → `—` — a covered name whose fundamentals just aren't fetched YET (transient).
+//   • PASS / FAIL → the real QMJ screen result.
+const BY_DESIGN_TITLE =
+  'No fundamentals by design — a non-US (fail-closed) or no-EDGAR name the PIT source can never ' +
+  'resolve. Not a coverage gap and not an error: it is intentionally excluded from the QMJ screen.'
+function QualityCell({ qualityPass, unavailable }: { qualityPass: boolean | null; unavailable: boolean | null }) {
+  if (unavailable === true) {
+    return <span className="text-amber-300/80" title={BY_DESIGN_TITLE}>by design</span>
+  }
+  if (qualityPass === null) return <span className="text-gray-600" title="Fundamentals not yet fetched">—</span>
+  return qualityPass
+    ? <span className="text-emerald-400">PASS</span>
+    : <span className="text-red-400">FAIL</span>
 }
 
 function truncate(s: string, n: number): string {

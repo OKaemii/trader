@@ -42,6 +42,10 @@ interface FundamentalsResponse {
   marketCapGbp: number | null
   asOf: number | null
   source: string | null
+  // RC3 by-design marker (Task 8 tombstone): true ⇒ the PIT source can never resolve this name
+  // (non-US fail-closed / no-EDGAR). Rendered as an honest "no fundamentals (by design)" state,
+  // distinct from a covered-but-not-yet-fetched name (which a refresh WOULD populate).
+  unavailable: boolean | null
 }
 // From /admin/api/market-data/corporate-actions (Task 14 release notes).
 interface StoredDividend {
@@ -142,6 +146,10 @@ export async function FundamentalsTab({ symbol }: { symbol: string }) {
   // the trailing-12m payout per share (the honest, source-only figure) and the history table rather
   // than fabricating a yield from a stale price.
   const haveFundamentals = !!raw && (raw.totalEquity !== 0 || raw.marketCapGbp !== 0)
+  // RC3: a by-design tombstone (non-US fail-closed / no-EDGAR) can NEVER have fundamentals, so it gets
+  // an honest, distinct state — not the generic "not yet cached, try a refresh" copy (a refresh would
+  // never populate it). Takes priority over `haveFundamentals` (a tombstone has null `raw`).
+  const byDesign = fund?.unavailable === true
 
   return (
     <div className="space-y-4">
@@ -158,7 +166,16 @@ export async function FundamentalsTab({ symbol }: { symbol: string }) {
         ) : null}
       </div>
 
-      {!haveFundamentals ? (
+      {byDesign ? (
+        <div className="rounded border border-amber-900/40 bg-amber-950/20 p-4 text-sm text-amber-200/80">
+          <span className="font-medium">No fundamentals (by design)</span> for{' '}
+          <span className="font-mono text-amber-200">{symbol}</span>. This is a non-US (fail-closed) or
+          no-EDGAR name the point-in-time SEC-EDGAR source can never resolve — there is no Yahoo
+          substitute — so it is intentionally excluded from the QMJ screen. Not a coverage gap and not
+          an error; a refresh will not populate it. Dividend history (below) is independent and may
+          still be present.
+        </div>
+      ) : !haveFundamentals ? (
         <div className="rounded border border-dashed border-gray-800 bg-gray-900/40 p-4 text-sm text-gray-500">
           No fundamentals snapshot cached for{' '}
           <span className="font-mono text-gray-400">{symbol}</span> yet. The QMJ refresher populates
