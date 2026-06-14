@@ -105,9 +105,19 @@ function dropClosureGaps(gaps: MissingRange[], bridgeMs: number): MissingRange[]
  * `dropClosureGaps`. Pass `0` to keep the raw grid math.
  *
  * Live (`is_superseded:false`) rows only — the same fast lane `coverageOf` and the live read
- * path use. Reads Mongo directly (matches where these backfills write + the default
- * `BARS_BACKEND=mongo`); if Timescale ever becomes the live bars store, coverage detection
- * must move with it.
+ * path use.
+ *
+ * STORE NOTE (RC4 audit, card 218). Reads Mongo `ohlcv_bars` directly — deliberately, and
+ * correctly. Coverage/gap detection MUST read the store the bars are WRITTEN to, not the
+ * `BARS_BACKEND` read store. `writeBarRevisions` (persist-bars.ts) is still Mongo-primary
+ * (Timescale only when `DUAL_WRITE_BARS=true`), so every backfill/poll/emit write lands in Mongo;
+ * a gap check against the (read-side) Timescale store would mis-detect coverage and re-fetch the
+ * whole universe each cycle. Flipping this site to the `BARS_BACKEND` dispatcher in ISOLATION
+ * would CAUSE a re-fetch storm, not fix one. The real defect is the writer/reader store inversion
+ * (live config is `BARS_BACKEND=timescale` + `DUAL_WRITE_BARS=false`, so reads dispatch to
+ * Timescale while writes stay Mongo); this read moves to dispatch ATOMICALLY with the writer flip
+ * — see the follow-up card "writeBarRevisions Timescale-primary". Until then, Mongo IS the write
+ * store and reading it here is the consistent choice.
  */
 export async function planGapWindows(
   db: Db,
@@ -248,6 +258,11 @@ async function backfillOne(
  * the strategy's 60-bar 15m rolling window plus the regime engine's 126-cycle
  * prewarm at intraday cadence). Override per call when bootstrapping a different
  * mode.
+ *
+ * STORE NOTE (RC4 audit, card 218). Reads Mongo `ohlcv_bars` — correct: this gates a backfill, so
+ * it must read the store the bars are WRITTEN to (Mongo, via the still-Mongo-primary
+ * `writeBarRevisions`), NOT the `BARS_BACKEND` read store. Moves to dispatch with the writer flip
+ * — see `planGapWindows` STORE NOTE + the "writeBarRevisions Timescale-primary" follow-up card.
  */
 export async function tickersMissingHistory(
   db: Db,
@@ -292,6 +307,13 @@ export async function tickersMissingHistory(
  * them" without grep-ing logs.
  *
  * Steady-state cost when nothing is gapped: one aggregation, zero Yahoo calls.
+ *
+ * STORE NOTE (RC4 audit, card 218). The latest-bar aggregation reads Mongo `ohlcv_bars` — correct:
+ * heal decides what to re-fetch, so it must read the store the bars are WRITTEN to (Mongo, via the
+ * still-Mongo-primary `writeBarRevisions`), NOT the `BARS_BACKEND` read store. A heal driven off a
+ * stale Timescale read would re-fetch the universe every cycle (credit blowout). Moves to dispatch
+ * with the writer flip — see `planGapWindows` STORE NOTE + the "writeBarRevisions Timescale-primary"
+ * follow-up card.
  */
 export async function healMissingHistory(
   db: Db,
@@ -370,7 +392,6 @@ export async function healMissingHistory(
       // see a non-contiguous series for this ticker until someone re-bootstraps from
       // a deeper-history source.
       unrecoverable++;
-      await collection.insertOne ? null : null;  // collection is OHLCV_BARS; use BAD_TICKS below
       try {
         await db.collection(COLLECTIONS.BAD_TICKS).insertOne({
           type: 'unrecoverable_gap',
