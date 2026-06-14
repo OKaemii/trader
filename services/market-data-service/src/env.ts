@@ -88,11 +88,16 @@ const EnvSchema = z.object({
     FUNDAMENTALS_REFRESH_RETRY_MS:    z.coerce.number().int().positive().default(20 * 60_000),
     FUNDAMENTALS_REFRESH_PROGRESS_MS: z.coerce.number().int().positive().default(2 * 60_000),
 
-    // Earnings/dividend calendar source ('yahoo' calendarEvents, free, default; 'eodhd' dormant).
-    // Weekly TTL in EarningsStore; the refresher re-checks staleness on the idle interval below.
-    EARNINGS_PROVIDER:               z.enum(["yahoo", "eodhd"]).default("yahoo"),
+    // Earnings/dividend calendar source. 'ir_calendar' (default) scrapes future expected earnings
+    // dates from company IR/press pages via Firecrawl (Pipeline B), dividend dates from
+    // corporate_actions; 'stub' returns no dates (a Firecrawl-down fallback). Weekly TTL in
+    // EarningsStore; the refresher re-checks staleness on the idle interval below.
+    EARNINGS_PROVIDER:               z.enum(["ir_calendar", "stub"]).default("ir_calendar"),
     EARNINGS_REQUEST_SPACING_MS:     z.coerce.number().int().nonnegative().default(500),
     EARNINGS_REFRESH_IDLE_MS:        z.coerce.number().int().positive().default(24 * 60 * 60_000),
+    // Firecrawl scrape-stack base URL (homeserver) — backs the ir_calendar earnings provider. Empty
+    // ⇒ the provider falls back to the no-op stub (it can only miss without a scrape stack).
+    FIRECRAWL_BASE_URL:              z.string().url().or(z.literal("")).default("http://192.168.50.2:3002"),
 
     // Corporate-actions (EODHD Dividends + Splits) incremental sync. The store re-checks a ticker no
     // more often than the TTL and fetches only events past its stored cursor (§I), so a current
