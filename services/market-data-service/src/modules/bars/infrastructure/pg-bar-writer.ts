@@ -62,6 +62,51 @@ export const WRITE_BATCH_SIZE = (() => {
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 250;
 })();
 
+// Anything with a `query` method — the pg Pool OR a checked-out PoolClient. The supersede helper runs
+// inside the writer's per-bar transaction, so it takes the same client (not the pool) to stay in-txn.
+type Queryable = { query: (text: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>>; rowCount: number | null }> };
+
+/**
+ * Resolve the `_timescaledb_internal._hyper_*_chunk` relation of the `bars` hypertable that holds a
+ * given `observation_ts`, or `null` when no chunk covers it (no row at that instant). Used by the
+ * supersede step to decompress-if-needed + UPDATE the ONE owning chunk directly instead of the parent
+ * hypertable (see the supersede block for the compression handling that pairs with this).
+ *
+ * WHY (the QA-FAILED defect-1 root cause): a plain `UPDATE bars … WHERE observation_ts = X` — with X a
+ * bind param OR an inlined literal OR a single-chunk range — locks EVERY chunk of the `bars` hypertable
+ * at planner/executor startup on TimescaleDB 2.17: the `ModifyTable` result-relation is the whole
+ * hypertable and DML chunk-exclusion does NOT prune it (verified — even `EXPLAIN UPDATE` errors 53200
+ * under a tight lock budget). Production has ~30 curated names with deep daily (back to 1991) + 5m
+ * chunks, so the hypertable's total chunk count overflows the shared lock table → "out of shared memory"
+ * / SQLSTATE 53200, and EVERY per-bar supersede (a re-emit of a UTC day is a revision for each name)
+ * fails + rolls back — the write silently does not land. Targeting the single owning chunk's underlying
+ * table updates exactly one relation, so the lock footprint is one chunk regardless of series depth.
+ *
+ * The chunk is resolved from `_timescaledb_catalog` (stable across the 2.x line): the dimension slice on
+ * the `observation_ts` dimension whose `[range_start, range_end)` brackets the value. `dropped = false`
+ * skips tombstoned chunks. A revision always has a prior live row, so its chunk exists; `null` is the
+ * defensive path (the caller then skips the supersede — a first-print never calls this).
+ */
+async function resolveBarsChunkFor(q: Queryable, observationTs: number): Promise<string | null> {
+  const { rows } = await q.query(
+    `SELECT format('%I.%I', c.schema_name, c.table_name) AS chunk
+       FROM _timescaledb_catalog.chunk c
+       JOIN _timescaledb_catalog.hypertable h       ON c.hypertable_id = h.id
+       JOIN _timescaledb_catalog.chunk_constraint cc ON cc.chunk_id = c.id
+       JOIN _timescaledb_catalog.dimension_slice ds  ON ds.id = cc.dimension_slice_id
+       JOIN _timescaledb_catalog.dimension d         ON d.id = ds.dimension_id AND d.hypertable_id = h.id
+      WHERE h.table_name = 'bars'
+        AND d.column_name = 'observation_ts'
+        AND $1 >= ds.range_start
+        AND $1 <  ds.range_end
+        AND c.dropped = false
+      LIMIT 1`,
+    [observationTs],
+  );
+  const chunk = rows[0]?.chunk;
+  return typeof chunk === 'string' ? chunk : null;
+}
+
 /**
  * Batch-fetch the *first-print* close per (ticker, observation_ts) for the incoming
  * bars. "First-print" = the row with the smallest `knowledge_ts` at that observation.
@@ -228,22 +273,46 @@ async function writeBatchPg(
       await client.query('BEGIN');
 
       if (isRevision) {
-        // Flip the prior latest row. The partial-unique index guarantees there's
-        // exactly one such row to flip. (A hypertable UPDATE inherently locks every
-        // chunk at plan time — TimescaleDB can't chunk-exclude DML — but that is a
-        // single bounded ~chunk-count lock set per revision, well within the production
-        // lock table; the lock-fan that overflowed it was the bulk-write LOOKUP above,
-        // which this fix bounds. Revisions are also rare on a deep series.)
-        await client.query(
-          `UPDATE bars
-              SET is_superseded = TRUE
-            WHERE symbol = $1
-              AND market = $2
-              AND observation_ts = $3
-              AND interval = $4
-              AND is_superseded = FALSE`,
-          [id.symbol, id.market, bar.observation_ts, interval],
-        );
+        // Flip the prior latest row by updating the ONE owning chunk directly — NOT the parent
+        // hypertable — after decompressing that chunk if needed. Two failure modes have to be dodged
+        // together (both reproduced on the deploy image timescale 2.17.2):
+        //   (a) A plain `UPDATE bars … WHERE observation_ts = …` locks EVERY chunk of the deep `bars`
+        //       hypertable: DML chunk-exclusion does not prune the ModifyTable result relation (bind
+        //       param, inlined literal, AND single-chunk range all OOM under a constrained lock budget,
+        //       even EXPLAIN UPDATE). On production's deep series (daily back to 1991 → ~1800 7-day
+        //       chunks × {table + 3 indexes + compressed internal rel} lock objects) this overflows the
+        //       shared lock table → SQLSTATE 53200, and EVERY per-bar supersede rolled back (the write
+        //       silently did not land — QA-FAILED defect 1, first pass).
+        //   (b) But `bars` has a 7-day compression policy (0012), so every chunk older than ~7d is
+        //       COMPRESSED — and a direct `UPDATE <chunk>` matches ZERO compressed rows, so the prior
+        //       row is NOT flipped and the subsequent revision INSERT then breaches bars_latest_unique
+        //       (two is_superseded=FALSE rows) → the txn rolls back, revision lost. (The hypertable-wide
+        //       UPDATE avoids this only because it auto-decompresses the segment — at the cost of the
+        //       all-chunk lock fan in (a).) Every corporate-action re-adjust + any re-emit/backfill of a
+        //       day >7d old hits a compressed chunk, so this is the common case, not an edge.
+        // The combined fix: resolve the ONE owning chunk, `decompress_chunk(…, if_compressed=>TRUE)` it
+        // (a no-op on a recent uncompressed chunk; bounded to that single chunk's lock footprint on a
+        // deep series — verified under a 16-lock budget with 1000+ compressed chunks), then UPDATE that
+        // chunk relation. The compression policy re-compresses it on its next run. A `null` chunk
+        // (impossible for a real revision — its prior live row exists, so the chunk exists) skips the
+        // supersede defensively rather than falling back to the hypertable-wide UPDATE that OOMs.
+        const chunk = await resolveBarsChunkFor(client, bar.observation_ts);
+        if (chunk) {
+          // `chunk` is a TimescaleDB-generated, `format('%I.%I')`-quoted internal relation name (never
+          // user input) — safe to interpolate; row-selecting values stay bind params.
+          // if_compressed=>TRUE ⇒ no error + no-op when the chunk is already decompressed (recent bars).
+          await client.query(`SELECT decompress_chunk('${chunk}', if_compressed => TRUE)`);
+          await client.query(
+            `UPDATE ${chunk}
+                SET is_superseded = TRUE
+              WHERE symbol = $1
+                AND market = $2
+                AND observation_ts = $3
+                AND interval = $4
+                AND is_superseded = FALSE`,
+            [id.symbol, id.market, bar.observation_ts, interval],
+          );
+        }
       }
 
       await client.query(

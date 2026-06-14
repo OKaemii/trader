@@ -288,12 +288,13 @@ describe.skipIf(!dockerAvailable)('writeBarRevisionsPg', () => {
 // (Verified: removing the sort/batch + literal lower/upper bound makes the lookup OOM
 // reappear inside writeBarRevisionsPg itself.)
 //
-// NOTE the supersede correctness test lives in its own DEFAULT-lock-budget block below: a
-// hypertable UPDATE inherently locks every chunk at PLAN time (TimescaleDB can't
-// chunk-exclude DML), so a single deep-history revision needs ~chunk-count lock slots — a
-// bounded set that fits production's lock table but NOT this artificially tiny one. The
-// tight budget here isolates the BULK-WRITE lookup lock-fan, which is the production bug;
-// revisions are bounded-per-row and rare on a deep series.
+// The supersede UPDATE is exercised under BOTH budgets: this tight-budget block pins that the
+// (fixed) literal-`observation_ts` UPDATE chunk-excludes to one chunk and lands even under 16 locks
+// (and that the OLD bind-param shape OOMs there) — the defect-1 regression; the DEFAULT-budget block
+// below additionally pins the full bi-temporal supersede SEMANTICS on a deep series. (The earlier
+// claim that "a hypertable UPDATE inherently locks every chunk, fine under production's table" was
+// wrong: a bind-param DML predicate prunes nothing, so it OOMed live; a LITERAL bound prunes to the
+// row's chunk. See the writer's supersede comment.)
 const OOM_MAX_LOCKS = 16;
 const OOM_MAX_CONNECTIONS = 10;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -418,17 +419,140 @@ describe.skipIf(!dockerAvailable)('writeBarRevisionsPg — bulk-write lock-table
       ),
     ).rejects.toMatchObject({ code: '53200' }); // 53200 = out_of_memory (shared lock table)
   }, TEST_TIMEOUT_MS);
+
+  // The supersede UPDATE OOM — the QA-FAILED defect 1. A plain `UPDATE bars … WHERE observation_ts=…`
+  // locks EVERY chunk of the deep `bars` hypertable on TimescaleDB 2.17: DML chunk-exclusion does NOT
+  // prune the ModifyTable result relation, so the predicate shape is irrelevant — a BIND PARAM, an
+  // inlined LITERAL, and a single-chunk RANGE were all verified to 53200 under this tight budget (even
+  // `EXPLAIN UPDATE` errors). In production (~30 curated names, deep daily back to 1991 + 5m chunks) the
+  // hypertable's total chunk count overflows the shared lock table, so every per-bar supersede (a re-
+  // emit of a UTC day is a revision per name) rolled back and the write silently did not land. The
+  // earlier "revisions are bounded-per-row, fine under production's lock table" assumption was WRONG.
+  // The fix targets the ONE owning chunk relation (resolveBarsChunkFor) and UPDATEs that directly, so
+  // the lock footprint is a single chunk regardless of series depth. These tests pin BOTH the OOM (the
+  // hypertable-wide shape) and the fix (the chunk-scoped writer path) under the SAME tight budget the
+  // bulk-write block uses — exactly where the prior supersede test (default budget) was blind (its
+  // 1068-chunk series happened to fit the default ~6400-slot lock table, hiding the bug).
+  it('a hypertable-wide supersede UPDATE exhausts the lock table on a deep series (reproduces defect 1)', async () => {
+    process.env.BARS_BACKEND = 'timescale';
+    // Seed a deep series (its own ticker — no TRUNCATE under the tiny budget) via the fixed writer.
+    const series = deepDailySeries('UPDOLD_US_EQ');
+    await writeBarRevisionsPg(series, 'daily');
+    const pool = getPgPool();
+    const reviseTs = START_2006 + 40 * DAY_MS; // a 2006 observation, deep in the series
+    const obsLiteral = BigInt(reviseTs).toString();
+    // Even a LITERAL observation_ts (the first attempted "fix") OOMs — DML on the parent hypertable
+    // can't chunk-exclude, so it locks every chunk → 53200. (Asserting the literal shape, not just the
+    // bind-param shape, so the regression captures "don't re-try the literal — go chunk-scoped".)
+    await expect(
+      pool.query(
+        `UPDATE bars SET is_superseded = TRUE
+          WHERE symbol = $1 AND market = $2 AND observation_ts = ${obsLiteral} AND interval = $3 AND is_superseded = FALSE`,
+        ['UPDOLD', 'US', 'daily'],
+      ),
+    ).rejects.toMatchObject({ code: '53200' });
+  }, TEST_TIMEOUT_MS);
+
+  it('writeBarRevisionsPg supersedes a deep-history bar in a COMPRESSED chunk under the tight budget (defect 1 fixed)', async () => {
+    process.env.BARS_BACKEND = 'timescale';
+    // Seed deep, then COMPRESS the chunk holding the bar we revise. This is the load-bearing part of the
+    // regression: `bars` has a 7-day compression policy (0012), so in production every chunk >7d old is
+    // compressed — and a direct `UPDATE <chunk>` matches ZERO compressed rows, leaving the prior row
+    // un-flipped so the revision INSERT breaches bars_latest_unique and the txn rolls back (revision
+    // lost). The first cut of this fix (chunk UPDATE without decompress) passed ONLY because the
+    // testcontainer never auto-compresses. Compressing the target chunk here reproduces production and
+    // proves the decompress-then-chunk-UPDATE path supersedes correctly — still under the 16-lock budget.
+    const series = deepDailySeries('UPDNEW_US_EQ', 10);
+    await writeBarRevisionsPg(series, 'daily', 1_700_000_000_000);
+    const reviseTs = START_2006 + 40 * DAY_MS;
+    const pool = getPgPool();
+    // Resolve + compress just the owning chunk (compressing all ~1068 would be needlessly slow; one is
+    // enough to reproduce — production compresses it via policy, the test does it explicitly).
+    const { rows: cr } = await pool.query<{ ch: string }>(
+      `SELECT format('%I.%I', c.schema_name, c.table_name) AS ch
+         FROM _timescaledb_catalog.chunk c
+         JOIN _timescaledb_catalog.hypertable h        ON c.hypertable_id = h.id
+         JOIN _timescaledb_catalog.chunk_constraint cc ON cc.chunk_id = c.id
+         JOIN _timescaledb_catalog.dimension_slice ds  ON ds.id = cc.dimension_slice_id
+         JOIN _timescaledb_catalog.dimension d         ON d.id = ds.dimension_id AND d.hypertable_id = h.id
+        WHERE h.table_name = 'bars' AND d.column_name = 'observation_ts'
+          AND $1 >= ds.range_start AND $1 < ds.range_end AND c.dropped = false
+        LIMIT 1`,
+      [reviseTs],
+    );
+    await pool.query(`SELECT compress_chunk('${cr[0]!.ch}', if_not_compressed => TRUE)`);
+    const { rows: comp } = await pool.query<{ is_compressed: boolean }>(
+      `SELECT is_compressed FROM timescaledb_information.chunks WHERE format('%I.%I', chunk_schema, chunk_name) = $1`,
+      [cr[0]!.ch],
+    );
+    expect(comp[0]!.is_compressed).toBe(true); // precondition: the revised bar sits in a compressed chunk
+
+    const revised = bar('UPDNEW_US_EQ', reviseTs, 11, { interval: 'daily', timestamp: reviseTs });
+    const stats = await writeBarRevisionsPg([revised], 'daily', 1_700_000_002_000);
+    expect(stats.inserted).toBe(1);
+    expect(stats.revisions).toBe(1);
+    // Exactly one live row at that observation, and it's the revision (close 11) — the prior is flipped
+    // superseded (still present — bi-temporal, never overwritten). If the supersede had silently matched
+    // 0 rows (the compression bug), the INSERT would have thrown a unique violation and inserted=0.
+    const { rows: live } = await pool.query(
+      `SELECT close, is_superseded FROM bars
+        WHERE symbol='UPDNEW' AND market='US' AND observation_ts=$1 AND interval='daily' AND is_superseded=FALSE`,
+      [reviseTs],
+    );
+    expect(live).toHaveLength(1);
+    expect(Number(live[0].close)).toBe(11);
+    const { rows: all } = await pool.query(
+      `SELECT close, is_superseded FROM bars
+        WHERE symbol='UPDNEW' AND market='US' AND observation_ts=$1 AND interval='daily' ORDER BY knowledge_ts ASC`,
+      [reviseTs],
+    );
+    expect(all).toHaveLength(2);
+    expect(all[0]).toMatchObject({ is_superseded: true });
+    expect(Number(all[0]!.close)).toBe(10);
+    expect(all[1]).toMatchObject({ is_superseded: false });
+  }, TEST_TIMEOUT_MS);
+
+  it('a direct chunk UPDATE matches ZERO rows on a COMPRESSED chunk — why decompress is required (defect 1, compression)', async () => {
+    process.env.BARS_BACKEND = 'timescale';
+    // The bug the chunk-scoped fix had to additionally solve: a direct `UPDATE <chunk>` is invisible to
+    // compressed rows. Seed one bar in its own ticker, compress its chunk, and assert the bare chunk
+    // UPDATE flips nothing (rowCount 0). The writer pairs decompress_chunk(if_compressed=>TRUE) before
+    // the UPDATE so the real supersede (tested above) lands; this isolates the failure the decompress
+    // prevents.
+    const pool = getPgPool();
+    const obsTs = START_2006 + 200 * DAY_MS;
+    await writeBarRevisionsPg([bar('ZCMP_US_EQ', obsTs, 10, { interval: 'daily', timestamp: obsTs })], 'daily');
+    const { rows: cr } = await pool.query<{ ch: string }>(
+      `SELECT format('%I.%I', c.schema_name, c.table_name) AS ch
+         FROM _timescaledb_catalog.chunk c
+         JOIN _timescaledb_catalog.hypertable h        ON c.hypertable_id = h.id
+         JOIN _timescaledb_catalog.chunk_constraint cc ON cc.chunk_id = c.id
+         JOIN _timescaledb_catalog.dimension_slice ds  ON ds.id = cc.dimension_slice_id
+         JOIN _timescaledb_catalog.dimension d         ON d.id = ds.dimension_id AND d.hypertable_id = h.id
+        WHERE h.table_name = 'bars' AND d.column_name = 'observation_ts'
+          AND $1 >= ds.range_start AND $1 < ds.range_end AND c.dropped = false
+        LIMIT 1`,
+      [obsTs],
+    );
+    await pool.query(`SELECT compress_chunk('${cr[0]!.ch}', if_not_compressed => TRUE)`);
+    const u = await pool.query(
+      `UPDATE ${cr[0]!.ch} SET is_superseded = TRUE
+        WHERE symbol='ZCMP' AND market='US' AND observation_ts=$1 AND interval='daily' AND is_superseded=FALSE`,
+      [obsTs],
+    );
+    expect(u.rowCount).toBe(0); // compressed rows are invisible to the bare chunk UPDATE — hence decompress
+  }, TEST_TIMEOUT_MS);
 });
 
 describe.skipIf(!dockerAvailable)('writeBarRevisionsPg — deep-series bi-temporal supersede (default lock budget)', () => {
   let container: StartedTestContainer;
 
   beforeAll(async () => {
-    // DEFAULT lock budget (no max_locks_per_transaction override): a hypertable UPDATE
-    // locks every chunk at plan time, so a deep-history revision needs ~chunk-count slots —
-    // fine under the default ~6400-slot table (production), impossible under the tight
-    // budget the bulk-write block uses. This block proves the batching fix keeps the
-    // supersede semantics correct on a deep, multi-chunk series.
+    // DEFAULT lock budget (no max_locks_per_transaction override). This block proves the full
+    // bi-temporal supersede SEMANTICS on a deep, multi-chunk series (the prior row flipped, the
+    // revision live, depth preserved). The lock-safety of the supersede UPDATE itself is pinned
+    // under the TIGHT budget in the bulk-write block above (the literal-`observation_ts` chunk
+    // exclusion) — that is the defect-1 regression; here we only assert correctness.
     container = await new GenericContainer('timescale/timescaledb:2.17.2-pg16')
       .withEnvironment({ POSTGRES_PASSWORD: 'test', POSTGRES_DB: 'trader_ts' })
       .withExposedPorts(5432)

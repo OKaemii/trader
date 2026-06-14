@@ -178,7 +178,7 @@ describe('dispatched coverage reads — Mongo branch', () => {
       makeRevDoc('AAPL', 'US', utcMidnight, utcMidnight + 3, 'prev2'),             // revision
       makeRevDoc('MSFT', 'US', utcMidnight, utcMidnight + 1, 'prev'),              // revision
     ];
-    const counts = await countRevisionsForTickers(makeDb([], revs), '5m');
+    const counts = await countRevisionsForTickers(makeDb([], revs), '5m', utcMidnight - day);
     expect(counts.get('AAPL|US')).toBe(2);
     expect(counts.get('MSFT|US')).toBe(1);
   });
@@ -202,7 +202,7 @@ describe('dispatched coverage reads — Mongo branch', () => {
     await expect(latestObservationForTickers(undefined, [AAPL], '5m', 0)).rejects.toThrow(/db parameter required/);
     await expect(countAllBars(undefined, '5m', 0)).rejects.toThrow(/db parameter required/);
     await expect(getObservedTimestamps(undefined, 'AAPL_US_EQ', '5m', 0, 1)).rejects.toThrow(/db parameter required/);
-    await expect(countRevisionsForTickers(undefined, '5m')).rejects.toThrow(/db parameter required/);
+    await expect(countRevisionsForTickers(undefined, '5m', 0)).rejects.toThrow(/db parameter required/);
     await expect(getRevisionsForTicker(undefined, 'AAPL', 'US', 0, 10)).rejects.toThrow(/db parameter required/);
   });
 
@@ -293,7 +293,7 @@ describe.skipIf(!dockerAvailable)('dispatched coverage reads — Mongo↔pg pari
     const pgCount = await countBarsForTickers(undefined, ids, '5m', sinceMs);
     const pgAll   = await countAllBars(undefined, '5m', sinceMs);
     const pgLatest = await latestObservationForTickers(undefined, ids, '5m', sinceMs);
-    const pgRevs  = await countRevisionsForTickers(undefined, '5m');
+    const pgRevs  = await countRevisionsForTickers(undefined, '5m', sinceMs);
 
     delete process.env.BARS_BACKEND;
     const db = makeDb(bars, revs);
@@ -301,7 +301,7 @@ describe.skipIf(!dockerAvailable)('dispatched coverage reads — Mongo↔pg pari
     const moCount = await countBarsForTickers(db, ids, '5m', sinceMs);
     const moAll   = await countAllBars(db, '5m', sinceMs);
     const moLatest = await latestObservationForTickers(db, ids, '5m', sinceMs);
-    const moRevs  = await countRevisionsForTickers(db, '5m');
+    const moRevs  = await countRevisionsForTickers(db, '5m', sinceMs);
 
     expect(pgObs).toEqual(moObs);
     expect(pgObs).toEqual([utcMidnight + 5 * 60_000, utcMidnight + 10 * 60_000]);
@@ -408,6 +408,28 @@ describe.skipIf(!dockerAvailable)('countAllBars — many-chunk bounded-read (OOM
         [lo, hi, day],
       );
     }
+    // Deep bar_revisions_log 2006→now for AAPL — one FIRST-PRINT row per day (prior_hash NULL),
+    // mirroring what the deep-daily backfill writes. bar_revisions_log is itself an observation_ts-
+    // partitioned hypertable (0012), so this series ALSO spans ~1000+ chunks: the substrate that makes
+    // an un-windowed count / knowledge_ts-only scan over the ledger exhaust the lock table. knowledge_ts
+    // = observation_ts (first-print = knowable next session ≈ same day at this fixture granularity).
+    for (let lo = startTs; lo < endTs; lo += INSERT_BATCH_MS) {
+      const hi = Math.min(lo + INSERT_BATCH_MS - day, endTs);
+      await pool.query(
+        `INSERT INTO bar_revisions_log (symbol, market, observation_ts, interval, knowledge_ts, prior_hash, new_hash)
+         SELECT 'AAPL', 'US', g, 'daily', g, NULL, 'h' || g::text
+           FROM generate_series($1::bigint, $2::bigint, $3::bigint) AS g`,
+        [lo, hi, day],
+      );
+    }
+    // A handful of genuine REVISIONS (prior_hash NOT NULL) at recent observation_ts, so the
+    // count-revisions / trail reads have non-first-print rows to find. Two with recent knowledge_ts.
+    const recentObs = endTs - 3 * day;
+    await pool.query(
+      `INSERT INTO bar_revisions_log (symbol, market, observation_ts, interval, knowledge_ts, prior_hash, new_hash)
+       VALUES ('AAPL','US',$1,'daily',$2,'old1','new1'), ('AAPL','US',$3,'daily',$4,'old2','new2')`,
+      [recentObs, endTs - 2 * day, endTs - 2 * day, endTs - day],
+    );
   }, TEST_TIMEOUT_MS);
 
   afterAll(async () => {
@@ -488,6 +510,70 @@ describe.skipIf(!dockerAvailable)('countAllBars — many-chunk bounded-read (OOM
     process.env.BARS_BACKEND = 'timescale';
     const counts = await countBarsForTickers(undefined, [AAPL], 'daily', sinceMs);
     expect(counts.get('AAPL|US')).toBe(direct);  // the walk EXACTLY equals the direct count
+  }, TEST_TIMEOUT_MS);
+
+  // ── bar_revisions_log OOM regression (the QA-FAILED defects 2 + 3) ────────────────────────────────
+  // bar_revisions_log is an observation_ts-partitioned hypertable; the deep-daily backfill writes a
+  // first-print row per bar back to 2006, so the ledger spans ~1000+ 7-day chunks. The whole-store
+  // revision count and the per-ticker trail both shipped UN-windowed and OOMed live (SQLSTATE 53200):
+  // the count's `interval` predicate is not the partition key, and the trail's `knowledge_ts` predicate
+  // is not the partition key — neither prunes a single chunk, so the planner locks every chunk at
+  // executor startup. These pin the old shapes failing and the new window-walks succeeding + correct.
+
+  it('an UNBOUNDED count over bar_revisions_log exhausts the lock table — the regression (defect 2)', async () => {
+    const pool = getPgPool();
+    await expect(
+      pool.query(
+        `SELECT symbol, market, count(*)::bigint AS n
+           FROM bar_revisions_log
+          WHERE interval = $1 AND prior_hash IS NOT NULL
+          GROUP BY symbol, market`,
+        ['daily'],
+      ),
+    ).rejects.toMatchObject({ code: '53200' });
+  });
+
+  it('countRevisionsForTickers WALKS bar_revisions_log: counts the genuine revisions WITHOUT OOMing (defect 2)', async () => {
+    process.env.BARS_BACKEND = 'timescale';
+    // A deep floor (2006) forces the walk across the whole ~20y ledger — proving the walk stays under
+    // the lock budget at maximum width. Only the 2 genuine revisions (prior_hash NOT NULL) count; the
+    // ~7000 first-prints are excluded.
+    const counts = await countRevisionsForTickers(undefined, 'daily', Date.UTC(2006, 0, 1));
+    expect(counts.get('AAPL|US')).toBe(2);
+  }, TEST_TIMEOUT_MS);
+
+  it('an UNBOUNDED knowledge_ts-only trail over bar_revisions_log exhausts the lock table — the regression (defect 3)', async () => {
+    const pool = getPgPool();
+    // The OLD getRevisionsForTickerPg shape: filter on knowledge_ts (NOT the partition key) + LIMIT.
+    // knowledge_ts prunes no chunks, so the full chunk-lock fan happens before LIMIT can short-circuit.
+    await expect(
+      pool.query(
+        `SELECT symbol, market, observation_ts, interval, knowledge_ts, prior_hash, new_hash
+           FROM bar_revisions_log
+          WHERE symbol = $1 AND market = $2 AND knowledge_ts >= $3
+          ORDER BY knowledge_ts DESC
+          LIMIT $4`,
+        ['AAPL', 'US', 0, 5],
+      ),
+    ).rejects.toMatchObject({ code: '53200' });
+  });
+
+  it('getRevisionsForTicker WALKS bar_revisions_log: returns the recent revisions newest-first WITHOUT OOMing (defect 3)', async () => {
+    process.env.BARS_BACKEND = 'timescale';
+    // since=0 would match every first-print too; use a recent cutoff so only the 2 genuine revisions'
+    // recent knowledge_ts qualify. The walk covers the deep ledger in bounded windows (no OOM) and
+    // returns them newest-knowledge-first.
+    const since = Date.now() - 5 * day;
+    const rows = await getRevisionsForTicker(undefined, 'AAPL', 'US', since, 10);
+    // The two recent genuine revisions (new1 @ endTs-2d, new2 @ endTs-1d) plus the recent first-prints
+    // whose knowledge_ts ≥ since. Assert the two genuine revisions are present, newest-first by
+    // knowledge_ts, and the read did not OOM.
+    const genuine = rows.filter((r) => r.prior_hash !== null);
+    expect(genuine.map((r) => r.new_hash)).toEqual(['new2', 'new1']);  // newest knowledge_ts first
+    // Ordering invariant across the whole result: knowledge_ts strictly non-increasing.
+    for (let i = 1; i < rows.length; i++) {
+      expect(rows[i - 1]!.knowledge_ts).toBeGreaterThanOrEqual(rows[i]!.knowledge_ts);
+    }
   }, TEST_TIMEOUT_MS);
 });
 

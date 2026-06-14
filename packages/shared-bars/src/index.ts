@@ -523,11 +523,17 @@ export async function latestObservationForTickers(
 }
 
 /**
- * Per-(symbol, market) genuine-revision count for `interval` (first-prints excluded), dispatched per
- * `BARS_BACKEND`, from the revision audit ledger. Returns a Map keyed `${symbol}|${market}`. Backs the
- * `/coverage` revisions column. The audit ledger lives in the SAME store as the bars writer writes it
- * to (Mongo `bar_revisions_log` on the mongo path; the Timescale `bar_revisions_log` hypertable on the
- * timescale path), so this dispatch keeps `/coverage` honest post-flip.
+ * Per-(symbol, market) genuine-revision count for `interval` (first-prints excluded) at/after `sinceMs`,
+ * dispatched per `BARS_BACKEND`, from the revision audit ledger. Returns a Map keyed `${symbol}|${market}`.
+ * Backs the `/coverage` revisions column. The audit ledger lives in the SAME store as the bars writer
+ * writes it to (Mongo `bar_revisions_log` on the mongo path; the Timescale `bar_revisions_log` hypertable
+ * on the timescale path), so this dispatch keeps `/coverage` honest post-flip.
+ *
+ * `sinceMs` is the OOM-safe lower bound on Timescale: `bar_revisions_log` is an `observation_ts`-
+ * partitioned hypertable, so the PG path window-walks `[sinceMs, now]` (an un-windowed aggregate locks
+ * every chunk → "out of shared memory"). Pass the interval's natural floor — the `/coverage` 5m path
+ * passes ~75d (a single window). The Mongo branch applies the same `observation_ts >= sinceMs` filter so
+ * both backends count the identical set (parity).
  *
  * @param db  MongoDB handle. Required when `BARS_BACKEND=mongo` (the default); may be `undefined`
  *           when `BARS_BACKEND=timescale`.
@@ -535,15 +541,16 @@ export async function latestObservationForTickers(
 export async function countRevisionsForTickers(
   db: Db | undefined,
   interval: BarInterval,
+  sinceMs: number,
 ): Promise<Map<string, number>> {
   if (activeBackend() === 'timescale') {
-    return countRevisionsForTickersPg(interval);
+    return countRevisionsForTickersPg(interval, sinceMs);
   }
   if (!db) {
     throw new Error('[shared-bars] countRevisionsForTickers: db parameter required when BARS_BACKEND=mongo (the default)');
   }
   const rows = await db.collection(COLLECTIONS.BAR_REVISIONS_LOG).aggregate([
-    { $match: { interval, prior_hash: { $ne: null } } },
+    { $match: { interval, prior_hash: { $ne: null }, observation_ts: { $gte: sinceMs } } },
     { $group: { _id: { symbol: '$symbol', market: '$market' }, revisions: { $sum: 1 } } },
   ]).toArray();
   const out = new Map<string, number>();
