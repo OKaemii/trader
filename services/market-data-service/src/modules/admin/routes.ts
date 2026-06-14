@@ -22,6 +22,7 @@ import { aggregateBars, getBars, getBarAtOrBefore, getDailyDepth, invalidateBars
 import { Trading212TickerAdapter } from '@trader/ticker-identity';
 import { backfillTickers, CACHE_INVALIDATED_TOPIC } from '../bars/infrastructure/backfill.ts';
 import { backfillDailyHistory } from '../bars/infrastructure/daily-history.ts';
+import { foldDailyEmit } from '../bars/infrastructure/daily-emit.ts';
 import { REDIS_STREAMS, POLL_INTERVAL_OPTIONS, type BarInterval, type OHLCVBar, type PollIntervalKey } from '@trader/shared-types';
 import type { HolidayCache, ExchangeCalendar, Market } from '@trader/shared-calendar';
 import { scheduleBetween, marketStateOf } from '@trader/shared-calendar';
@@ -413,6 +414,60 @@ export function createAdminRouter(
         failures: results.filter((r) => r.error).length,
         results,
       });
+    },
+  );
+
+  // ── On-demand daily emit (operator-gated, BYPASSES the session-close NX gate) ──
+  // POST /api/admin/market-data/daily-emit/force
+  // body: { market?: 'US'|'LSE', date?: 'YYYY-MM-DD' }
+  // Folds a UTC day's persisted 5m bars into daily bars and publishes them to
+  // market:raw:daily — the same read→group→aggregate→persist→publish fold the
+  // session-close path runs (foldDailyEmit), but WITHOUT the once-per-(market, UTC-date)
+  // NX gate, so the operator can (re-)emit a missed/past day on demand. This is the RC1 QA
+  // hook that revives the strategy→PIT chain after a wipe (proving pit_served>0 end-to-end)
+  // without waiting for the next real NYSE/LSE close.
+  //   market omitted → both US + LSE (each market's active-universe subset by T212 suffix);
+  //                     a value narrows to that one market.
+  //   date   omitted → today (UTC); a past YYYY-MM-DD folds ONLY that single UTC day (the
+  //                     5m read is floored at the day's UTC-midnight and capped at the next
+  //                     UTC-midnight so a deep 5m series doesn't fold into the wrong day).
+  // Returns { emitted: <total daily bar count>, market, date }. emitted:0 (never an error)
+  // when no 5m bars exist for that day — an empty day is a valid no-op, not a failure.
+  r.post(
+    '/admin/api/market-data/daily-emit/force',
+    zValidator('json', MarketDataContracts.DailyEmitForceRequestSchema, (result, c) => {
+      if (!result.success) return c.json({ error: 'invalid body', issues: result.error.issues }, 400);
+    }),
+    async (c) => {
+      const body = c.req.valid('json');
+      // UTC-day window: [midnight of `date`, midnight of the next day). Default to today (UTC).
+      // The lower bound (sinceTs) is the load-bearing OOM-safe floor for the Timescale 5m read;
+      // the exclusive upper bound trims a past date's fold to its single day.
+      const utcDate = body.date ?? new Date().toISOString().slice(0, 10);
+      const sinceTs = Date.parse(`${utcDate}T00:00:00.000Z`);
+      const upperBoundTs = sinceTs + 24 * 60 * 60_000;
+      // Resolve the active-universe tickers for the requested market(s). US is the `_US_EQ`
+      // suffix, LSE the `l_EQ` suffix — the same routing the poll partition + curatedUsTickers
+      // use. `market` omitted ⇒ both.
+      const markets: Market[] = body.market ? [body.market] : ['US', 'LSE'];
+      const active = universeManager.activeTickers;
+      const tickersFor = (m: Market): string[] =>
+        m === 'US' ? active.filter((t) => /_US_EQ$/.test(t)) : active.filter((t) => /l_EQ$/.test(t));
+
+      const db = await getMongoDb();
+      const redis = await getRedisClient();
+      let emitted = 0;
+      for (const m of markets) {
+        const tickers = tickersFor(m);
+        if (tickers.length === 0) continue;
+        const res = await foldDailyEmit(redis, db, tickers, sinceTs, upperBoundTs);
+        emitted += res.emitted;
+        logger.info(
+          { market: m, date: utcDate, emitted: res.emitted },
+          `[market-data] daily-emit/force ${m} ${utcDate}: ${res.emitted} bars → market:raw:daily`,
+        );
+      }
+      return c.json({ emitted, market: body.market ?? 'ALL', date: utcDate });
     },
   );
 
