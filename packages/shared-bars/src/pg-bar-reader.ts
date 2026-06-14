@@ -28,6 +28,7 @@
 
 import type { RedisClientType } from 'redis';
 import type { OHLCVBar, BarInterval } from '@trader/shared-types';
+import type { TickerIdentity } from '@trader/ticker-identity';
 import { getPgPool } from '@trader/shared-pg';
 
 import type { GetBarsOpts, RangeKey } from './index.ts';
@@ -148,6 +149,59 @@ export async function getBarsFromPg(
   }
 
   return bars;
+}
+
+/**
+ * Latest unsuperseded `interval` bars at/after `sinceTs` for a SET of (symbol, market) identities,
+ * read from Timescale. The set-form mirror of getBarsFromPg's live path (the `is_superseded = FALSE`
+ * fast lane): a single `(symbol, market) IN (...)` scan instead of one query per ticker — what the
+ * daily-emit needs to fold "every active universe ticker's 5m bars since UTC-midnight" into one read.
+ *
+ * Bounded BELOW by `observation_ts >= sinceTs` — the load-bearing OOM-safe rule (same as
+ * getBarsFromPg / getBarAtOrBefore). With both the name set and the `observation_ts >=` floor on the
+ * time dimension, chunk-exclusion prunes the plan to the day's chunks; without the floor the planner
+ * would Merge-Append every chunk of the deep `bars` hypertable and lock them all at executor startup
+ * → lock-table exhaustion → "out of shared memory" (the bug the bars-OOM work fights). The partial
+ * index bars_asof_lookup `(symbol, market, interval, observation_ts DESC) WHERE is_superseded = FALSE`
+ * backs the scan.
+ *
+ * No Redis cache: this is the live emit's per-cycle read of a moving "today" window over the whole
+ * universe — a cache keyed on the (set, sinceTs) tuple would miss every cycle and only add a write.
+ * Returns OHLCVBar[] oldest-first, the T212 `ticker` re-derived per row (the OHLCVBar contract is
+ * unchanged); empty array when `ids` is empty or nothing matches.
+ */
+export async function getRecentBarsForTickersPg(
+  ids: ReadonlyArray<TickerIdentity>,
+  { interval, sinceTs }: { interval: BarInterval; sinceTs: number },
+): Promise<OHLCVBar[]> {
+  if (ids.length === 0) return [];
+  const pool = getPgPool();
+
+  // Build parameterised `(symbol, market)` tuples — $1=symbol0, $2=market0, $3=symbol1, … — then the
+  // trailing two binds for interval + sinceTs. Never interpolate identities into SQL text (injection
+  // + plan-cache churn): every value is a placeholder.
+  const params: Array<string | number> = [];
+  const tuples = ids.map((id) => {
+    params.push(id.symbol, id.market);
+    return `($${params.length - 1}, $${params.length})`;
+  });
+  const intervalIdx = params.push(interval);
+  const sinceIdx = params.push(sinceTs);
+
+  const { rows } = await pool.query(
+    `SELECT symbol, market, observation_ts, knowledge_ts, interval,
+            open, high, low, close, volume,
+            raw_close, adjusted_close, adjustment_factor,
+            currency, content_hash, is_superseded
+       FROM bars
+      WHERE (symbol, market) IN (${tuples.join(', ')})
+        AND interval = $${intervalIdx}
+        AND is_superseded = FALSE
+        AND observation_ts >= $${sinceIdx}
+      ORDER BY observation_ts ASC`,
+    params,
+  );
+  return rows.map(rowToBar);
 }
 
 interface CachedBar {
