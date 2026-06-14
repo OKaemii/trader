@@ -50,6 +50,21 @@ from quant_core.fundamentals.contract import LINE_ITEMS, SOURCE_PIT_EDGAR
 from quant_core.fundamentals.lake.metrics import metric_series, template_for_sic
 from quant_core.ticker_identity import TickerIdentity
 
+# The public contract surface. `pit_line_items` (the single-period byte-compatible seam dict) and
+# `pit_metric_history` (the bounded multi-period series the forecast engine builds on) are the two
+# entry points; the rest are the leg helpers they share. Importing this module IS the public surface —
+# `quant_core.fundamentals.__init__` deliberately does NOT re-export these, because `lake/__init__`
+# keeps the lake submodules lazy (this module transitively needs pyarrow via `store`/`metrics`, the
+# `quant-core[lake]` extra), so a caller that only wants the calendar never drags pyarrow in. Consumers
+# import from here directly: `from quant_core.fundamentals.lake.contract import pit_metric_history`.
+__all__ = [
+    "pit_line_items",
+    "pit_metric_history",
+    "earnings_stability",
+    "ttm_or_annual",
+    "latest_instant",
+]
+
 # Only US listings file with SEC EDGAR — the lake's sole jurisdiction. A non-US identity fails closed.
 _EDGAR_MARKET = "US"
 
@@ -84,6 +99,12 @@ _EARNINGS_STABILITY_MIN_PERIODS = 3
 # is far above float64 rounding noise on the largest plausible net-income magnitudes (so an
 # equal-but-fractional series reads as flat) yet far below any genuine year-to-year earnings spread.
 _FLAT_EARNINGS_REL_TOL = 1e-9
+
+# A calendar year in UTC ms — the unit `pit_metric_history` bounds its tail by. 365.25 days averages
+# over leap years so a fixed-`years` window never silently clips a point that is genuinely inside it (a
+# flat 365 would, every fourth year, drop the oldest point by a day). The point `end` is a period-end
+# DATE, so this day-level precision is all the bound needs.
+_YEAR_MS = int(365.25 * 24 * 60 * 60 * 1000)
 
 
 def _as_of_date(as_of_ms: int) -> date:
@@ -205,6 +226,82 @@ def earnings_stability(store, cik: int, as_of_ms: int, sector: str | None = None
     if stddev <= abs(mean) * _FLAT_EARNINGS_REL_TOL:
         return None
     return mean / stddev
+
+
+# The provenance fields each returned history point carries — the forecast layer ages BOTH features and
+# realised labels on `knowledge_ts` (no look-ahead) and keys training joins on `accession`. `end` is the
+# period-end (the observation axis), `filed` the SEC filing date, `value` the standardized figure.
+_HISTORY_FIELDS: tuple[str, ...] = ("value", "end", "knowledge_ts", "filed", "accession")
+
+
+def pit_metric_history(
+    store,
+    ident: TickerIdentity,
+    metric: str,
+    freq: str,
+    as_of_ms: int,
+    years: int = 10,
+) -> list[dict]:
+    """The PIT-filtered series of one metric as-of a knowledge instant, oldest-first.
+
+    The public multi-period accessor over the lake's internal :func:`metric_series` — the foundation
+    the analyst-free forecast engine builds on (the seasonal-RW baseline, the Li-Mohanram / HVZ pooled
+    regressions, earnings volatility, SUE windowing all need the full annual earnings *time-series*
+    as-of a date, not the single latest period :func:`pit_line_items` returns). Mirrors
+    :func:`earnings_stability`'s CIK + sector resolution so a bank's `total_revenue` (net interest
+    income, not product sales) resolves through the same registry override every other leg uses.
+
+    `metric` is a `METRICS`/`DERIVED` key (`net_income`, `total_assets`, …); `freq ∈ {"q","a","ttm"}`
+    (ignored for instant metrics). Each returned point is a fresh dict carrying exactly
+    ``{value, end, knowledge_ts, filed, accession}``:
+
+      * ``value`` — the standardized figure; ``end`` — the period-end ``date`` (the observation axis);
+      * ``knowledge_ts`` — the UTC-ms instant this version became knowable. A raw annual / quarter /
+        instant carries the row's own ``knowledge_ts``; a derived (TTM / computed-Q4) point carries the
+        MAX of its inputs' (a TTM is knowable only once all four quarters are public — ``metrics``'s
+        ``_max_knowledge_ts`` carry keeps it PIT-safe). Read via ``.get`` so any future derived path
+        that ever omitted the field reports ``None`` rather than raising — the annual (`freq="a"`)
+        series the engines train on always carries a real instant;
+      * ``filed`` — the SEC filing ``date``; ``accession`` — the filing id (the training-join key).
+
+    Fail-closed, on the SAME axis as :func:`pit_line_items`:
+      * Non-US (``ident.market != "US"``) → ``[]`` immediately — no EDGAR, no Yahoo fallback (Thread C).
+      * An unresolved CIK (cold lake / unknown / private name) → ``[]``.
+
+    PIT-safety + OOM-safety:
+      * The store has already applied the look-ahead guard (``knowledge_ts <= as_of_ms``), so a later
+        10-K/A restatement is invisible to an as-of read at the original date — the series is exactly
+        what was knowable at the cutoff.
+      * ``years`` bounds the tail — points whose ``end`` is older than ``as_of_ms − years·year`` are
+        dropped, so this is NEVER an unbounded read (the §C1 NVIDIA-£0 OOM cautionary tale: a forecast
+        loop calling this per as-of must not pull a 30-year tail). The default 10y comfortably covers
+        the longest horizon any forecaster here needs (a τ=3 label off a ~7-point training window).
+    """
+    if ident.market != _EDGAR_MARKET:
+        return []  # LSE/foreign: no EDGAR, no Yahoo fallback (Thread C)
+
+    ent = store.resolve(ident.symbol, ident.market, _as_of_date(as_of_ms))
+    if ent is None:
+        return []  # cold lake / unknown / private name
+    cik = ent["cik"]
+
+    # Sector template from the entity SIC — same registry override every other leg threads through, so a
+    # bank/insurer's per-sector concept list governs here too (a cold/absent profile ⇒ `general`).
+    profile = store.profile(cik)
+    sector = template_for_sic(profile.get("sic") if profile is not None else None)
+
+    points = metric_series(store, cik, metric, freq, as_of_ms, sector=sector)["points"]
+
+    # Bound the tail: drop points older than the `years` window. `metric_series` returns points sorted
+    # by `end` ascending, so the survivors stay oldest-first. `p.get(f)` (not `p[f]`) is defensive — a
+    # standard point carries all five fields, but a `.get` keeps any future row variant that omitted one
+    # from raising mid-projection (the missing field reports None instead).
+    cutoff_ms = as_of_ms - years * _YEAR_MS
+    return [
+        {f: p.get(f) for f in _HISTORY_FIELDS}
+        for p in points
+        if _date_to_ms(p["end"]) >= cutoff_ms
+    ]
 
 
 def pit_line_items(
