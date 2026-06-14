@@ -8,7 +8,7 @@ import type { FundamentalsProvider } from '../modules/fundamentals/infrastructur
 // re-sources the universe once when the mode changes. The DECISION is the unit here — `refresh` is
 // spied so neither the provider nor Mongo is exercised.
 
-const noopProvider: FundamentalsProvider = { fetch: async () => ({}) };
+const noopProvider: FundamentalsProvider = { fetch: async () => ({ values: {}, status: {} }) };
 
 function fakeModeStore(initial: string | null) {
   const m = new Map<string, string>();

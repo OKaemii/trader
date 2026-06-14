@@ -171,7 +171,10 @@ describe('FundamentalsCache.refresh — per-name source stamping', () => {
     // The live PIT provider only returns covered US names (a hit), each stamped pit-edgar; non-US /
     // misses are fail-closed (absent), so `refresh` never writes a doc for them.
     const provider: FundamentalsProvider = {
-      fetch: async () => ({ AAPL_US_EQ: RAW(3_000_000), MSFT_US_EQ: RAW(2_000_000) }),
+      fetch: async () => ({
+        values: { AAPL_US_EQ: RAW(3_000_000), MSFT_US_EQ: RAW(2_000_000) },
+        status: { AAPL_US_EQ: 'hit', MSFT_US_EQ: 'hit' },
+      }),
       sourceOf: () => 'pit-edgar',
     };
     const cache = new FundamentalsCache(provider, 'pit');
@@ -192,7 +195,9 @@ describe('FundamentalsCache.refresh — per-name source stamping', () => {
 
   it('stamps the configured mode when the provider has no sourceOf (eodhd)', async () => {
     const { coll, writes } = stubColl();
-    const provider: FundamentalsProvider = { fetch: async () => ({ AAPL_US_EQ: RAW(3_000_000) }) };
+    const provider: FundamentalsProvider = {
+      fetch: async () => ({ values: { AAPL_US_EQ: RAW(3_000_000) }, status: { AAPL_US_EQ: 'hit' } }),
+    };
     const cache = new FundamentalsCache(provider, 'eodhd');
     (cache as unknown as { coll: () => Promise<typeof coll> }).coll = async () => coll;
 
@@ -201,7 +206,7 @@ describe('FundamentalsCache.refresh — per-name source stamping', () => {
   });
 
   it('exposes the configured mode as effectiveSource', () => {
-    expect(new FundamentalsCache({ fetch: async () => ({}) }, 'pit').effectiveSource).toBe('pit');
-    expect(new FundamentalsCache({ fetch: async () => ({}) }, 'eodhd').effectiveSource).toBe('eodhd');
+    expect(new FundamentalsCache({ fetch: async () => ({ values: {}, status: {} }) }, 'pit').effectiveSource).toBe('pit');
+    expect(new FundamentalsCache({ fetch: async () => ({ values: {}, status: {} }) }, 'eodhd').effectiveSource).toBe('eodhd');
   });
 });
