@@ -224,25 +224,44 @@ export class TwelveDataClient {
     log.warn(`[twelvedata] daily credit budget (${this.limiter.dailyLimit}) exhausted — skipping further upstream requests until UTC midnight`);
   }
 
-  // Single GET against the TwelveData REST API. Returns null (not throw) on any failure —
-  // daily-budget exhaustion, HTTP 429/5xx, or network error — so callers degrade to empty.
-  // The query string (which carries the apikey) is never logged; only the path is.
-  private async get<T>(path: string, query: Record<string, string>): Promise<T | null> {
+  // Single GET against the TwelveData REST API. Returns the parsed body plus the HTTP
+  // status so the caller can distinguish a hard not-available (HTTP 404) from a transient
+  // throttle/outage and blacklist accordingly. `httpStatus` is undefined only when the
+  // request never reached a response (daily budget exhausted, network error). TwelveData
+  // answers an unentitled/missing symbol with HTTP 404 AND a `status:"error"` JSON body
+  // (e.g. the free-tier "available starting with the Grow or Venture plan" wall), so the
+  // body is parsed even on a non-OK status — both signals feed the blacklist decision
+  // upstream. `ticker` is logged on every failure (the query string, which carries the
+  // apikey, is never logged); without it a 404 line is anonymous and the offending name can
+  // only be found by elimination.
+  private async get<T>(
+    path: string,
+    query: Record<string, string>,
+    ticker: string,
+  ): Promise<{ body: T | null; httpStatus?: number }> {
     try {
       await this.limiter.acquire();
     } catch (err) {
-      if (err instanceof TwelveDataDailyLimitError) { this.logDailyLimitOnce(); return null; }
+      if (err instanceof TwelveDataDailyLimitError) { this.logDailyLimitOnce(); return { body: null }; }
       throw err;
     }
     const qs = new URLSearchParams({ ...query, apikey: this.apiKey }).toString();
     try {
       const res = await fetch(`${TWELVEDATA_BASE}${path}?${qs}`, { headers: { Accept: 'application/json' } });
-      if (res.status === 429) { log.warn(`[twelvedata] HTTP 429 on ${path} — minute/credit throttle`); return null; }
-      if (!res.ok) { log.warn(`[twelvedata] HTTP ${res.status} on ${path}`); return null; }
-      return (await res.json()) as T;
+      if (res.status === 429) {
+        log.warn(`[twelvedata] HTTP 429 on ${path} for ${ticker} — minute/credit throttle`);
+        return { body: null, httpStatus: 429 };
+      }
+      // Parse the JSON body regardless of HTTP status — TwelveData returns a descriptive
+      // `status:"error"` body alongside a 404/4xx (the entitlement/not-found message the
+      // blacklist keys off). Tolerate a non-JSON error body (parse failure → null body).
+      let body: T | null = null;
+      try { body = (await res.json()) as T; } catch { body = null; }
+      if (!res.ok) log.warn(`[twelvedata] HTTP ${res.status} on ${path} for ${ticker}`);
+      return { body, httpStatus: res.status };
     } catch (err) {
-      log.warn(`[twelvedata] request failed on ${path}:`, err instanceof Error ? err.message : err);
-      return null;
+      log.warn(`[twelvedata] request failed on ${path} for ${ticker}:`, err instanceof Error ? err.message : err);
+      return { body: null };
     }
   }
 
@@ -274,17 +293,40 @@ export class TwelveDataClient {
     if (td.micCode) query.mic_code = td.micCode;
     else if (td.country) query.country = td.country;
 
-    const body = await this.get<TdTimeSeriesResponse>('/time_series', query);
+    const { body, httpStatus } = await this.get<TdTimeSeriesResponse>('/time_series', query, ticker);
+
+    // A permanent HTTP 404 means the listing is not available to this key — either genuinely
+    // absent, or (the free-tier case) paid-walled: TwelveData answers an unentitled symbol
+    // with 404 + a "available starting with the Grow or Venture plan" body. Either way it can
+    // never succeed on this plan, so blacklist it after the first failure — otherwise the poll
+    // (and especially the per-cycle self-heal, which re-requests every "missing" name) burns a
+    // credit on it every cycle and floods the logs. 429 is deliberately NOT blacklisted: it is
+    // transient minute/credit throttle, not a permanent unavailability.
+    if (httpStatus === 404) {
+      this.unsupported.add(ticker);
+      // Surface the body message when present — TwelveData's 404 body explains *why*
+      // (paid-tier wall vs genuinely-absent symbol), which is the actionable diagnostic.
+      const reason = body?.message ? `: ${body.message}` : '';
+      log.warn(`[twelvedata] ${ticker} (${td.symbol}) HTTP 404 — unavailable on this plan, blacklisted${reason}`);
+      return [];
+    }
     if (!body) return [];
     if (body.status === 'error') {
       const msg = body.message ?? 'no message';
-      // "symbol not found" → blacklist so we stop wasting credits. Other errors (e.g. "no
-      // data on the specified dates") are transient — log but keep the ticker pollable.
-      if (/not found/i.test(msg)) {
+      // Blacklist any error that signals permanent unavailability so we stop wasting credits:
+      //   • "symbol not found" — the symbol isn't in TwelveData's catalog.
+      //   • plan-gated — "available starting with the Grow/Venture plan" / "upgrade" / "is only
+      //     available on the …" : the free tier doesn't serve this listing's /time_series (the
+      //     LSE-on-free-Basic case). These carry a status:"error" body but no "not found", so
+      //     the prior /not found/i test missed them and they re-requested forever.
+      // Other errors (e.g. "no data on the specified dates") are transient — log, stay pollable.
+      const permanentlyUnavailable =
+        /not found/i.test(msg) || /available (starting|on|with)|upgrad|only available/i.test(msg);
+      if (permanentlyUnavailable) {
         this.unsupported.add(ticker);
-        log.warn(`[twelvedata] ${td.symbol} not found — blacklisted`);
+        log.warn(`[twelvedata] ${ticker} (${td.symbol}) unavailable — blacklisted: ${msg}`);
       } else {
-        log.warn(`[twelvedata] ${td.symbol} error ${body.code ?? '?'}: ${msg}`);
+        log.warn(`[twelvedata] ${ticker} (${td.symbol}) error ${body.code ?? '?'}: ${msg}`);
       }
       return [];
     }
