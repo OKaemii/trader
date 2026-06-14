@@ -94,6 +94,10 @@ spec:
             # Firecrawl scrape-stack base URL (homeserver) backing the ir_calendar earnings provider.
             - name: FIRECRAWL_BASE_URL
               value: {{ .Values.global.env.firecrawlBaseUrl | default "http://192.168.50.2:3002" | quote }}
+            # Analyst-consensus source (Pipeline C). stub (default — no consensus vendor entitled; the
+            # surprise fields render "requires consensus — not sourced") | eodhd (swap-ready, dormant).
+            - name: CONSENSUS_PROVIDER
+              value: {{ .Values.global.env.consensusProvider | default "stub" | quote }}
             - name: SECTOR_ETF_TICKERS
               value: {{ .Values.global.env.sectorEtfTickers | default "" | quote }}
             - name: QUOTE_PROVIDER

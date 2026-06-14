@@ -55,6 +55,25 @@ export const COLLECTIONS = {
   // which returns {} for every name, so the store stays empty (no doc is ever written) until a PIT-backed
   // earnings source is wired by a later epic. The shape is migrated for that future writer's sake.
   EARNINGS_CALENDAR:     'earnings_calendar',
+  // Pipeline C (analyst-free-estimates-engine, Task 12) — forward analyst-consensus estimates. Written
+  // by market-data-service's ConsensusStore from a ConsensusProvider. SHIPPED STUBBED: the wired
+  // StubConsensusProvider returns {} for every name (no consensus vendor entitled), so this store stays
+  // EMPTY until an EodhdConsensusProvider / gold-standard vendor is swapped in — the honest "requires
+  // consensus — not sourced" state. Keyed on the bare (symbol, market) identity (the platform rule):
+  // `_id` is the composite `<symbol>:<market>:<fiscal_period>:<metric>` string and `symbol`/`market` are
+  // also carried as queryable fields; the concatenated T212 ticker is never stored. Doc:
+  //   { _id, symbol, market, fiscalPeriod, metric, consensus, numAnalysts, snapshotDate, source, updatedAt }.
+  CONSENSUS_ESTIMATE:    'consensus_estimate',
+  // Pipeline C (Task 12) — realised earnings surprises. surprise_pct = (actual_eps − consensus_eps)/
+  // |consensus_eps| (the ONLY honest surprise — measured against analyst consensus; a mechanical
+  // SUE-vs-seasonal-RW or EAR proxy is NOT a surprise and must never land here). Derived by
+  // ConsensusStore.refresh ONLY where a consensus EPS estimate AND a realised actual coexist for a
+  // (ticker, fiscal_period). SHIPPED STUBBED → empty (no consensus → no surprise; "not built rather than
+  // faked"). `surprisePct` is null when the consensus denominator is zero (fail-closed, never a fabricated
+  // 0%). Keyed on the bare (symbol, market) identity: `_id` is `<symbol>:<market>:<fiscal_period>`,
+  // `symbol`/`market` queryable. Doc:
+  //   { _id, symbol, market, fiscalPeriod, actualEps, consensusEps, surprisePct, source, updatedAt }.
+  EARNINGS_SURPRISE:     'earnings_surprise',
   // Price alert rules (manual + auto-derived from trade-plan stop/target). The AlertWatcher reads
   // enabled rules each cycle and fires on a bar-range cross. { _id: id, ticker, kind, direction,
   // level: Money, enabled, cooldownH, lastFiredAt?, source, updatedAt }. Derived rules use a
