@@ -148,6 +148,10 @@ describe.skipIf(!dockerAvailable)('bar-equivalence (Mongo vs Timescale)', () => 
   }, TEST_TIMEOUT_MS);
 
   beforeEach(async () => {
+    // Default backend for the parity tests (writeBarRevisions is expected Mongo-primary here); the
+    // dispatch round-trip tests set BARS_BACKEND themselves and restore it.
+    delete process.env.BARS_BACKEND;
+    delete process.env.DUAL_WRITE_BARS;
     // Wipe both stores.
     const mongoDb = await getMongoDb('trader');
     await mongoDb.collection('ohlcv_bars').deleteMany({});
@@ -290,6 +294,67 @@ describe.skipIf(!dockerAvailable)('bar-equivalence (Mongo vs Timescale)', () => 
     expect(mongoDaily[0]?.close).toBe(103);
     expect(mongoDaily[0]?.high).toBe(103.5);
     expect(mongoDaily[0]?.low).toBe(99.5);
+  }, TEST_TIMEOUT_MS);
+
+  // The store-inversion fix end-to-end: under BARS_BACKEND=timescale the DISPATCHED writer
+  // (writeBarRevisions, not writeBarRevisionsPg) lands bars in Timescale and NOT Mongo, and the
+  // DISPATCHED reader (getBars, db=undefined) reads them back from the SAME store. This is the
+  // round-trip the live config runs: write store == read store. Pre-fix the writer was Mongo-primary
+  // so this read-back returned nothing (the bug).
+  it('BARS_BACKEND=timescale: dispatched write → dispatched read round-trips through Timescale only', async () => {
+    const mongoDb = await getMongoDb('trader');
+    const prev = process.env.BARS_BACKEND;
+    process.env.BARS_BACKEND = 'timescale';
+    try {
+      const obs = OBS_A_1;
+      const b = bar('A_US_EQ', obs, 140);
+      // The DISPATCHER decides the store — pass the Mongo db, but timescale routing must ignore it
+      // for the write (Timescale-primary, DUAL_WRITE_BARS unset).
+      delete process.env.DUAL_WRITE_BARS;
+      await writeBarRevisions(mongoDb, [b], '5m');
+
+      // Read back through the DISPATCHER (db=undefined is legal on the timescale path).
+      const readBack = await getBars(makeRedis() as never, undefined, 'A_US_EQ', '5m', '180d');
+      expect(readBack).toHaveLength(1);
+      expect(readBack[0]?.close).toBe(140);
+      expect(readBack[0]?.observation_ts).toBe(obs);
+
+      // Landed in Timescale…
+      const { rows } = await getPgPool().query<{ n: number }>(
+        "SELECT count(*)::int AS n FROM bars WHERE symbol = 'A' AND market = 'US' AND interval = '5m'",
+      );
+      expect(rows[0]?.n).toBe(1);
+      // …and NOT in Mongo (the inversion is fixed — no Mongo-only write stranded).
+      const mongoCount = await mongoDb.collection('ohlcv_bars').countDocuments({ symbol: 'A', market: 'US', interval: '5m' });
+      expect(mongoCount).toBe(0);
+    } finally {
+      if (prev === undefined) delete process.env.BARS_BACKEND; else process.env.BARS_BACKEND = prev;
+    }
+  }, TEST_TIMEOUT_MS);
+
+  // The rollback path stays whole: BARS_BACKEND=timescale + DUAL_WRITE_BARS=true writes BOTH stores
+  // (Timescale primary + the Mongo rollback mirror), so flipping BARS_BACKEND back to mongo finds the
+  // bars already present.
+  it('BARS_BACKEND=timescale + DUAL_WRITE_BARS=true: writes BOTH stores (rollback mirror intact)', async () => {
+    const mongoDb = await getMongoDb('trader');
+    const prevBackend = process.env.BARS_BACKEND;
+    const prevDual = process.env.DUAL_WRITE_BARS;
+    process.env.BARS_BACKEND = 'timescale';
+    process.env.DUAL_WRITE_BARS = 'true';
+    try {
+      const b = bar('B_US_EQ', OBS_B_1, 77);
+      await writeBarRevisions(mongoDb, [b], '5m');
+
+      const { rows } = await getPgPool().query<{ n: number }>(
+        "SELECT count(*)::int AS n FROM bars WHERE symbol = 'B' AND market = 'US' AND interval = '5m'",
+      );
+      expect(rows[0]?.n).toBe(1);                                       // Timescale (primary)
+      const mongoCount = await mongoDb.collection('ohlcv_bars').countDocuments({ symbol: 'B', market: 'US', interval: '5m' });
+      expect(mongoCount).toBe(1);                                       // Mongo (rollback mirror)
+    } finally {
+      if (prevBackend === undefined) delete process.env.BARS_BACKEND; else process.env.BARS_BACKEND = prevBackend;
+      if (prevDual === undefined) delete process.env.DUAL_WRITE_BARS; else process.env.DUAL_WRITE_BARS = prevDual;
+    }
   }, TEST_TIMEOUT_MS);
 });
 

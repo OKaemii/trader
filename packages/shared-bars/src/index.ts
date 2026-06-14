@@ -29,11 +29,22 @@ import type { OHLCVBar, BarInterval } from '@trader/shared-types';
 import type { TickerIdentity } from '@trader/ticker-identity';
 import { COLLECTIONS } from '@trader/shared-mongo';
 import { getPgPool } from '@trader/shared-pg';
-import { getBarsFromPg, getBarAtOrBeforePg, getDailyDepthPg, getRecentBarsForTickersPg, pgCacheKey, pgAtCacheKey } from './pg-bar-reader.ts';
+import {
+  getBarsFromPg, getBarAtOrBeforePg, getDailyDepthPg, getRecentBarsForTickersPg,
+  getObservedTimestampsPg, countBarsForTickersPg, countAllBarsPg, latestObservationForTickersPg,
+  countRevisionsForTickersPg, getRevisionsForTickerPg,
+  pgCacheKey, pgAtCacheKey,
+} from './pg-bar-reader.ts';
+import type { BarRevisionLogRow } from './pg-bar-reader.ts';
 import { identityOf, tickerOf, identityKey } from './identity.ts';
 
 export { hashBarContent } from './content-hash.ts';
-export { getBarsFromPg, getBarAtOrBeforePg, getDailyDepthPg, getRecentBarsForTickersPg, getLastClosePg, pgCacheKey, pgAtCacheKey } from './pg-bar-reader.ts';
+export {
+  getBarsFromPg, getBarAtOrBeforePg, getDailyDepthPg, getRecentBarsForTickersPg,
+  getObservedTimestampsPg, countBarsForTickersPg, countAllBarsPg, latestObservationForTickersPg,
+  countRevisionsForTickersPg, getRevisionsForTickerPg, type BarRevisionLogRow,
+  getLastClosePg, pgCacheKey, pgAtCacheKey,
+} from './pg-bar-reader.ts';
 export { computeMissingRanges, coverageOf } from './coverage.ts';
 export type { MissingRange } from './coverage.ts';
 
@@ -363,6 +374,224 @@ export async function getRecentBarsForTickers(
     .sort({ observation_ts: 1 })
     .toArray();
   return docs.map(docToBar);
+}
+
+// ── Coverage / gap-detection reads, BARS_BACKEND-dispatched ─────────────────────────────────────
+// These are the maintenance reads (gap planning, bootstrap-coverage counts, heal latest-bar, the
+// admin /coverage + /revisions surfaces) that MUST read the SAME store the writer writes to. Before
+// the writer flip they read Mongo directly at their call sites (correct while the writer was
+// Mongo-primary); they move here, dispatched, so when BARS_BACKEND=timescale they reflect Timescale —
+// otherwise the writer would land bars in Timescale while gap-detection counted Mongo (0 rows post-
+// wipe) and re-fetched the whole universe. Each carries a `sinceMs` floor on the Timescale path for
+// the same OOM-safe reason every PG read here does (an unbounded aggregate over a deep daily hypertable
+// locks every chunk → "out of shared memory"); the Mongo branch keeps the exact prior query.
+
+/**
+ * Observed unsuperseded `observation_ts` values for ONE ticker in `[sinceMs, untilMs]`, dispatched per
+ * `BARS_BACKEND`. The gap-aware fetch planner diffs these against the step grid. The window bounds it
+ * on both sides (OOM-safe on Timescale; identical result on Mongo).
+ *
+ * @param db  MongoDB handle. Required when `BARS_BACKEND=mongo` (the default); may be `undefined`
+ *           when `BARS_BACKEND=timescale`.
+ */
+export async function getObservedTimestamps(
+  db: Db | undefined,
+  ticker: string,
+  interval: BarInterval,
+  sinceMs: number,
+  untilMs: number,
+): Promise<number[]> {
+  if (activeBackend() === 'timescale') {
+    return getObservedTimestampsPg(ticker, interval, sinceMs, untilMs);
+  }
+  if (!db) {
+    throw new Error('[shared-bars] getObservedTimestamps: db parameter required when BARS_BACKEND=mongo (the default)');
+  }
+  const { symbol, market } = identityOf(ticker);
+  const docs = await db
+    .collection(COLLECTIONS.OHLCV_BARS)
+    .find(
+      { symbol, market, interval, is_superseded: false, observation_ts: { $gte: sinceMs, $lte: untilMs } },
+      { projection: { _id: 0, observation_ts: 1 } },
+    )
+    .toArray();
+  const out: number[] = [];
+  for (const d of docs) {
+    const ts = (d as { observation_ts?: unknown }).observation_ts;
+    if (typeof ts === 'number') out.push(ts);
+  }
+  return out;
+}
+
+/**
+ * Unsuperseded `interval` bar count per (symbol, market) for a SET of identities, dispatched per
+ * `BARS_BACKEND`, bounded below by `sinceMs`. Returns a Map keyed `${symbol}|${market}` (absent ⇒ 0).
+ * Backs the bootstrap-coverage checks + admin `/coverage` count. `sinceMs` is the OOM-safe floor on
+ * Timescale — pass a window covering the caller's `minBars` threshold, never the whole hypertable.
+ *
+ * @param db  MongoDB handle. Required when `BARS_BACKEND=mongo` (the default); may be `undefined`
+ *           when `BARS_BACKEND=timescale`.
+ */
+export async function countBarsForTickers(
+  db: Db | undefined,
+  ids: ReadonlyArray<TickerIdentity>,
+  interval: BarInterval,
+  sinceMs: number,
+): Promise<Map<string, number>> {
+  if (ids.length === 0) return new Map();
+  if (activeBackend() === 'timescale') {
+    return countBarsForTickersPg(ids, interval, sinceMs);
+  }
+  if (!db) {
+    throw new Error('[shared-bars] countBarsForTickers: db parameter required when BARS_BACKEND=mongo (the default)');
+  }
+  const rows = await db.collection(COLLECTIONS.OHLCV_BARS).aggregate([
+    { $match: { $or: ids.map((id) => ({ symbol: id.symbol, market: id.market })), interval, is_superseded: false, observation_ts: { $gte: sinceMs } } },
+    { $group: { _id: { symbol: '$symbol', market: '$market' }, count: { $sum: 1 } } },
+  ]).toArray();
+  const out = new Map<string, number>();
+  for (const row of rows as Array<{ _id: { symbol: string; market: string }; count: number }>) {
+    out.set(`${row._id.symbol}|${row._id.market}`, row.count ?? 0);
+  }
+  return out;
+}
+
+/**
+ * Unsuperseded `interval` bar count per (symbol, market) across the WHOLE store (every name with bars,
+ * not a fixed set), dispatched per `BARS_BACKEND`, bounded below by `sinceMs`. Returns a Map keyed
+ * `${symbol}|${market}`. Backs the admin `/coverage` endpoint. `sinceMs` is the OOM-safe floor on
+ * Timescale (pass the interval's natural window — 5m: ~the 60d provider cap).
+ *
+ * @param db  MongoDB handle. Required when `BARS_BACKEND=mongo` (the default); may be `undefined`
+ *           when `BARS_BACKEND=timescale`.
+ */
+export async function countAllBars(
+  db: Db | undefined,
+  interval: BarInterval,
+  sinceMs: number,
+): Promise<Map<string, number>> {
+  if (activeBackend() === 'timescale') {
+    return countAllBarsPg(interval, sinceMs);
+  }
+  if (!db) {
+    throw new Error('[shared-bars] countAllBars: db parameter required when BARS_BACKEND=mongo (the default)');
+  }
+  const rows = await db.collection(COLLECTIONS.OHLCV_BARS).aggregate([
+    { $match: { interval, is_superseded: false, observation_ts: { $gte: sinceMs } } },
+    { $group: { _id: { symbol: '$symbol', market: '$market' }, count: { $sum: 1 } } },
+  ]).toArray();
+  const out = new Map<string, number>();
+  for (const row of rows as Array<{ _id: { symbol: string; market: string }; count: number }>) {
+    out.set(`${row._id.symbol}|${row._id.market}`, row.count ?? 0);
+  }
+  return out;
+}
+
+/**
+ * Latest unsuperseded `observation_ts` per (symbol, market) for a SET of identities, dispatched per
+ * `BARS_BACKEND`, bounded below by `sinceMs`. Returns a Map keyed `${symbol}|${market}`. Backs the
+ * self-heal gap detector. `sinceMs` is the OOM-safe floor on Timescale (heal works the 5m series, so
+ * the 60d provider cap is the natural bound). Legacy Mongo rows that stored `observation_ts` as a Date
+ * are normalised to UTC ms so the Map value type matches both backends.
+ *
+ * @param db  MongoDB handle. Required when `BARS_BACKEND=mongo` (the default); may be `undefined`
+ *           when `BARS_BACKEND=timescale`.
+ */
+export async function latestObservationForTickers(
+  db: Db | undefined,
+  ids: ReadonlyArray<TickerIdentity>,
+  interval: BarInterval,
+  sinceMs: number,
+): Promise<Map<string, number>> {
+  if (ids.length === 0) return new Map();
+  if (activeBackend() === 'timescale') {
+    return latestObservationForTickersPg(ids, interval, sinceMs);
+  }
+  if (!db) {
+    throw new Error('[shared-bars] latestObservationForTickers: db parameter required when BARS_BACKEND=mongo (the default)');
+  }
+  const rows = await db.collection(COLLECTIONS.OHLCV_BARS).aggregate([
+    { $match: { $or: ids.map((id) => ({ symbol: id.symbol, market: id.market })), interval, is_superseded: false, observation_ts: { $gte: sinceMs } } },
+    { $group: { _id: { symbol: '$symbol', market: '$market' }, latest: { $max: '$observation_ts' } } },
+  ]).toArray() as Array<{ _id: { symbol: string; market: string }; latest: number | Date }>;
+  const out = new Map<string, number>();
+  for (const row of rows) {
+    const latest = row.latest instanceof Date ? row.latest.getTime() : Number(row.latest);
+    if (Number.isFinite(latest)) out.set(`${row._id.symbol}|${row._id.market}`, latest);
+  }
+  return out;
+}
+
+/**
+ * Per-(symbol, market) genuine-revision count for `interval` (first-prints excluded), dispatched per
+ * `BARS_BACKEND`, from the revision audit ledger. Returns a Map keyed `${symbol}|${market}`. Backs the
+ * `/coverage` revisions column. The audit ledger lives in the SAME store as the bars writer writes it
+ * to (Mongo `bar_revisions_log` on the mongo path; the Timescale `bar_revisions_log` hypertable on the
+ * timescale path), so this dispatch keeps `/coverage` honest post-flip.
+ *
+ * @param db  MongoDB handle. Required when `BARS_BACKEND=mongo` (the default); may be `undefined`
+ *           when `BARS_BACKEND=timescale`.
+ */
+export async function countRevisionsForTickers(
+  db: Db | undefined,
+  interval: BarInterval,
+): Promise<Map<string, number>> {
+  if (activeBackend() === 'timescale') {
+    return countRevisionsForTickersPg(interval);
+  }
+  if (!db) {
+    throw new Error('[shared-bars] countRevisionsForTickers: db parameter required when BARS_BACKEND=mongo (the default)');
+  }
+  const rows = await db.collection(COLLECTIONS.BAR_REVISIONS_LOG).aggregate([
+    { $match: { interval, prior_hash: { $ne: null } } },
+    { $group: { _id: { symbol: '$symbol', market: '$market' }, revisions: { $sum: 1 } } },
+  ]).toArray();
+  const out = new Map<string, number>();
+  for (const row of rows as Array<{ _id: { symbol: string; market: string }; revisions: number }>) {
+    out.set(`${row._id.symbol}|${row._id.market}`, row.revisions ?? 0);
+  }
+  return out;
+}
+
+/**
+ * The revision audit trail for ONE ticker since a knowledge instant, newest-first, dispatched per
+ * `BARS_BACKEND`, from the revision audit ledger (the same store the writer writes it to). Bounded by
+ * `knowledge_ts >= since` + `limit`. Returns identity-keyed `BarRevisionLogRow`s (the caller re-derives
+ * the T212 ticker for display). Backs the operator `/revisions/:ticker` surface.
+ *
+ * @param db  MongoDB handle. Required when `BARS_BACKEND=mongo` (the default); may be `undefined`
+ *           when `BARS_BACKEND=timescale`.
+ */
+export async function getRevisionsForTicker(
+  db: Db | undefined,
+  symbol: string,
+  market: string,
+  since: number,
+  limit: number,
+): Promise<BarRevisionLogRow[]> {
+  if (activeBackend() === 'timescale') {
+    return getRevisionsForTickerPg(symbol, market, since, limit);
+  }
+  if (!db) {
+    throw new Error('[shared-bars] getRevisionsForTicker: db parameter required when BARS_BACKEND=mongo (the default)');
+  }
+  const rows = await db.collection(COLLECTIONS.BAR_REVISIONS_LOG)
+    .find({ symbol, market, knowledge_ts: { $gte: since } })
+    .sort({ knowledge_ts: -1 })
+    .limit(limit)
+    .toArray();
+  return rows.map((r) => {
+    const doc = r as Record<string, unknown>;
+    return {
+      symbol: String(doc.symbol ?? ''),
+      market: String(doc.market ?? ''),
+      observation_ts: Number(doc.observation_ts ?? 0),
+      interval: String(doc.interval ?? ''),
+      knowledge_ts: Number(doc.knowledge_ts ?? 0),
+      prior_hash: typeof doc.prior_hash === 'string' ? doc.prior_hash : null,
+      new_hash: String(doc.new_hash ?? ''),
+    };
+  });
 }
 
 /**

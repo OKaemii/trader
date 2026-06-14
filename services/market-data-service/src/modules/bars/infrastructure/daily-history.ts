@@ -9,8 +9,7 @@
 
 import type { Db } from 'mongodb';
 import type { RedisClientType } from 'redis';
-import { COLLECTIONS } from '@trader/shared-mongo';
-import { invalidateBars } from '@trader/shared-bars';
+import { invalidateBars, countBarsForTickers } from '@trader/shared-bars';
 import { Trading212TickerAdapter } from '@trader/ticker-identity';
 import type { OHLCVBar } from '@trader/shared-types';
 import { writeBarRevisions } from './persist-bars.ts';
@@ -19,6 +18,14 @@ import { CACHE_INVALIDATED_TOPIC, planGapWindows } from './backfill.ts';
 import { log } from '../../../logger.ts';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+// OOM-safe lower bound for the dispatched daily count. The persisted daily series can reach 1990→now;
+// an UNBOUNDED count over that deep hypertable locks every chunk → "out of shared memory". The
+// write-gating question is only "does this name have ≥`minBars` (≈280) recent daily bars?", so a 3-year
+// window (~750 trading days) gives ample headroom over the 280 threshold while pruning the Timescale
+// aggregate to a bounded chunk slice. A currently-listed name (the whole active universe) always has
+// far more than 280 bars in 3y; a name with no recent daily data simply re-runs the (idempotent,
+// gap-aware) backfill. On Mongo the bound only excludes rows older than 3y (none affect the threshold).
+const DAILY_COVERAGE_WINDOW_MS = 3 * 365 * DAY_MS;
 // Bridge interior daily holes up to 4 days — a weekend (2d) plus an adjacent long-weekend
 // holiday — so weekends/holidays in a fully-seeded series don't trigger no-yield re-fetches.
 // A genuinely-missing run of trading days exceeds this and stays a fetchable interior gap.
@@ -136,13 +143,12 @@ async function backfillDailyOne(
  * long lookback. `minBars` defaults to 280 (≈ 12-1 momentum's 252 lookback + 21 skip + a
  * small buffer). Counts only the latest unsuperseded revision per (ticker, observation_ts).
  *
- * STORE NOTE (RC4 audit, card 218). Reads Mongo `ohlcv_bars` — correct: this gates the deep daily
- * backfill, so it must read the store the daily series is WRITTEN to (Mongo, via the still-Mongo-
- * primary `writeBarRevisions`), NOT the `BARS_BACKEND` read store. (The OOM-safe Timescale daily
- * depth read is `getDailyDepth` / `GET /admin/api/market-data/daily-depth`, used to PROVE depth
- * post-backfill — a read-side surface, distinct from this write-gating count.) Moves to dispatch
- * with the writer flip — see backfill.ts `planGapWindows` STORE NOTE + the "writeBarRevisions
- * Timescale-primary" follow-up card.
+ * STORE: counts through the `BARS_BACKEND`-dispatched `countBarsForTickers`, so it gates the deep
+ * daily backfill off the store the daily series is WRITTEN to (the same dispatch as the writer). (The
+ * OOM-safe Timescale daily DEPTH read — `getDailyDepth` / `GET /admin/api/market-data/daily-depth` —
+ * is the separate read-side surface that PROVES depth post-backfill; this is the write-gating count.)
+ * Bounded by the 3-year coverage window so the Timescale count stays chunk-pruned (lock safety) — see
+ * `DAILY_COVERAGE_WINDOW_MS`.
  */
 export async function tickersMissingDailyHistory(
   db: Db,
@@ -150,23 +156,17 @@ export async function tickersMissingDailyHistory(
   minBars = 280,
 ): Promise<string[]> {
   if (tickers.length === 0) return [];
-  const coll = db.collection(COLLECTIONS.OHLCV_BARS);
-  // ohlcv_bars is keyed on (symbol, market); split the T212 tickers, group on the identity, and
-  // re-key the result back to T212 form for the returned "missing" list.
+  // Storage is keyed on (symbol, market); split the T212 tickers, count per identity, and re-key the
+  // result back to T212 form for the returned "missing" list.
   const adapter = new Trading212TickerAdapter();
   const ids = tickers.map((t) => ({ ticker: t, ...adapter.fromT212(t) }));
   const tickerByIdentity = new Map(ids.map((i) => [`${i.symbol}|${i.market}`, i.ticker]));
-  const counts = await coll.aggregate([
-    { $match: { $or: ids.map((i) => ({ symbol: i.symbol, market: i.market })), interval: 'daily', is_superseded: false } },
-    { $group: { _id: { symbol: '$symbol', market: '$market' }, count: { $sum: 1 } } },
-  ]).toArray();
+  const sinceMs = Date.now() - DAILY_COVERAGE_WINDOW_MS;
+  const counts = await countBarsForTickers(db, ids.map((i) => ({ symbol: i.symbol, market: i.market })), 'daily', sinceMs);
   const sufficient = new Set(
-    counts
-      .filter((d: Record<string, unknown>) => (d.count as number) >= minBars)
-      .map((d: Record<string, unknown>) => {
-        const id = d._id as { symbol: string; market: string };
-        return tickerByIdentity.get(`${id.symbol}|${id.market}`);
-      })
+    [...counts.entries()]
+      .filter(([, count]) => count >= minBars)
+      .map(([key]) => tickerByIdentity.get(key))
       .filter((t): t is string => t !== undefined),
   );
   return tickers.filter((t) => !sufficient.has(t));

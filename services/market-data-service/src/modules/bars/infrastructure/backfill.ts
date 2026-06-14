@@ -19,7 +19,10 @@
 import type { Db } from 'mongodb';
 import type { RedisClientType } from 'redis';
 import { COLLECTIONS } from '@trader/shared-mongo';
-import { invalidateBars, computeMissingRanges } from '@trader/shared-bars';
+import {
+  invalidateBars, computeMissingRanges,
+  getObservedTimestamps, countBarsForTickers, latestObservationForTickers,
+} from '@trader/shared-bars';
 import type { MissingRange } from '@trader/shared-bars';
 import { Trading212TickerAdapter } from '@trader/ticker-identity';
 import type { BarInterval } from '@trader/shared-types';
@@ -27,11 +30,20 @@ import type { MarketDataProvider } from './providers/market-data-provider.ts';
 import { writeBarRevisions } from './persist-bars.ts';
 import { log } from '../../../logger.ts';
 
-// ohlcv_bars is keyed on the bare identity (symbol, market); the coverage/heal reads here split the
-// T212 ticker at the storage boundary via the platform's single suffix parser.
+// Bars are keyed on the bare identity (symbol, market); the coverage/heal reads here split the T212
+// ticker at the storage boundary via the platform's single suffix parser. The actual store reads go
+// through the BARS_BACKEND-dispatched shared-bars helpers (not a direct Mongo collection) so gap/heal
+// detection reads the SAME store writeBarRevisions writes to — flipping the writer to Timescale-primary
+// without flipping these would count an empty Mongo and re-fetch the whole universe.
 const tickerAdapter = new Trading212TickerAdapter();
 
 const FIVE_MIN_MS = 5 * 60_000;
+// OOM-safe lower bound for the dispatched 5m count/latest reads. The 5m series is provider-capped at
+// ~60 days (no 5m bar older than that can exist), so a 75-day floor captures every extant 5m bar while
+// keeping the Timescale aggregate pruned to a bounded chunk slice (an unbounded count over a deep
+// hypertable locks every chunk → "out of shared memory"). On Mongo it changes nothing (no rows older
+// than the cap exist to exclude).
+const FIVE_MIN_COVERAGE_WINDOW_MS = 75 * 24 * 60 * 60_000;
 // Bridge a weeknight overnight close (~17.5h, e.g. Mon 16:00 → Tue 09:30) between two covered
 // sessions — it's intrinsic to a 5m series, not missing data. Sized BELOW a fully-missing
 // trading day (Mon 16:00 → Wed 09:30 ≈ 41.5h) so a real interior hole stays a fetchable gap.
@@ -107,17 +119,13 @@ function dropClosureGaps(gaps: MissingRange[], bridgeMs: number): MissingRange[]
  * Live (`is_superseded:false`) rows only — the same fast lane `coverageOf` and the live read
  * path use.
  *
- * STORE NOTE (RC4 audit, card 218). Reads Mongo `ohlcv_bars` directly — deliberately, and
- * correctly. Coverage/gap detection MUST read the store the bars are WRITTEN to, not the
- * `BARS_BACKEND` read store. `writeBarRevisions` (persist-bars.ts) is still Mongo-primary
- * (Timescale only when `DUAL_WRITE_BARS=true`), so every backfill/poll/emit write lands in Mongo;
- * a gap check against the (read-side) Timescale store would mis-detect coverage and re-fetch the
- * whole universe each cycle. Flipping this site to the `BARS_BACKEND` dispatcher in ISOLATION
- * would CAUSE a re-fetch storm, not fix one. The real defect is the writer/reader store inversion
- * (live config is `BARS_BACKEND=timescale` + `DUAL_WRITE_BARS=false`, so reads dispatch to
- * Timescale while writes stay Mongo); this read moves to dispatch ATOMICALLY with the writer flip
- * — see the follow-up card "writeBarRevisions Timescale-primary". Until then, Mongo IS the write
- * store and reading it here is the consistent choice.
+ * STORE: reads through the `BARS_BACKEND`-dispatched `getObservedTimestamps`, so it reflects whatever
+ * store `writeBarRevisions` writes to. This MUST stay aligned with the writer: gap/coverage detection
+ * counts the store the bars are WRITTEN to, and (post the writer flip) that is Timescale under
+ * `BARS_BACKEND=timescale`. Were the writer Timescale-primary while this read stayed Mongo, the gap
+ * check would see an empty Mongo and re-fetch the whole universe every cycle — so the writer flip and
+ * this read move together. The `[neededStart, endMs]` window bounds the Timescale read to that
+ * window's chunks (OOM-safe).
  */
 export async function planGapWindows(
   db: Db,
@@ -132,21 +140,7 @@ export async function planGapWindows(
   const neededStart = Math.floor(startMs / stepMs) * stepMs;
   const neededEnd   = Math.floor(endMs   / stepMs) * stepMs;
 
-  const { symbol, market } = tickerAdapter.fromT212(ticker);
-  const docs = await db
-    .collection(COLLECTIONS.OHLCV_BARS)
-    .find(
-      { symbol, market, interval, is_superseded: false, observation_ts: { $gte: neededStart, $lte: endMs } },
-      { projection: { _id: 0, observation_ts: 1 } },
-    )
-    .toArray();
-
-  const observed: number[] = [];
-  for (const d of docs) {
-    const ts = (d as { observation_ts?: unknown }).observation_ts;
-    if (typeof ts === 'number') observed.push(ts);
-  }
-
+  const observed = await getObservedTimestamps(db, ticker, interval, neededStart, endMs);
   const gaps = computeMissingRanges(observed, neededStart, neededEnd, stepMs);
   return dropClosureGaps(gaps, bridgeMs);
 }
@@ -259,10 +253,12 @@ async function backfillOne(
  * prewarm at intraday cadence). Override per call when bootstrapping a different
  * mode.
  *
- * STORE NOTE (RC4 audit, card 218). Reads Mongo `ohlcv_bars` — correct: this gates a backfill, so
- * it must read the store the bars are WRITTEN to (Mongo, via the still-Mongo-primary
- * `writeBarRevisions`), NOT the `BARS_BACKEND` read store. Moves to dispatch with the writer flip
- * — see `planGapWindows` STORE NOTE + the "writeBarRevisions Timescale-primary" follow-up card.
+ * STORE: counts through the `BARS_BACKEND`-dispatched `countBarsForTickers`, so it reads the store the
+ * bars are WRITTEN to (the same dispatch as the writer). It gates a backfill, so reading anything but
+ * the write store would re-fetch the universe (the empty-Mongo trap once the writer is Timescale-
+ * primary). Counts only unsuperseded rows (one per logical bar) within the 5m coverage window, which
+ * bounds the Timescale aggregate for lock safety; the 5m series is capped at ~60d, so the 75d window
+ * captures every bar that can exist.
  */
 export async function tickersMissingHistory(
   db: Db,
@@ -270,26 +266,19 @@ export async function tickersMissingHistory(
   minBars = 250,
 ): Promise<string[]> {
   if (tickers.length === 0) return [];
-  const collection = db.collection(COLLECTIONS.OHLCV_BARS);
   // Split each T212 ticker to its (symbol, market) identity (storage key); re-key the grouped
   // result back to the caller's ticker so the returned "missing" list stays in T212 form.
   const ids = tickers.map((t) => ({ ticker: t, ...tickerAdapter.fromT212(t) }));
   const tickerByIdentity = new Map(ids.map((i) => [`${i.symbol}|${i.market}`, i.ticker]));
-  // Count only the latest unsuperseded revision per (symbol, market, observation_ts). A name
-  // with N first-prints and M revisions has N unsuperseded rows, not N+M — without
-  // is_superseded:false the count would inflate after every revision and a brand-new
-  // ticker that revised every bar would falsely appear "well-covered".
-  const counts = await collection.aggregate([
-    { $match: { $or: ids.map((i) => ({ symbol: i.symbol, market: i.market })), interval: '5m', is_superseded: false } },
-    { $group: { _id: { symbol: '$symbol', market: '$market' }, count: { $sum: 1 } } },
-  ]).toArray();
+  // Count only the latest unsuperseded revision per (symbol, market, observation_ts). A name with N
+  // first-prints and M revisions has N unsuperseded rows, not N+M — the dispatched count filters
+  // is_superseded so a brand-new ticker that revised every bar can't falsely appear "well-covered".
+  const sinceMs = Date.now() - FIVE_MIN_COVERAGE_WINDOW_MS;
+  const counts = await countBarsForTickers(db, ids.map((i) => ({ symbol: i.symbol, market: i.market })), '5m', sinceMs);
   const sufficient = new Set(
-    counts
-      .filter((d: Record<string, unknown>) => (d.count as number) >= minBars)
-      .map((d: Record<string, unknown>) => {
-        const id = d._id as { symbol: string; market: string };
-        return tickerByIdentity.get(`${id.symbol}|${id.market}`);
-      })
+    [...counts.entries()]
+      .filter(([, count]) => count >= minBars)
+      .map(([key]) => tickerByIdentity.get(key))
       .filter((t): t is string => t !== undefined),
   );
   return tickers.filter((t) => !sufficient.has(t));
@@ -308,12 +297,12 @@ export async function tickersMissingHistory(
  *
  * Steady-state cost when nothing is gapped: one aggregation, zero Yahoo calls.
  *
- * STORE NOTE (RC4 audit, card 218). The latest-bar aggregation reads Mongo `ohlcv_bars` — correct:
- * heal decides what to re-fetch, so it must read the store the bars are WRITTEN to (Mongo, via the
- * still-Mongo-primary `writeBarRevisions`), NOT the `BARS_BACKEND` read store. A heal driven off a
- * stale Timescale read would re-fetch the universe every cycle (credit blowout). Moves to dispatch
- * with the writer flip — see `planGapWindows` STORE NOTE + the "writeBarRevisions Timescale-primary"
- * follow-up card.
+ * STORE: the latest-bar read is `BARS_BACKEND`-dispatched (`latestObservationForTickers`), so heal
+ * decides what to re-fetch off the store the bars are WRITTEN to (the same dispatch as the writer).
+ * Driving heal off a different store than the writer writes (an empty/stale store) would re-fetch the
+ * universe every cycle (credit blowout) — so this moves with the writer flip. The 5m series is capped
+ * at ~60d, so the 75d window bounds the Timescale aggregate (lock safety) while still finding every
+ * re-fetchable bar (anything older is past the provider cap and logged as an unrecoverable gap).
  */
 export async function healMissingHistory(
   db: Db,
@@ -325,7 +314,6 @@ export async function healMissingHistory(
   if (tickers.length === 0) return { healed: 0, barsAdded: 0, unrecoverable: 0 };
   const stale = opts.staleThresholdMs ?? 24 * 60 * 60_000;
   const now   = Date.now();
-  const collection = db.collection(COLLECTIONS.OHLCV_BARS);
 
   // Session-aware gap detection. When the caller passes `expectedLatestMs` (the most
   // recent session close for the relevant market, from @trader/shared-calendar's
@@ -342,25 +330,20 @@ export async function healMissingHistory(
     return now - latestMs > stale;
   };
 
-  // Single aggregation: latest unsuperseded observation_ts per (symbol, market) for the 5m series.
-  // Names not present in the result have no history at all (handled by bootstrap, not heal — heal
-  // trusts that bootstrap ran). is_superseded:false keeps the gap check honest: a revision of a
-  // stale bar shouldn't appear as fresh coverage. Split the T212 tickers to identities and re-key
-  // the grouped result back to T212 (backfillTickers below takes T212 tickers).
+  // Dispatched read: latest unsuperseded observation_ts per (symbol, market) for the 5m series.
+  // Names not present in the result have no recent history (handled by bootstrap, not heal — heal
+  // trusts that bootstrap ran). is_superseded keeps the gap check honest: a revision of a stale bar
+  // shouldn't appear as fresh coverage. Split the T212 tickers to identities and re-key the grouped
+  // result back to T212 (backfillTickers below takes T212 tickers).
   const ids = tickers.map((t) => ({ ticker: t, ...tickerAdapter.fromT212(t) }));
   const tickerByIdentity = new Map(ids.map((i) => [`${i.symbol}|${i.market}`, i.ticker]));
-  const agg = await collection.aggregate([
-    { $match: { $or: ids.map((i) => ({ symbol: i.symbol, market: i.market })), interval: '5m', is_superseded: false } },
-    { $group: { _id: { symbol: '$symbol', market: '$market' }, latest: { $max: '$observation_ts' } } },
-  ]).toArray() as Array<{ _id: { symbol: string; market: string }; latest: number | Date }>;
+  const sinceMs = now - FIVE_MIN_COVERAGE_WINDOW_MS;
+  const latestByIdentity = await latestObservationForTickers(db, ids.map((i) => ({ symbol: i.symbol, market: i.market })), '5m', sinceMs);
 
   const gapped: Array<{ ticker: string; latestMs: number }> = [];
-  for (const row of agg) {
-    const ticker = tickerByIdentity.get(`${row._id.symbol}|${row._id.market}`);
+  for (const [key, latestMs] of latestByIdentity) {
+    const ticker = tickerByIdentity.get(key);
     if (ticker === undefined) continue;
-    // observation_ts is a number; legacy rows pre-migration carried Date. Tolerate both
-    // until the migration has run on every existing deployment.
-    const latestMs = row.latest instanceof Date ? row.latest.getTime() : Number(row.latest);
     if (isGapped(latestMs)) gapped.push({ ticker, latestMs });
   }
   if (gapped.length === 0) return { healed: 0, barsAdded: 0, unrecoverable: 0 };

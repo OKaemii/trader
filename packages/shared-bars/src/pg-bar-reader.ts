@@ -204,6 +204,245 @@ export async function getRecentBarsForTickersPg(
   return rows.map(rowToBar);
 }
 
+// Window size for the observed-ts walk. The gap planner hands ranges as wide as the daily backfill's
+// 5y default (or the 35y deep-backfill) — and a SINGLE query bounded only at the range edges still
+// opens (and locks) EVERY 7-day chunk in that multi-year span at executor startup → "out of shared
+// memory" (the range='max' lock-fan; the OOM-safe rule is "prune to a SMALL slice", not just "have a
+// bound"). So the read walks the requested range in bounded ~2-year windows — each query's
+// `observation_ts >= lo AND < hi` prunes chunk-exclusion to that window's ~104 chunks — exactly the
+// getDailyDepthPg pattern. A 60d 5m range is a single window; a 35y daily range is ~18.
+const OBSERVED_WALK_WINDOW_MS = 730 * 24 * 60 * 60 * 1000; // 2 years ≈ 104 7-day chunks per query.
+// Same bounded-window size for the per-set count walk (countBarsForTickersPg) — keeps each windowed
+// count(*) plan under the lock budget regardless of how wide a `sinceMs` the caller passes.
+const COUNT_WALK_WINDOW_MS = 730 * 24 * 60 * 60 * 1000; // 2 years ≈ 104 7-day chunks per query.
+
+/**
+ * Observed unsuperseded `observation_ts` values for ONE ticker within `[sinceMs, untilMs]`, from
+ * Timescale. The set-of-timestamps the gap-aware fetch planner (`planGapWindows`) diffs against the
+ * step grid to find the windows it must re-fetch. The range is WALKED in bounded ~2-year windows so no
+ * single query plan spans more chunks than one window holds — the OOM-safe rule (a single query over
+ * the daily backfill's multi-year range would lock every chunk → "out of shared memory"; see
+ * OBSERVED_WALK_WINDOW_MS). Live (`is_superseded = FALSE`) rows only — the same fast lane the gap
+ * planner's Mongo branch reads. Returns the raw `observation_ts` numbers (no row mapping — the planner
+ * only needs the timestamps), accumulated across windows.
+ */
+export async function getObservedTimestampsPg(
+  ticker: string,
+  interval: BarInterval,
+  sinceMs: number,
+  untilMs: number,
+): Promise<number[]> {
+  if (untilMs < sinceMs) return [];
+  const pool = getPgPool();
+  const { symbol, market } = identityOf(ticker);
+  const out: number[] = [];
+  // Walk [sinceMs, untilMs] in bounded windows. Each query is bounded on BOTH sides of the time
+  // dimension, so the planner prunes to that window's chunks — never the whole multi-year range.
+  for (let lo = sinceMs; lo <= untilMs; lo += OBSERVED_WALK_WINDOW_MS) {
+    const hi = Math.min(lo + OBSERVED_WALK_WINDOW_MS - 1, untilMs); // inclusive upper edge per window
+    const { rows } = await pool.query<{ observation_ts: string }>(
+      `SELECT observation_ts
+         FROM bars
+        WHERE symbol = $1
+          AND market = $2
+          AND interval = $3
+          AND is_superseded = FALSE
+          AND observation_ts >= $4
+          AND observation_ts <= $5`,
+      [symbol, market, interval, lo, hi],
+    );
+    for (const r of rows) out.push(Number(r.observation_ts));
+  }
+  return out;
+}
+
+/**
+ * Unsuperseded `interval` bar COUNT per (symbol, market) identity in a SET, from Timescale, over
+ * `[sinceMs, now]`. Backs the bootstrap "does this ticker have ≥N bars?" checks
+ * (`tickersMissingHistory` / `tickersMissingDailyHistory`) and is the per-set count behind `/coverage`.
+ * Returns a Map keyed `${symbol}|${market}` (only names with ≥1 row in the window appear; absent ⇒ 0).
+ *
+ * OOM-safe by WALKING `[sinceMs, now]` in bounded ~2-year windows and summing per identity — a
+ * `sinceMs`-only lower bound is NOT enough on its own: the daily threshold needs ≥~400 days of window
+ * (to fit the ~280-bar `minBars`), and the daily-backfill gate passes a multi-year `sinceMs`, so a
+ * single `count(*) … observation_ts >= sinceMs` would still open (and lock) every chunk back to the
+ * floor → "out of shared memory" (the default max_locks_per_transaction is 64; a 3y span is ~156
+ * chunks). Each windowed query's `observation_ts >= lo AND < hi` prunes chunk-exclusion to ~104 chunks
+ * (the getDailyDepthPg pattern). A 5m 75d call is a single window; a daily 3y call is ~2. The
+ * `(symbol, market, interval, observation_ts DESC) WHERE is_superseded = FALSE` partial index
+ * (`bars_asof_lookup`) backs each window scan.
+ */
+export async function countBarsForTickersPg(
+  ids: ReadonlyArray<TickerIdentity>,
+  interval: BarInterval,
+  sinceMs: number,
+): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  if (ids.length === 0) return out;
+  const pool = getPgPool();
+  const symbols = ids.map((id) => id.symbol);
+  const markets = ids.map((id) => id.market);
+  const nowMs = Date.now();
+  // Walk forward in bounded windows so no single aggregate plan spans more chunks than one window
+  // holds. +DAY_MS on the final upper edge so the newest bar's window is inclusive.
+  for (let lo = sinceMs; lo < nowMs; lo += COUNT_WALK_WINDOW_MS) {
+    const hi = Math.min(lo + COUNT_WALK_WINDOW_MS, nowMs + 24 * 60 * 60 * 1000);
+    const { rows } = await pool.query<{ symbol: string; market: string; n: string }>(
+      `SELECT symbol, market, count(*)::bigint AS n
+         FROM bars
+        WHERE (symbol, market) IN (
+                SELECT unnest($1::text[]), unnest($2::text[])
+              )
+          AND interval = $3
+          AND is_superseded = FALSE
+          AND observation_ts >= $4
+          AND observation_ts < $5
+        GROUP BY symbol, market`,
+      [symbols, markets, interval, lo, hi],
+    );
+    for (const r of rows) {
+      const key = `${r.symbol}|${r.market}`;
+      out.set(key, (out.get(key) ?? 0) + Number(r.n));
+    }
+  }
+  return out;
+}
+
+/**
+ * Unsuperseded `interval` bar count per (symbol, market) across the WHOLE store (no identity set),
+ * from Timescale, bounded below by `sinceMs`. The set-free companion to `countBarsForTickersPg` — backs
+ * the admin `/coverage` endpoint, which reports every name that has bars, not a fixed universe. The
+ * `sinceMs` floor is the OOM-safe bound (an unbounded whole-store group-by locks every chunk); the
+ * caller passes the interval's natural window (5m: ~60d provider cap). Returns a Map keyed
+ * `${symbol}|${market}`.
+ */
+export async function countAllBarsPg(
+  interval: BarInterval,
+  sinceMs: number,
+): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  const pool = getPgPool();
+  const { rows } = await pool.query<{ symbol: string; market: string; n: string }>(
+    `SELECT symbol, market, count(*)::bigint AS n
+       FROM bars
+      WHERE interval = $1
+        AND is_superseded = FALSE
+        AND observation_ts >= $2
+      GROUP BY symbol, market`,
+    [interval, sinceMs],
+  );
+  for (const r of rows) out.set(`${r.symbol}|${r.market}`, Number(r.n));
+  return out;
+}
+
+/**
+ * Latest unsuperseded `observation_ts` per (symbol, market) identity in a SET, from Timescale, bounded
+ * below by `sinceMs`. Backs the self-heal gap detector (`healMissingHistory`) — the `$group({$max})`
+ * the Mongo branch ran, dispatched so heal reads the store the writer now writes to. Returns a Map
+ * keyed `${symbol}|${market}` (only names with ≥1 row in the window appear). Same `sinceMs` OOM bound
+ * + `bars_asof_lookup` index as the count read; heal works the 5m series so the bound is the 60d
+ * provider cap. The `MAX(observation_ts)` aggregate over the bounded window is index-backed.
+ */
+export async function latestObservationForTickersPg(
+  ids: ReadonlyArray<TickerIdentity>,
+  interval: BarInterval,
+  sinceMs: number,
+): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  if (ids.length === 0) return out;
+  const pool = getPgPool();
+  const symbols = ids.map((id) => id.symbol);
+  const markets = ids.map((id) => id.market);
+  const { rows } = await pool.query<{ symbol: string; market: string; latest: string }>(
+    `SELECT symbol, market, max(observation_ts) AS latest
+       FROM bars
+      WHERE (symbol, market) IN (
+              SELECT unnest($1::text[]), unnest($2::text[])
+            )
+        AND interval = $3
+        AND is_superseded = FALSE
+        AND observation_ts >= $4
+      GROUP BY symbol, market`,
+    [symbols, markets, interval, sinceMs],
+  );
+  for (const r of rows) out.set(`${r.symbol}|${r.market}`, Number(r.latest));
+  return out;
+}
+
+/** One row of the bar-revision audit ledger, identity-keyed (symbol, market). */
+export interface BarRevisionLogRow {
+  symbol: string;
+  market: string;
+  observation_ts: number;
+  interval: string;
+  knowledge_ts: number;
+  prior_hash: string | null;
+  new_hash: string;
+}
+
+/**
+ * Per-(symbol, market) revision COUNT for `interval` from the Timescale `bar_revisions_log` ledger,
+ * EXCLUDING first-prints (`prior_hash IS NOT NULL`) — the genuine-revisions count the `/coverage`
+ * endpoint reports beside the bar count. The PG writer writes this ledger in the SAME transaction as
+ * each bar supersede, so post-flip the revisions live here, not in Mongo. `bar_revisions_log` is a
+ * small append-only ledger (one row per revision/first-print, NOT per bar) — its chunk count is tiny
+ * relative to `bars`, so an interval-scoped scan is cheap; no window bound is needed for correctness or
+ * lock safety here. Returns a Map keyed `${symbol}|${market}`.
+ */
+export async function countRevisionsForTickersPg(
+  interval: BarInterval,
+): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  const pool = getPgPool();
+  const { rows } = await pool.query<{ symbol: string; market: string; n: string }>(
+    `SELECT symbol, market, count(*)::bigint AS n
+       FROM bar_revisions_log
+      WHERE interval = $1
+        AND prior_hash IS NOT NULL
+      GROUP BY symbol, market`,
+    [interval],
+  );
+  for (const r of rows) out.set(`${r.symbol}|${r.market}`, Number(r.n));
+  return out;
+}
+
+/**
+ * The bi-temporal revision audit trail for ONE ticker since a knowledge instant, newest-first, from
+ * the Timescale `bar_revisions_log` ledger — the operator-facing `/revisions/:ticker` read, dispatched
+ * so it reflects the store the writer now writes its audit log to. Bounded by `knowledge_ts >= since`
+ * + `LIMIT`. Returns identity-keyed rows; the route re-derives the T212 ticker for display.
+ */
+export async function getRevisionsForTickerPg(
+  symbol: string,
+  market: string,
+  since: number,
+  limit: number,
+): Promise<BarRevisionLogRow[]> {
+  const pool = getPgPool();
+  const { rows } = await pool.query<{
+    symbol: string; market: string; observation_ts: string; interval: string;
+    knowledge_ts: string; prior_hash: string | null; new_hash: string;
+  }>(
+    `SELECT symbol, market, observation_ts, interval, knowledge_ts, prior_hash, new_hash
+       FROM bar_revisions_log
+      WHERE symbol = $1
+        AND market = $2
+        AND knowledge_ts >= $3
+      ORDER BY knowledge_ts DESC
+      LIMIT $4`,
+    [symbol, market, since, limit],
+  );
+  return rows.map((r) => ({
+    symbol: r.symbol,
+    market: r.market,
+    observation_ts: Number(r.observation_ts),
+    interval: r.interval,
+    knowledge_ts: Number(r.knowledge_ts),
+    prior_hash: r.prior_hash,
+    new_hash: r.new_hash,
+  }));
+}
+
 interface CachedBar {
   v: 1;
   cachedAt: number;

@@ -9,7 +9,7 @@
 
 process.env.INTERNAL_SECRET = 'test-internal-secret';
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { hashBarContent } from '@trader/shared-bars';
 import type { OHLCVBar } from '@trader/shared-types';
 
@@ -36,14 +36,16 @@ vi.mock('@trader/shared-mongo', async () => {
 // tests override via mockResolvedValueOnce/mockRejectedValueOnce. vi.hoisted is
 // required because vi.mock factories are hoisted to the top of the file, before
 // regular `const` declarations evaluate.
-const { pgWriteMock } = vi.hoisted(() => ({
+const { pgWriteMock, pgFirstPrintMock } = vi.hoisted(() => ({
   pgWriteMock: vi.fn(async () => ({ attempted: 0, inserted: 0, revisions: 0, skipped: 0 })),
+  pgFirstPrintMock: vi.fn(async () => new Map<string, number>()),
 }));
 vi.mock('../modules/bars/infrastructure/pg-bar-writer.ts', () => ({
   writeBarRevisionsPg: pgWriteMock,
+  fetchFirstPrintClosesPg: pgFirstPrintMock,
 }));
 
-import { writeBarRevisions } from '../modules/bars/infrastructure/persist-bars.ts';
+import { writeBarRevisions, fetchFirstPrintCloses } from '../modules/bars/infrastructure/persist-bars.ts';
 
 // In-memory Mongo collection stub that records every mutation the writer issues.
 // `priorByKey` seeds the latest-unsuperseded-row lookup so a test can simulate
@@ -259,8 +261,11 @@ describe('writeBarRevisions — mixed batch', () => {
   });
 });
 
-describe('writeBarRevisions — dual-write to Timescale', () => {
+describe('writeBarRevisions — dual-write to Timescale (BARS_BACKEND=mongo primary)', () => {
   beforeEach(() => {
+    // These cover the Mongo-PRIMARY path — pin the backend explicitly so a leaked
+    // BARS_BACKEND=timescale from another test can't silently re-route them.
+    delete process.env.BARS_BACKEND;
     pgWriteMock.mockClear();
     pgWriteMock.mockResolvedValue({ attempted: 0, inserted: 0, revisions: 0, skipped: 0 });
   });
@@ -332,6 +337,124 @@ describe('writeBarRevisions — dual-write to Timescale', () => {
     } finally {
       delete process.env.DUAL_WRITE_BARS;
     }
+  });
+});
+
+// The store-inversion fix: under BARS_BACKEND=timescale the writer is Timescale-PRIMARY (the PG twin
+// owns the write + audit), NOT a best-effort dual-write. Mongo is written ONLY as a rollback mirror
+// (DUAL_WRITE_BARS=true). Live config (timescale + DUAL_WRITE_BARS=false) writes Timescale ONLY — so
+// writes land in the SAME store every reader dispatches to (the bug this card fixes).
+describe('writeBarRevisions — BARS_BACKEND=timescale primary', () => {
+  beforeEach(() => {
+    process.env.BARS_BACKEND = 'timescale';
+    delete process.env.DUAL_WRITE_BARS;
+    pgWriteMock.mockClear();
+    pgWriteMock.mockResolvedValue({ attempted: 1, inserted: 1, revisions: 0, skipped: 0 });
+  });
+  afterEach(() => {
+    delete process.env.BARS_BACKEND;
+    delete process.env.DUAL_WRITE_BARS;
+  });
+
+  it('writes Timescale ONLY (no Mongo) when DUAL_WRITE_BARS is off — the live config', async () => {
+    const { db, inserts, updates, audits } = makeCollections({});
+    const b = bar('A_US_EQ', 1_000, 100);
+    const now = 1_700_000_000_000;
+
+    const stats = await writeBarRevisions(db, [b], '5m', now);
+
+    // PG (primary) invoked with the bars; its stats are what the writer returns.
+    expect(pgWriteMock).toHaveBeenCalledTimes(1);
+    expect(pgWriteMock).toHaveBeenCalledWith([b], '5m', now);
+    expect(stats).toEqual({ attempted: 1, inserted: 1, revisions: 0, skipped: 0 });
+    // Mongo NOT touched — no bar insert, no supersede, no audit row.
+    expect(inserts).toHaveLength(0);
+    expect(updates).toHaveLength(0);
+    expect(audits).toHaveLength(0);
+  });
+
+  it('also mirrors to Mongo (rollback target) when DUAL_WRITE_BARS=true, PG still primary', async () => {
+    process.env.DUAL_WRITE_BARS = 'true';
+    const { db, inserts, audits } = makeCollections({});
+    const b = bar('A_US_EQ', 1_000, 100);
+    const now = 1_700_000_000_000;
+
+    const stats = await writeBarRevisions(db, [b], '5m', now);
+
+    // PG primary + Mongo mirror both ran; the returned stats are PG's.
+    expect(pgWriteMock).toHaveBeenCalledTimes(1);
+    expect(stats.inserted).toBe(1);
+    expect(inserts).toHaveLength(1);          // the rollback mirror wrote the bar to Mongo
+    expect(audits).toHaveLength(1);           // and its audit row
+  });
+
+  it('a Mongo rollback-mirror failure does NOT fail the Timescale write that already landed', async () => {
+    process.env.DUAL_WRITE_BARS = 'true';
+    // A Mongo collection whose insertOne throws — the mirror fails, but PG already succeeded.
+    const failingDb = {
+      collection: () => ({
+        find: () => ({ project: () => ({ toArray: async () => [] }), toArray: async () => [] }),
+        updateMany: async () => { throw new Error('mongo mirror down'); },
+        insertOne:  async () => { throw new Error('mongo mirror down'); },
+      }),
+    } as unknown as import('mongodb').Db;
+
+    const stats = await writeBarRevisions(failingDb, [bar('A_US_EQ', 1_000, 100)], '5m');
+
+    // PG primary stats returned; no throw despite the mirror failing.
+    expect(pgWriteMock).toHaveBeenCalledTimes(1);
+    expect(stats.inserted).toBe(1);
+  });
+
+  it('propagates a PRIMARY (Timescale) write failure — the primary store is not best-effort', async () => {
+    pgWriteMock.mockRejectedValueOnce(new Error('timescale primary down'));
+    const { db } = makeCollections({});
+    await expect(
+      writeBarRevisions(db, [bar('A_US_EQ', 1_000, 100)], '5m'),
+    ).rejects.toThrow(/timescale primary down/);
+  });
+});
+
+// The BarValidator first-print seam must read the SAME store the writer writes to. Under
+// BARS_BACKEND=timescale it must delegate to the PG twin — reading the (post-flip empty) Mongo
+// ohlcv_bars would make the validator treat every revision as a first-print and silently kill the
+// revision_zscore_anomaly audit.
+describe('fetchFirstPrintCloses — BARS_BACKEND dispatch', () => {
+  beforeEach(() => {
+    pgFirstPrintMock.mockClear();
+    pgFirstPrintMock.mockResolvedValue(new Map([['A|US|1000', 99]]));
+  });
+  afterEach(() => { delete process.env.BARS_BACKEND; });
+
+  it('reads via the PG twin (NOT the Mongo aggregation) under BARS_BACKEND=timescale', async () => {
+    process.env.BARS_BACKEND = 'timescale';
+    // A Mongo db whose aggregate would throw if touched — proving the timescale path never reads it.
+    const explodingDb = { collection: () => ({ aggregate: () => { throw new Error('Mongo must not be read on the timescale path'); } }) } as unknown as import('mongodb').Db;
+    const b = bar('A_US_EQ', 1_000, 100);
+    const result = await fetchFirstPrintCloses(explodingDb, [b], '5m');
+    expect(pgFirstPrintMock).toHaveBeenCalledTimes(1);
+    expect(pgFirstPrintMock).toHaveBeenCalledWith([b], '5m');
+    expect(result.get('A|US|1000')).toBe(99);
+  });
+
+  it('reads the Mongo aggregation under the mongo default (PG twin untouched)', async () => {
+    delete process.env.BARS_BACKEND;
+    // Mongo stub returning a first-print row for the key.
+    const aggDb = {
+      collection: () => ({
+        aggregate: () => ({ toArray: async () => [{ _id: { symbol: 'A', market: 'US', observation_ts: 1_000 }, close: 42 }] }),
+      }),
+    } as unknown as import('mongodb').Db;
+    const result = await fetchFirstPrintCloses(aggDb, [bar('A_US_EQ', 1_000, 100)], '5m');
+    expect(pgFirstPrintMock).not.toHaveBeenCalled();
+    expect(result.get('A|US|1000')).toBe(42);
+  });
+
+  it('short-circuits empty input on both backends without reading either store', async () => {
+    process.env.BARS_BACKEND = 'timescale';
+    const explodingDb = { collection: () => { throw new Error('must not touch the store on empty input'); } } as unknown as import('mongodb').Db;
+    expect((await fetchFirstPrintCloses(explodingDb, [], '5m')).size).toBe(0);
+    expect(pgFirstPrintMock).not.toHaveBeenCalled();
   });
 });
 
