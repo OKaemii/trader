@@ -118,6 +118,46 @@ describe('GET /admin/api/market-data/scanner/snapshot — per-name source', () =
     expect(aapl.sector).toBe('Technology');
     expect(aapl.ratios).toEqual({ roe: 0.2, debtToEquity: 0.4, currentRatio: 2.0 });
   });
+
+  // RC5: each row carries the BARE (symbol, market) the portal displays, derived via the adapter from
+  // the T212 ticker — NOT the reconstructed suffix form. The `ticker` field stays (runtime/wire key).
+  it('carries the bare symbol + market per row (RC5), retaining ticker for the wire id', async () => {
+    const res = await buildApp().request('/admin/api/market-data/scanner/snapshot', {
+      headers: { Authorization: await adminToken() },
+    });
+    const body = await res.json();
+    const byTicker = Object.fromEntries(body.rows.map((r: { ticker: string }) => [r.ticker, r]));
+    expect(byTicker.AAPL_US_EQ.symbol).toBe('AAPL');
+    expect(byTicker.AAPL_US_EQ.market).toBe('US');
+    expect(byTicker.AAPL_US_EQ.ticker).toBe('AAPL_US_EQ');     // runtime/wire id retained
+    expect(byTicker.SHELl_EQ.symbol).toBe('SHEL');             // London name → bare 'SHEL', not 'SHELl_EQ'
+    expect(byTicker.SHELl_EQ.market).toBe('LSE');
+    expect(byTicker.TSLA_US_EQ.symbol).toBe('TSLA');
+  });
+
+  // RC3: a Task-8 tombstone (unavailable:true) surfaces on the row so the portal renders "by design"
+  // distinct from a covered-but-pending dash. A real/unfetched row carries unavailable false/null.
+  it('surfaces the unavailable by-design flag from the cached tombstone (RC3)', async () => {
+    const res = await buildApp({
+      // `peek` is stubbed to key by the requested T212 ticker, so key the override the same way.
+      peekDocs: {
+        // A real refreshed US row carries unavailable:false (as refreshWithStatus writes it).
+        AAPL_US_EQ: { ...doc('AAPL:US', 'pit-edgar', 3_000_000, 'AAPL', 'US'), unavailable: false },
+        // SHEL is a by-design tombstone — non-US fail-closed. raw/ratios/source null, unavailable:true.
+        SHELl_EQ: {
+          _id: 'SHEL:LSE', symbol: 'SHEL', market: 'LSE', asOf: 1_700_000_000_000,
+          raw: null, ratios: null, qualityPass: false, marketCapGbp: null, source: null,
+          unavailable: true, updatedAt: 1_700_000_000_000,
+        },
+      },
+    }).request('/admin/api/market-data/scanner/snapshot', { headers: { Authorization: await adminToken() } });
+    const body = await res.json();
+    const byTicker = Object.fromEntries(body.rows.map((r: { ticker: string }) => [r.ticker, r]));
+    expect(byTicker.SHELl_EQ.unavailable).toBe(true);          // by-design tombstone surfaces
+    expect(byTicker.SHELl_EQ.source).toBeNull();
+    expect(byTicker.AAPL_US_EQ.unavailable).toBe(false);       // real refreshed row → false (not a tombstone)
+    expect(byTicker.TSLA_US_EQ.unavailable).toBeNull();        // no cached doc → null
+  });
 });
 
 describe('GET /admin/api/market-data/scanner/feed-health — effective provider', () => {

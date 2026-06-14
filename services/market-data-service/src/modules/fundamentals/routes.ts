@@ -87,6 +87,11 @@ export function createFundamentalsRouter(
       marketCapGbp: doc?.marketCapGbp ?? null,
       asOf:         doc?.asOf ?? null,
       source:       doc?.source ?? null,
+      // By-design fail-closed marker (Task 8 tombstone): true ⇒ the provider can never resolve this
+      // name (non-US fail-closed, or a US no-EDGAR miss). Lets the Research Fundamentals tab render an
+      // honest "no fundamentals (by design)" state, distinct from a covered-but-not-yet-fetched row.
+      // null = no cached doc at all.
+      unavailable:  doc?.unavailable ?? null,
       analyst:      estimates,                  // null = estimates not yet available (placeholder, decision I)
     });
   });

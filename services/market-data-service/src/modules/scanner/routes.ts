@@ -33,6 +33,10 @@ export function createScannerRouter(universe: UniverseManager, fundamentals: Fun
     const ids = tickers
       .map((t) => ({ ticker: t, id: tryIdentityOf(t) }))
       .filter((x): x is { ticker: string; id: NonNullable<typeof x.id> } => x.id !== null);
+    // Keep the parsed identity per ticker so each snapshot row can carry the BARE (symbol, market) the
+    // portal displays (RC5) without re-parsing — the T212 string stays the runtime key (sort/join),
+    // but the operator sees `STAN`/`AAPL` + a market badge, not the reconstructed `STANl_EQ`.
+    const idByTicker = new Map(ids.map((x) => [x.ticker, x.id]));
     const regs = ids.length === 0 ? [] : await db.collection<RegistryRow>(COLLECTIONS.INSTRUMENT_REGISTRY)
       .find({ $or: ids.map((x) => ({ symbol: x.id.symbol, market: x.id.market })), activeTo: null }).toArray();
     const regByTicker = new Map<string, RegistryRow>();
@@ -44,21 +48,34 @@ export function createScannerRouter(universe: UniverseManager, fundamentals: Fun
 
     const rows = tickers.map((t) => {
       const reg = regByTicker.get(t);
+      const id = idByTicker.get(t);
       const f = funds[t];
       return {
+        // `ticker` is the runtime/wire T212 form, retained for cross-links (the research drawer opens
+        // on the canonical id) — the portal display reads `symbol`/`market` instead (RC5).
         ticker:       t,
-        name:         reg?.name ?? t,
-        market:       reg?.market ?? 'OTHER',
+        // Bare exchange identity from the adapter (the registry is keyed on it). `symbol` falls back
+        // to the T212 string only for an un-routable name (shouldn't occur for an active ticker);
+        // `market` prefers the parsed identity, then the registry row, then 'OTHER'.
+        symbol:       id?.symbol ?? t,
+        market:       id?.market ?? reg?.market ?? 'OTHER',
+        name:         reg?.name ?? id?.symbol ?? t,
         sector:       sectors[t] ?? 'Unknown',
         marketCapGbp: f?.marketCapGbp ?? null,
         ratios:       f?.ratios ?? null,
         qualityPass:  f?.qualityPass ?? null,           // null = fundamentals not yet fetched
+        // By-design fail-closed marker (Task 8 tombstone): true ⇒ the provider can NEVER resolve this
+        // name (non-US fail-closed, or a US no-EDGAR miss). The portal renders "no fundamentals (by
+        // design)" for it — visually distinct from a covered-but-pending `—`. Absent/false ⇒ a real
+        // (or not-yet-fetched) row. null when there's no cached doc at all.
+        unavailable:  f?.unavailable ?? null,
         // Per-name provenance for the portal source badge (#150): `pit-edgar` (US warehouse hit) /
         // `yahoo` (PIT fall-back or yahoo mode) / `eodhd`, as persisted on the cached row. null when
         // fundamentals aren't fetched yet — the badge then shows "none", never a fabricated source.
         source:       f?.source ?? null,
       };
     });
+    // Headline cap-sort is unchanged; the portal re-sorts client-side (now by `symbol`, not `ticker`).
     rows.sort((a, b) => (b.marketCapGbp ?? 0) - (a.marketCapGbp ?? 0));
     return c.json({
       universeSize:     tickers.length,

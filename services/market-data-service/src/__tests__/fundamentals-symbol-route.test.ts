@@ -69,6 +69,7 @@ describe('GET /admin/api/market-data/fundamentals/:ticker', () => {
     expect(body.qualityPass).toBe(true);
     expect(body.marketCapGbp).toBe(2_000_000);
     expect(body.source).toBe('yahoo');
+    expect(body.unavailable).toBeNull(); // a real row with no tombstone marker → null (not by-design)
     expect(body.analyst).toBeNull(); // no analyst fetcher wired in this case
   });
 
@@ -82,6 +83,27 @@ describe('GET /admin/api/market-data/fundamentals/:ticker', () => {
     expect(body.ratios).toBeNull();
     expect(body.qualityPass).toBeNull();
     expect(body.marketCapGbp).toBeNull();
+    expect(body.unavailable).toBeNull(); // no cached doc → null (the tab shows "not yet fetched")
+  });
+
+  // RC3: a by-design tombstone (Task 8, unavailable:true — non-US fail-closed / no-EDGAR) surfaces the
+  // flag so the Research Fundamentals tab renders an honest "no fundamentals (by design)" state.
+  it('surfaces unavailable:true for a by-design tombstone (non-US fail-closed)', async () => {
+    const tombstone: FundamentalsDoc = {
+      _id: 'SHEL:LSE', symbol: 'SHEL', market: 'LSE', asOf: 1_700_000_000_000,
+      raw: null, ratios: null, qualityPass: false, marketCapGbp: null, source: null,
+      unavailable: true, updatedAt: 1_700_000_000_000,
+    };
+    const peek = async (tickers: string[]) =>
+      Object.fromEntries(tickers.filter((t) => t === 'SHELl_EQ').map((t) => [t, tombstone]));
+    const res = await buildApp({ peek }).request('/admin/api/market-data/fundamentals/SHELl_EQ', {
+      headers: { Authorization: await adminToken() },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.unavailable).toBe(true);
+    expect(body.raw).toBeNull();
+    expect(body.source).toBeNull();
   });
 
   it('does NOT let the :ticker param capture the coverage/refresh literal paths', async () => {
