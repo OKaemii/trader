@@ -315,13 +315,20 @@ export class TwelveDataClient {
       const msg = body.message ?? 'no message';
       // Blacklist any error that signals permanent unavailability so we stop wasting credits:
       //   • "symbol not found" — the symbol isn't in TwelveData's catalog.
-      //   • plan-gated — "available starting with the Grow/Venture plan" / "upgrade" / "is only
-      //     available on the …" : the free tier doesn't serve this listing's /time_series (the
-      //     LSE-on-free-Basic case). These carry a status:"error" body but no "not found", so
-      //     the prior /not found/i test missed them and they re-requested forever.
-      // Other errors (e.g. "no data on the specified dates") are transient — log, stay pollable.
+      //   • plan-gated — the free tier doesn't serve this listing's /time_series (the
+      //     LSE-on-free-Basic case): "available starting with the Grow/Venture plan",
+      //     "only available on the Pro plan", "please upgrade". These carry a status:"error"
+      //     body but no "not found", so the prior /not found/i test missed them and they
+      //     re-requested forever.
+      // The discriminator is subscription-PLAN / upgrade vocabulary — NOT the bare word
+      // "available". A transient "No data is available on the specified dates." also contains
+      // "available", so a loose /available on/ test mis-classified that empty-window case as a
+      // permanent wall and blacklisted a still-valid name; key off plan/upgrade instead.
       const permanentlyUnavailable =
-        /not found/i.test(msg) || /available (starting|on|with)|upgrad|only available/i.test(msg);
+        /not found/i.test(msg) ||
+        /available starting with/i.test(msg) ||
+        /\bupgrad/i.test(msg) ||
+        /\bplan\b/i.test(msg);
       if (permanentlyUnavailable) {
         this.unsupported.add(ticker);
         log.warn(`[twelvedata] ${ticker} (${td.symbol}) unavailable — blacklisted: ${msg}`);
