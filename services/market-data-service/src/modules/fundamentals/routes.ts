@@ -39,7 +39,10 @@ export function createFundamentalsRouter(
     return c.json({ fundamentals: out });
   });
 
-  // Admin: coverage summary for the Scanner/Feeds health panel.
+  // Admin: coverage summary for the Scanner/Feeds health panel. `coverage()` returns the
+  // covered/unavailable split ({ count, covered, unavailable, passing, oldestAsOf }) — `covered` =
+  // real rows, `unavailable` = by-design tombstones (non-US / no-EDGAR), `count` = covered +
+  // unavailable — relayed verbatim so the panel separates real coverage from by-design gaps.
   r.get('/admin/api/market-data/fundamentals/coverage', parseAdminHeaders, async (c) => {
     return c.json(await cache.coverage());
   });

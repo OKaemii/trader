@@ -283,11 +283,26 @@ export class FundamentalsCache {
     return { written, tombstoned, outage };
   }
 
-  async coverage(): Promise<{ count: number; passing: number; oldestAsOf: number | null }> {
+  /**
+   * Coverage summary for the Scanner feed-health + fundamentals/coverage surfaces. Splits the cache
+   * into genuinely-covered names vs by-design-unavailable tombstones so the portal can show the two
+   * honestly (the Task 7 tombstone made every terminal name a row with `qualityPass:false`, which
+   * would otherwise quietly inflate `count` against a passing minority and read as "broken coverage").
+   *   • `count`       — total rows (covered + unavailable; the invariant the QA reconciles).
+   *   • `unavailable` — tombstone rows (`unavailable===true`): a name the provider can never resolve
+   *                     (non-US fail-closed, or a US no-EDGAR miss). NOT a coverage gap — by design.
+   *   • `covered`     — REAL rows (not a tombstone): names we actually hold fundamentals for.
+   *   • `passing`     — covered rows that pass the QMJ screen. Tombstones are excluded explicitly
+   *                     (they are `qualityPass:false` already, but the guard keeps the count honest
+   *                     against any future tombstone shape).
+   */
+  async coverage(): Promise<{ count: number; covered: number; unavailable: number; passing: number; oldestAsOf: number | null }> {
     const coll = await this.coll();
-    const docs = await coll.find({}, { projection: { qualityPass: 1, asOf: 1 } }).toArray();
-    const passing = docs.filter((d) => d.qualityPass).length;
+    const docs = await coll.find({}, { projection: { qualityPass: 1, asOf: 1, unavailable: 1 } }).toArray();
+    const unavailable = docs.filter((d) => d.unavailable === true).length;
+    const covered = docs.length - unavailable;
+    const passing = docs.filter((d) => d.unavailable !== true && d.qualityPass).length;
     const oldestAsOf = docs.reduce<number | null>((min, d) => (min === null ? d.asOf : Math.min(min, d.asOf)), null);
-    return { count: docs.length, passing, oldestAsOf };
+    return { count: docs.length, covered, unavailable, passing, oldestAsOf };
   }
 }

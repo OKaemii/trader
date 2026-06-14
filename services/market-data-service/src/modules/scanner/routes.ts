@@ -70,6 +70,10 @@ export function createScannerRouter(universe: UniverseManager, fundamentals: Fun
 
   r.get('/admin/api/market-data/scanner/feed-health', parseAdminHeaders, async (c) => {
     const eodhd = getEodhdClient();
+    // coverage() carries the covered/unavailable split: `covered` = real rows, `unavailable` =
+    // by-design tombstones (non-US / no-EDGAR), `count` = covered + unavailable. Relayed verbatim so
+    // the portal renders "covered vs by-design-unavailable" honestly instead of lumping tombstones
+    // (qualityPass:false) into the headline count.
     const cov = await fundamentals.coverage();
     const redis = await getRedisClient();
     const today = new Date().toISOString().slice(0, 10);
