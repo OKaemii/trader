@@ -82,13 +82,15 @@ export function toTwelveDataSymbolFromIdentity(id: TickerIdentity): TwelveDataSy
 
 /**
  * Map a T212 ticker to the TwelveData request parameters. Thin wrapper over the identity-native
- * mapping for the per-ticker fetch path (which holds a T212 string). Fail-soft on a non-US/LSE string:
- * returns a bare `{ symbol }` (no mic/country) so TwelveData resolves its default listing — the prior
- * parser's behaviour for legacy ETF oddballs with no exchange metadata — rather than throwing.
+ * mapping for the per-ticker fetch path (which holds a T212 string). Returns `null` when the string
+ * is not a parseable US/LSE equity (an `OTHER`-bucket / malformed ticker the adapter rejects): the
+ * old fail-soft passthrough forwarded such a string verbatim to `/time_series`, which TwelveData
+ * answered with a 404 — a guaranteed wasted credit on every poll. Returning `null` lets the caller
+ * hard-skip the ticker (blacklist it) instead of paying for a request that can only fail.
  */
-export function toTwelveDataSymbol(t212Ticker: string): TwelveDataSymbol {
+export function toTwelveDataSymbol(t212Ticker: string): TwelveDataSymbol | null {
   try { return toTwelveDataSymbolFromIdentity(adapter.fromT212(t212Ticker)); }
-  catch { return { symbol: t212Ticker.trim() }; }
+  catch { return null; }
 }
 
 // ── Credit rate-limiter ─────────────────────────────────────────────────────────
@@ -252,6 +254,16 @@ export class TwelveDataClient {
   ): Promise<OHLCVBar[]> {
     if (this.unsupported.has(ticker)) return [];
     const td = toTwelveDataSymbol(ticker);
+    // A ticker the adapter can't parse into a US/LSE listing (an `OTHER`-bucket / malformed
+    // string) has no valid /time_series request — sending it anyway is a guaranteed 404 and a
+    // wasted credit. Hard-skip: blacklist it (so subsequent polls short-circuit at the check
+    // above), log once, and return [] — callers (poll / heal / backfill) already treat an empty
+    // result as "no bars for this ticker", so the skip is a no-op for them, not an error.
+    if (td === null) {
+      this.unsupported.add(ticker);
+      log.warn(`[twelvedata] ${ticker} is not a parseable US/LSE ticker — skipped (no request) and blacklisted`);
+      return [];
+    }
     const query: Record<string, string> = {
       symbol:   td.symbol,
       interval: tdInterval,
