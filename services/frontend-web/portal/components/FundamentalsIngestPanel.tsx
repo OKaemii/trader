@@ -5,6 +5,7 @@ import { FundamentalsSourceTag } from '@/components/FundamentalsSourceTag'
 import {
   buildSummary,
   filterRows,
+  lastCycleMs,
   mergeFundamentalsRows,
   sortRows,
   type FreshnessAudit,
@@ -263,8 +264,58 @@ export function FundamentalsIngestPanel({
 
   const bootstrapDone = status?.bootstrap_complete ?? false
 
+  // ── PIT health vs strategy-serving — two SEPARATE signals (the honesty fix) ─────────────────────
+  // The authoritative PIT-availability signal is the HARVESTER/LAKE state (does the lake hold facts we
+  // can serve), NOT the live strategy's serving count. The strategy only consumes the lake once a daily
+  // cycle runs, so a freshly-bootstrapped lake that no cycle has read yet (`pit_served:0`,
+  // `last_cycle_ts:null`) is "strategy idle — awaiting first cycle", NOT "PIT broken". Conflating the two
+  // made a healthy lake read as broken whenever the strategy hadn't cycled. We surface them apart:
+  //   • lakeHealthy — bootstrap done AND the lake holds covered CIKs (the real PIT-up signal).
+  //   • strategyIdle — the source read SUCCEEDED but the strategy has served 0 from PIT and never cycled.
+  // strategyIdle is only meaningful when the source endpoint actually answered; a cold/unreachable source
+  // (handled by the all-cold fallback above and the per-card last-good degradation) is NOT "idle".
+  const lakeHealthy = bootstrapDone && (status?.covered_ciks ?? 0) > 0
+  const strategyIdle =
+    source != null && source.pit_served === 0 && lastCycleMs(source.last_cycle_ts) == null
+
   return (
     <div className="space-y-5">
+      {/* ── PIT health banner — lake state is authoritative; strategy-serving is a separate signal ──── */}
+      {status && (
+        <div
+          className={`rounded border px-4 py-3 text-sm ${
+            lakeHealthy
+              ? 'border-emerald-900 bg-emerald-950/40 text-emerald-200'
+              : 'border-amber-900 bg-amber-950 text-amber-200'
+          }`}
+          data-testid="pit-health-banner"
+        >
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <span className="font-semibold">
+              {lakeHealthy ? 'PIT lake healthy' : 'PIT lake not ready'}
+            </span>
+            <span className={lakeHealthy ? 'text-emerald-300/80' : 'text-amber-300/80'}>
+              {lakeHealthy
+                ? `${status.covered_ciks.toLocaleString()} CIKs harvested · bootstrap complete${
+                    status.last_sweep_date ? ` · last sweep ${status.last_sweep_date}` : ''
+                  }`
+                : bootstrapDone
+                  ? 'bootstrap complete but no covered CIKs yet'
+                  : 'bootstrapping — full companyfacts seed in progress'}
+            </span>
+          </div>
+          {/* The live strategy's PIT-serving count is a DIFFERENT thing from lake health. When the source
+              read succeeded but the strategy hasn't run a daily cycle, say so honestly — this is idle, not
+              broken (a healthy lake stays healthy regardless of whether the strategy has cycled). */}
+          {strategyIdle && (
+            <p className="mt-1.5 text-xs text-gray-300" data-testid="strategy-idle-note">
+              Strategy idle — awaiting first daily cycle (no bars emitted yet). The lake is the
+              authoritative PIT signal above; the live cycle will start serving PIT facts on its next run.
+            </p>
+          )}
+        </div>
+      )}
+
       {/* ── Status: lake coverage + sweep + size ───────────────────────────────────────────────── */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
         <Stat

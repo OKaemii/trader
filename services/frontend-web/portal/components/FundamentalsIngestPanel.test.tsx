@@ -212,6 +212,65 @@ describe('FundamentalsIngestPanel — summary + per-name table (bare symbols)', 
   })
 })
 
+describe('FundamentalsIngestPanel — PIT health vs strategy idle (honesty)', () => {
+  // A healthy lake whose strategy has not yet run a daily cycle (pit_served:0, last_cycle_ts:null) must
+  // read as "strategy idle — awaiting first cycle", NOT a red "PIT broken/unavailable". The lake state
+  // is the authoritative PIT signal and is shown separately from the live-strategy serving count.
+  const idleSource: FundamentalsSource = {
+    provider: 'pit',
+    sources: {},
+    by_ticker: {},
+    pit_served: 0,
+    last_cycle_ts: null,
+  }
+
+  it('shows the lake as healthy from the harvester status, independent of the strategy count', () => {
+    renderPanel({ initialSource: idleSource })
+    const banner = screen.getByTestId('pit-health-banner')
+    expect(within(banner).getByText('PIT lake healthy')).toBeInTheDocument()
+    // the authoritative signal is the harvested CIK count from /status, not the strategy serving count
+    expect(banner.textContent).toMatch(/17,312 CIKs harvested/)
+  })
+
+  it('labels a pre-cycle strategy "idle — awaiting first daily cycle", not broken', () => {
+    renderPanel({ initialSource: idleSource })
+    expect(screen.getByTestId('strategy-idle-note')).toHaveTextContent(
+      /Strategy idle — awaiting first daily cycle/,
+    )
+    // honesty: a healthy lake + idle strategy must NOT surface a broken/unavailable PIT state
+    expect(screen.queryByText(/PIT.*unavailable/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/PIT lake not ready/i)).not.toBeInTheDocument()
+  })
+
+  it('does NOT show the idle note when the strategy is actively serving PIT', () => {
+    renderPanel() // default source has pit_served:2 + a non-null last_cycle_ts
+    expect(screen.getByTestId('pit-health-banner')).toBeInTheDocument()
+    expect(screen.queryByTestId('strategy-idle-note')).not.toBeInTheDocument()
+  })
+
+  it('flags the lake "not ready" while the harvester is still bootstrapping', () => {
+    renderPanel({
+      initialStatus: { ...status, bootstrap_complete: false, covered_ciks: 0 },
+      initialSource: idleSource,
+    })
+    const banner = screen.getByTestId('pit-health-banner')
+    expect(within(banner).getByText('PIT lake not ready')).toBeInTheDocument()
+    expect(banner.textContent).toMatch(/bootstrapping/)
+  })
+
+  it('still degrades to the unavailable fallback when EVERY read is cold (unreachable ≠ idle)', () => {
+    renderPanel({
+      initialStatus: null,
+      initialConfig: null,
+      initialFreshness: null,
+      initialSource: null,
+    })
+    expect(screen.getByText(/harvester status unavailable/i)).toBeInTheDocument()
+    // the idle/health banner needs a status read; with everything cold it is absent
+    expect(screen.queryByTestId('pit-health-banner')).not.toBeInTheDocument()
+  })
+})
+
 describe('FundamentalsIngestPanel — force sweep', () => {
   it('posts to the force-sweep proxy after confirm', async () => {
     vi.useRealTimers()
