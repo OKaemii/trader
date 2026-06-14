@@ -10,14 +10,23 @@
 // Factored here so both run the exact same read→group→aggregate→persist→publish — the
 // gate is the ONLY difference, and it lives at the caller, not in the fold.
 //
-// The 5m read goes through the BARS_BACKEND-dispatched SET reader, never a raw Mongo
-// find: live config is BARS_BACKEND=timescale + DUAL_WRITE_BARS=false, so the poll path
-// writes 5m bars only to Timescale and the wipe emptied Mongo ohlcv_bars — a direct Mongo
-// read returns 0 rows forever, starving market:raw:daily and idling the strategy. The
-// reader honours the backend, splits each T212 partition ticker to its bare (symbol,
-// market) identity (storage is keyed bare), filters is_superseded:false + the
-// observation_ts >= sinceTs day floor, and returns OHLCVBar[] with the T212 ticker
-// re-derived per row.
+// The 5m read goes through the BARS_BACKEND-dispatched SET reader, never a raw Mongo find:
+// live config is BARS_BACKEND=timescale, so reads dispatch to Timescale. The original RC1 bug
+// was a HARDCODED Mongo 5m read that returned 0 rows once the wipe ran, starving market:raw:daily
+// and idling the strategy. The reader honours the backend, splits each T212 partition ticker to
+// its bare (symbol, market) identity (storage is keyed bare), filters is_superseded:false + the
+// observation_ts >= sinceTs day floor, and returns OHLCVBar[] with the T212 ticker re-derived
+// per row.
+//
+// STORE-INVERSION CAVEAT (RC4 audit, card 218). The WRITE side below (writeBarRevisions) is the
+// MIRROR-IMAGE problem and is NOT yet fixed: it is still Mongo-primary (Timescale only when
+// DUAL_WRITE_BARS=true — currently false), so this fold's persist writes the daily bar to MONGO
+// while a getBars('daily') read dispatches to TIMESCALE; the emitted daily bar is invisible to a
+// Timescale daily read-back, and the persisted daily series diverges between the two stores. The
+// revival rides the market:raw:daily STREAM publish (below), which is store-agnostic, so the
+// strategy still cycles regardless. The durable fix is to flip writeBarRevisions to dispatch on
+// BARS_BACKEND (Timescale-primary under `timescale`) so writes land where reads look — its own
+// follow-up card.
 
 import type { Db } from 'mongodb';
 import type { getRedisClient } from '@trader/shared-redis';

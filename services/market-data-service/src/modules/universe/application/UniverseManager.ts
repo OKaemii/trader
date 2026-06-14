@@ -618,6 +618,15 @@ export class UniverseManager {
       selected = selectCurated(rawInstruments, cfg);
     } else {
       // ── 2. Fetch OHLCV stats for Section 29b eligibility filters ─────────────
+      // STORE NOTE (RC4 audit, card 218). This whole `else` branch is the LEGACY "first N from T212"
+      // selection — it runs only when `source` is NEITHER `eodhd_scan` NOR a curated include-list.
+      // Live + Helm both set `UNIVERSE_SOURCE=eodhd_scan` (which ranks by market cap, not OHLCV ADV)
+      // and the curated path takes include-list order, so this branch is DEAD in every deployed
+      // config — the ADV aggregation below never executes in production. It reads Mongo `ohlcv_bars`
+      // directly; if this branch were ever revived it would (like the backfill coverage reads) need
+      // to read the bar WRITE store, so it stays Mongo and would move with the "writeBarRevisions
+      // Timescale-primary" writer flip (see backfill.ts `planGapWindows` STORE NOTE). Annotated, not
+      // changed: flipping a dead path adds risk with zero live benefit.
       const lookbackDate = new Date(now.getTime() - ADV_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
 
       // Aggregate 20-day ADV and latest close per name from stored OHLCV bars. Storage is keyed on
