@@ -160,9 +160,12 @@ describe('TwelveDataProvider', () => {
     });
 
     it('omits the currency tag when TwelveData returns no currency meta', async () => {
+      // A parseable ticker that reaches /time_series; the response carries no currency meta, so the
+      // bar must omit the currency tag. (An unparseable ticker is now hard-skipped before the fetch,
+      // so it can't exercise this path — see "unparseable-ticker hard skip" below.)
       spy = installFetch(() => tdSeries([['2026-05-20 14:30:00', 100]]));   // no currency
       const p = new TwelveDataProvider(OPTS);
-      const bars = await p.fetchHistory('UNKNOWN', Date.now() - 60_000);
+      const bars = await p.fetchHistory('AAPL_US_EQ', Date.now() - 60_000);
       expect(bars[0].currency).toBeUndefined();
       expect(bars[0].close).toBe(100);
     });
@@ -197,5 +200,55 @@ describe('TwelveDataProvider', () => {
     const p = new TwelveDataProvider(OPTS);   // no FX → identity; ADV stays in native units
     const adv = await p.fetchLiquidity(['AAPL_US_EQ']);
     expect(adv['AAPL_US_EQ']).toBeCloseTo(100 * 1000, 4);    // close 100 × volume 1000
+  });
+
+  // Fail-soft hardening: an unparseable ticker must be hard-skipped, never forwarded to
+  // /time_series (the old passthrough turned every such name into a 404 + a wasted credit).
+  describe('unparseable-ticker hard skip', () => {
+    it('toTwelveDataSymbol returns null for a non-US/LSE string and maps valid US/LSE', () => {
+      // OTHER-bucket / malformed inputs the adapter rejects → null (no fabricated bare symbol).
+      expect(toTwelveDataSymbol('VWRP')).toBeNull();          // bare symbol, no _US_EQ / l_EQ suffix
+      expect(toTwelveDataSymbol('SPY5_LSE_GBX')).toBeNull();  // unrecognised CFD/ETF-style form
+      // Well-formed tickers still map (regression guard for the valid path).
+      expect(toTwelveDataSymbol('AAPL_US_EQ')).toEqual({ symbol: 'AAPL', country: 'United States' });
+      expect(toTwelveDataSymbol('HSBAl_EQ')).toEqual({ symbol: 'HSBA', micCode: 'XLON' });
+    });
+
+    it('skips an unparseable ticker with no HTTP request and no credit spent', async () => {
+      spy = installFetch(() => tdSeries([['2026-05-20 14:30:00', 100]], 'USD'));
+      const p = new TwelveDataProvider(OPTS);
+      const bars = await p.fetchHistory('VWRP', Date.now() - 60_000);   // unparseable
+      expect(bars).toEqual([]);                                 // treated as "no bars", not an error
+      expect(spy.calls).toHaveLength(0);                        // never hit /time_series
+      expect(p.creditsUsedToday).toBe(0);                       // no credit burned on a doomed request
+    });
+
+    it('blacklists the unparseable ticker so a second poll also makes no request', async () => {
+      spy = installFetch(() => tdSeries([['2026-05-20 14:30:00', 100]], 'USD'));
+      const p = new TwelveDataProvider(OPTS);
+      await p.fetchHistory('VWRP', Date.now() - 60_000);
+      await p.fetchHistory('VWRP', Date.now() - 60_000);
+      expect(spy.calls).toHaveLength(0);                        // both polls short-circuit (blacklisted)
+      expect(p.creditsUsedToday).toBe(0);
+    });
+
+    it('a valid US ticker still reaches /time_series with country=United States', async () => {
+      spy = installFetch(() => tdSeries([['2026-05-20 14:30:00', 100]], 'USD'));
+      const p = new TwelveDataProvider(OPTS);
+      const bars = await p.fetchHistory('AAPL_US_EQ', Date.now() - 60_000);
+      expect(bars).toHaveLength(1);
+      expect(spy.calls).toHaveLength(1);                        // the valid path is unaffected
+      expect(paramsOf(spy.calls[0].url).get('country')).toBe('United States');
+      expect(p.creditsUsedToday).toBe(1);
+    });
+
+    it('a valid LSE ticker still reaches /time_series with mic_code=XLON', async () => {
+      spy = installFetch(() => tdSeries([['2026-05-20 14:30:00', 870]], 'GBp'));
+      const p = new TwelveDataProvider(OPTS);
+      const bars = await p.fetchHistory('HSBAl_EQ', Date.now() - 60_000);
+      expect(bars).toHaveLength(1);
+      expect(spy.calls).toHaveLength(1);
+      expect(paramsOf(spy.calls[0].url).get('mic_code')).toBe('XLON');
+    });
   });
 });
