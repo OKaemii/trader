@@ -16,17 +16,27 @@ export interface FundamentalsDoc {
   _id:          string;        // '<symbol>:<market>' (the bare-identity composite key since Task 16b)
   symbol:       string;        // bare exchange symbol
   market:       string;        // 'US' | 'LSE'
-  asOf:         number;        // when fetched (UTC ms)
-  raw:          FundamentalsRaw;
+  asOf:         number;        // when fetched (UTC ms) — for a tombstone, when it was last attempted
+  // For a REAL row `raw` holds the fetched line items; a TOMBSTONE (see `unavailable`) carries `null`.
+  raw:          FundamentalsRaw | null;
   ratios:       QmjRatios | null;
-  qualityPass:  boolean;
+  qualityPass:  boolean;         // a tombstone is `false` (no quality data — never a false PASS)
   marketCapGbp: number | null;   // null = uncomputable cap (renders `—`, never a fabricated £0)
   // Per-name provenance: the concrete upstream this row came from, as the provider reported it on
   // the fetch (`provider.sourceOf`) — `pit-edgar` for a PIT lake hit, or the configured mode
-  // (`eodhd`) when the provider resolves every name from one upstream. After the Yahoo removal a
-  // non-US name / PIT miss is fail-closed (no doc written), so it never carries a source. Lets the
-  // scanner show an honest per-name source.
-  source:       string;
+  // (`eodhd`) when the provider resolves every name from one upstream. A REAL row always carries a
+  // source string; a TOMBSTONE carries `null` (no upstream resolved it). Lets the scanner show an
+  // honest per-name source.
+  source:       string | null;
+  // Tombstone marker. A name the provider reported `terminal` (can NEVER resolve from this provider:
+  // a non-US name with no EDGAR/no Yahoo substitute, or a US name the lake returned a miss for — no
+  // CIK / no facts, e.g. TCEHY). A tombstone is a real Mongo row written with `unavailable:true`,
+  // `raw/ratios/marketCapGbp/source = null`, `qualityPass:false`, and `asOf:now`, so the stale set
+  // drains and the QMJ refresh loop CONVERGES (an `asOf:now` row is fresh, so `refreshStale` stops
+  // counting it instead of spinning on a name that can never resolve). A genuine fetch `hit` always
+  // overwrites the tombstone with real data. Absent/false ⇒ a real row. Task 8 reads this flag to
+  // split coverage (count `unavailable` names separately from genuinely-covered ones).
+  unavailable?: boolean;
   updatedAt:    number;
 }
 
@@ -145,23 +155,35 @@ export class FundamentalsCache {
 
   /**
    * Refresh only the missing/stale subset of `tickers` (the same freshness filter `get` applies),
-   * without the trailing read. Returns counts so the background refresher can decide its backoff:
-   * `stale` is how many needed work, `refreshed` how many the provider actually returned (a gap
-   * means the provider was throttled / omitted unknown symbols).
+   * without the trailing read. Returns counts so the background refresher can decide its backoff and
+   * whether to warn:
+   *   • `stale`     — how many names needed work this pass.
+   *   • `refreshed` — how many made PROGRESS = `hit` rows written + `terminal` tombstones written. A
+   *                   tombstone is progress: the name leaves the stale set (its `asOf:now` is fresh)
+   *                   and won't be re-fetched next cycle, so an all-`terminal` residual converges to
+   *                   `stale === 0` and the loop idles — it is NOT "no progress".
+   *   • `outage`    — names left untouched because the upstream was unreachable (resolvability
+   *                   unknown). These stay stale and retry next cycle; `refreshed === 0 && outage > 0`
+   *                   is the only genuine "made no progress", and the only case the scheduler warns on.
+   * A tombstone treats `asOf:now` as fresh, so a tombstoned name is no longer stale on the next pass —
+   * this is what makes the QMJ refresh loop converge.
    */
-  async refreshStale(tickers: string[]): Promise<{ stale: number; refreshed: number }> {
-    if (tickers.length === 0) return { stale: 0, refreshed: 0 };
+  async refreshStale(
+    tickers: string[],
+  ): Promise<{ stale: number; refreshed: number; outage: number }> {
+    if (tickers.length === 0) return { stale: 0, refreshed: 0, outage: 0 };
     const coll = await this.coll();
     const { ids, idToTicker } = this.idMap(tickers);
-    if (ids.length === 0) return { stale: 0, refreshed: 0 };
+    if (ids.length === 0) return { stale: 0, refreshed: 0, outage: 0 };
     const existing = await coll.find({ _id: { $in: ids } }, { projection: { asOf: 1 } }).toArray();
     const asOfById = new Map(existing.map((d) => [d._id, d.asOf]));
     const now = Date.now();
     const stale = [...idToTicker.entries()]
       .filter(([id]) => { const a = asOfById.get(id); return a == null || now - a > this.ttlMs; })
       .map(([, ticker]) => ticker);
-    const refreshed = stale.length > 0 ? await this.refresh(stale) : 0;
-    return { stale: stale.length, refreshed };
+    if (stale.length === 0) return { stale: 0, refreshed: 0, outage: 0 };
+    const { written, tombstoned, outage } = await this.refreshWithStatus(stale);
+    return { stale: stale.length, refreshed: written + tombstoned, outage };
   }
 
   /** Read-only: cached docs for `tickers` with NO provider refresh (for the Scanner snapshot). Keyed
@@ -180,16 +202,38 @@ export class FundamentalsCache {
     return out;
   }
 
-  /** Force a provider fetch + upsert for the given tickers. Returns the number written. The doc is
-   *  keyed on the (symbol, market) composite `_id` since Task 16b — an un-routable name the provider
-   *  somehow returned is skipped (fail-soft). */
+  /** Force a provider fetch + upsert for the given tickers. Returns the number of REAL rows written
+   *  (a `hit`); tombstones for `terminal` names are NOT counted here (callers like the admin refresh
+   *  endpoint and `refreshIfModeChanged` mean "how many names now have real fundamentals"). For the
+   *  fuller breakdown the refresh loop needs to converge, see `refreshWithStatus`. */
   async refresh(tickers: string[]): Promise<number> {
-    if (tickers.length === 0) return 0;
+    return (await this.refreshWithStatus(tickers)).written;
+  }
+
+  /**
+   * The real fetch + persist, returning the per-name outcome split the background refresher needs to
+   * converge (`refresh` is the thin "hits-only count" wrapper over this):
+   *   • `written`    — `hit` names upserted with real fundamentals.
+   *   • `tombstoned` — `terminal` names upserted as a TOMBSTONE (asOf:now, unavailable:true, nulls,
+   *                    qualityPass:false). A tombstone leaves the stale set (its `asOf:now` is fresh),
+   *                    so a name that can never resolve stops being re-fetched every cycle — this is
+   *                    what stops the `refresh made no progress` loop. A later `hit` overwrites it.
+   *   • `outage`     — names the provider could not classify (upstream unreachable / non-2xx); their
+   *                    resolvability is unknown, so they are left UNTOUCHED (no tombstone) and retry on
+   *                    the next cycle. `outage > 0 && written+tombstoned === 0` is the only genuine
+   *                    "made no progress" — the case the scheduler still warns on.
+   * Both upserts are keyed on the (symbol, market) composite `_id` since Task 16b — an un-routable
+   * name (shouldn't occur for a provider-returned status, but defended for parity with `idMap`) is
+   * skipped fail-soft.
+   */
+  private async refreshWithStatus(
+    tickers: string[],
+  ): Promise<{ written: number; tombstoned: number; outage: number }> {
+    if (tickers.length === 0) return { written: 0, tombstoned: 0, outage: 0 };
     const coll = await this.coll();
-    // `fetch` now returns `{ values, status }`: `values` is the resolved (`hit`) names — the same map
-    // this loop already upserted. The per-name `status` (hit / terminal / outage) is the seam for the
-    // refresh-convergence work (writing tombstones for `terminal` names so the stale set drains); this
-    // cache continues to upsert only the real `values` rows here.
+    // `fetch` returns `{ values, status }`: `values` is the resolved (`hit`) names; `status` carries
+    // one entry per input ticker (`hit | terminal | outage`) so we can tombstone `terminal` names and
+    // leave `outage` names to retry — the seam that lets the loop converge instead of spinning.
     const fetched = await this.provider.fetch(tickers);
     const now = Date.now();
     let written = 0;
@@ -197,21 +241,46 @@ export class FundamentalsCache {
       const identity = tryIdentityOf(ticker);
       if (identity === null) continue;   // un-routable form — never store a concatenated/legacy key
       // Persist the provider's per-name source when it exposes one (the `pit` provider stamps
-      // `pit-edgar`/`yahoo` per ticker); otherwise the configured mode is already the per-name truth.
+      // `pit-edgar` per ticker); otherwise the configured mode is already the per-name truth.
       const source = this.provider.sourceOf?.(ticker) ?? this.source;
       await coll.updateOne(
         { _id: idOf(identity) },
         { $set: {
           symbol: identity.symbol, market: identity.market,
           asOf: now, raw, ratios: computeRatios(raw), qualityPass: qualityPass(raw),
-          marketCapGbp: raw.marketCapGbp, source, updatedAt: now,
+          marketCapGbp: raw.marketCapGbp, source, unavailable: false, updatedAt: now,
         } },
         { upsert: true },
       );
       written++;
     }
-    log.info(`[fundamentals] refreshed ${written}/${tickers.length} ticker(s) from ${this.source}`);
-    return written;
+    // Tombstone the `terminal` names + tally the `outage` names. A `hit` is already persisted above,
+    // so skip any ticker also present in `values` (a status map is per-input; `values` is the
+    // authoritative hit set) — a real row must never be clobbered by a tombstone in the same pass.
+    let tombstoned = 0;
+    let outage = 0;
+    for (const [ticker, status] of Object.entries(fetched.status)) {
+      if (status === 'hit') continue;
+      if (status === 'outage') { outage++; continue; }      // unknown resolvability — leave to retry
+      if (ticker in fetched.values) continue;               // already written as a real hit
+      const identity = tryIdentityOf(ticker);
+      if (identity === null) continue;                      // un-routable — fail-soft skip
+      await coll.updateOne(
+        { _id: idOf(identity) },
+        { $set: {
+          symbol: identity.symbol, market: identity.market,
+          asOf: now, raw: null, ratios: null, qualityPass: false,
+          marketCapGbp: null, source: null, unavailable: true, updatedAt: now,
+        } },
+        { upsert: true },
+      );
+      tombstoned++;
+    }
+    log.info(
+      `[fundamentals] refreshed ${written}/${tickers.length} ticker(s) from ${this.source}` +
+      (tombstoned > 0 || outage > 0 ? ` (${tombstoned} unavailable, ${outage} outage)` : ''),
+    );
+    return { written, tombstoned, outage };
   }
 
   async coverage(): Promise<{ count: number; passing: number; oldestAsOf: number | null }> {
