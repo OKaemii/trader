@@ -26,13 +26,14 @@
 import type { Db } from 'mongodb';
 import type { RedisClientType } from 'redis';
 import type { OHLCVBar, BarInterval } from '@trader/shared-types';
+import type { TickerIdentity } from '@trader/ticker-identity';
 import { COLLECTIONS } from '@trader/shared-mongo';
 import { getPgPool } from '@trader/shared-pg';
-import { getBarsFromPg, getBarAtOrBeforePg, getDailyDepthPg, pgCacheKey, pgAtCacheKey } from './pg-bar-reader.ts';
+import { getBarsFromPg, getBarAtOrBeforePg, getDailyDepthPg, getRecentBarsForTickersPg, pgCacheKey, pgAtCacheKey } from './pg-bar-reader.ts';
 import { identityOf, tickerOf, identityKey } from './identity.ts';
 
 export { hashBarContent } from './content-hash.ts';
-export { getBarsFromPg, getBarAtOrBeforePg, getDailyDepthPg, getLastClosePg, pgCacheKey, pgAtCacheKey } from './pg-bar-reader.ts';
+export { getBarsFromPg, getBarAtOrBeforePg, getDailyDepthPg, getRecentBarsForTickersPg, getLastClosePg, pgCacheKey, pgAtCacheKey } from './pg-bar-reader.ts';
 export { computeMissingRanges, coverageOf } from './coverage.ts';
 export type { MissingRange } from './coverage.ts';
 
@@ -306,6 +307,62 @@ async function getBarsFromMongo(
   }
 
   return bars;
+}
+
+export interface RecentBarsQuery {
+  /** Bar granularity to read (storage interval — `'5m'` for the daily-emit's intraday fold). */
+  interval: BarInterval;
+  /** Lower bound (UTC ms, inclusive) on `observation_ts`. The load-bearing read-bound. */
+  sinceTs: number;
+}
+
+/**
+ * Latest unsuperseded `interval` bars at/after `sinceTs` for a SET of (symbol, market) identities,
+ * dispatched per `BARS_BACKEND`. This is the multi-ticker companion to `getBars` (which is
+ * per-ticker, range-keyed): one read over a whole identity set, the shape the daily-emit fold needs
+ * ("every active-universe ticker's 5m bars since UTC-midnight"). None of the existing readers fit —
+ * `getBars` is one ticker, `getBarAtOrBefore`/`getDailyDepth` are single-purpose bounded reads.
+ *
+ * Bounded by `observation_ts >= sinceTs` so the Timescale plan stays pruned to the day's chunks (the
+ * OOM-safe rule — see getRecentBarsForTickersPg / getBarAtOrBefore). The Mongo branch is the same
+ * `{ $or: [{symbol, market}…], interval, is_superseded:false, observation_ts:{$gte} }` query the
+ * daily-emit ran inline, lifted here so both stores share one dispatch and one row shape.
+ *
+ * Unlike the windowed/series readers this read is NOT Redis-cached: the emit calls it once per cycle
+ * with a moving "today" window over the whole universe, so a (set, sinceTs)-keyed entry would miss
+ * every cycle. Returns OHLCVBar[] oldest-first with the T212 `ticker` re-derived per row; empty array
+ * when `ids` is empty or nothing matches.
+ *
+ * @param db  MongoDB handle. Required when `BARS_BACKEND=mongo` (the default); may be `undefined`
+ *           when `BARS_BACKEND=timescale`.
+ */
+export async function getRecentBarsForTickers(
+  _redis: Pick<RedisClientType, 'get' | 'setEx'>,
+  db: Db | undefined,
+  ids: ReadonlyArray<TickerIdentity>,
+  q: RecentBarsQuery,
+): Promise<OHLCVBar[]> {
+  if (ids.length === 0) return [];
+  if (activeBackend() === 'timescale') {
+    return getRecentBarsForTickersPg(ids, q);
+  }
+  if (!db) {
+    throw new Error('[shared-bars] getRecentBarsForTickers: db parameter required when BARS_BACKEND=mongo (the default)');
+  }
+  // Mongo branch — the lifted daily-emit query. Storage is keyed on the bare identity, so the set is
+  // matched as an `$or` over (symbol, market); `is_superseded:false` picks the live revision per
+  // (symbol, market, observation_ts) via the partial-unique index; `observation_ts:$gte` bounds it.
+  const coll = db.collection(COLLECTIONS.OHLCV_BARS);
+  const docs = await coll
+    .find({
+      $or:            ids.map((id) => ({ symbol: id.symbol, market: id.market })),
+      interval:       q.interval,
+      is_superseded:  false,
+      observation_ts: { $gte: q.sinceTs },
+    })
+    .sort({ observation_ts: 1 })
+    .toArray();
+  return docs.map(docToBar);
 }
 
 /**
