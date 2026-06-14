@@ -20,7 +20,7 @@ import { TwelveDataProvider } from './modules/bars/infrastructure/providers/twel
 import { configureEodhdClient, getEodhdClient } from './modules/bars/infrastructure/providers/eodhd-client.ts';
 import type { MarketDataProvider } from './modules/bars/infrastructure/providers/market-data-provider.ts';
 import { FxClient, TwelveDataFxProvider } from '@trader/shared-fx';
-import { aggregateBars, invalidateBarsBulk, getBarAtOrBefore } from '@trader/shared-bars';
+import { aggregateBars, invalidateBarsBulk, getBarAtOrBefore, getRecentBarsForTickers } from '@trader/shared-bars';
 import {
   HolidayCache, NyseIcalProvider, UkGovBankHolidayProvider, EodhdExchangeHolidayProvider,
   StaticFallbackProvider, STATIC_FALLBACK,
@@ -194,19 +194,17 @@ export async function maybeEmitDailyAtClose(
 
     try {
       const db = await getMongoDb();
-      // Read the latest unsuperseded 5m bars for the UTC day. is_superseded:false
-      // picks one row per (symbol, market, observation_ts) via the partial-unique index;
-      // observation_ts:$gte bounds the day. Storage is keyed on the bare identity, so the
-      // T212 partition tickers are split to (symbol, market) for the membership match.
-      const docs = await db.collection(COLLECTIONS.OHLCV_BARS)
-        .find({
-          $or:            tickers.map((t) => { const id = tickerAdapter.fromT212(t); return { symbol: id.symbol, market: id.market }; }),
-          interval:       '5m',
-          is_superseded:  false,
-          observation_ts: { $gte: utcMidnightMs },
-        })
-        .toArray();
-      if (docs.length === 0) {
+      // Read the latest unsuperseded 5m bars for the UTC day through the BARS_BACKEND dispatcher,
+      // NOT a raw Mongo query: live config is BARS_BACKEND=timescale + DUAL_WRITE_BARS=false, so the
+      // poll path writes 5m bars only to Timescale and the wipe emptied Mongo ohlcv_bars — a direct
+      // Mongo read returns 0 rows forever, starving market:raw:daily and idling the strategy. The
+      // dispatched set-reader honours the backend; it splits each T212 partition ticker to its bare
+      // (symbol, market) identity (storage is keyed bare), filters is_superseded:false + the
+      // observation_ts >= utcMidnight day bound, and returns OHLCVBar[] with the T212 ticker
+      // re-derived per row. Bounded by sinceTs so Timescale chunk-exclusion prunes to the day.
+      const ids = tickers.map((t) => tickerAdapter.fromT212(t));
+      const bars = await getRecentBarsForTickers(redis, db, ids, { interval: '5m', sinceTs: utcMidnightMs });
+      if (bars.length === 0) {
         // Release the gate so a later cycle retries once today's 5m bars land. An early
         // CLOSED-state cycle (or a pod restart) can run this BEFORE the EOD poll has fetched
         // today's bars; without the release the gate burned here blocks the real emit for 25h,
@@ -217,23 +215,10 @@ export async function maybeEmitDailyAtClose(
       }
       // Group by ticker then aggregate-to-daily so aggregateBars sees one ticker's bars
       // at a time (it folds all rows into a single output bar keyed by the head ticker).
+      // The reader already returns fully-formed OHLCVBar[] (T212 ticker re-derived, OHLCV fields
+      // populated) for both backends, so we group on bar.ticker directly — no doc→bar conversion.
       const byTicker = new Map<string, OHLCVBar[]>();
-      for (const d of docs) {
-        const obsTs = typeof d.observation_ts === 'number'
-          ? d.observation_ts
-          : (d.timestamp instanceof Date ? d.timestamp.getTime() : Number(d.timestamp ?? 0));
-        // Docs carry (symbol, market); re-derive the T212 ticker for the aggregate + downstream emit.
-        const bar: OHLCVBar = {
-          ticker:         tickerAdapter.toT212({ symbol: d.symbol as string, market: d.market as 'US' | 'LSE' }),
-          observation_ts: obsTs,
-          timestamp:      obsTs,
-          interval:       '5m',
-          open:           d.open as number,
-          high:           d.high as number,
-          low:            d.low as number,
-          close:          d.close as number,
-          volume:         d.volume as number,
-        };
+      for (const bar of bars) {
         let list = byTicker.get(bar.ticker);
         if (!list) { list = []; byTicker.set(bar.ticker, list); }
         list.push(bar);
