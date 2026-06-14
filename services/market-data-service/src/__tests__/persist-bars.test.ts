@@ -9,7 +9,7 @@
 
 process.env.INTERNAL_SECRET = 'test-internal-secret';
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { hashBarContent } from '@trader/shared-bars';
 import type { OHLCVBar } from '@trader/shared-types';
 
@@ -259,8 +259,11 @@ describe('writeBarRevisions — mixed batch', () => {
   });
 });
 
-describe('writeBarRevisions — dual-write to Timescale', () => {
+describe('writeBarRevisions — dual-write to Timescale (BARS_BACKEND=mongo primary)', () => {
   beforeEach(() => {
+    // These cover the Mongo-PRIMARY path — pin the backend explicitly so a leaked
+    // BARS_BACKEND=timescale from another test can't silently re-route them.
+    delete process.env.BARS_BACKEND;
     pgWriteMock.mockClear();
     pgWriteMock.mockResolvedValue({ attempted: 0, inserted: 0, revisions: 0, skipped: 0 });
   });
@@ -332,6 +335,81 @@ describe('writeBarRevisions — dual-write to Timescale', () => {
     } finally {
       delete process.env.DUAL_WRITE_BARS;
     }
+  });
+});
+
+// The store-inversion fix: under BARS_BACKEND=timescale the writer is Timescale-PRIMARY (the PG twin
+// owns the write + audit), NOT a best-effort dual-write. Mongo is written ONLY as a rollback mirror
+// (DUAL_WRITE_BARS=true). Live config (timescale + DUAL_WRITE_BARS=false) writes Timescale ONLY — so
+// writes land in the SAME store every reader dispatches to (the bug this card fixes).
+describe('writeBarRevisions — BARS_BACKEND=timescale primary', () => {
+  beforeEach(() => {
+    process.env.BARS_BACKEND = 'timescale';
+    delete process.env.DUAL_WRITE_BARS;
+    pgWriteMock.mockClear();
+    pgWriteMock.mockResolvedValue({ attempted: 1, inserted: 1, revisions: 0, skipped: 0 });
+  });
+  afterEach(() => {
+    delete process.env.BARS_BACKEND;
+    delete process.env.DUAL_WRITE_BARS;
+  });
+
+  it('writes Timescale ONLY (no Mongo) when DUAL_WRITE_BARS is off — the live config', async () => {
+    const { db, inserts, updates, audits } = makeCollections({});
+    const b = bar('A_US_EQ', 1_000, 100);
+    const now = 1_700_000_000_000;
+
+    const stats = await writeBarRevisions(db, [b], '5m', now);
+
+    // PG (primary) invoked with the bars; its stats are what the writer returns.
+    expect(pgWriteMock).toHaveBeenCalledTimes(1);
+    expect(pgWriteMock).toHaveBeenCalledWith([b], '5m', now);
+    expect(stats).toEqual({ attempted: 1, inserted: 1, revisions: 0, skipped: 0 });
+    // Mongo NOT touched — no bar insert, no supersede, no audit row.
+    expect(inserts).toHaveLength(0);
+    expect(updates).toHaveLength(0);
+    expect(audits).toHaveLength(0);
+  });
+
+  it('also mirrors to Mongo (rollback target) when DUAL_WRITE_BARS=true, PG still primary', async () => {
+    process.env.DUAL_WRITE_BARS = 'true';
+    const { db, inserts, audits } = makeCollections({});
+    const b = bar('A_US_EQ', 1_000, 100);
+    const now = 1_700_000_000_000;
+
+    const stats = await writeBarRevisions(db, [b], '5m', now);
+
+    // PG primary + Mongo mirror both ran; the returned stats are PG's.
+    expect(pgWriteMock).toHaveBeenCalledTimes(1);
+    expect(stats.inserted).toBe(1);
+    expect(inserts).toHaveLength(1);          // the rollback mirror wrote the bar to Mongo
+    expect(audits).toHaveLength(1);           // and its audit row
+  });
+
+  it('a Mongo rollback-mirror failure does NOT fail the Timescale write that already landed', async () => {
+    process.env.DUAL_WRITE_BARS = 'true';
+    // A Mongo collection whose insertOne throws — the mirror fails, but PG already succeeded.
+    const failingDb = {
+      collection: () => ({
+        find: () => ({ project: () => ({ toArray: async () => [] }), toArray: async () => [] }),
+        updateMany: async () => { throw new Error('mongo mirror down'); },
+        insertOne:  async () => { throw new Error('mongo mirror down'); },
+      }),
+    } as unknown as import('mongodb').Db;
+
+    const stats = await writeBarRevisions(failingDb, [bar('A_US_EQ', 1_000, 100)], '5m');
+
+    // PG primary stats returned; no throw despite the mirror failing.
+    expect(pgWriteMock).toHaveBeenCalledTimes(1);
+    expect(stats.inserted).toBe(1);
+  });
+
+  it('propagates a PRIMARY (Timescale) write failure — the primary store is not best-effort', async () => {
+    pgWriteMock.mockRejectedValueOnce(new Error('timescale primary down'));
+    const { db } = makeCollections({});
+    await expect(
+      writeBarRevisions(db, [bar('A_US_EQ', 1_000, 100)], '5m'),
+    ).rejects.toThrow(/timescale primary down/);
   });
 });
 

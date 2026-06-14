@@ -73,30 +73,107 @@ export async function fetchFirstPrintCloses(
 }
 
 /**
- * Persist a batch of bars bi-temporally. Idempotent: re-running on the same
- * provider response writes zero rows.
+ * Which physical store the bar WRITE path is PRIMARY on, dispatched per `BARS_BACKEND` — read fresh
+ * each call (no restart needed to re-point, matching the shared-bars READ dispatcher). The writer must
+ * land bars in the SAME store the readers read: live config is `BARS_BACKEND=timescale`, and every
+ * shared-bars reader dispatches to Timescale, so the write MUST be Timescale-primary or reads see an
+ * ever-staler store (the inversion this fixes — the cutover runbook's "final code drop", step 9).
+ * Defaults to `mongo` so the pre-cutover default is unchanged. See agent-docs/plans/three-database-split.md §Cutover.
+ */
+function barsBackend(): 'mongo' | 'timescale' {
+  return (process.env.BARS_BACKEND ?? 'mongo') === 'timescale' ? 'timescale' : 'mongo';
+}
+
+/**
+ * Persist a batch of bars bi-temporally, into the store `BARS_BACKEND` selects. Idempotent:
+ * re-running on the same provider response writes zero rows.
+ *
+ * Dispatch (mirrors the shared-bars READ dispatcher so write store == read store):
+ *   • `BARS_BACKEND=timescale` → write Timescale-PRIMARY via `writeBarRevisionsPg` (the complete,
+ *     OOM-safe, equivalence-tested PG twin: same hash-gate skip, same supersede-in-txn, same
+ *     bar_revisions_log audit — bar-equivalence.test.ts pins identical `getBars` output to the Mongo
+ *     writer). Mongo is written ONLY when `DUAL_WRITE_BARS=true`, as a best-effort ROLLBACK MIRROR
+ *     (the break-glass target to flip `BARS_BACKEND` back to `mongo`); a mirror failure NEVER fails
+ *     the Timescale write that already landed. NOTE: with `DUAL_WRITE_BARS=false` (live) there is no
+ *     Mongo write — the write-loss safety net is the deliberate cost of completing the cutover (the
+ *     read store is the source of truth; Mongo bars are cutover residue).
+ *   • `BARS_BACKEND=mongo` (default) → write Mongo-PRIMARY (the bi-temporal transactional path below),
+ *     then best-effort dual-write Timescale when `DUAL_WRITE_BARS=true` (the pre-cutover behaviour,
+ *     unchanged). A PG failure here logs to `dual_write_failures` and never fails the Mongo write.
+ *
+ * The returned stats reflect the PRIMARY store's writes (the count the admin/portal display reports).
+ */
+export async function writeBarRevisions(
+  db: Db,
+  bars: OHLCVBar[],
+  interval: BarInterval,
+  now: number = Date.now(),
+): Promise<WriteBarRevisionsStats> {
+  if (barsBackend() === 'timescale') {
+    // Timescale is primary. The PG twin owns the hash-gate, supersede-in-txn, and audit log; its
+    // returned stats are the source of truth for the count consumers display.
+    const pgStats = await writeBarRevisionsPg(bars, interval, now);
+    // Optional rollback mirror to Mongo — best-effort, never fails the PG write that already landed.
+    // Off in live config (DUAL_WRITE_BARS=false); on only during a cutover/rollback soak.
+    if (process.env.DUAL_WRITE_BARS === 'true') {
+      try {
+        await writeBarRevisionsMongo(db, bars, interval, now);
+      } catch (err) {
+        log.error('[persist-bars] mongo rollback-mirror failed (Timescale write still succeeded):', err);
+      }
+    }
+    return pgStats;
+  }
+
+  // Mongo is primary (the default / pre-cutover path) — write Mongo, then best-effort dual-write PG.
+  const stats = await writeBarRevisionsMongo(db, bars, interval, now);
+  // Dual-write to Timescale during the migration window. Strictly best-effort —
+  // a PG failure here MUST NOT fail the Mongo write that already succeeded. The
+  // equivalence verification job (bar-equivalence.test.ts) catches divergence;
+  // the operator re-runs the targeted backfill on the affected tickers.
+  //
+  // The gate is read fresh each call so toggling the env without a restart works
+  // (e.g. operator flipping it off mid-cutover to investigate a problem).
+  if (process.env.DUAL_WRITE_BARS === 'true' && bars.length > 0) {
+    try {
+      await writeBarRevisionsPg(bars, interval, now);
+    } catch (err) {
+      log.error(`[persist-bars] timescale dual-write failed (Mongo write still succeeded):`, err);
+      try {
+        const dualFailuresColl = db.collection('dual_write_failures');
+        const obsTsValues = bars.map((b) => b.observation_ts).filter((t) => Number.isFinite(t));
+        await dualFailuresColl.insertOne({
+          tickers:              [...new Set(bars.map((b) => b.ticker))],
+          observation_ts_range: obsTsValues.length > 0
+            ? [Math.min(...obsTsValues), Math.max(...obsTsValues)]
+            : null,
+          interval,
+          error:                err instanceof Error ? err.message : String(err),
+          loggedAt:             new Date(),
+        });
+      } catch (logErr) {
+        // If even the failure-log write fails (Mongo down? collection denied?),
+        // we still need to keep going — the Mongo bars write already landed.
+        log.error('[persist-bars] failed to log dual-write failure (continuing):', logErr);
+      }
+    }
+  }
+  return stats;
+}
+
+/**
+ * Mongo-primary bi-temporal write (the original `writeBarRevisions` body). Idempotent: re-running on
+ * the same provider response writes zero rows.
  *
  * Performance shape: one batched `find` for prior revisions, then a per-bar
  * decision. Cosmetic skips never enter a transaction; only genuine revisions
- * (or first-prints) start a session + transaction. In steady state (Yahoo
+ * (or first-prints) start a session + transaction. In steady state (the provider
  * doesn't revise), the cost is one `find` per call, zero writes.
  *
- * STORE INVERSION — KNOWN DEFECT (RC4 audit, card 218; NOT fixed in that card — its own follow-up).
- * This writer is Mongo-PRIMARY: it always writes Mongo and writes Timescale only as a best-effort
- * dual-write when DUAL_WRITE_BARS=true. But the live config is BARS_BACKEND=timescale +
- * DUAL_WRITE_BARS=false, so EVERY consumer read (getBars / getRecentBarsForTickers / getDailyDepth
- * / getBarAtOrBefore) dispatches to TIMESCALE while every write here lands in MONGO ONLY. The
- * three-DB cutover flipped the READ backend (runbook step 6) and turned dual-write off (step 8) but
- * the "final code drop" (step 9 — flip this writer to Timescale-primary) was never done, so the two
- * sides are inverted. Today both stores happen to agree (the dual-write soak left them ~identical),
- * which is why RC1's stream-publish revival works; but new Mongo-only writes will diverge from the
- * Timescale read store over time (force-emit revisions already do). The fix is to make this writer
- * dispatch on BARS_BACKEND (write Timescale-primary under `timescale`), at which point the five
- * Mongo-direct coverage/read sites annotated "STORE NOTE (RC4 audit)" move to the dispatcher with
- * it. Do that as one cohesive change (high blast radius — the single bar write path — needs its own
- * review + live soak), in the safe window while both stores still agree.
+ * Called as the PRIMARY when `BARS_BACKEND=mongo`, and as the best-effort ROLLBACK MIRROR (under
+ * `DUAL_WRITE_BARS=true`) when `BARS_BACKEND=timescale`. See `writeBarRevisions` for the dispatch.
  */
-export async function writeBarRevisions(
+async function writeBarRevisionsMongo(
   db: Db,
   bars: OHLCVBar[],
   interval: BarInterval,
@@ -213,38 +290,9 @@ export async function writeBarRevisions(
     if (session !== null) await session.endSession();
   }
 
-  // Dual-write to Timescale during the migration window. Strictly best-effort —
-  // a PG failure here MUST NOT fail the Mongo write that already succeeded. The
-  // equivalence verification job (bar-equivalence.test.ts) catches divergence;
-  // the operator re-runs the targeted backfill on the affected tickers.
-  //
-  // The gate is read fresh each call so toggling the env without a restart works
-  // (e.g. operator flipping it off mid-cutover to investigate a problem).
-  if (process.env.DUAL_WRITE_BARS === 'true') {
-    try {
-      await writeBarRevisionsPg(bars, interval, now);
-    } catch (err) {
-      log.error(`[persist-bars] timescale dual-write failed (Mongo write still succeeded):`, err);
-      try {
-        const dualFailuresColl = db.collection('dual_write_failures');
-        const obsTsValues = bars.map((b) => b.observation_ts).filter((t) => Number.isFinite(t));
-        await dualFailuresColl.insertOne({
-          tickers:              [...new Set(bars.map((b) => b.ticker))],
-          observation_ts_range: obsTsValues.length > 0
-            ? [Math.min(...obsTsValues), Math.max(...obsTsValues)]
-            : null,
-          interval,
-          error:                err instanceof Error ? err.message : String(err),
-          loggedAt:             new Date(),
-        });
-      } catch (logErr) {
-        // If even the failure-log write fails (Mongo down? collection denied?),
-        // we still need to keep going — the Mongo bars write already landed.
-        log.error('[persist-bars] failed to log dual-write failure (continuing):', logErr);
-      }
-    }
-  }
-
+  // No dual-write tail here — the cross-store mirroring (Timescale dual-write when Mongo-primary;
+  // Mongo rollback-mirror when Timescale-primary) lives in the `writeBarRevisions` dispatcher above so
+  // this body is the pure Mongo write whether it runs as primary or as the rollback mirror.
   return stats;
 }
 
