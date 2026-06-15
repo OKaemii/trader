@@ -17,6 +17,19 @@ from .baseline import (
     seasonal_random_walk_eps,
     seasonal_random_walk_eps_path,
 )
+from .cross_sectional import (
+    MODEL_EP,
+    MODEL_HVZ,
+    MODEL_RI,
+    MODELS,
+    CrossSectionalFit,
+    TrainingPair,
+    admissible_at,
+    fit_all_models,
+    fit_vintage,
+    predict,
+    predict_ratio,
+)
 from .features import FirmYearFeatures, build_firm_year_features
 from .region import REGIONS, Region, region_of
 
@@ -29,4 +42,15 @@ __all__ = [
     "region_of",
     "FirmYearFeatures",
     "build_firm_year_features",
+    "MODEL_RI",
+    "MODEL_EP",
+    "MODEL_HVZ",
+    "MODELS",
+    "CrossSectionalFit",
+    "TrainingPair",
+    "admissible_at",
+    "fit_vintage",
+    "fit_all_models",
+    "predict",
+    "predict_ratio",
 ]
